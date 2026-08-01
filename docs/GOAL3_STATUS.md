@@ -2,7 +2,7 @@
 
 ## Current milestone
 
-Milestone -2 — isolation: complete. Milestone -1 — inherited baseline: complete. Milestone 0 — remote/signing/source/artifact contracts: complete. Milestone 1 — physical-device compile: implementation complete. Milestone 2 — signing engine: implementation complete with synthetic fixtures. Milestone 3 — GitHub provider: in progress; the live Linux client has proved authentication, repository binding, trusted workflow bytes, and temporary-ref authorization. The macOS worker job and automatic archive download remain pending.
+Milestone -2 — isolation: complete. Milestone -1 — inherited baseline: complete. Milestone 0 — remote/signing/source/artifact contracts: complete. Milestone 1 — physical-device compile: implementation complete. Milestone 2 — signing engine: implementation complete with synthetic fixtures. Milestone 3 — GitHub provider: in progress; the live Linux client has proved authentication, repository binding, trusted workflow bytes, temporary-ref authorization, and launch of the exact macOS worker. Physical-device archive production and automatic download remain pending.
 
 ## Validation levels
 
@@ -26,6 +26,7 @@ Milestone -2 — isolation: complete. Milestone -1 — inherited baseline: compl
 - Repository signing secret names: none returned. No secret values were requested or accessed.
 - Signed setup, doctor, and submission intentionally reject this public repository; a private execution repository is required before development signing.
 - Live Linux acceptance runs `30722271351` and `30723002515` failed before submission, first on unsupported Actions-token identity lookup and then because executable canonicalization changed the Rustup `cargo` proxy basename. Both failures were fixed with focused regression coverage; neither run created a temporary ref or macOS job.
+- Acceptance run `30723358152` proved an authenticated temporary-ref push. Its first attempt exposed a first-registration discovery race; after an exact manual trigger registered the branch-only worker workflow, the failed-job rerun launched macOS worker run `30723639422`. That worker verified and built the pinned trusted worker revision, then rejected the valid project manifest because `toml::Value::from_str` parses one TOML value rather than a TOML document in `toml` 0.9. The worker now parses `toml::Table`; all 15 worker binary tests and strict clippy pass. End-to-end rerun remains pending.
 
 ## Honest product status
 

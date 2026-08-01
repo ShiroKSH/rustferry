@@ -1318,7 +1318,7 @@ fn read_cargo_targets(project_root: &Utf8Path) -> Result<(String, String), CliFa
     let source = std::str::from_utf8(&bytes)
         .map_err(|_| CliFailure::input("invalid_cargo_manifest", "Cargo manifest is invalid"))?;
     let document = source
-        .parse::<toml::Value>()
+        .parse::<toml::Table>()
         .map_err(|_| CliFailure::input("invalid_cargo_manifest", "Cargo manifest is invalid"))?;
     let package = document
         .get("package")
@@ -3185,6 +3185,41 @@ mod tests {
         assert!(decode_unique_value(br#"{"a":1,"a":2}"#).is_err());
         assert!(decode_unique_value(br#"{"a":1} null"#).is_err());
         assert!(decode_unique_value(br#"{"a":[true,null]}"#).is_ok());
+    }
+
+    #[test]
+    fn cargo_document_parser_accepts_package_and_binary_tables() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let root = Utf8PathBuf::from_path_buf(temporary.path().to_path_buf())
+            .expect("UTF-8 temporary directory");
+        let source = r#"
+[package]
+name = "counter"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[lib]
+name = "counter"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "counter"
+path = "src/main.rs"
+
+[dependencies]
+serde = "1"
+
+[lints.rust]
+unsafe_code = "deny"
+"#;
+        fs::write(root.join("Cargo.toml"), source).expect("Cargo manifest");
+
+        assert_eq!(
+            read_cargo_targets(&root).expect("valid Cargo document"),
+            ("counter".to_owned(), "counter".to_owned())
+        );
     }
 
     #[test]
