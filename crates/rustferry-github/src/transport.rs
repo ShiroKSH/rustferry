@@ -14,6 +14,7 @@ use std::{
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -642,31 +643,16 @@ pub enum GhAuthentication {
     EnvironmentToken {
         /// Allowlisted variable name; never its value.
         variable: TokenEnvironmentVariable,
-        /// Canonical directory preventing fallback to ambient gh config.
-        isolated_config_directory: PathBuf,
     },
     /// Use exactly one canonical `gh` configuration directory.
     ConfigDirectory(PathBuf),
 }
 
 impl GhAuthentication {
-    /// Configure exact environment-token authentication.
-    ///
-    /// # Errors
-    ///
-    /// Rejects a missing, relative, non-directory, or symlink-final config
-    /// directory. The token itself is not read until request execution.
-    pub fn environment_token(
-        variable: TokenEnvironmentVariable,
-        isolated_config_directory: impl AsRef<Path>,
-    ) -> Result<Self, TransportConfigError> {
-        Ok(Self::EnvironmentToken {
-            variable,
-            isolated_config_directory: canonical_directory(
-                isolated_config_directory.as_ref(),
-                "isolated gh config directory",
-            )?,
-        })
+    /// Configure exact environment-token authentication. The token itself is
+    /// not read until request execution.
+    pub const fn environment_token(variable: TokenEnvironmentVariable) -> Self {
+        Self::EnvironmentToken { variable }
     }
 
     /// Configure authentication through one exact `gh` config directory.
@@ -680,24 +666,22 @@ impl GhAuthentication {
             "gh config directory",
         )?))
     }
+}
 
-    fn config_directory_path(&self) -> &Path {
-        match self {
-            Self::EnvironmentToken {
-                isolated_config_directory,
-                ..
-            } => isolated_config_directory,
-            Self::ConfigDirectory(directory) => directory,
-        }
-    }
+#[derive(Debug)]
+struct GhPrivateState {
+    _lifetime: tempfile::TempDir,
+    root: PathBuf,
 }
 
 /// Real fixed-argv GitHub CLI process runner.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct GhProcessRunner {
     executable: PathBuf,
     neutral_working_directory: PathBuf,
     authentication: GhAuthentication,
+    configuration_directory: PathBuf,
+    private_state: Arc<GhPrivateState>,
 }
 
 impl GhProcessRunner {
@@ -721,32 +705,51 @@ impl GhProcessRunner {
             neutral_working_directory.as_ref(),
             "neutral working directory",
         )?;
+        let private_state = Arc::new(create_private_gh_state(&neutral_working_directory)?);
+        let configuration_directory = match &authentication {
+            GhAuthentication::EnvironmentToken { .. } => private_state.root.clone(),
+            GhAuthentication::ConfigDirectory(directory) => directory.clone(),
+        };
         Ok(Self {
             executable,
             neutral_working_directory,
             authentication,
+            configuration_directory,
+            private_state,
         })
     }
-}
 
-impl GhRunner for GhProcessRunner {
-    fn execute(&mut self, request: &GhRequest) -> Result<Vec<u8>, GhExecutionError> {
+    fn command(&self, request: &GhRequest) -> Command {
         let mut command = Command::new(&self.executable);
         command
             .args(request.arguments())
             .current_dir(&self.neutral_working_directory)
             .env_clear()
-            .env("GH_CONFIG_DIR", self.authentication.config_directory_path())
+            .env("GH_CONFIG_DIR", &self.configuration_directory)
             .env("GH_PROMPT_DISABLED", "1")
             .env("GH_NO_UPDATE_NOTIFIER", "1")
+            .env("GH_TELEMETRY", "false")
+            .env("DO_NOT_TRACK", "true")
             .env("GH_PAGER", "cat")
             .env("PAGER", "cat")
             .env("NO_COLOR", "1")
             .env("LC_ALL", "C")
             .env("LANG", "C")
+            .env("XDG_STATE_HOME", &self.private_state.root)
+            .env("HOME", &self.private_state.root)
+            .env("USERPROFILE", &self.private_state.root)
+            .env("APPDATA", &self.private_state.root)
+            .env("LOCALAPPDATA", &self.private_state.root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        command
+    }
+}
+
+impl GhRunner for GhProcessRunner {
+    fn execute(&mut self, request: &GhRequest) -> Result<Vec<u8>, GhExecutionError> {
+        let mut command = self.command(request);
 
         if let GhAuthentication::EnvironmentToken { variable, .. } = &self.authentication {
             let name = variable.as_str();
@@ -758,6 +761,37 @@ impl GhRunner for GhProcessRunner {
 
         run_process(command, request.timeout, request.output_limit)
     }
+}
+
+fn create_private_gh_state(
+    neutral_working_directory: &Path,
+) -> Result<GhPrivateState, TransportConfigError> {
+    let directory = tempfile::Builder::new()
+        .prefix("rustferry-gh-")
+        .tempdir()
+        .map_err(|_| TransportConfigError::InvalidLocalPath {
+            field: "private gh state directory",
+        })?;
+    let root = validate_private_gh_state_root(directory.path(), neutral_working_directory)?;
+    Ok(GhPrivateState {
+        _lifetime: directory,
+        root,
+    })
+}
+
+fn validate_private_gh_state_root(
+    root: &Path,
+    neutral_working_directory: &Path,
+) -> Result<PathBuf, TransportConfigError> {
+    let root = canonical_directory(root, "private gh state directory")?;
+    let neutral_working_directory =
+        canonical_directory(neutral_working_directory, "neutral working directory")?;
+    if root.starts_with(neutral_working_directory) {
+        return Err(TransportConfigError::InvalidLocalPath {
+            field: "private gh state directory",
+        });
+    }
+    Ok(root)
 }
 
 /// Parsed authenticated GitHub account.
@@ -2504,6 +2538,103 @@ mod tests {
             Path::new("/usr/bin/not-gh"),
             "gh"
         ));
+    }
+
+    #[test]
+    fn private_gh_state_is_canonical_and_outside_the_project() {
+        let neutral = tempfile::TempDir::new().expect("neutral directory");
+        let neutral_path = fs::canonicalize(neutral.path()).expect("canonical neutral directory");
+        let state = create_private_gh_state(&neutral_path).expect("private gh state");
+        assert!(state.root.is_absolute());
+        assert!(!state.root.starts_with(neutral_path));
+        let metadata = fs::symlink_metadata(&state.root).expect("private state metadata");
+        assert!(metadata.is_dir());
+        assert!(!metadata.file_type().is_symlink());
+    }
+
+    #[test]
+    fn private_gh_state_rejects_project_local_roots() {
+        let neutral = tempfile::TempDir::new().expect("neutral directory");
+        let project_local_state =
+            tempfile::TempDir::new_in(neutral.path()).expect("project-local state directory");
+        assert!(matches!(
+            validate_private_gh_state_root(project_local_state.path(), neutral.path()),
+            Err(TransportConfigError::InvalidLocalPath {
+                field: "private gh state directory"
+            })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_gh_state_rejects_a_parent_symlink_alias_into_the_project() {
+        let neutral = tempfile::TempDir::new().expect("neutral directory");
+        let state = neutral.path().join("state");
+        fs::create_dir(&state).expect("project-local state directory");
+        let alias_parent = tempfile::TempDir::new().expect("alias parent");
+        let alias = alias_parent.path().join("project-alias");
+        std::os::unix::fs::symlink(neutral.path(), &alias).expect("project symlink alias");
+
+        assert!(matches!(
+            validate_private_gh_state_root(&alias.join("state"), neutral.path()),
+            Err(TransportConfigError::InvalidLocalPath {
+                field: "private gh state directory"
+            })
+        ));
+    }
+
+    #[test]
+    fn gh_process_environment_uses_only_private_state_and_disables_telemetry() {
+        let executable_directory = tempfile::TempDir::new().expect("executable directory");
+        let executable =
+            executable_directory
+                .path()
+                .join(if cfg!(windows) { "gh.exe" } else { "gh" });
+        fs::write(&executable, []).expect("fake gh executable");
+        let neutral = tempfile::TempDir::new().expect("neutral directory");
+        let runner = GhProcessRunner::new(
+            &executable,
+            neutral.path(),
+            GhAuthentication::environment_token(TokenEnvironmentVariable::GhToken),
+        )
+        .expect("isolated gh runner");
+        let request = GhRequest {
+            method: ApiMethod::Get,
+            endpoint: "/user".to_owned(),
+            fields: Vec::new(),
+            jq: Some(USER_QUERY),
+            silent: false,
+            output_limit: 1024,
+            timeout: Duration::from_secs(1),
+        };
+        let command = runner.command(&request);
+        let environment = command
+            .get_envs()
+            .map(|(name, value)| (name.to_owned(), value.map(OsStr::to_owned)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let value = |name: &str| {
+            environment
+                .get(OsStr::new(name))
+                .and_then(Option::as_ref)
+                .map(OsString::as_os_str)
+        };
+
+        assert_eq!(
+            value("GH_CONFIG_DIR"),
+            Some(runner.private_state.root.as_os_str())
+        );
+        assert_eq!(value("GH_TELEMETRY"), Some(OsStr::new("false")));
+        assert_eq!(value("DO_NOT_TRACK"), Some(OsStr::new("true")));
+        for name in [
+            "XDG_STATE_HOME",
+            "HOME",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+        ] {
+            assert_eq!(value(name), Some(runner.private_state.root.as_os_str()));
+        }
+        assert_eq!(environment.len(), 15);
     }
 
     #[test]

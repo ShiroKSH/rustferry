@@ -2386,19 +2386,18 @@ fn encode_stored_config(stored: &StoredGithubConfig) -> Result<Vec<u8>, CliError
 fn make_gh_runner(root: &Utf8Path) -> Result<GhProcessRunner, CliError> {
     let gh = executable("gh")?;
     let authentication = if let Some((variable, _)) = selected_environment_token() {
-        GhAuthentication::environment_token(variable, root)
+        GhAuthentication::environment_token(variable)
     } else {
         let config = gh_config_directory()?;
-        GhAuthentication::config_directory(config)
-    }
-    .map_err(|error| {
-        remote_error_with_details(
-            "github_authentication_invalid",
-            "GitHub CLI authentication configuration is not usable",
-            "Authenticate GitHub API access with `gh auth login` or GH_TOKEN. Temporary-ref publication also needs separately configured SSH or credential-manager Git authentication.",
-            vec![error.to_string()],
-        )
-    })?;
+        GhAuthentication::config_directory(config).map_err(|error| {
+            remote_error_with_details(
+                "github_authentication_invalid",
+                "GitHub CLI authentication configuration is not usable",
+                "Authenticate GitHub API access with `gh auth login` or GH_TOKEN. Temporary-ref publication also needs separately configured SSH or credential-manager Git authentication.",
+                vec![error.to_string()],
+            )
+        })?
+    };
     GhProcessRunner::new(&gh, root, authentication).map_err(|error| {
         remote_error_with_details(
             "github_cli_invalid",
