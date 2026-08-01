@@ -3,8 +3,8 @@ use std::fs;
 use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
 use rustferry_core::{FerryConfig, ProjectAssets, brand};
 use rustferry_remote::{
-    UnsignedNestedBundleExpectation, UnsignedNestedBundleKind, UnsignedXcarchiveExpectation,
-    UnsignedXcarchiveInspection, inspect_unsigned_xcarchive,
+    IosDeviceProductExpectation, UnsignedNestedBundleExpectation, UnsignedNestedBundleKind,
+    UnsignedXcarchiveExpectation, UnsignedXcarchiveInspection, inspect_unsigned_xcarchive,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -165,6 +165,62 @@ pub fn plan_ios_device_unsigned(
     plan_with_assets(request, toolchain, &assets)
 }
 
+/// Derive the complete client-owned product identity for a physical-iPhone request.
+///
+/// This helper is host-independent and does not inspect Xcode. The remote worker later compares
+/// the generated archive with these pre-submission values.
+///
+/// # Errors
+///
+/// Returns [`AppleError`] when the binary name, configuration, or extension graph is invalid.
+pub fn derive_ios_device_product_expectation(
+    config: &FerryConfig,
+    binary_name: &str,
+) -> Result<IosDeviceProductExpectation, AppleError> {
+    validate_binary_name(binary_name)?;
+    let _ = generate_ios_project_for_platform(
+        &IosProjectSpec::new(config.clone(), binary_name.to_owned()),
+        IosProjectPlatform::DeviceUnsigned,
+    )?;
+    let mut nested_bundles = vec![UnsignedNestedBundleExpectation {
+        relative_path: "Frameworks/FerryRuntimeBridge.framework".to_owned(),
+        bundle_identifier: "org.rustferry.runtime-bridge".to_owned(),
+        executable: "FerryRuntimeBridge".to_owned(),
+        kind: UnsignedNestedBundleKind::Framework,
+    }];
+    if config.extensions.live_activity.enabled {
+        nested_bundles.push(UnsignedNestedBundleExpectation {
+            relative_path: "Frameworks/FerryActivityModel.framework".to_owned(),
+            bundle_identifier: "org.rustferry.activity-model".to_owned(),
+            executable: "FerryActivityModel".to_owned(),
+            kind: UnsignedNestedBundleKind::Framework,
+        });
+        nested_bundles.push(UnsignedNestedBundleExpectation {
+            relative_path: "PlugIns/FerryLiveActivityExtension.appex".to_owned(),
+            bundle_identifier: format!("{}.liveactivity", config.app.identifier),
+            executable: "FerryLiveActivityExtension".to_owned(),
+            kind: UnsignedNestedBundleKind::AppExtension,
+        });
+    }
+    if config.extensions.widget.enabled {
+        nested_bundles.push(UnsignedNestedBundleExpectation {
+            relative_path: "PlugIns/FerryWidgetExtension.appex".to_owned(),
+            bundle_identifier: format!("{}.widget", config.app.identifier),
+            executable: "FerryWidgetExtension".to_owned(),
+            kind: UnsignedNestedBundleKind::AppExtension,
+        });
+    }
+    nested_bundles.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    let version = &config.app.version;
+    Ok(IosDeviceProductExpectation {
+        app_directory_name: format!("{binary_name}.app"),
+        executable: binary_name.to_owned(),
+        app_version: config.app.display_version.clone(),
+        build_number: format!("{}.{}.{}", version.major, version.minor, version.patch),
+        nested_bundles,
+    })
+}
+
 fn plan_with_assets(
     request: &IosDeviceArchiveRequest,
     toolchain: &IosDeviceToolchain,
@@ -253,35 +309,7 @@ fn archive_expectation(
     toolchain: &IosDeviceToolchain,
     generated: &crate::GeneratedAppleProject,
 ) -> Result<UnsignedXcarchiveExpectation, AppleError> {
-    let mut nested_bundles = vec![UnsignedNestedBundleExpectation {
-        relative_path: "Frameworks/FerryRuntimeBridge.framework".to_owned(),
-        bundle_identifier: "org.rustferry.runtime-bridge".to_owned(),
-        executable: "FerryRuntimeBridge".to_owned(),
-        kind: UnsignedNestedBundleKind::Framework,
-    }];
-    if request.config.extensions.live_activity.enabled {
-        nested_bundles.push(UnsignedNestedBundleExpectation {
-            relative_path: "Frameworks/FerryActivityModel.framework".to_owned(),
-            bundle_identifier: "org.rustferry.activity-model".to_owned(),
-            executable: "FerryActivityModel".to_owned(),
-            kind: UnsignedNestedBundleKind::Framework,
-        });
-        nested_bundles.push(UnsignedNestedBundleExpectation {
-            relative_path: "PlugIns/FerryLiveActivityExtension.appex".to_owned(),
-            bundle_identifier: format!("{}.liveactivity", request.config.app.identifier),
-            executable: "FerryLiveActivityExtension".to_owned(),
-            kind: UnsignedNestedBundleKind::AppExtension,
-        });
-    }
-    if request.config.extensions.widget.enabled {
-        nested_bundles.push(UnsignedNestedBundleExpectation {
-            relative_path: "PlugIns/FerryWidgetExtension.appex".to_owned(),
-            bundle_identifier: format!("{}.widget", request.config.app.identifier),
-            executable: "FerryWidgetExtension".to_owned(),
-            kind: UnsignedNestedBundleKind::AppExtension,
-        });
-    }
-    nested_bundles.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    let product = derive_ios_device_product_expectation(&request.config, &request.binary_name)?;
 
     let mut required_resources = std::collections::BTreeMap::new();
     for relative in ["FerryResources.json", "FerryIcon.png", "FerrySplash.png"] {
@@ -295,17 +323,16 @@ fn archive_expectation(
             })?;
         required_resources.insert(relative.to_owned(), format!("{:x}", Sha256::digest(bytes)));
     }
-    let version = &request.config.app.version;
     Ok(UnsignedXcarchiveExpectation {
-        app_directory_name: format!("{}.app", request.binary_name),
+        app_directory_name: product.app_directory_name,
         bundle_identifier: request.config.app.identifier.clone(),
-        executable: request.binary_name.clone(),
-        app_version: request.config.app.display_version.clone(),
-        build_number: format!("{}.{}.{}", version.major, version.minor, version.patch),
+        executable: product.executable,
+        app_version: product.app_version,
+        build_number: product.build_number,
         minimum_os: request.config.ios.min_version.clone(),
         sdk_version: toolchain.device_sdk.version.clone(),
         sdk_build_version: toolchain.device_sdk.build_version.clone(),
-        nested_bundles,
+        nested_bundles: product.nested_bundles,
         required_resources,
     })
 }

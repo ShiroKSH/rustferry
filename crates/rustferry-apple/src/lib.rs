@@ -26,7 +26,7 @@ pub use command::{CommandOutput, CommandSpec, DEFAULT_COMMAND_TIMEOUT, run_comma
 pub use device::{
     IosDeviceArchiveOutcome, IosDeviceArchivePlan, IosDeviceArchiveRequest,
     IosDeviceArtifactDisposition, IosDeviceMachOValidation, IosDeviceMachOValidationPlan,
-    build_ios_device_unsigned, plan_ios_device_unsigned,
+    build_ios_device_unsigned, derive_ios_device_product_expectation, plan_ios_device_unsigned,
 };
 pub use discovery::{
     AppleDiscovery, AppleDiscoveryOptions, AppleHostTools, AppleToolchain, IosDeviceSdk,

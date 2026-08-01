@@ -11,6 +11,8 @@ pub mod artifact;
 pub mod cancellation;
 /// Typed protocol and provider failures.
 pub mod error;
+/// Public compile-to-sign handoff evidence.
+pub mod handoff;
 /// Ferry Remote Build Protocol v1 data and NDJSON events.
 pub mod protocol;
 /// Runtime-neutral asynchronous build-provider boundary.
@@ -29,19 +31,25 @@ pub mod source;
 pub use artifact::{
     ARTIFACT_MANIFEST_SCHEMA_VERSION, ApplePlatform, AppleToolchainEvidence, ArtifactError,
     ArtifactKind, ArtifactManifest, ArtifactRecord, ArtifactSigningEvidence, CleanupStatus,
-    IpaExpectation, IpaInspection, MachOSliceEvidence, UnsignedAppInspection,
-    UnsignedNestedBundleExpectation, UnsignedNestedBundleKind, UnsignedXcarchiveExpectation,
-    UnsignedXcarchiveInspection, ValidationLevel, inspect_ipa, inspect_physical_iphone_macho,
-    inspect_unsigned_app_bundle, inspect_unsigned_xcarchive, verify_downloaded_file,
+    IosDeviceProductExpectation, IpaExpectation, IpaInspection, MachOSliceEvidence,
+    UnsignedAppInspection, UnsignedNestedBundleExpectation, UnsignedNestedBundleKind,
+    UnsignedXcarchiveExpectation, UnsignedXcarchiveInspection, ValidationLevel, inspect_ipa,
+    inspect_physical_iphone_macho, inspect_unsigned_app_bundle, inspect_unsigned_xcarchive,
+    verify_downloaded_file,
 };
 pub use cancellation::CancellationToken;
 pub use error::{RemoteBuildError, RemoteBuildResult};
+pub use handoff::{
+    COMPILE_HANDOFF_SCHEMA_VERSION, COMPILE_PHASE_EVIDENCE_SCHEMA_VERSION, CompileHandoff,
+    CompilePhaseEvidence, CompileToolchainEvidence, SEALED_UNSIGNED_ARCHIVE_SCHEMA_VERSION,
+    SealedUnsignedArchive,
+};
 pub use protocol::{
     BuildProfile, CURRENT_PROTOCOL_VERSION, CleanupConfirmation, DiagnosticSeverity,
     IOS_DEVICE_RUST_TARGET, IOS_DEVICE_SDK, IosArtifactType, IosDeviceBuildRequest,
     IosDeviceBuildResult, JobState, ProtocolPath, ProtocolPathSemantics, ProtocolVersion,
     REMOTE_BUILD_EVENT_TYPES, RemoteBuildEvent, RemoteBuildEventKind, RemoteDiagnostic,
-    RemoteErrorInfo,
+    RemoteErrorInfo, canonical_request_bytes, canonical_request_sha256,
 };
 pub use provider::{
     ArtifactDownloadRequest, ArtifactDownloadResult, ArtifactListRequest, BuildProvider,

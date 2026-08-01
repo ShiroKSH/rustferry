@@ -7,6 +7,7 @@ use std::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::secret::SecretReference;
 
@@ -110,14 +111,13 @@ impl SigningStatus {
     }
 }
 
-/// Serializable signing inputs containing references only, never secret bytes.
-#[derive(
-    Clone, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
+/// Serializable signing inputs containing public identity metadata and opaque
+/// references only, never secret bytes.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SigningReference {
-    /// Opaque reference to an encrypted identity bundle or configured identity.
-    pub identity: SecretReference,
+    /// Expected public certificate paired with the opaque private-key reference.
+    pub identity: SigningIdentity,
     /// Opaque reference to its password or passphrase, when required.
     pub password: Option<SecretReference>,
 }
@@ -234,12 +234,12 @@ impl<'de> Deserialize<'de> for DevelopmentTeam {
 /// Registered physical iPhone selected for a development artifact.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct DevicePlan {
-    udid: String,
+    udid_sha256: String,
     display_name: Option<String>,
 }
 
 impl DevicePlan {
-    /// Construct a validated opaque Apple device identifier.
+    /// Validate and hash an Apple device identifier without retaining it.
     ///
     /// # Errors
     ///
@@ -250,25 +250,48 @@ impl DevicePlan {
         display_name: Option<String>,
     ) -> Result<Self, SigningValidationError> {
         let udid = udid.into();
-        let valid_udid = (20..=64).contains(&udid.len())
-            && udid
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-            && !udid.starts_with('-')
-            && !udid.ends_with('-');
-        if !valid_udid
+        validate_raw_udid(&udid)?;
+        Self::from_sha256(sha256_lowercase(udid.as_bytes()), display_name)
+    }
+
+    /// Construct a device plan from an existing lowercase SHA-256 digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SigningValidationError::InvalidDeviceIdentifier`] for a
+    /// malformed digest or unsafe display name.
+    pub fn from_sha256(
+        udid_sha256: impl Into<String>,
+        display_name: Option<String>,
+    ) -> Result<Self, SigningValidationError> {
+        let udid_sha256 = udid_sha256.into();
+        if !is_lowercase_sha256(&udid_sha256)
             || display_name
                 .as_deref()
                 .is_some_and(|name| !is_safe_label(name))
         {
             return Err(SigningValidationError::InvalidDeviceIdentifier);
         }
-        Ok(Self { udid, display_name })
+        Ok(Self {
+            udid_sha256,
+            display_name,
+        })
     }
 
-    /// Return the validated device identifier.
-    pub fn udid(&self) -> &str {
-        &self.udid
+    /// Return the lowercase SHA-256 of the selected device identifier.
+    pub fn udid_sha256(&self) -> &str {
+        &self.udid_sha256
+    }
+
+    /// Validate and compare a raw device identifier without retaining it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SigningValidationError::InvalidDeviceIdentifier`] when the
+    /// candidate is malformed.
+    pub fn matches_udid(&self, udid: &str) -> Result<bool, SigningValidationError> {
+        validate_raw_udid(udid)?;
+        Ok(self.udid_sha256 == sha256_lowercase(udid.as_bytes()))
     }
 
     /// Return the optional public device name.
@@ -280,7 +303,7 @@ impl DevicePlan {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UncheckedDevicePlan {
-    udid: String,
+    udid_sha256: String,
     display_name: Option<String>,
 }
 
@@ -290,7 +313,8 @@ impl<'de> Deserialize<'de> for DevicePlan {
         D: Deserializer<'de>,
     {
         let unchecked = UncheckedDevicePlan::deserialize(deserializer)?;
-        Self::new(unchecked.udid, unchecked.display_name).map_err(serde::de::Error::custom)
+        Self::from_sha256(unchecked.udid_sha256, unchecked.display_name)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -447,8 +471,9 @@ pub struct ProvisioningProfile {
     pub created_at_unix_seconds: u64,
     /// Expiration time as a Unix timestamp.
     pub expires_at_unix_seconds: u64,
-    /// Registered device identifiers, empty for App Store profiles.
-    pub device_udids: Vec<String>,
+    /// Lowercase SHA-256 digests of registered device identifiers, empty for
+    /// App Store profiles.
+    pub device_udid_sha256s: Vec<String>,
     /// Profile entitlements.
     pub entitlements: EntitlementSet,
     /// Profile platform allowlist.
@@ -502,19 +527,19 @@ impl ProvisioningProfile {
             validate_fingerprint(fingerprint)?;
         }
         let mut devices = BTreeSet::new();
-        for udid in &self.device_udids {
-            DevicePlan::new(udid.clone(), None)?;
-            if !devices.insert(udid) {
+        for udid_sha256 in &self.device_udid_sha256s {
+            DevicePlan::from_sha256(udid_sha256.clone(), None)?;
+            if !devices.insert(udid_sha256) {
                 return Err(SigningValidationError::InvalidDeviceIdentifier);
             }
         }
         match self.profile_type {
             ProvisioningProfileType::Development | ProvisioningProfileType::AdHoc
-                if self.device_udids.is_empty() =>
+                if self.device_udid_sha256s.is_empty() =>
             {
                 return Err(SigningValidationError::DeviceNotProvisioned);
             }
-            ProvisioningProfileType::AppStore if !self.device_udids.is_empty() => {
+            ProvisioningProfileType::AppStore if !self.device_udid_sha256s.is_empty() => {
                 return Err(SigningValidationError::ProfileTypeMismatch);
             }
             ProvisioningProfileType::Development
@@ -541,6 +566,31 @@ impl ProvisioningProfile {
             Ok(())
         }
     }
+}
+
+fn validate_raw_udid(udid: &str) -> Result<(), SigningValidationError> {
+    let valid = (20..=64).contains(&udid.len())
+        && udid
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && !udid.starts_with('-')
+        && !udid.ends_with('-');
+    if valid {
+        Ok(())
+    } else {
+        Err(SigningValidationError::InvalidDeviceIdentifier)
+    }
+}
+
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn sha256_lowercase(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 /// Kind of code object in the required inside-out signing order.
@@ -599,7 +649,7 @@ pub struct EntitlementPlan {
 pub struct SigningPlan {
     /// Requested signing mode.
     pub mode: SigningMode,
-    /// Opaque identity/password references for modes that import an identity.
+    /// Public identity metadata plus opaque key/password references.
     pub signing: Option<SigningReference>,
     /// Expected team for all code and profiles.
     pub team: Option<DevelopmentTeamPlan>,
@@ -634,6 +684,16 @@ impl SigningPlan {
         } else {
             if self.mode.requires_identity_reference() && self.signing.is_none() {
                 errors.push(SigningValidationError::MissingSigningReference);
+            }
+            if let Some(signing) = &self.signing {
+                if let Err(error) = signing.identity.certificate.validate() {
+                    errors.push(error);
+                }
+                if self.team.as_ref().is_some_and(|team| {
+                    team.expected.id() != signing.identity.certificate.team.id()
+                }) {
+                    errors.push(SigningValidationError::CertificateTeamMismatch);
+                }
             }
             if self.mode == SigningMode::ManualDevelopment
                 && self

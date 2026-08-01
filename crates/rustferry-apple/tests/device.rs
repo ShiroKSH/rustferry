@@ -11,8 +11,8 @@ use rustferry_apple::{
 };
 use rustferry_apple::{
     IOS_DEVICE_TARGET, IosDeviceArchiveRequest, IosDeviceArtifactDisposition, IosDeviceSdk,
-    IosDeviceToolchain, IosProjectPlatform, IosProjectSpec, generate_ios_project,
-    generate_ios_project_for_platform, plan_ios_device_unsigned,
+    IosDeviceToolchain, IosProjectPlatform, IosProjectSpec, derive_ios_device_product_expectation,
+    generate_ios_project, generate_ios_project_for_platform, plan_ios_device_unsigned,
 };
 use rustferry_core::FerryConfig;
 #[cfg(target_os = "macos")]
@@ -121,6 +121,32 @@ fn device_plan_uses_physical_target_sdk_destination_and_unsigned_archive() {
             || argument.contains("aarch64-apple-ios-sim")
             || argument == "CODE_SIGNING_ALLOWED=YES"
     }));
+}
+
+#[test]
+fn client_product_expectation_matches_the_worker_archive_plan() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = Utf8Path::from_path(temporary.path()).unwrap();
+    let request = request(root);
+    let product =
+        derive_ios_device_product_expectation(&request.config, &request.binary_name).unwrap();
+    let plan = plan_ios_device_unsigned(&request, &fake_toolchain(root)).unwrap();
+
+    assert_eq!(product.app_directory_name, "weather.app");
+    assert_eq!(product.executable, "weather");
+    assert_eq!(product.app_version, request.config.app.display_version);
+    assert_eq!(product.nested_bundles.len(), 1);
+    assert_eq!(
+        plan.archive_expectation.app_directory_name,
+        product.app_directory_name
+    );
+    assert_eq!(plan.archive_expectation.executable, product.executable);
+    assert_eq!(plan.archive_expectation.app_version, product.app_version);
+    assert_eq!(plan.archive_expectation.build_number, product.build_number);
+    assert_eq!(
+        plan.archive_expectation.nested_bundles,
+        product.nested_bundles
+    );
 }
 
 #[test]

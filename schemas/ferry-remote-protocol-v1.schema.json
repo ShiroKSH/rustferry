@@ -24,6 +24,18 @@
       "$ref": "#/$defs/IosDeviceBuildRequest"
     },
     {
+      "description": "Complete public compile-to-sign handoff.",
+      "$ref": "#/$defs/CompileHandoff"
+    },
+    {
+      "description": "Public credential-free compile evidence.",
+      "$ref": "#/$defs/CompilePhaseEvidence"
+    },
+    {
+      "description": "Sealed unsigned archive descriptor.",
+      "$ref": "#/$defs/SealedUnsignedArchive"
+    },
+    {
       "description": "Accepted provider job handle.",
       "$ref": "#/$defs/JobHandle"
     },
@@ -77,6 +89,61 @@
     }
   ],
   "$defs": {
+    "ApplePlatform": {
+      "description": "Apple platform encoded in `LC_BUILD_VERSION`.",
+      "oneOf": [
+        {
+          "description": "Physical iOS device.",
+          "type": "string",
+          "const": "ios"
+        },
+        {
+          "description": "iOS Simulator.",
+          "type": "string",
+          "const": "ios_simulator"
+        },
+        {
+          "description": "macOS.",
+          "type": "string",
+          "const": "macos"
+        },
+        {
+          "description": "Mac Catalyst.",
+          "type": "string",
+          "const": "mac_catalyst"
+        },
+        {
+          "description": "visionOS device.",
+          "type": "string",
+          "const": "vision_os"
+        },
+        {
+          "description": "visionOS Simulator.",
+          "type": "string",
+          "const": "vision_os_simulator"
+        },
+        {
+          "description": "Another known Apple platform represented by its numeric value.",
+          "type": "object",
+          "properties": {
+            "other": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "other"
+          ]
+        },
+        {
+          "description": "Only legacy `LC_VERSION_MIN_IPHONEOS` was present; device status is not proven.",
+          "type": "string",
+          "const": "legacy_iphone_os"
+        }
+      ]
+    },
     "AppleToolchainEvidence": {
       "description": "Worker and Apple toolchain evidence.",
       "type": "object",
@@ -610,6 +677,166 @@
         }
       ]
     },
+    "CompileHandoff": {
+      "description": "Complete public handoff downloaded by a protected signer or independent client verifier.",
+      "type": "object",
+      "properties": {
+        "compile": {
+          "description": "Credential-free compile evidence bound to the request.",
+          "$ref": "#/$defs/CompilePhaseEvidence"
+        },
+        "request": {
+          "description": "Exact declarative request submitted by the client.",
+          "$ref": "#/$defs/IosDeviceBuildRequest"
+        },
+        "schema_version": {
+          "description": "Handoff-envelope schema version.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "request",
+        "compile"
+      ]
+    },
+    "CompilePhaseEvidence": {
+      "description": "Public evidence emitted by the credential-free compile phase.",
+      "type": "object",
+      "properties": {
+        "archive_inspection": {
+          "description": "Independently inspected unsigned archive and Mach-O graph.",
+          "$ref": "#/$defs/UnsignedXcarchiveInspection"
+        },
+        "cargo_lock_sha256": {
+          "description": "Exact `Cargo.lock` content SHA-256 from the source manifest.",
+          "type": "string"
+        },
+        "config_sha256": {
+          "description": "Exact `ferry.toml` content SHA-256 from the source manifest.",
+          "type": "string"
+        },
+        "finished_at_unix_seconds": {
+          "description": "Compile completion time in Unix seconds.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "job_id": {
+          "description": "Provider job identifier.",
+          "type": "string"
+        },
+        "provider": {
+          "description": "Provider implementation name.",
+          "type": "string"
+        },
+        "request_sha256": {
+          "description": "Canonical SHA-256 of the complete submitted request.",
+          "type": "string"
+        },
+        "rustferry_version": {
+          "description": "Client version copied from trusted provider metadata.",
+          "type": "string"
+        },
+        "schema_version": {
+          "description": "Compile-evidence schema version.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "sealed_archive": {
+          "description": "Deterministic sealed unsigned archive descriptor.",
+          "$ref": "#/$defs/SealedUnsignedArchive"
+        },
+        "source_sha256": {
+          "description": "Exact verified source-manifest SHA-256.",
+          "type": "string"
+        },
+        "started_at_unix_seconds": {
+          "description": "Compile start time in Unix seconds.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "toolchain": {
+          "description": "Selected toolchain evidence.",
+          "$ref": "#/$defs/CompileToolchainEvidence"
+        },
+        "worker_version": {
+          "description": "Worker crate version.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "job_id",
+        "provider",
+        "request_sha256",
+        "source_sha256",
+        "cargo_lock_sha256",
+        "config_sha256",
+        "rustferry_version",
+        "worker_version",
+        "toolchain",
+        "sealed_archive",
+        "archive_inspection",
+        "started_at_unix_seconds",
+        "finished_at_unix_seconds"
+      ]
+    },
+    "CompileToolchainEvidence": {
+      "description": "Public Apple and Rust toolchain evidence selected by the compile phase.",
+      "type": "object",
+      "properties": {
+        "developer_directory_sha256": {
+          "description": "SHA-256 of the canonical selected Xcode developer-directory string.",
+          "type": "string"
+        },
+        "iphoneos_sdk_build_version": {
+          "description": "Selected iPhoneOS SDK build version.",
+          "type": "string"
+        },
+        "iphoneos_sdk_version": {
+          "description": "Selected iPhoneOS SDK version.",
+          "type": "string"
+        },
+        "rust_target": {
+          "description": "Exact physical-iPhone Rust target.",
+          "type": "string"
+        },
+        "rust_version": {
+          "description": "Rust compiler version used by the selected installation.",
+          "type": "string"
+        },
+        "worker_architecture": {
+          "description": "Worker architecture.",
+          "type": "string"
+        },
+        "worker_os": {
+          "description": "Worker operating-system family and version.",
+          "type": "string"
+        },
+        "xcode_version": {
+          "description": "Normalized Xcode version evidence.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "worker_os",
+        "worker_architecture",
+        "xcode_version",
+        "iphoneos_sdk_version",
+        "iphoneos_sdk_build_version",
+        "developer_directory_sha256",
+        "rust_version",
+        "rust_target"
+      ]
+    },
     "DevelopmentTeam": {
       "description": "Apple development team selected for signing.",
       "type": "object",
@@ -652,12 +879,12 @@
             "null"
           ]
         },
-        "udid": {
+        "udid_sha256": {
           "type": "string"
         }
       },
       "required": [
-        "udid"
+        "udid_sha256"
       ]
     },
     "DiagnosticSeverity": {
@@ -878,6 +1105,10 @@
           "description": "Caller-owned operation identifier copied into every event.",
           "type": "string"
         },
+        "product": {
+          "description": "Client-derived product identity used for independent output validation.",
+          "$ref": "#/$defs/IosDeviceProductExpectation"
+        },
         "product_name": {
           "description": "Human-readable product name.",
           "type": "string"
@@ -931,6 +1162,7 @@
         "product_name",
         "bundle_identifier",
         "minimum_ios_version",
+        "product",
         "profile",
         "source_mode",
         "source",
@@ -983,6 +1215,43 @@
         "job_id",
         "state",
         "artifacts"
+      ]
+    },
+    "IosDeviceProductExpectation": {
+      "description": "Client-owned product identity used to validate both unsigned and signed outputs.\n\nUnlike [`UnsignedXcarchiveExpectation`], this contains no worker-selected SDK fields. Every\nvalue is derived before provider submission and is therefore safe to use as an independent\nartifact expectation.",
+      "type": "object",
+      "properties": {
+        "app_directory_name": {
+          "description": "Exact main application directory name, including `.app`.",
+          "type": "string"
+        },
+        "app_version": {
+          "description": "Exact `CFBundleShortVersionString`.",
+          "type": "string"
+        },
+        "build_number": {
+          "description": "Exact `CFBundleVersion`.",
+          "type": "string"
+        },
+        "executable": {
+          "description": "Exact main `CFBundleExecutable` and executable filename.",
+          "type": "string"
+        },
+        "nested_bundles": {
+          "description": "Exact generated extension and framework set.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/UnsignedNestedBundleExpectation"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "app_directory_name",
+        "executable",
+        "app_version",
+        "build_number",
+        "nested_bundles"
       ]
     },
     "JobHandle": {
@@ -1063,6 +1332,39 @@
           "type": "string",
           "const": "cleanup_failed"
         }
+      ]
+    },
+    "MachOSliceEvidence": {
+      "description": "Cross-platform Mach-O platform evidence for one architecture slice.",
+      "type": "object",
+      "properties": {
+        "architecture": {
+          "description": "Architecture name.",
+          "type": "string"
+        },
+        "minimum_os": {
+          "description": "Minimum operating-system version.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "platform": {
+          "description": "Apple platform.",
+          "$ref": "#/$defs/ApplePlatform"
+        },
+        "sdk": {
+          "description": "SDK version recorded by the linker.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "architecture",
+        "platform"
       ]
     },
     "ProtocolPath": {
@@ -2308,6 +2610,37 @@
         "retryable"
       ]
     },
+    "SealedUnsignedArchive": {
+      "description": "Public descriptor for one exact unsigned `.xcarchive` ZIP.",
+      "type": "object",
+      "properties": {
+        "contents": {
+          "description": "Exact file paths, modes, sizes, and hashes inside the archive.",
+          "$ref": "#/$defs/SourceManifest"
+        },
+        "expectation": {
+          "description": "Structural and physical-device invariants recomputed after extraction.",
+          "$ref": "#/$defs/UnsignedXcarchiveExpectation"
+        },
+        "schema_version": {
+          "description": "Sealed-handoff schema version.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "transport": {
+          "description": "Exact deterministic ZIP size and SHA-256.",
+          "$ref": "#/$defs/SourceArchive"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "transport",
+        "contents",
+        "expectation"
+      ]
+    },
     "SecretReference": {
       "description": "Serializable reference to secret material, never the material itself.\n\nConstruction and deserialization validate the identifier. The restricted\nalphabet prevents paths, URLs, shell fragments, control characters, and\naccidental inline `NAME=value` secret material from entering a protocol.",
       "type": "object",
@@ -2352,6 +2685,56 @@
     "SemVer": {
       "type": "string",
       "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-((?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\\.(?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\\+([0-9a-zA-Z-]+(?:\\.[0-9a-zA-Z-]+)*))?$"
+    },
+    "SigningCertificate": {
+      "description": "Public certificate metadata used for validation and reporting.",
+      "type": "object",
+      "properties": {
+        "common_name": {
+          "description": "Public certificate subject name.",
+          "type": "string"
+        },
+        "expires_at_unix_seconds": {
+          "description": "Certificate expiration as a Unix timestamp.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "sha256_fingerprint": {
+          "description": "Uppercase SHA-256 fingerprint without separators.",
+          "type": "string"
+        },
+        "team": {
+          "description": "Team encoded by the signing certificate.",
+          "$ref": "#/$defs/DevelopmentTeam"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "common_name",
+        "sha256_fingerprint",
+        "team",
+        "expires_at_unix_seconds"
+      ]
+    },
+    "SigningIdentity": {
+      "description": "Certificate metadata paired with an opaque private-key reference.",
+      "type": "object",
+      "properties": {
+        "certificate": {
+          "description": "Public certificate metadata.",
+          "$ref": "#/$defs/SigningCertificate"
+        },
+        "private_key": {
+          "description": "Reference only; private-key bytes are never serializable.",
+          "$ref": "#/$defs/SigningPrivateKeyReference"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "certificate",
+        "private_key"
+      ]
     },
     "SigningMode": {
       "description": "Supported Apple signing mode.",
@@ -2426,7 +2809,7 @@
           }
         },
         "signing": {
-          "description": "Opaque identity/password references for modes that import an identity.",
+          "description": "Public identity metadata plus opaque key/password references.",
           "anyOf": [
             {
               "$ref": "#/$defs/SigningReference"
@@ -2464,13 +2847,27 @@
         "allow_provisioning_updates"
       ]
     },
+    "SigningPrivateKeyReference": {
+      "description": "Opaque reference to private-key material held outside project configuration.",
+      "type": "object",
+      "properties": {
+        "reference": {
+          "description": "Validated credential-store, workflow-secret, environment, or worker handle.",
+          "$ref": "#/$defs/SecretReference"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "reference"
+      ]
+    },
     "SigningReference": {
-      "description": "Serializable signing inputs containing references only, never secret bytes.",
+      "description": "Serializable signing inputs containing public identity metadata and opaque\nreferences only, never secret bytes.",
       "type": "object",
       "properties": {
         "identity": {
-          "description": "Opaque reference to an encrypted identity bundle or configured identity.",
-          "$ref": "#/$defs/SecretReference"
+          "description": "Expected public certificate paired with the opaque private-key reference.",
+          "$ref": "#/$defs/SigningIdentity"
         },
         "password": {
           "description": "Opaque reference to its password or passphrase, when required.",
@@ -2583,6 +2980,27 @@
         }
       ]
     },
+    "SourceArchive": {
+      "description": "Integrity descriptor for the deterministic source ZIP transport.",
+      "type": "object",
+      "properties": {
+        "sha256": {
+          "description": "Lowercase hexadecimal SHA-256 digest of the complete ZIP.",
+          "type": "string"
+        },
+        "size": {
+          "description": "Exact ZIP size in bytes.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "size",
+        "sha256"
+      ]
+    },
     "SourceManifest": {
       "description": "Canonical description of a source snapshot.",
       "type": "object",
@@ -2668,6 +3086,217 @@
           "type": "string",
           "const": "snapshot"
         }
+      ]
+    },
+    "UnsignedAppInspection": {
+      "description": "Cross-platform evidence for one unsigned physical-iPhone `.app` directory.",
+      "type": "object",
+      "properties": {
+        "app_directory_name": {
+          "description": "Exact application directory name.",
+          "type": "string"
+        },
+        "bundle_identifier": {
+          "description": "Main application bundle identifier.",
+          "type": "string"
+        },
+        "entries": {
+          "description": "Sorted app-relative files and directories inspected.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "executable": {
+          "description": "Main executable name.",
+          "type": "string"
+        },
+        "extensions": {
+          "description": "Sorted extension bundle identifiers.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "main_executable": {
+          "description": "Main executable device-platform evidence.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MachOSliceEvidence"
+          }
+        },
+        "nested_executables": {
+          "description": "Every other Mach-O path relative to the app and its device evidence.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/MachOSliceEvidence"
+            }
+          }
+        },
+        "resources": {
+          "description": "Verified required resource hashes.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "app_directory_name",
+        "bundle_identifier",
+        "executable",
+        "main_executable",
+        "nested_executables",
+        "extensions",
+        "resources",
+        "entries"
+      ]
+    },
+    "UnsignedNestedBundleExpectation": {
+      "description": "Expected identity of one generated extension or framework in an unsigned app.",
+      "type": "object",
+      "properties": {
+        "bundle_identifier": {
+          "description": "Exact nested bundle identifier.",
+          "type": "string"
+        },
+        "executable": {
+          "description": "Exact `CFBundleExecutable` and executable filename.",
+          "type": "string"
+        },
+        "kind": {
+          "description": "Expected nested code kind.",
+          "$ref": "#/$defs/UnsignedNestedBundleKind"
+        },
+        "relative_path": {
+          "description": "Slash-separated path relative to the main `.app` root.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "relative_path",
+        "bundle_identifier",
+        "executable",
+        "kind"
+      ]
+    },
+    "UnsignedNestedBundleKind": {
+      "description": "Kind and expected package type of code nested inside an application bundle.",
+      "oneOf": [
+        {
+          "description": "An iOS application extension (`.appex`, package type `XPC!`).",
+          "type": "string",
+          "const": "app_extension"
+        },
+        {
+          "description": "An embedded dynamic framework (`.framework`, package type `FMWK`).",
+          "type": "string",
+          "const": "framework"
+        }
+      ]
+    },
+    "UnsignedXcarchiveExpectation": {
+      "description": "Exact generated-product invariants for an unsigned physical-iPhone archive.",
+      "type": "object",
+      "properties": {
+        "app_directory_name": {
+          "description": "Exact application directory name, including `.app`.",
+          "type": "string"
+        },
+        "app_version": {
+          "description": "Exact `CFBundleShortVersionString`.",
+          "type": "string"
+        },
+        "build_number": {
+          "description": "Exact `CFBundleVersion`.",
+          "type": "string"
+        },
+        "bundle_identifier": {
+          "description": "Main application bundle identifier.",
+          "type": "string"
+        },
+        "executable": {
+          "description": "Exact `CFBundleExecutable` and executable filename.",
+          "type": "string"
+        },
+        "minimum_os": {
+          "description": "Configured minimum iOS version.",
+          "type": "string"
+        },
+        "nested_bundles": {
+          "description": "Exact generated extension and framework set.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/UnsignedNestedBundleExpectation"
+          }
+        },
+        "required_resources": {
+          "description": "Required app-relative resource path to lowercase SHA-256.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "sdk_build_version": {
+          "description": "Exact selected iPhoneOS SDK build version injected into processed plists.",
+          "type": "string"
+        },
+        "sdk_version": {
+          "description": "Exact selected iPhoneOS SDK version encoded by newly built code.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "app_directory_name",
+        "bundle_identifier",
+        "executable",
+        "app_version",
+        "build_number",
+        "minimum_os",
+        "sdk_version",
+        "sdk_build_version",
+        "nested_bundles",
+        "required_resources"
+      ]
+    },
+    "UnsignedXcarchiveInspection": {
+      "description": "Cross-platform evidence for an unsigned physical-iPhone `.xcarchive`.",
+      "type": "object",
+      "properties": {
+        "app": {
+          "description": "Independently inspected application evidence.",
+          "$ref": "#/$defs/UnsignedAppInspection"
+        },
+        "application_path": {
+          "description": "Main application path relative to `Products/`.",
+          "type": "string"
+        },
+        "architectures": {
+          "description": "Architectures declared by the archive metadata.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "entries": {
+          "description": "Sorted archive-relative files and directories inspected.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "application_path",
+        "architectures",
+        "app",
+        "entries"
       ]
     },
     "ValidationLevel": {

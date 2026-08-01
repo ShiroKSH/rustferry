@@ -342,8 +342,11 @@ pub struct MachOSliceEvidence {
 }
 
 /// Expected metadata for client-side IPA inspection.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct IpaExpectation {
+    /// Exact main application directory name, including `.app`.
+    pub app_directory_name: String,
     /// Main bundle identifier.
     pub bundle_identifier: String,
     /// `CFBundleExecutable`.
@@ -352,6 +355,10 @@ pub struct IpaExpectation {
     pub app_version: Option<String>,
     /// Optional expected build number.
     pub build_number: Option<String>,
+    /// Configured minimum iOS version.
+    pub minimum_os: String,
+    /// Exact generated extension and framework set.
+    pub nested_bundles: Vec<UnsignedNestedBundleExpectation>,
     /// Whether a development provisioning profile must be embedded.
     pub provisioning_required: bool,
 }
@@ -420,6 +427,26 @@ pub struct UnsignedNestedBundleExpectation {
     pub executable: String,
     /// Expected nested code kind.
     pub kind: UnsignedNestedBundleKind,
+}
+
+/// Client-owned product identity used to validate both unsigned and signed outputs.
+///
+/// Unlike [`UnsignedXcarchiveExpectation`], this contains no worker-selected SDK fields. Every
+/// value is derived before provider submission and is therefore safe to use as an independent
+/// artifact expectation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IosDeviceProductExpectation {
+    /// Exact main application directory name, including `.app`.
+    pub app_directory_name: String,
+    /// Exact main `CFBundleExecutable` and executable filename.
+    pub executable: String,
+    /// Exact `CFBundleShortVersionString`.
+    pub app_version: String,
+    /// Exact `CFBundleVersion`.
+    pub build_number: String,
+    /// Exact generated extension and framework set.
+    pub nested_bundles: Vec<UnsignedNestedBundleExpectation>,
 }
 
 /// Exact generated-product invariants for an unsigned physical-iPhone archive.
@@ -840,6 +867,13 @@ pub fn inspect_ipa(
     }
     let info_path = app_info_plists.pop().unwrap_or_default();
     let app_path = info_path.trim_end_matches("/Info.plist").to_owned();
+    let expected_app_path = format!("Payload/{}", expectation.app_directory_name);
+    if app_path != expected_app_path {
+        return invalid_ipa(
+            path,
+            format!("application path is `{app_path}`, expected `{expected_app_path}`"),
+        );
+    }
     let info = read_zip_plist(&mut archive, path, &info_path)?;
     let bundle_identifier = plist_string(path, &info, "CFBundleIdentifier")?;
     let executable = plist_string(path, &info, "CFBundleExecutable")?;
@@ -879,10 +913,18 @@ pub fn inspect_ipa(
             );
         }
     }
+    let minimum_os = plist_string(path, &info, "MinimumOSVersion")?;
+    validate_ipa_minimum_os(path, "application", &minimum_os, &expectation.minimum_os)?;
 
     let executable_path = format!("{app_path}/{executable}");
     let main_bytes = read_zip_entry(&mut archive, path, &executable_path)?;
     let main_executable = inspect_physical_iphone_macho(&main_bytes)?;
+    validate_ipa_macho_minimum_os(
+        path,
+        &executable_path,
+        &main_executable,
+        &expectation.minimum_os,
+    )?;
     let profile_path = format!("{app_path}/embedded.mobileprovision");
     let provisioning_profile_present = exact.contains(&profile_path);
     if expectation.provisioning_required && !provisioning_profile_present {
@@ -891,6 +933,22 @@ pub fn inspect_ipa(
 
     let mut extensions = Vec::new();
     let mut nested_executables = BTreeMap::new();
+    let mut expected_nested = BTreeMap::new();
+    for expected in &expectation.nested_bundles {
+        if expected_nested
+            .insert(expected.relative_path.as_str(), expected)
+            .is_some()
+        {
+            return invalid_ipa(
+                path,
+                format!(
+                    "duplicate nested bundle expectation `{}`",
+                    expected.relative_path
+                ),
+            );
+        }
+    }
+    let mut actual_nested = BTreeSet::new();
     let nested_plists = entries
         .iter()
         .filter(|name| {
@@ -903,13 +961,84 @@ pub fn inspect_ipa(
         let nested_info = read_zip_plist(&mut archive, path, &nested_info_path)?;
         let nested_executable = plist_string(path, &nested_info, "CFBundleExecutable")?;
         let nested_root = nested_info_path.trim_end_matches("/Info.plist");
+        let relative_root = nested_root
+            .strip_prefix(&format!("{app_path}/"))
+            .ok_or_else(|| ArtifactError::InvalidIpa {
+                path: path.to_owned(),
+                reason: format!("nested bundle `{nested_root}` escaped the main application"),
+            })?;
+        let expected =
+            expected_nested
+                .get(relative_root)
+                .ok_or_else(|| ArtifactError::InvalidIpa {
+                    path: path.to_owned(),
+                    reason: format!("unexpected nested bundle `{relative_root}`"),
+                })?;
+        let actual_kind = if nested_info_path.ends_with(".appex/Info.plist") {
+            UnsignedNestedBundleKind::AppExtension
+        } else {
+            UnsignedNestedBundleKind::Framework
+        };
+        let nested_bundle_identifier = plist_string(path, &nested_info, "CFBundleIdentifier")?;
+        if expected.kind != actual_kind
+            || expected.executable != nested_executable
+            || expected.bundle_identifier != nested_bundle_identifier
+        {
+            return invalid_ipa(
+                path,
+                format!("nested bundle `{relative_root}` differs from its request expectation"),
+            );
+        }
+        if let Some(expected_version) = &expectation.app_version {
+            let actual_version = plist_string(path, &nested_info, "CFBundleShortVersionString")?;
+            if actual_version != *expected_version {
+                return invalid_ipa(
+                    path,
+                    format!("nested bundle `{relative_root}` has an unexpected app version"),
+                );
+            }
+        }
+        if let Some(expected_build) = &expectation.build_number {
+            let actual_build = plist_string(path, &nested_info, "CFBundleVersion")?;
+            if actual_build != *expected_build {
+                return invalid_ipa(
+                    path,
+                    format!("nested bundle `{relative_root}` has an unexpected build number"),
+                );
+            }
+        }
+        let nested_minimum_os = plist_string(path, &nested_info, "MinimumOSVersion")?;
+        validate_ipa_minimum_os(
+            path,
+            relative_root,
+            &nested_minimum_os,
+            &expectation.minimum_os,
+        )?;
         let nested_path = format!("{nested_root}/{nested_executable}");
         let nested_bytes = read_zip_entry(&mut archive, path, &nested_path)?;
         let nested_evidence = inspect_physical_iphone_macho(&nested_bytes)?;
-        if nested_info_path.ends_with(".appex/Info.plist") {
-            extensions.push(plist_string(path, &nested_info, "CFBundleIdentifier")?);
+        validate_ipa_macho_minimum_os(
+            path,
+            &nested_path,
+            &nested_evidence,
+            &expectation.minimum_os,
+        )?;
+        if actual_kind == UnsignedNestedBundleKind::AppExtension {
+            extensions.push(nested_bundle_identifier);
         }
+        actual_nested.insert(relative_root.to_owned());
         nested_executables.insert(nested_path, nested_evidence);
+    }
+    if actual_nested
+        != expected_nested
+            .keys()
+            .map(|path| (*path).to_owned())
+            .collect()
+    {
+        return invalid_ipa(
+            path,
+            "nested bundle set differs from the request".to_owned(),
+        );
     }
     for name in entries.iter().filter(|name| {
         name.starts_with(&format!("{app_path}/Frameworks/")) && has_ascii_extension(name, "dylib")
@@ -931,6 +1060,45 @@ pub fn inspect_ipa(
         sha256,
         size,
     })
+}
+
+fn validate_ipa_minimum_os(
+    path: &Utf8Path,
+    context: &str,
+    actual: &str,
+    expected: &str,
+) -> Result<(), ArtifactError> {
+    let actual = parse_apple_version(actual);
+    let expected = parse_apple_version(expected);
+    if actual.is_none() || actual != expected {
+        return invalid_ipa(
+            path,
+            format!("{context} minimum iOS version does not match the request"),
+        );
+    }
+    Ok(())
+}
+
+fn validate_ipa_macho_minimum_os(
+    path: &Utf8Path,
+    relative: &str,
+    evidence: &[MachOSliceEvidence],
+    expected: &str,
+) -> Result<(), ArtifactError> {
+    let expected = parse_apple_version(expected).ok_or_else(|| ArtifactError::InvalidIpa {
+        path: path.to_owned(),
+        reason: "request minimum iOS version is invalid".to_owned(),
+    })?;
+    if evidence
+        .iter()
+        .any(|slice| slice.minimum_os.as_deref().and_then(parse_apple_version) != Some(expected))
+    {
+        return invalid_ipa(
+            path,
+            format!("Mach-O `{relative}` minimum iOS version does not match the request"),
+        );
+    }
+    Ok(())
 }
 
 /// Inspect an unsigned physical-iPhone `.xcarchive` without trusting Xcode's exit status.

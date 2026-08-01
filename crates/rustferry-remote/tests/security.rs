@@ -8,7 +8,8 @@ use rustferry_remote::{
     signing::{
         BundleIdentifier, DevelopmentTeam, DevelopmentTeamPlan, DevicePlan, EntitlementPlan,
         EntitlementSet, ProvisioningPlan, ProvisioningPlatform, ProvisioningProfile,
-        ProvisioningProfileType, SigningPlan, SigningStatus, SigningTarget, SigningTargetKind,
+        ProvisioningProfileType, SigningCertificate, SigningIdentity, SigningPlan,
+        SigningPrivateKeyReference, SigningStatus, SigningTarget, SigningTargetKind,
         SigningValidationError, SigningValidationReport, ValidationComponent, ValidationStatus,
     },
 };
@@ -17,6 +18,18 @@ use serde_json::json;
 fn github_secret(name: &str) -> SecretReference {
     SecretReference::new(SecretReferenceKind::GithubActions, name)
         .expect("test secret name is valid")
+}
+
+fn signing_identity(reference: SecretReference, team: DevelopmentTeam) -> SigningIdentity {
+    SigningIdentity {
+        certificate: SigningCertificate {
+            common_name: "Apple Development: Example (ABC123XYZ9)".to_owned(),
+            sha256_fingerprint: "A".repeat(64),
+            team,
+            expires_at_unix_seconds: u64::MAX,
+        },
+        private_key: SigningPrivateKeyReference { reference },
+    }
 }
 
 #[test]
@@ -44,7 +57,10 @@ fn secret_references_round_trip_only_validated_identifiers() {
     assert_eq!(decoded, reference);
 
     let signing = SigningReference {
-        identity: reference,
+        identity: signing_identity(
+            reference,
+            DevelopmentTeam::new("ABC123XYZ9", None).expect("valid team"),
+        ),
         password: Some(github_secret("IOS_SIGNING_PASSWORD")),
     };
     let encoded = serde_json::to_string(&signing).expect("signing references serialize");
@@ -53,6 +69,52 @@ fn secret_references_round_trip_only_validated_identifiers() {
         serde_json::from_str::<SigningReference>(&encoded).expect("signing references validate"),
         signing
     );
+}
+
+#[test]
+fn device_plan_wire_form_contains_only_a_lowercase_sha256() {
+    const RAW_UDID: &str = "00008110-001234567890801E";
+    const OTHER_UDID: &str = "00008110-00AAAAAAAAAAAAAA";
+    const UDID_SHA256: &str = "4a5f50907ec074080957ea89dd35b48051f861d4e0db99a4ab391acd90fefc6d";
+
+    let device = DevicePlan::new(RAW_UDID, Some("Acceptance iPhone".to_owned()))
+        .expect("raw device identifier should validate");
+    assert_eq!(device.udid_sha256(), UDID_SHA256);
+    assert!(device.matches_udid(RAW_UDID).expect("raw UDID is valid"));
+    assert!(
+        !device
+            .matches_udid(OTHER_UDID)
+            .expect("other raw UDID is valid")
+    );
+    assert!(device.matches_udid("invalid").is_err());
+
+    let encoded = serde_json::to_string(&device).expect("device plan should serialize");
+    assert!(!encoded.contains(RAW_UDID));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&encoded).expect("wire form should be JSON"),
+        json!({
+            "udid_sha256": UDID_SHA256,
+            "display_name": "Acceptance iPhone"
+        })
+    );
+    assert_eq!(
+        serde_json::from_str::<DevicePlan>(&encoded).expect("hash-only wire form should decode"),
+        device
+    );
+    assert!(!format!("{device:?}").contains(RAW_UDID));
+
+    let raw_wire_error = serde_json::from_value::<DevicePlan>(json!({
+        "udid": RAW_UDID,
+        "display_name": null
+    }))
+    .expect_err("raw device identifier must not decode from the wire");
+    assert!(!raw_wire_error.to_string().contains(RAW_UDID));
+    assert!(DevicePlan::from_sha256(UDID_SHA256.to_ascii_uppercase(), None).is_err());
+
+    let signing_plan =
+        serde_json::to_string(&valid_manual_signing_plan()).expect("signing plan should serialize");
+    assert!(!signing_plan.contains(RAW_UDID));
+    assert!(signing_plan.contains(UDID_SHA256));
 }
 
 #[test]
@@ -377,7 +439,12 @@ fn provisioning_metadata_and_entitlements_are_bounded_and_typed() {
         wildcard: false,
         created_at_unix_seconds: 1,
         expires_at_unix_seconds: 2,
-        device_udids: vec!["00008110-001234567890801E".to_owned()],
+        device_udid_sha256s: vec![
+            DevicePlan::new("00008110-001234567890801E", None)
+                .expect("valid device")
+                .udid_sha256()
+                .to_owned(),
+        ],
         entitlements: EntitlementSet::default(),
         platforms: BTreeSet::from([ProvisioningPlatform::Ios]),
         profile_type: ProvisioningProfileType::Development,
@@ -453,7 +520,7 @@ fn valid_manual_signing_plan() -> SigningPlan {
     SigningPlan {
         mode: SigningMode::ManualDevelopment,
         signing: Some(SigningReference {
-            identity: github_secret("IOS_SIGNING_P12"),
+            identity: signing_identity(github_secret("IOS_SIGNING_P12"), team.clone()),
             password: Some(github_secret("IOS_SIGNING_PASSWORD")),
         }),
         team: Some(DevelopmentTeamPlan { expected: team }),

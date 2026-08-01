@@ -881,7 +881,7 @@ fn extraction_ancestor_swap_never_writes_through_attacker_symlink() {
 #[cfg(unix)]
 #[test]
 fn archive_parent_swap_never_publishes_into_replacement_directory() {
-    use std::{thread, time::Instant};
+    use std::{sync::mpsc, thread, time::Instant};
 
     let fixture = Fixture::new();
     write(
@@ -898,7 +898,9 @@ fn archive_parent_swap_never_publishes_into_replacement_directory() {
     let watched_parent = output_parent.clone();
     let replacement_parent = output_parent.clone();
     let moved_parent_for_attacker = moved_parent.clone();
+    let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
     let attacker = thread::spawn(move || {
+        ready_sender.send(()).unwrap();
         let deadline = Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let partial_exists = fs::read_dir(&watched_parent).unwrap().any(|entry| {
@@ -922,6 +924,7 @@ fn archive_parent_swap_never_publishes_into_replacement_directory() {
         write(&replacement_parent.join("sentinel"), b"unchanged");
     });
 
+    ready_receiver.recv().unwrap();
     let result = create_source_bundle_archive(&plan, &output, SourceArchiveLimits::default());
     attacker.join().unwrap();
 

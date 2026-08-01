@@ -4,9 +4,10 @@ use schemars::{JsonSchema, schema_for};
 
 use crate::{
     ArtifactDownloadRequest, ArtifactDownloadResult, ArtifactListRequest, ArtifactManifest,
-    CancellationAck, CancellationRequest, CleanupConfirmation, CleanupRequest, EventPage,
-    EventRequest, HandshakeRequest, HandshakeResponse, IosDeviceBuildRequest, IosDeviceBuildResult,
-    JobHandle, ProviderDoctorReport, ProviderDoctorRequest, RemoteBuildEvent,
+    CancellationAck, CancellationRequest, CleanupConfirmation, CleanupRequest, CompileHandoff,
+    CompilePhaseEvidence, EventPage, EventRequest, HandshakeRequest, HandshakeResponse,
+    IosDeviceBuildRequest, IosDeviceBuildResult, JobHandle, ProviderDoctorReport,
+    ProviderDoctorRequest, RemoteBuildEvent, SealedUnsignedArchive,
 };
 
 /// Every standalone document exchanged or persisted by protocol v1.
@@ -15,6 +16,7 @@ use crate::{
 /// which concrete document is valid at each boundary.
 #[derive(JsonSchema)]
 #[schemars(title = "Ferry Remote Build Protocol v1", untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum RemoteProtocolV1Document {
     /// Client-to-provider compatibility request.
     HandshakeRequest(HandshakeRequest),
@@ -26,6 +28,12 @@ pub enum RemoteProtocolV1Document {
     ProviderDoctorReport(ProviderDoctorReport),
     /// Declarative physical-iPhone build request.
     IosDeviceBuildRequest(IosDeviceBuildRequest),
+    /// Complete public compile-to-sign handoff.
+    CompileHandoff(CompileHandoff),
+    /// Public credential-free compile evidence.
+    CompilePhaseEvidence(CompilePhaseEvidence),
+    /// Sealed unsigned archive descriptor.
+    SealedUnsignedArchive(SealedUnsignedArchive),
     /// Accepted provider job handle.
     JobHandle(JobHandle),
     /// One NDJSON event envelope.

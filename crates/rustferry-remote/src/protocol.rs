@@ -3,11 +3,15 @@ use std::{collections::BTreeSet, fmt};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use unicode_normalization::UnicodeNormalization;
 
 use crate::{
-    artifact::ArtifactManifest,
+    artifact::{
+        ArtifactManifest, IosDeviceProductExpectation, IpaExpectation, UnsignedNestedBundleKind,
+    },
     error::{RemoteBuildError, RemoteBuildResult},
-    signing::{SigningMode, SigningPlan},
+    signing::{SigningMode, SigningPlan, SigningTargetKind},
     source::{SourceLimits, SourceManifest, SourceMode, validate_source_manifest},
 };
 
@@ -332,6 +336,8 @@ pub struct IosDeviceBuildRequest {
     pub bundle_identifier: String,
     /// Minimum supported iOS version.
     pub minimum_ios_version: String,
+    /// Client-derived product identity used for independent output validation.
+    pub product: IosDeviceProductExpectation,
     /// Rust/Xcode optimization profile.
     pub profile: BuildProfile,
     /// How the provider obtains the source.
@@ -363,6 +369,7 @@ impl IosDeviceBuildRequest {
         validate_safe_text("product_name", &self.product_name, 255)?;
         validate_bundle_identifier(&self.bundle_identifier)?;
         validate_ios_version(&self.minimum_ios_version)?;
+        validate_product_expectation(&self.product, &self.bundle_identifier, &self.signing)?;
         validate_source_manifest(&self.source, SourceLimits::default()).map_err(|error| {
             RemoteBuildError::InvalidSourceManifest {
                 message: error.to_string(),
@@ -428,6 +435,52 @@ impl IosDeviceBuildRequest {
         }
         Ok(())
     }
+
+    /// Derive a complete client-side IPA expectation without worker-provided metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed request-validation error when any product or signing field is invalid.
+    pub fn ipa_expectation(&self) -> RemoteBuildResult<IpaExpectation> {
+        self.validate()?;
+        Ok(IpaExpectation {
+            app_directory_name: self.product.app_directory_name.clone(),
+            bundle_identifier: self.bundle_identifier.clone(),
+            executable: self.product.executable.clone(),
+            app_version: Some(self.product.app_version.clone()),
+            build_number: Some(self.product.build_number.clone()),
+            minimum_os: self.minimum_ios_version.clone(),
+            nested_bundles: self.product.nested_bundles.clone(),
+            provisioning_required: self.signing.mode.is_signed(),
+        })
+    }
+}
+
+/// Serialize one validated iPhone build request using the protocol's deterministic field order.
+///
+/// Maps and sets nested in the request use ordered representations. Keeping this function in the
+/// protocol crate prevents providers and workers from hashing subtly different request encodings.
+///
+/// # Errors
+///
+/// Returns a typed validation or serialization failure.
+pub fn canonical_request_bytes(request: &IosDeviceBuildRequest) -> RemoteBuildResult<Vec<u8>> {
+    request.validate()?;
+    serde_json::to_vec(request).map_err(|error| RemoteBuildError::Serialization {
+        message: error.to_string(),
+    })
+}
+
+/// Return lowercase SHA-256 of [`canonical_request_bytes`].
+///
+/// # Errors
+///
+/// Returns the same validation or serialization failure as [`canonical_request_bytes`].
+pub fn canonical_request_sha256(request: &IosDeviceBuildRequest) -> RemoteBuildResult<String> {
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(canonical_request_bytes(request)?)
+    ))
 }
 
 /// Provider result after a physical-iPhone build reaches a build-terminal state.
@@ -1031,6 +1084,172 @@ fn validate_ios_version(value: &str) -> RemoteBuildResult<()> {
         });
     }
     Ok(())
+}
+
+fn validate_product_expectation(
+    product: &IosDeviceProductExpectation,
+    main_bundle_identifier: &str,
+    signing: &SigningPlan,
+) -> RemoteBuildResult<()> {
+    validate_portable_component("app_directory_name", &product.app_directory_name)?;
+    if !has_exact_extension(&product.app_directory_name, "app") {
+        return Err(RemoteBuildError::InvalidIdentifier {
+            field: "app_directory_name",
+            reason: "value must end with .app",
+        });
+    }
+    validate_portable_component("executable", &product.executable)?;
+    validate_bundle_version("app_version", &product.app_version)?;
+    validate_bundle_version("build_number", &product.build_number)?;
+    if product.nested_bundles.len() > 512 {
+        return Err(RemoteBuildError::InvalidEventPayload {
+            event: "ios_device_build_request",
+            reason: "product contains too many nested bundles",
+        });
+    }
+
+    let mut paths = BTreeSet::new();
+    let mut portable_paths = BTreeSet::new();
+    let mut bundle_identifiers = BTreeSet::from([main_bundle_identifier.to_owned()]);
+    let mut product_targets = BTreeSet::new();
+    let mut previous_path: Option<&str> = None;
+    for nested in &product.nested_bundles {
+        if previous_path.is_some_and(|previous| previous >= nested.relative_path.as_str()) {
+            return Err(RemoteBuildError::InvalidEventPayload {
+                event: "ios_device_build_request",
+                reason: "nested product bundles must be strictly sorted by path",
+            });
+        }
+        previous_path = Some(&nested.relative_path);
+        validate_nested_bundle_path(&nested.relative_path, nested.kind)?;
+        validate_portable_component("nested_executable", &nested.executable)?;
+        validate_bundle_identifier(&nested.bundle_identifier)?;
+        if !paths.insert(nested.relative_path.as_str())
+            || !portable_paths.insert(portable_name_key(&nested.relative_path))
+            || !bundle_identifiers.insert(nested.bundle_identifier.clone())
+        {
+            return Err(RemoteBuildError::InvalidEventPayload {
+                event: "ios_device_build_request",
+                reason: "nested product bundles contain duplicate or portable-colliding identities",
+            });
+        }
+        let signing_kind = match nested.kind {
+            UnsignedNestedBundleKind::AppExtension => SigningTargetKind::Extension,
+            UnsignedNestedBundleKind::Framework => SigningTargetKind::Framework,
+        };
+        product_targets.insert((nested.bundle_identifier.as_str(), signing_kind));
+    }
+
+    let signing_targets = signing
+        .targets
+        .iter()
+        .filter(|target| {
+            matches!(
+                target.kind,
+                SigningTargetKind::Extension | SigningTargetKind::Framework
+            )
+        })
+        .map(|target| (target.bundle_identifier.as_str(), target.kind))
+        .collect::<BTreeSet<_>>();
+    if product_targets != signing_targets {
+        return Err(RemoteBuildError::InvalidEventPayload {
+            event: "ios_device_build_request",
+            reason: "product nested bundle graph does not match signing targets",
+        });
+    }
+    Ok(())
+}
+
+fn validate_portable_component(field: &'static str, value: &str) -> RemoteBuildResult<()> {
+    validate_safe_text(field, value, 255)?;
+    if matches!(value, "." | "..")
+        || value.contains(['/', '\\', '\0', ':', '*', '?', '"', '<', '>', '|'])
+        || value.ends_with(['.', ' '])
+    {
+        return Err(RemoteBuildError::InvalidIdentifier {
+            field,
+            reason: "value is not a portable filename component",
+        });
+    }
+    let basename = value
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let reserved = matches!(basename.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || basename
+            .strip_prefix("COM")
+            .or_else(|| basename.strip_prefix("LPT"))
+            .is_some_and(|suffix| {
+                matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+            });
+    if reserved {
+        return Err(RemoteBuildError::InvalidIdentifier {
+            field,
+            reason: "value is reserved on a supported client filesystem",
+        });
+    }
+    Ok(())
+}
+
+fn validate_nested_bundle_path(
+    path: &str,
+    kind: UnsignedNestedBundleKind,
+) -> RemoteBuildResult<()> {
+    validate_safe_text("nested_bundle_path", path, 1024)?;
+    let components = path.split('/').collect::<Vec<_>>();
+    if components.len() != 2 {
+        return Err(RemoteBuildError::InvalidIdentifier {
+            field: "nested_bundle_path",
+            reason: "value must be directly below PlugIns or Frameworks",
+        });
+    }
+    validate_portable_component("nested_bundle_directory", components[1])?;
+    let valid = match kind {
+        UnsignedNestedBundleKind::AppExtension => {
+            components[0] == "PlugIns" && has_exact_extension(components[1], "appex")
+        }
+        UnsignedNestedBundleKind::Framework => {
+            components[0] == "Frameworks" && has_exact_extension(components[1], "framework")
+        }
+    };
+    if !valid {
+        return Err(RemoteBuildError::InvalidIdentifier {
+            field: "nested_bundle_path",
+            reason: "value does not match its nested bundle kind",
+        });
+    }
+    Ok(())
+}
+
+fn validate_bundle_version(field: &'static str, value: &str) -> RemoteBuildResult<()> {
+    validate_safe_text(field, value, 64)?;
+    let components = value.split('.').collect::<Vec<_>>();
+    if components.is_empty()
+        || components.len() > 3
+        || components.iter().any(|component| {
+            component.is_empty()
+                || (component.len() > 1 && component.starts_with('0'))
+                || !component.bytes().all(|byte| byte.is_ascii_digit())
+                || component.parse::<u32>().is_err()
+        })
+    {
+        return Err(RemoteBuildError::InvalidIdentifier {
+            field,
+            reason: "value must contain one to three canonical numeric components",
+        });
+    }
+    Ok(())
+}
+
+fn portable_name_key(value: &str) -> String {
+    value.nfkc().flat_map(char::to_lowercase).collect()
+}
+
+fn has_exact_extension(value: &str, expected: &str) -> bool {
+    value
+        .rsplit_once('.')
+        .is_some_and(|(_, extension)| extension == expected)
 }
 
 fn validate_github_repository(value: &str) -> RemoteBuildResult<()> {
