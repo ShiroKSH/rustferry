@@ -112,7 +112,7 @@ jobs:
             --worker-version 0.1.0 \
             | tee "$evidence/setup.json"
           jq -e \
-            '.data.repository == "ShiroKSH/rustferry" and .data.installed == true and .data.signing_mode == "unsigned-smoke-only"' \
+            '.data.repository == "ShiroKSH/rustferry" and .data.authenticated_as == "repository-scoped token" and .data.installed == true and .data.signing_mode == "unsigned-smoke-only"' \
             "$evidence/setup.json" >/dev/null
 
           target/debug/cargo-ferry --json remote doctor github \

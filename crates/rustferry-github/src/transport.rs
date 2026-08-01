@@ -39,6 +39,7 @@ const ZIP_END_RECORD_MINIMUM_BYTES: usize = 22;
 const ZIP_END_RECORD_SEARCH_BYTES: usize = 65_557;
 
 const USER_QUERY: &str = ".login";
+const INSTALLATION_REPOSITORY_QUERY: &str = ".repositories[] | [.id,(.full_name | @base64)] | @tsv";
 const REPOSITORY_QUERY: &str =
     "[.id,.full_name,.private,.archived,.disabled,.default_branch] | @tsv";
 const RUN_LIST_QUERY: &str = ".workflow_runs[] | [.id,.workflow_id,(.path | @base64),.run_number,.run_attempt,.head_sha,(.head_branch | @base64),.event,.status,(.conclusion // \"\")] | @tsv";
@@ -800,6 +801,34 @@ pub struct AuthenticatedUser {
     login: String,
 }
 
+/// Validated GitHub API credential principal without overstating identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AuthenticatedPrincipal {
+    /// User credential verified through `GET /user`.
+    User(AuthenticatedUser),
+    /// Installation credential whose accessible-repository list contains the
+    /// exact requested repository.
+    RepositoryCredential,
+}
+
+impl AuthenticatedPrincipal {
+    /// Stable human-readable principal label for diagnostics and JSON output.
+    pub fn label(&self) -> &str {
+        match self {
+            Self::User(user) => user.login(),
+            Self::RepositoryCredential => "repository-scoped token",
+        }
+    }
+
+    /// Human login only when the API proved a user credential.
+    pub fn user_login(&self) -> Option<&str> {
+        match self {
+            Self::User(user) => Some(user.login()),
+            Self::RepositoryCredential => None,
+        }
+    }
+}
+
 impl AuthenticatedUser {
     /// Authenticated GitHub login.
     pub fn login(&self) -> &str {
@@ -1182,6 +1211,8 @@ pub enum TransportError {
     },
     /// Repository metadata did not match the exact requested owner/name.
     RepositoryIdentityMismatch,
+    /// An installation credential did not include the exact requested repository.
+    RepositoryAuthorizationMissing,
     /// Environment metadata did not match the exact configured name.
     EnvironmentIdentityMismatch,
     /// Workflow path was not one validated `.github/workflows/*.yml` file.
@@ -1229,6 +1260,9 @@ impl fmt::Display for TransportError {
             Self::RepositoryIdentityMismatch => {
                 formatter.write_str("GitHub returned a different repository identity")
             }
+            Self::RepositoryAuthorizationMissing => formatter.write_str(
+                "the GitHub installation credential does not authorize the exact repository",
+            ),
             Self::EnvironmentIdentityMismatch => {
                 formatter.write_str("GitHub returned a different environment identity")
             }
@@ -1314,6 +1348,30 @@ impl<R> GithubTransport<R> {
 }
 
 impl<R: GhRunner> GithubTransport<R> {
+    /// Prove the configured credential by API capability, then bind it to the
+    /// exact repository when it is an installation token.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted execution or response-validation failure. A user
+    /// credential must satisfy `GET /user`. If that capability is
+    /// rejected, the credential must satisfy the installation-only accessible
+    /// repositories endpoint and list the exact target. Environment variable
+    /// names are never used to infer token type.
+    pub fn authenticate(
+        &mut self,
+        repository: &Repository,
+    ) -> Result<AuthenticatedPrincipal, TransportError> {
+        match self.authenticated_user() {
+            Ok(user) => Ok(AuthenticatedPrincipal::User(user)),
+            Err(TransportError::Execution(GhExecutionError::CommandFailed { .. })) => {
+                self.prove_installation_repository_access(repository)?;
+                Ok(AuthenticatedPrincipal::RepositoryCredential)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Verify authentication through `GET /user`.
     ///
     /// # Errors
@@ -1344,6 +1402,39 @@ impl<R: GhRunner> GithubTransport<R> {
             self.metadata_request(ApiMethod::Get, repository.endpoint(""), REPOSITORY_QUERY);
         let output = self.runner.execute(&request)?;
         parse_repository(&output, repository)
+    }
+
+    fn prove_installation_repository_access(
+        &mut self,
+        repository: &Repository,
+    ) -> Result<(), TransportError> {
+        for page in 1..=self.limits.pages {
+            let fields = vec![
+                ("per_page".to_owned(), self.limits.per_page.to_string()),
+                ("page".to_owned(), page.to_string()),
+            ];
+            let request = self.metadata_request_with_fields(
+                ApiMethod::Get,
+                "/installation/repositories".to_owned(),
+                fields,
+                INSTALLATION_REPOSITORY_QUERY,
+            );
+            let output = self.runner.execute(&request)?;
+            let repositories = parse_installation_repositories(&output)?;
+            let page_length = repositories.len();
+            if repositories
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(&repository.full_name()))
+            {
+                return Ok(());
+            }
+            if page_length < usize::from(self.limits.per_page) {
+                return Err(TransportError::RepositoryAuthorizationMissing);
+            }
+        }
+        Err(TransportError::PaginationLimitReached {
+            resource: "installation repository",
+        })
     }
 
     /// Fetch and bind one exact protected signing environment.
@@ -1785,6 +1876,30 @@ fn parse_repository(
         disabled,
         default_branch,
     })
+}
+
+fn parse_installation_repositories(output: &[u8]) -> Result<Vec<String>, TransportError> {
+    let operation = "installation repository list";
+    let text = parse_utf8(output, operation)?;
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    text.lines()
+        .map(|line| {
+            let columns = split_columns(line, 2, operation)?;
+            parse_nonzero_u64(columns[0], operation)?;
+            let full_name = parse_base64_metadata_name(columns[1], operation, 256)?;
+            let (owner, name) = full_name
+                .split_once('/')
+                .ok_or(TransportError::MalformedResponse { operation })?;
+            if name.contains('/') {
+                return Err(TransportError::MalformedResponse { operation });
+            }
+            Repository::new(owner, name)
+                .map_err(|_| TransportError::MalformedResponse { operation })?;
+            Ok(full_name)
+        })
+        .collect()
 }
 
 fn parse_environment(
@@ -2595,7 +2710,7 @@ mod tests {
         let runner = GhProcessRunner::new(
             &executable,
             neutral.path(),
-            GhAuthentication::environment_token(TokenEnvironmentVariable::GhToken),
+            GhAuthentication::environment_token(TokenEnvironmentVariable::GithubToken),
         )
         .expect("isolated gh runner");
         let request = GhRequest {
@@ -2701,6 +2816,54 @@ mod tests {
         assert_eq!(info.full_name(), "shiroksh/RustFerry");
         assert!(!info.is_private());
         assert_eq!(info.default_branch().as_str(), "master");
+    }
+
+    #[test]
+    fn repository_credential_is_proved_without_claiming_a_user_identity() {
+        let runner = FakeRunner::with([
+            Err(GhExecutionError::CommandFailed { exit_code: Some(1) }),
+            Ok(b"991\tU2hpcm9LU0gvcnVzdGZlcnJ5\n".to_vec()),
+        ]);
+        let mut transport = GithubTransport::new(runner, limits(2, 3));
+        let principal = transport
+            .authenticate(&repository())
+            .expect("repository credential");
+        assert_eq!(principal, AuthenticatedPrincipal::RepositoryCredential);
+        assert_eq!(principal.label(), "repository-scoped token");
+        assert_eq!(principal.user_login(), None);
+
+        let runner = transport.into_runner();
+        assert_eq!(runner.requests.len(), 2);
+        assert_eq!(runner.requests[0].endpoint(), "/user");
+        assert_eq!(runner.requests[1].endpoint(), "/installation/repositories");
+    }
+
+    #[test]
+    fn successful_user_probe_takes_precedence_over_installation_fallback() {
+        let runner = FakeRunner::with([Ok(b"ShiroKSH\n".to_vec())]);
+        let mut transport = GithubTransport::new(runner, limits(2, 3));
+        let principal = transport
+            .authenticate(&repository())
+            .expect("user credential");
+        assert_eq!(principal.label(), "ShiroKSH");
+        assert_eq!(principal.user_login(), Some("ShiroKSH"));
+
+        let runner = transport.into_runner();
+        assert_eq!(runner.requests.len(), 1);
+        assert_eq!(runner.requests[0].endpoint(), "/user");
+    }
+
+    #[test]
+    fn installation_credential_must_include_the_exact_repository() {
+        let runner = FakeRunner::with([
+            Err(GhExecutionError::CommandFailed { exit_code: Some(1) }),
+            Ok(b"992\tU2hpcm9LU0gvb3RoZXI=\n".to_vec()),
+        ]);
+        let mut transport = GithubTransport::new(runner, limits(2, 3));
+        assert_eq!(
+            transport.authenticate(&repository()),
+            Err(TransportError::RepositoryAuthorizationMissing)
+        );
     }
 
     #[test]

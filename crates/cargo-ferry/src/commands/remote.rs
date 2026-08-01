@@ -727,7 +727,7 @@ fn setup(arguments: RemoteSetupArgs, dry_run: bool, reporter: &Reporter) -> Resu
 
     let mut transport =
         GithubTransport::new(make_gh_runner(&root)?, TransportLimits::secure_defaults());
-    let authenticated = transport.authenticated_user().map_err(|error| {
+    let authenticated = transport.authenticate(&git.repository).map_err(|error| {
         remote_error_with_details(
             "github_authentication_required",
             "GitHub authentication could not be verified",
@@ -777,7 +777,7 @@ fn setup(arguments: RemoteSetupArgs, dry_run: bool, reporter: &Reporter) -> Resu
 
     let output = SetupOutput {
         repository: stored.repository.clone(),
-        authenticated_as: authenticated.login().to_owned(),
+        authenticated_as: authenticated.label().to_owned(),
         workflow: paths.workflow.to_string(),
         provider_config: paths.config.to_string(),
         trusted_source_ref: stored.trusted_source_ref.clone(),

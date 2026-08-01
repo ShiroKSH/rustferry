@@ -1931,13 +1931,13 @@ where
             validate_provider_identifier("operation_id", &request.operation_id)?;
 
             let mut checks = Vec::new();
-            match self.lock_transport()?.authenticated_user() {
-                Ok(user) => checks.push(ProviderCheck {
+            match self.lock_transport()?.authenticate(&self.config.repository) {
+                Ok(principal) => checks.push(ProviderCheck {
                     code: "github.authentication".to_owned(),
                     status: ProviderCheckStatus::Ready,
-                    message: format!(
-                        "Authenticated GitHub account `{}` is available",
-                        user.login()
+                    message: principal.user_login().map_or_else(
+                        || "Repository-scoped GitHub credential is available".to_owned(),
+                        |login| format!("Authenticated GitHub account `{login}` is available"),
                     ),
                     help: None,
                 }),
