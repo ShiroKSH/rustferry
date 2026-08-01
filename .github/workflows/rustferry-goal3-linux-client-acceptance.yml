@@ -6,6 +6,16 @@ on:
       - 'goal3/macless-iphone-builds'
     paths:
       - '.github/workflows/rustferry-goal3-linux-client-acceptance.yml'
+      - '.github/workflows/rustferry-goal3-iphone.yml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'rust-toolchain.toml'
+      - 'crates/cargo-ferry/**'
+      - 'crates/rustferry-apple/**'
+      - 'crates/rustferry-github/**'
+      - 'crates/rustferry-remote/**'
+      - 'crates/rustferry-worker-macos/**'
+      - 'examples/counter/**'
 
 permissions: {}
 
