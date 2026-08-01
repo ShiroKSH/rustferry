@@ -18,7 +18,7 @@
 RustFerry keeps application code and assets in an ordinary Rust project. When you build, it creates the required platform host below `target/ferry/`; that generated glue is disposable and stays out of your source tree.
 
 > [!IMPORTANT]
-> RustFerry is pre-release and build-only. Its pre-rename codebase produced independently inspected Android and iOS Simulator artifacts; RustFerry-named artifacts still need a fresh build and inspection. Runtime behavior has not been observed on an emulator, Simulator, or physical device. See the [support matrix](docs/support-matrix.md) and [evidence log](docs/STATUS.md).
+> RustFerry is pre-release and build-only. [Platform artifacts run 30699379465](https://github.com/ShiroKSH/rustferry/actions/runs/30699379465) generated and inspected RustFerry-named Starter and Kitchen Sink projects: signed and aligned arm64 Android APKs, plus arm64 iOS Simulator `.app` bundles containing `FerryRuntimeBridge.framework` and signed WidgetKit/ActivityKit `.appex` products with checked entitlements. Runtime behavior has not been observed on an emulator, Simulator, or physical device. See the [support matrix](docs/support-matrix.md) and [evidence log](docs/STATUS.md).
 
 ## What it does
 

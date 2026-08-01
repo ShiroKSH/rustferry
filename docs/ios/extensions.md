@@ -21,7 +21,7 @@ Generation adds:
 - extension identifier `<app identifier>.widget`;
 - embed-target dependency and `Embed App Extensions` phase.
 
-The Rust `widgets::update` path validates and writes the serialized snapshot plus title, value, caption, progress, deep link, and constrained action data to the configured app-group `UserDefaults` suite, then requests a WidgetKit timeline reload. The generated provider reads that snapshot and renders the supported fields. The legacy-named publisher, dynamic framework, provider, and embedded extension compiled and passed artifact inspection before the rename; the current `Ferry*` artifacts require a fresh build. Their behavior has not been observed in a running Simulator.
+The Rust `widgets::update` path validates and writes the serialized snapshot plus title, value, caption, progress, deep link, and constrained action data to the configured app-group `UserDefaults` suite, then requests a WidgetKit timeline reload. The generated provider reads that snapshot and renders the supported fields. The current `Ferry*` publisher, framework, provider, and embedded extension compiled and passed artifact inspection in [Platform artifacts run 30699379465](https://github.com/ShiroKSH/rustferry/actions/runs/30699379465), including exact application-group entitlements. Their behavior has not been observed in a running Simulator.
 
 ## ActivityKit and Dynamic Island
 
@@ -44,7 +44,7 @@ Generation adds:
 - extension identifier `<app identifier>.liveactivity`;
 - embed-target dependency and `Embed App Extensions` phase.
 
-The Rust `start`, `update`, `end`, and `list_active` paths call the generated ActivityKit application bridge. The legacy-named main-app framework and presentation extension compiled, linked, embedded, and passed artifact inspection before the rename; the current `Ferry*` artifacts require a fresh build. No ActivityKit session has been started in a running Simulator or device, so this is not runtime validation. Push-based updates remain unavailable.
+The Rust `start`, `update`, `end`, and `list_active` paths call the generated ActivityKit application bridge. The current `Ferry*` main-app framework and presentation extension compiled, linked, embedded, and passed artifact inspection in [Platform artifacts run 30699379465](https://github.com/ShiroKSH/rustferry/actions/runs/30699379465). No ActivityKit session has been started in a running Simulator or device, so this is not runtime validation. Push-based updates remain unavailable.
 
 ## Artifact validation
 
@@ -59,7 +59,7 @@ For each enabled extension, the build requires:
 - exact configured application-group entitlement on the widget signature;
 - no unexpected extra `.appex` bundles.
 
-Before the RustFerry rename, the equivalent legacy-named WidgetKit and ActivityKit targets, their standalone `.appex` products, and an app embedding both were built and validated with Xcode 26.6/iPhoneSimulator 26.5 without a Simulator runtime. The current `Ferry*` products require a fresh artifact build and inspection.
+At commit `be5206c`, [Platform artifacts run 30699379465](https://github.com/ShiroKSH/rustferry/actions/runs/30699379465) built a RustFerry-named Kitchen Sink app embedding `FerryWidgetExtension.appex` and `FerryLiveActivityExtension.appex`. Both arm64 products passed identifier, plist, extension-point, resource-sealing, and strict ad-hoc signature checks; the ActivityKit product also passed exact runtime-framework linkage inspection, and the widget and containing app carried the exact configured application-group entitlement. Before the rename, the equivalent legacy-named targets, standalone `.appex` products, and combined app were also built and validated with Xcode 26.6/iPhoneSimulator 26.5 without a Simulator runtime.
 
 ## Device-signing limitation
 

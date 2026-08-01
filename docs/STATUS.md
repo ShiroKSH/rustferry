@@ -2,7 +2,7 @@
 
 Last updated: 2026-08-01
 
-Brand transition: source and documentation now use RustFerry. Every platform artifact claim dated 2026-08-01 below refers to pre-rename binaries built with the legacy `cargo-pocket`/`Pocket*` names. Exact legacy paths, identifiers, symbols, and hashes are retained as historical evidence; no RustFerry-named APK, `.app`, or `.appex` has been inspected yet.
+Source and documentation now use RustFerry. [Platform artifacts run 30699379465](https://github.com/ShiroKSH/rustferry/actions/runs/30699379465) at commit `be5206c` produced and inspected current RustFerry-named Android and iOS artifacts. Exact pre-rename `cargo-pocket`/`Pocket*` paths, identifiers, symbols, and hashes remain below as historical evidence.
 
 Status terms:
 
@@ -23,11 +23,20 @@ Status terms:
 | Live Activity | Ongoing-notification fallback enabled in an inspected APK; runtime unobserved | ActivityKit lifecycle bridge and `.appex` artifact-inspected | State model/example pass | Public-CLI Kitchen Sink plus Live Score |
 | Install/run | Not implemented | Not implemented; no Simulator runtime/device | N/A | Toolchain audit |
 
-Real arm64 Android APK, iOS Simulator `.app`, and `.appex` artifacts have been produced and inspected from projects generated and built through the public CLI. No simulator, emulator, or physical-device behavior has been validated. Platform CI is configured to repeat starter and Kitchen Sink generation/builds plus independent artifact checks; no CI run is claimed for this uncommitted revision.
+Real arm64 Android APK, iOS Simulator `.app`, and `.appex` artifacts have been produced and inspected from projects generated and built through the public CLI. No simulator, emulator, or physical-device behavior has been validated.
+
+## Current RustFerry artifact evidence
+
+At commit `be5206c`, [Platform artifacts run 30699379465](https://github.com/ShiroKSH/rustferry/actions/runs/30699379465) generated default Starter and Kitchen Sink projects with the public CLI, then built and independently checked both platforms:
+
+- Android: both arm64 APKs passed ZIP integrity, v2/v3 signature, 16 KiB-aware alignment, package/launcher/API, DEX, resources, and AArch64 ELF checks. The Kitchen Sink APK also passed permission, deep-link, notification, provider, widget, and Live Activity fallback inspection.
+- iOS Simulator: both arm64 `.app` bundles passed plist, resource, architecture, and deep/strict ad-hoc signature checks. Inspection covered `FerryRuntimeBridge.framework`, its required exports and application hook, embedded WidgetKit and ActivityKit `.appex` products, exact identifiers, framework linkage, and application-group entitlements.
+
+This is artifact validation only. The workflow did not boot an emulator or Simulator, install or launch either application, or exercise behavior on a physical device.
 
 ## Recorded checks
 
-These results predate the rename. Commands use current RustFerry names for reproduction and must be rerun before they count as rename-integration evidence.
+The local results in this subsection predate the rename and remain historical host/test evidence. The Platform run above supplies current rename-integration artifact evidence; commands below use RustFerry names for reproduction.
 
 - `cargo test -p rustferry` and its doctests passed.
 - Every Rust fence across the 20 cookbook pages compiled and ran through `rustdoc --test`.
