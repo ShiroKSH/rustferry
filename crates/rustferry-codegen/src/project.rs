@@ -497,28 +497,68 @@ mod tests {
         let mut registry = request("registry-runtime");
         registry.runtime_dependency = RuntimeDependency::Registry("1.2.3".to_owned());
         let registry = ProjectGenerator::new(parent, registry).generate().unwrap();
-        let registry_manifest =
-            fs::read_to_string(registry.destination.join("Cargo.toml")).unwrap();
-        assert!(registry_manifest.contains("version = \"=1.2.3\""));
-        assert!(registry_manifest.contains("[workspace]"));
-        assert!(!registry_manifest.contains("workspace = true"));
-        assert!(!registry_manifest.contains(parent.as_str()));
+        let registry_source = fs::read_to_string(registry.destination.join("Cargo.toml")).unwrap();
+        assert!(!registry_source.contains(parent.as_str()));
+        let registry_manifest = toml::from_str::<toml::Value>(&registry_source).unwrap();
+        let registry_dependency = registry_manifest
+            .get("dependencies")
+            .and_then(|dependencies| dependencies.get("rustferry"))
+            .unwrap();
+        assert!(
+            registry_manifest
+                .get("workspace")
+                .is_some_and(toml::Value::is_table)
+        );
+        assert_eq!(
+            registry_dependency
+                .get("version")
+                .and_then(toml::Value::as_str),
+            Some("=1.2.3")
+        );
+        assert!(registry_dependency.get("workspace").is_none());
+        assert!(registry_dependency.get("path").is_none());
 
         let mut workspace = request("workspace-runtime");
         workspace.runtime_dependency = RuntimeDependency::Workspace;
         let workspace = ProjectGenerator::new(parent, workspace).generate().unwrap();
-        let workspace_manifest =
+        let workspace_source =
             fs::read_to_string(workspace.destination.join("Cargo.toml")).unwrap();
-        assert!(workspace_manifest.contains("workspace = true"));
-        assert!(!workspace_manifest.contains("[workspace]"));
+        let workspace_manifest = toml::from_str::<toml::Value>(&workspace_source).unwrap();
+        let workspace_dependency = workspace_manifest
+            .get("dependencies")
+            .and_then(|dependencies| dependencies.get("rustferry"))
+            .unwrap();
+        assert!(workspace_manifest.get("workspace").is_none());
+        assert_eq!(
+            workspace_dependency
+                .get("workspace")
+                .and_then(toml::Value::as_bool),
+            Some(true)
+        );
+        assert!(workspace_dependency.get("version").is_none());
+        assert!(workspace_dependency.get("path").is_none());
 
         let runtime = parent.join("runtime with spaces");
         let mut path = request("path-runtime");
         path.runtime_dependency = RuntimeDependency::Path(runtime.clone());
         let path = ProjectGenerator::new(parent, path).generate().unwrap();
         let path_manifest = fs::read_to_string(path.destination.join("Cargo.toml")).unwrap();
-        assert!(path_manifest.contains("[workspace]"));
-        assert!(path_manifest.contains(&format!("path = {:?}", runtime.as_str())));
+        let path_manifest = toml::from_str::<toml::Value>(&path_manifest).unwrap();
+        let path_dependency = path_manifest
+            .get("dependencies")
+            .and_then(|dependencies| dependencies.get("rustferry"))
+            .unwrap();
+        assert!(
+            path_manifest
+                .get("workspace")
+                .is_some_and(toml::Value::is_table)
+        );
+        assert_eq!(
+            path_dependency.get("path").and_then(toml::Value::as_str),
+            Some(runtime.as_str())
+        );
+        assert!(path_dependency.get("version").is_none());
+        assert!(path_dependency.get("workspace").is_none());
     }
 
     #[test]
