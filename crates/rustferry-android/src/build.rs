@@ -1372,14 +1372,31 @@ mod tests {
 
     fn fixture_toolchain(root: &Utf8Path) -> AndroidToolchain {
         let tool = |name: &str| {
-            let path = root.join(name);
+            let path = root.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
             fs::write(&path, b"").unwrap();
             path
         };
         let prebuilt = root.join("ndk/toolchains/llvm/prebuilt/test");
         fs::create_dir_all(prebuilt.join("bin")).unwrap();
-        fs::write(prebuilt.join("bin/aarch64-linux-android26-clang"), b"").unwrap();
-        fs::write(prebuilt.join("bin/llvm-ar"), b"").unwrap();
+        let clang_suffix = if cfg!(target_os = "windows") {
+            ".cmd"
+        } else {
+            ""
+        };
+        fs::write(
+            prebuilt
+                .join("bin")
+                .join(format!("aarch64-linux-android26-clang{clang_suffix}")),
+            b"",
+        )
+        .unwrap();
+        fs::write(
+            prebuilt
+                .join("bin")
+                .join(format!("llvm-ar{}", std::env::consts::EXE_SUFFIX)),
+            b"",
+        )
+        .unwrap();
         let android_jar = root.join("android.jar");
         fs::write(&android_jar, b"").unwrap();
         AndroidToolchain {

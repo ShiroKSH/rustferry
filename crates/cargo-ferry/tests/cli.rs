@@ -193,6 +193,21 @@ fn capability_info_reports_the_inspected_android_live_activity_fallback() {
 }
 
 #[cfg(unix)]
+fn process_is_zombie(_process_id: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let status = fs::read_to_string(format!("/proc/{_process_id}/status")).unwrap_or_default();
+        return status.lines().any(|line| {
+            line.strip_prefix("State:")
+                .is_some_and(|state| state.trim_start().starts_with('Z'))
+        });
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    false
+}
+
+#[cfg(unix)]
 fn assert_process_exits(process_id: u32) {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
@@ -208,12 +223,13 @@ fn assert_process_exits(process_id: u32) {
             .status()
             .expect("probe fake cargo")
             .success();
-        if !still_exists {
+        // `kill -0` succeeds for zombies; CI subreapers can defer reaping them.
+        if !still_exists || process_is_zombie(process_id) {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "fake cargo survived cargo-ferry Ctrl+C handling"
+            "fake cargo descendant remained live after cargo-ferry Ctrl+C handling"
         );
         std::thread::sleep(Duration::from_millis(20));
     }

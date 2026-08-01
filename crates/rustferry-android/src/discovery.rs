@@ -690,16 +690,22 @@ mod tests {
         for version in ["34.0.0", "35.0.0"] {
             let directory = root.join("build-tools").join(version);
             for tool in ["aapt2", "d8", "zipalign", "apksigner"] {
-                touch(&directory.join(tool));
+                touch(&directory.join(format!("{tool}{}", executable_suffix())));
             }
         }
         let ndk = root.join("ndk/27.1.0");
-        touch(&ndk.join("toolchains/llvm/prebuilt/test-host/bin/llvm-ar"));
-        touch(&ndk.join("toolchains/llvm/prebuilt/test-host/bin/aarch64-linux-android26-clang"));
+        touch(&ndk.join(format!(
+            "toolchains/llvm/prebuilt/test-host/bin/llvm-ar{}",
+            executable_suffix()
+        )));
+        touch(&ndk.join(format!(
+            "toolchains/llvm/prebuilt/test-host/bin/aarch64-linux-android26-clang{}",
+            ndk_clang_suffix()
+        )));
         fs::write(ndk.join("source.properties"), "Pkg.Revision = 27.1.0\n").unwrap();
         let bin = root.join("host-bin");
         for tool in ["cargo", "rustc", "rustup", "java", "javac", "keytool"] {
-            touch(&bin.join(tool));
+            touch(&bin.join(format!("{tool}{}", executable_suffix())));
         }
         let options = DiscoveryOptions {
             sdk_root: Some(root.clone()),
@@ -715,12 +721,13 @@ mod tests {
             .unwrap();
         assert_eq!(toolchain.platform.api_level, 35);
         assert_eq!(toolchain.build_tools.version, "35.0.0");
+        let expected_linker = format!("aarch64-linux-android26-clang{}", ndk_clang_suffix());
         assert_eq!(
             toolchain
                 .linker_for(AndroidAbi::Arm64V8a, 26)
                 .unwrap()
                 .file_name(),
-            Some("aarch64-linux-android26-clang")
+            Some(expected_linker.as_str())
         );
     }
 

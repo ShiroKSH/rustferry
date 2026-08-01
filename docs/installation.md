@@ -17,6 +17,8 @@ cargo ferry --version
 
 `CARGO_FERRY_RUNTIME_PATH` must be valid UTF-8, absolute, and remain set when running `cargo ferry new`. It must resolve canonically to a directory containing `Cargo.toml`; invalid values fail before project files are written. The generated `Cargo.toml` points at that canonical runtime directory. The current repository is pre-release: neither `cargo-ferry` nor `rustferry` 0.1.0 is claimed available from crates.io.
 
+Checking a generated Slint/Skia application on Linux also requires `pkg-config` and the system Fontconfig development package (`libfontconfig1-dev` on Debian and Ubuntu). RustFerry reports the underlying Cargo diagnostic when either prerequisite is missing.
+
 PowerShell equivalent:
 
 ```powershell

@@ -306,6 +306,29 @@ mod tests {
 
     use super::*;
 
+    fn cargo_messages(native: &Utf8Path, out_dir: &Utf8Path) -> String {
+        [
+            serde_json::json!({
+                "reason": "compiler-artifact",
+                "target": {
+                    "name": "weather",
+                    "kind": ["cdylib"],
+                    "crate_types": ["cdylib"]
+                },
+                "filenames": [native.as_str()]
+            }),
+            serde_json::json!({
+                "reason": "build-script-executed",
+                "out_dir": out_dir.as_str()
+            }),
+        ]
+        .into_iter()
+        .map(|message| message.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+            + "\n"
+    }
+
     #[test]
     fn extracts_cdylib_and_dependency_dex_from_cargo_json() {
         let temp = TempDir::new().unwrap();
@@ -317,9 +340,7 @@ mod tests {
         fs::create_dir_all(&out_dir).unwrap();
         fs::write(&native, b"native").unwrap();
         fs::write(&dex, b"dex\n035\0").unwrap();
-        let json = format!(
-            "{{\"reason\":\"compiler-artifact\",\"target\":{{\"name\":\"weather\",\"kind\":[\"cdylib\"],\"crate_types\":[\"cdylib\"]}},\"filenames\":[\"{native}\"]}}\n{{\"reason\":\"build-script-executed\",\"out_dir\":\"{out_dir}\"}}\n"
-        );
+        let json = cargo_messages(&native, &out_dir);
         let artifacts =
             collect_cargo_artifacts(json.as_bytes(), "aarch64-linux-android", "weather", &root)
                 .unwrap();
@@ -340,9 +361,7 @@ mod tests {
         let native = target.join("libweather.so");
         fs::write(&native, b"native").unwrap();
         fs::write(outside.join("classes.dex"), b"dex\n035\0").unwrap();
-        let json = format!(
-            "{{\"reason\":\"compiler-artifact\",\"target\":{{\"name\":\"weather\",\"kind\":[\"cdylib\"],\"crate_types\":[\"cdylib\"]}},\"filenames\":[\"{native}\"]}}\n{{\"reason\":\"build-script-executed\",\"out_dir\":\"{outside}\"}}\n"
-        );
+        let json = cargo_messages(&native, &outside);
         let artifacts =
             collect_cargo_artifacts(json.as_bytes(), "aarch64-linux-android", "weather", &target)
                 .unwrap();
