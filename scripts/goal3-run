@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+set -u
+
+fail() {
+  printf 'goal3-run: %s\n' "$1" >&2
+  exit 64
+}
+
+canonical_dir() {
+  (cd -P -- "$1" 2>/dev/null && pwd -P)
+}
+
+[[ $# -ge 4 ]] || fail "usage: goal3-run <category> <path-category> -- <command> [args...]"
+
+command_category="$1"
+path_category="$2"
+shift 2
+[[ "$1" == "--" ]] || fail "missing -- before command"
+shift
+[[ $# -gt 0 ]] || fail "missing command"
+[[ "$command_category" =~ ^[A-Za-z0-9_.-]+$ ]] || fail "invalid command category"
+[[ "$path_category" =~ ^[A-Za-z0-9_.-]+$ ]] || fail "invalid path category"
+
+script_dir="$(canonical_dir "$(dirname -- "${BASH_SOURCE[0]}")")" || fail "cannot resolve script directory"
+goal3_repo="$(canonical_dir "$script_dir/..")" || fail "cannot resolve Goal 3 repository"
+source_file="$goal3_repo/.goal3/SOURCE_REPO.txt"
+goal3_file="$goal3_repo/.goal3/GOAL3_REPO.txt"
+[[ -f "$source_file" && -f "$goal3_file" ]] || fail "isolation path files are missing"
+
+source_recorded="$(<"$source_file")"
+goal3_recorded="$(<"$goal3_file")"
+source_repo="$(canonical_dir "$source_recorded")" || fail "cannot resolve source repository"
+goal3_expected="$(canonical_dir "$goal3_recorded")" || fail "cannot resolve recorded Goal 3 repository"
+[[ "$goal3_repo" == "$goal3_expected" ]] || fail "Goal 3 repository path mismatch"
+
+cwd="$(pwd -P)" || fail "cannot resolve current directory"
+case "$cwd/" in
+  "$source_repo/"*) fail "refusing a mutating command inside SOURCE_REPO" ;;
+esac
+case "$cwd/" in
+  "$goal3_repo/"*) ;;
+  *) fail "commands are allowed only inside GOAL3_REPO" ;;
+esac
+
+for argument in "$@"; do
+  case "$argument" in
+    "$source_repo"|"$source_repo/"*) fail "refusing a command argument that targets SOURCE_REPO" ;;
+  esac
+done
+
+export CARGO_TARGET_DIR="$goal3_repo/.goal3/target"
+export RUSTFERRY_GOAL="3"
+export RUSTFERRY_CACHE_DIR="$goal3_repo/.goal3/cache"
+export RUSTFERRY_CONFIG_HOME="$goal3_repo/.goal3/config"
+export RUSTFERRY_ARTIFACT_DIR="$goal3_repo/.goal3/artifacts"
+export TMPDIR="$goal3_repo/.goal3/tmp"
+
+mkdir -p -- "$CARGO_TARGET_DIR" "$RUSTFERRY_CACHE_DIR" "$RUSTFERRY_CONFIG_HOME" \
+  "$RUSTFERRY_ARTIFACT_DIR" "$TMPDIR" "$goal3_repo/.goal3/logs"
+
+operation_id="goal3-$(date -u +%Y%m%dT%H%M%SZ)-$$-${RANDOM:-0}"
+export RUSTFERRY_OPERATION_ID="$operation_id"
+audit_file="$goal3_repo/docs/GOAL3_COMMAND_AUDIT.jsonl"
+started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+printf '{"timestamp":"%s","operation_id":"%s","cwd":"%s","command_category":"%s","affected_path_category":"%s","result":"started","exit_code":null}\n' \
+  "$started_at" "$operation_id" "$cwd" "$command_category" "$path_category" >> "$audit_file"
+
+audit_complete=0
+audit_on_exit() {
+  trapped_exit=$?
+  if [[ "$audit_complete" -eq 0 ]]; then
+    if [[ "$trapped_exit" -eq 0 ]]; then
+      trapped_result="success"
+    else
+      trapped_result="failure"
+    fi
+    trapped_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '{"timestamp":"%s","operation_id":"%s","cwd":"%s","command_category":"%s","affected_path_category":"%s","result":"%s","exit_code":%d}\n' \
+      "$trapped_at" "$operation_id" "$cwd" "$command_category" "$path_category" "$trapped_result" "$trapped_exit" >> "$audit_file"
+  fi
+}
+trap audit_on_exit EXIT
+
+"$@"
+exit_code=$?
+if [[ $exit_code -eq 0 ]]; then
+  result="success"
+else
+  result="failure"
+fi
+timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+printf '{"timestamp":"%s","operation_id":"%s","cwd":"%s","command_category":"%s","affected_path_category":"%s","result":"%s","exit_code":%d}\n' \
+  "$timestamp" "$operation_id" "$cwd" "$command_category" "$path_category" "$result" "$exit_code" >> "$audit_file"
+audit_complete=1
+
+exit "$exit_code"

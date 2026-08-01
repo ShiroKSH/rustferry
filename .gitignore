@@ -1,4 +1,5 @@
 /target/
+/.goal3/
 /.idea/
 /.vscode/
 *.log
