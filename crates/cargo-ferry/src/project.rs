@@ -246,7 +246,7 @@ fn terminate_process_tree(child: &mut Child, process_group: u32) {
     #[cfg(unix)]
     {
         let _ = Command::new("/bin/kill")
-            .args(["-KILL", &format!("-{process_group}")])
+            .args(["-KILL", "--", &format!("-{process_group}")])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

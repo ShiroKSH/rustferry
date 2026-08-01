@@ -789,23 +789,21 @@ mod tests {
         }
         assert_eq!(
             widget_sign.args[5],
-            root.join("target/ferry/ios/generated/WidgetExtension/Widget.entitlements")
+            plan.generated_root
+                .join("WidgetExtension/Widget.entitlements")
                 .to_string()
         );
         assert_eq!(
             widget_sign.args[8],
-            root.join("target/ferry/ios/debug/weather.app/PlugIns/FerryWidgetExtension.appex")
+            plan.artifact_path
+                .join("PlugIns/FerryWidgetExtension.appex")
                 .to_string()
         );
         assert_eq!(
             app_sign.args[5],
-            root.join("target/ferry/ios/generated/App.entitlements")
-                .to_string()
+            plan.generated_root.join("App.entitlements").to_string()
         );
-        assert_eq!(
-            app_sign.args[8],
-            root.join("target/ferry/ios/debug/weather.app").to_string()
-        );
+        assert_eq!(app_sign.args[8], plan.artifact_path.to_string());
         assert!(
             plan.generated_files
                 .iter()

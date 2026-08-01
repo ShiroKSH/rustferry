@@ -192,18 +192,17 @@ fn capability_info_reports_the_inspected_android_live_activity_fallback() {
     );
 }
 
-#[cfg(unix)]
-fn process_is_zombie(_process_id: u32) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        let status = fs::read_to_string(format!("/proc/{_process_id}/status")).unwrap_or_default();
-        return status.lines().any(|line| {
-            line.strip_prefix("State:")
-                .is_some_and(|state| state.trim_start().starts_with('Z'))
-        });
-    }
+#[cfg(target_os = "linux")]
+fn process_is_zombie(process_id: u32) -> bool {
+    let status = fs::read_to_string(format!("/proc/{process_id}/status")).unwrap_or_default();
+    status.lines().any(|line| {
+        line.strip_prefix("State:")
+            .is_some_and(|state| state.trim_start().starts_with('Z'))
+    })
+}
 
-    #[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
+const fn process_is_zombie(_: u32) -> bool {
     false
 }
 
@@ -309,6 +308,7 @@ fn ctrl_c_stops_descendants_during_output_drain_and_emits_json() {
         if Instant::now() >= deadline {
             let _ = Command::new("/bin/kill")
                 .arg("-KILL")
+                .arg("--")
                 .arg(format!("-{child_pid}"))
                 .status();
             let _ = cli.kill();
