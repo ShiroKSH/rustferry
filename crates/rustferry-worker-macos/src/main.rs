@@ -869,21 +869,38 @@ fn run_cleanup(arguments: CleanupArgs) -> Result<(), CliFailure> {
     let worker_root = trusted_worker_root()?;
     let supplied = path_to_utf8(arguments.job_root)?;
     let (job_root, marker, identity) = validate_owned_job_root(&supplied, &worker_root)?;
+    remove_owned_job_root(&worker_root, &job_root, &marker, &identity)?;
+    write_json_stdout(&serde_json::json!({
+        "schema_version": CLI_SCHEMA_VERSION,
+        "status": "cleaned",
+        "complete": true,
+        "phase": marker.phase.as_str(),
+    }))
+}
+
+fn remove_owned_job_root(
+    worker_root: &Utf8Path,
+    job_root: &Utf8Path,
+    marker: &JobMarker,
+    identity: &Handle,
+) -> Result<(), CliFailure> {
     #[cfg(target_os = "macos")]
-    cleanup_stale_keychains_below(&worker_root, &job_root)?;
-    if contains_owned_signing_material(&job_root)? {
+    if marker.phase == JobPhase::Sign {
+        cleanup_stale_keychains_below(worker_root, job_root)?;
+    }
+    if marker.phase == JobPhase::Sign && contains_owned_signing_material(job_root)? {
         return Err(CliFailure::cleanup(
             "signing_cleanup_incomplete",
             "worker-owned signing material remains active",
         ));
     }
-    if handle_binding_changed(&job_root, &identity) {
+    if handle_binding_changed(job_root, identity) {
         return Err(CliFailure::cleanup(
             "job_root_changed",
             "worker job root changed before cleanup",
         ));
     }
-    fs::remove_dir_all(&job_root).map_err(|_| {
+    fs::remove_dir_all(job_root).map_err(|_| {
         CliFailure::cleanup("job_cleanup_failed", "worker job root could not be removed")
     })?;
     if job_root.exists() {
@@ -892,12 +909,7 @@ fn run_cleanup(arguments: CleanupArgs) -> Result<(), CliFailure> {
             "worker job root removal could not be confirmed",
         ));
     }
-    write_json_stdout(&serde_json::json!({
-        "schema_version": CLI_SCHEMA_VERSION,
-        "status": "cleaned",
-        "complete": true,
-        "phase": marker.phase.as_str(),
-    }))
+    Ok(())
 }
 
 fn validate_workflow_dispatch_event(
@@ -3565,5 +3577,33 @@ unsafe_code = "deny"
         )
         .expect("replace test marker");
         assert!(validate_owned_job_root(&job_root, &worker_root).is_err());
+    }
+
+    #[test]
+    fn compile_cleanup_does_not_inventory_untrusted_build_output() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let worker_root =
+            Utf8PathBuf::from_path_buf(temporary.path().join("worker")).expect("UTF-8 worker root");
+        create_private_directory(&worker_root).expect("private worker root");
+        let job_path = worker_root.join("rustferry-compile-job");
+        let job_root = create_job_root(
+            job_path.as_std_path(),
+            &worker_root,
+            JobPhase::Compile,
+            Some("operation-1".to_owned()),
+        )
+        .expect("owned compile root");
+        let mut nested = job_root.join("untrusted-build-output");
+        for _ in 0..18 {
+            nested.push("nested");
+        }
+        fs::create_dir_all(&nested).expect("deep untrusted output");
+
+        let (bound_root, marker, identity) =
+            validate_owned_job_root(&job_root, &worker_root).expect("valid cleanup binding");
+        remove_owned_job_root(&worker_root, &bound_root, &marker, &identity)
+            .expect("compile cleanup");
+
+        assert!(!job_root.exists());
     }
 }

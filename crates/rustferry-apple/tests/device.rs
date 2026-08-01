@@ -89,6 +89,7 @@ fn device_plan_uses_physical_target_sdk_destination_and_unsigned_archive() {
         Some("-showdestinations")
     );
     let cargo = &plan.commands[1];
+    assert!(cargo.args.iter().any(|argument| argument == "--locked"));
     assert_eq!(
         adjacent_argument(&cargo.args, "--target"),
         Some(IOS_DEVICE_TARGET)

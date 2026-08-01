@@ -349,6 +349,7 @@ fn cargo_build_command(
     );
     command.args = vec![
         "build".to_owned(),
+        "--locked".to_owned(),
         "--target".to_owned(),
         IOS_DEVICE_TARGET.to_owned(),
         "--bin".to_owned(),
