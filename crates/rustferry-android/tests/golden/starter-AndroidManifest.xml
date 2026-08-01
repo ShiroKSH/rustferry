@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.example.counter">
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="35" />
+    <application
+        android:allowBackup="false"
+        android:debuggable="true"
+        android:extractNativeLibs="false"
+        android:hasCode="true"
+        android:icon="@drawable/ferry_icon"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/FerryTheme">
+        <activity
+            android:name="org.rustferry.bridge.FerryActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden|uiMode|density"
+            android:exported="true"
+            android:launchMode="singleTop">
+            <meta-data android:name="android.app.lib_name" android:value="counter" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="counter" />
+            </intent-filter>
+        </activity>
+        <receiver
+            android:name="org.rustferry.bridge.FerryNotificationReceiver"
+            android:enabled="true"
+            android:exported="false" />
+    </application>
+</manifest>

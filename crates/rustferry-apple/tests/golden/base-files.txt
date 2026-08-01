@@ -1,0 +1,6 @@
+FerryHost.xcodeproj/project.pbxproj
+FerryHost.xcodeproj/xcshareddata/xcschemes/FerryApp.xcscheme
+FerryResources.json
+Info.plist
+RuntimeBridge/FerryRuntimeBridge.swift
+RuntimeBridge/Info.plist

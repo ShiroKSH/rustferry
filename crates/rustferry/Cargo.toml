@@ -1,0 +1,47 @@
+[package]
+name = "rustferry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Cross-platform runtime APIs for RustFerry Android and iOS applications"
+
+[lib]
+name = "rustferry"
+
+[features]
+default = ["storage", "network", "haptics"]
+storage = []
+network = []
+haptics = []
+notifications = []
+clipboard = []
+share = []
+deep-links = []
+widgets = []
+live-activity = []
+
+[dependencies]
+once_cell.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { version = "0.6.1", features = ["native-activity"] }
+jni = "0.22.4"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

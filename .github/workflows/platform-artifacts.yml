@@ -1,0 +1,474 @@
+name: Platform artifacts
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - crates/**
+      - examples/**
+      - schemas/**
+      - .github/workflows/platform-artifacts.yml
+  pull_request:
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - crates/**
+      - examples/**
+      - schemas/**
+      - .github/workflows/platform-artifacts.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-artifacts-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  android:
+    name: Signed Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
+        with:
+          packages: ""
+          accept-android-sdk-licenses: "yes"
+          log-accepted-android-sdk-licenses: "false"
+      - name: Install pinned Android components
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;29.0.14206865" < /dev/null
+          printf 'ANDROID_NDK_HOME=%s\n' \
+            "$ANDROID_SDK_ROOT/ndk/29.0.14206865" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-bin: "false"
+      - name: Generate default starter with the public CLI
+        id: generate
+        shell: bash
+        env:
+          CARGO_FERRY_RUNTIME_PATH: ${{ github.workspace }}/crates/rustferry
+        run: |
+          set -euo pipefail
+          project="$RUNNER_TEMP/ci-mobile"
+          cargo run --locked --quiet -p cargo-ferry -- new ci-mobile \
+            --id org.rustferry.cimobile \
+            --parent "$RUNNER_TEMP" \
+            --no-git
+          python3 - "$project/ferry.toml" <<'PY'
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          source = path.read_text()
+          needle = 'target_sdk = "installed"'
+          if source.count(needle) != 1:
+              raise SystemExit(f"expected exactly one {needle!r} in {path}")
+          path.write_text(source.replace(needle, 'target_sdk = "35"'))
+          PY
+          test -s "$project/ferry.toml"
+          test -s "$project/src/app.rs"
+          test -s "$project/assets/icon.png"
+          forbidden="$(find "$project" -path "$project/target" -prune -o -type f \
+            \( -name '*.java' -o -name '*.kt' -o -name 'build.gradle*' \) -print -quit)"
+          if test -n "$forbidden"; then
+            echo "Generated user project contains forbidden file: $forbidden" >&2
+            exit 1
+          fi
+          printf 'project=%s\n' "$project" >> "$GITHUB_OUTPUT"
+      - name: Build and independently check generated APK
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          project="${{ steps.generate.outputs.project }}"
+          result="$RUNNER_TEMP/android-build.json"
+          cargo run --locked --quiet -p cargo-ferry -- \
+            --json build android --project-dir "$project" > "$result"
+          jq -e '
+            .status == "ok" and
+            .data.validated == true and
+            .data.validation.package_name == "org.rustferry.cimobile" and
+            .data.validation.launcher_activity == "org.rustferry.bridge.FerryActivity" and
+            (.data.validation.native_abis | index("arm64-v8a")) != null and
+            .data.validation.dex_files >= 1
+          ' \
+            "$result" > /dev/null
+          artifact="$(jq -er '.data.artifact' "$result")"
+          case "$artifact" in
+            "$project"/target/ferry/*) ;;
+            *) echo "Unexpected artifact path: $artifact" >&2; exit 1 ;;
+          esac
+          test -s "$artifact"
+          unzip -tq "$artifact"
+          build_tools="$ANDROID_SDK_ROOT/build-tools/35.0.0"
+          signature="$("$build_tools/apksigner" verify --verbose "$artifact")"
+          grep -E '^Verified using v2 scheme .*: true$' <<< "$signature"
+          grep -E '^Verified using v3 scheme .*: true$' <<< "$signature"
+          "$build_tools/zipalign" -c -P 16 4 "$artifact"
+          badging="$("$build_tools/aapt2" dump badging "$artifact")"
+          grep -F "package: name='org.rustferry.cimobile'" <<< "$badging"
+          grep -F "launchable-activity: name='org.rustferry.bridge.FerryActivity'" <<< "$badging"
+          manifest="$("$build_tools/aapt2" dump xmltree \
+            --file AndroidManifest.xml "$artifact")"
+          grep -E 'minSdkVersion.*=26$' <<< "$manifest"
+          grep -E 'targetSdkVersion.*=35$' <<< "$manifest"
+          unzip -Z1 "$artifact" | grep -Fx 'classes.dex'
+          unzip -Z1 "$artifact" | grep -Fx 'resources.arsc'
+          unzip -Z1 "$artifact" | grep -Fx 'res/drawable/ferry_icon.xml'
+          native_entry="$(unzip -Z1 "$artifact" | grep -E '^lib/arm64-v8a/lib.*\.so$')"
+          test -n "$native_entry"
+          native="$RUNNER_TEMP/ci-mobile.so"
+          unzip -p "$artifact" "$native_entry" > "$native"
+          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -h "$native" \
+            | grep -F 'Machine:                           AArch64'
+          symbols="$("$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" \
+            -D --defined-only "$native")"
+          grep -E ' T android_main$' <<< "$symbols"
+          grep -E ' T Java_org_rustferry_bridge_FerryBridge_nativeDispatchEvent$' <<< "$symbols"
+          dex="$RUNNER_TEMP/classes.dex"
+          unzip -p "$artifact" classes.dex > "$dex"
+          dex_dump="$("$build_tools/dexdump" "$dex")"
+          grep -F "Class descriptor  : 'Lorg/rustferry/bridge/FerryActivity;'" <<< "$dex_dump"
+          grep -F "Class descriptor  : 'Lorg/rustferry/bridge/FerryBridge;'" <<< "$dex_dump"
+          printf 'artifact=%s\n' "$artifact" >> "$GITHUB_OUTPUT"
+          printf 'result=%s\n' "$result" >> "$GITHUB_OUTPUT"
+      - name: Generate and build Android widget and Live Activity fallback
+        id: extensions
+        shell: bash
+        env:
+          CARGO_FERRY_RUNTIME_PATH: ${{ github.workspace }}/crates/rustferry
+        run: |
+          set -euo pipefail
+          project="$RUNNER_TEMP/ci-extensions"
+          cargo run --locked --quiet -p cargo-ferry -- new ci-extensions \
+            --id org.rustferry.ciextensions \
+            --template kitchen-sink \
+            --parent "$RUNNER_TEMP" \
+            --no-git
+          python3 - "$project/ferry.toml" <<'PY'
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          source = path.read_text()
+          needle = 'target_sdk = "installed"'
+          if source.count(needle) != 1:
+              raise SystemExit(f"expected exactly one {needle!r} in {path}")
+          path.write_text(source.replace(needle, 'target_sdk = "35"'))
+          PY
+          result="$RUNNER_TEMP/android-extensions-build.json"
+          cargo run --locked --quiet -p cargo-ferry -- \
+            --json build android --project-dir "$project" > "$result"
+          jq -e '
+            .status == "ok" and
+            .data.validated == true and
+            .data.validation.package_name == "org.rustferry.ciextensions" and
+            (.data.validation.manifest.components | index("receiver:org.rustferry.bridge.FerryWidgetProvider")) != null and
+            (.data.validation.manifest.components | index("receiver:org.rustferry.bridge.FerryNotificationReceiver")) != null and
+            (.data.validation.manifest.components | index("provider:org.rustferry.bridge.FerryFileProvider")) != null and
+            (.data.validation.manifest.deep_link_filters | index("scheme=ciextensions;host=*;pathPrefix=*")) != null and
+            (.data.validation.manifest.permissions | index("android.permission.POST_NOTIFICATIONS")) != null
+          ' "$result" > /dev/null
+          artifact="$(jq -er '.data.artifact' "$result")"
+          case "$artifact" in
+            "$project"/target/ferry/*) ;;
+            *) echo "Unexpected artifact path: $artifact" >&2; exit 1 ;;
+          esac
+          test -s "$artifact"
+          build_tools="$ANDROID_SDK_ROOT/build-tools/35.0.0"
+          signature="$("$build_tools/apksigner" verify --verbose "$artifact")"
+          grep -E '^Verified using v2 scheme .*: true$' <<< "$signature"
+          grep -E '^Verified using v3 scheme .*: true$' <<< "$signature"
+          "$build_tools/zipalign" -c -P 16 4 "$artifact"
+          permissions="$("$build_tools/aapt2" dump permissions "$artifact")"
+          grep -F "uses-permission: name='android.permission.POST_NOTIFICATIONS'" <<< "$permissions"
+          manifest="$("$build_tools/aapt2" dump xmltree \
+            --file AndroidManifest.xml "$artifact")"
+          grep -E 'minSdkVersion.*=26$' <<< "$manifest"
+          grep -E 'targetSdkVersion.*=35$' <<< "$manifest"
+          grep -F 'org.rustferry.bridge.FerryWidgetProvider' <<< "$manifest"
+          grep -F 'org.rustferry.bridge.FerryNotificationReceiver' <<< "$manifest"
+          grep -F 'org.rustferry.bridge.FerryFileProvider' <<< "$manifest"
+          grep -F 'ciextensions' <<< "$manifest"
+          dex="$RUNNER_TEMP/extensions-classes.dex"
+          unzip -p "$artifact" classes.dex > "$dex"
+          strings "$dex" | grep -Fx 'live-activity-start'
+          strings "$dex" | grep -Fx 'live-activity-update'
+          strings "$dex" | grep -Fx 'live-activity-end'
+          strings "$dex" | grep -Fx 'live-activity-list'
+          printf 'artifact=%s\n' "$artifact" >> "$GITHUB_OUTPUT"
+          printf 'result=%s\n' "$result" >> "$GITHUB_OUTPUT"
+      - name: Upload verified APKs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: generated-mobile-debug-apks
+          path: |
+            ${{ steps.build.outputs.artifact }}
+            ${{ steps.build.outputs.result }}
+            ${{ steps.extensions.outputs.artifact }}
+            ${{ steps.extensions.outputs.result }}
+          if-no-files-found: error
+          retention-days: 7
+
+  ios:
+    name: iOS app and extensions
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+          targets: aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-bin: "false"
+      - name: Inspect Xcode prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk iphonesimulator --show-sdk-version
+          rustup target list --installed | grep -Fx aarch64-apple-ios-sim
+      - name: Generate default starter with the public CLI
+        id: generate
+        shell: bash
+        env:
+          CARGO_FERRY_RUNTIME_PATH: ${{ github.workspace }}/crates/rustferry
+        run: |
+          set -euo pipefail
+          project="$RUNNER_TEMP/ci-mobile"
+          cargo run --locked --quiet -p cargo-ferry -- new ci-mobile \
+            --id org.rustferry.cimobile \
+            --parent "$RUNNER_TEMP" \
+            --no-git
+          test -s "$project/ferry.toml"
+          test -s "$project/src/app.rs"
+          printf 'project=%s\n' "$project" >> "$GITHUB_OUTPUT"
+      - name: Build and independently check generated Slint app
+        id: slint
+        shell: bash
+        run: |
+          set -euo pipefail
+          project="${{ steps.generate.outputs.project }}"
+          result="$RUNNER_TEMP/ios-build.json"
+          cargo run --locked --quiet -p cargo-ferry -- \
+            --json build ios --simulator --project-dir "$project" > "$result"
+          jq -e '
+            .status == "ok" and
+            .data.validated == true and
+            .data.validation.schema_version == 5 and
+            .data.validation.bundle_identifier == "org.rustferry.cimobile" and
+            .data.validation.rust_binary_embedded == true and
+            .data.validation.code_signature.identifier == "org.rustferry.cimobile" and
+            .data.validation.code_signature.ad_hoc == true and
+            .data.validation.code_signature.strict_verified == true and
+            .data.validation.code_signature.deep_verified == true and
+            .data.validation.code_signature.info_plist_sealed == true and
+            .data.validation.code_signature.resources_sealed == true and
+            .data.validation.code_signature.app_groups == [] and
+            .data.validation.runtime_bridge.code_signature.identifier == "org.rustferry.runtime-bridge" and
+            .data.validation.runtime_bridge.code_signature.ad_hoc == true and
+            .data.validation.runtime_bridge.code_signature.strict_verified == true and
+            .data.validation.runtime_bridge.code_signature.deep_verified == false and
+            .data.validation.runtime_bridge.code_signature.info_plist_sealed == true and
+            .data.validation.runtime_bridge.code_signature.resources_sealed == true and
+            .data.validation.runtime_bridge.code_signature.app_groups == [] and
+            .data.validation.runtime_bridge.application_delegate_hook == true and
+            ([
+              "_ferry_bridge_call",
+              "_ferry_bridge_free",
+              "_ferry_bridge_init",
+              "_ferry_bridge_install",
+              "_ferry_bridge_with_application"
+            ] - .data.validation.runtime_bridge.exported_symbols | length) == 0
+          ' \
+            "$result" > /dev/null
+          artifact="$(jq -er '.data.artifact' "$result")"
+          case "$artifact" in
+            "$project"/target/ferry/*) ;;
+            *) echo "Unexpected artifact path: $artifact" >&2; exit 1 ;;
+          esac
+          test -d "$artifact"
+          plist="$artifact/Info.plist"
+          plutil -lint "$plist"
+          test "$(plutil -extract CFBundleIdentifier raw -o - "$plist")" = \
+            'org.rustferry.cimobile'
+          executable="$(plutil -extract CFBundleExecutable raw -o - "$plist")"
+          test -s "$artifact/$executable"
+          test "$(xcrun lipo -archs "$artifact/$executable")" = "arm64"
+          test -s "$artifact/FerryResources.json"
+          codesign --verify --deep --strict --verbose=4 "$artifact"
+          app_signature="$(codesign --display --verbose=4 "$artifact" 2>&1)"
+          grep -Fx 'Identifier=org.rustferry.cimobile' <<< "$app_signature"
+          app_entitlements="$RUNNER_TEMP/ci-mobile-entitlements.plist"
+          codesign --display --entitlements "$app_entitlements" --xml "$artifact" > /dev/null
+          if test -s "$app_entitlements"; then
+            app_groups="$(plutil -convert json -o - "$app_entitlements" | \
+              jq -c '."com.apple.security.application-groups" // []')"
+            test "$app_groups" = '[]'
+          fi
+          framework_bundle="$artifact/Frameworks/FerryRuntimeBridge.framework"
+          framework="$framework_bundle/FerryRuntimeBridge"
+          test -s "$framework"
+          test "$(xcrun lipo -archs "$framework")" = "arm64"
+          codesign --verify --strict --verbose=4 "$framework_bundle"
+          framework_signature="$(codesign --display --verbose=4 "$framework_bundle" 2>&1)"
+          grep -Fx 'Identifier=org.rustferry.runtime-bridge' <<< "$framework_signature"
+          exports="$(nm -gU "$framework")"
+          for symbol in \
+            _ferry_bridge_call \
+            _ferry_bridge_free \
+            _ferry_bridge_init \
+            _ferry_bridge_install \
+            _ferry_bridge_with_application
+          do
+            grep -F " $symbol" <<< "$exports"
+          done
+          printf 'artifact=%s\n' "$artifact" >> "$GITHUB_OUTPUT"
+          printf 'result=%s\n' "$result" >> "$GITHUB_OUTPUT"
+      - name: Generate and build WidgetKit and ActivityKit project with the public CLI
+        id: extensions
+        shell: bash
+        env:
+          CARGO_FERRY_RUNTIME_PATH: ${{ github.workspace }}/crates/rustferry
+        run: |
+          set -euo pipefail
+          project="$RUNNER_TEMP/ci-extensions"
+          cargo run --locked --quiet -p cargo-ferry -- new ci-extensions \
+            --id org.rustferry.ciextensions \
+            --template kitchen-sink \
+            --parent "$RUNNER_TEMP" \
+            --no-git
+          result="$RUNNER_TEMP/ios-extensions-build.json"
+          cargo run --locked --quiet -p cargo-ferry -- \
+            --json build ios --simulator --project-dir "$project" > "$result"
+          jq -e '
+            .status == "ok" and
+            .data.validated == true and
+            .data.validation.schema_version == 5 and
+            .data.validation.bundle_identifier == "org.rustferry.ciextensions" and
+            .data.validation.code_signature.identifier == "org.rustferry.ciextensions" and
+            .data.validation.code_signature.ad_hoc == true and
+            .data.validation.code_signature.strict_verified == true and
+            .data.validation.code_signature.deep_verified == true and
+            .data.validation.code_signature.info_plist_sealed == true and
+            .data.validation.code_signature.resources_sealed == true and
+            .data.validation.code_signature.app_groups == ["group.org.rustferry.ciextensions"] and
+            .data.validation.runtime_bridge.code_signature.identifier == "org.rustferry.runtime-bridge" and
+            .data.validation.runtime_bridge.code_signature.ad_hoc == true and
+            .data.validation.runtime_bridge.code_signature.strict_verified == true and
+            .data.validation.runtime_bridge.code_signature.deep_verified == false and
+            .data.validation.runtime_bridge.code_signature.info_plist_sealed == true and
+            .data.validation.runtime_bridge.code_signature.resources_sealed == true and
+            .data.validation.runtime_bridge.code_signature.app_groups == [] and
+            (.data.validation.extensions | length) == 2 and
+            ([.data.validation.extensions[].bundle_identifier] | sort) ==
+              (["org.rustferry.ciextensions.liveactivity", "org.rustferry.ciextensions.widget"] | sort) and
+            ([.data.validation.extensions[].architectures[]] | all(. == "arm64")) and
+            ([.data.validation.extensions[].code_signature.ad_hoc] | all) and
+            ([.data.validation.extensions[].code_signature.strict_verified] | all) and
+            ([.data.validation.extensions[].code_signature.deep_verified] | all(. == false)) and
+            ([.data.validation.extensions[].code_signature.info_plist_sealed] | all) and
+            ([.data.validation.extensions[].code_signature.resources_sealed] | all) and
+            ([.data.validation.extensions[] | select(.kind == "widget-kit")][0].code_signature.identifier == "org.rustferry.ciextensions.widget") and
+            ([.data.validation.extensions[] | select(.kind == "widget-kit")][0].code_signature.app_groups == ["group.org.rustferry.ciextensions"]) and
+            ([.data.validation.extensions[] | select(.kind == "activity-kit")][0].runtime_bridge_linked == true) and
+            ([.data.validation.extensions[] | select(.kind == "activity-kit")][0].code_signature.identifier == "org.rustferry.ciextensions.liveactivity") and
+            ([.data.validation.extensions[] | select(.kind == "activity-kit")][0].code_signature.app_groups == [])
+          ' "$result" > /dev/null
+          artifact="$(jq -er '.data.artifact' "$result")"
+          case "$artifact" in
+            "$project"/target/ferry/*) ;;
+            *) echo "Unexpected artifact path: $artifact" >&2; exit 1 ;;
+          esac
+          test -d "$artifact"
+          codesign --verify --deep --strict --verbose=4 "$artifact"
+          app_signature="$(codesign --display --verbose=4 "$artifact" 2>&1)"
+          grep -Fx 'Identifier=org.rustferry.ciextensions' <<< "$app_signature"
+          for name in FerryWidgetExtension FerryLiveActivityExtension; do
+            bundle="$artifact/PlugIns/$name.appex"
+            test -d "$bundle"
+            plutil -lint "$bundle/Info.plist"
+            executable="$(plutil -extract CFBundleExecutable raw -o - "$bundle/Info.plist")"
+            test -s "$bundle/$executable"
+            test "$(xcrun lipo -archs "$bundle/$executable")" = "arm64"
+            point="$(plutil -extract NSExtension.NSExtensionPointIdentifier raw -o - "$bundle/Info.plist")"
+            test "$point" = "com.apple.widgetkit-extension"
+            case "$name" in
+              FerryWidgetExtension)
+                expected_id='org.rustferry.ciextensions.widget'
+                ;;
+              FerryLiveActivityExtension)
+                expected_id='org.rustferry.ciextensions.liveactivity'
+                ;;
+            esac
+            test "$(plutil -extract CFBundleIdentifier raw -o - "$bundle/Info.plist")" = \
+              "$expected_id"
+            codesign --verify --strict --verbose=4 "$bundle"
+            extension_signature="$(codesign --display --verbose=4 "$bundle" 2>&1)"
+            grep -Fx "Identifier=$expected_id" <<< "$extension_signature"
+          done
+          framework_bundle="$artifact/Frameworks/FerryRuntimeBridge.framework"
+          codesign --verify --strict --verbose=4 "$framework_bundle"
+          framework_signature="$(codesign --display --verbose=4 "$framework_bundle" 2>&1)"
+          grep -Fx 'Identifier=org.rustferry.runtime-bridge' <<< "$framework_signature"
+          app_entitlements="$RUNNER_TEMP/ci-extensions-app-entitlements.plist"
+          codesign --display --entitlements "$app_entitlements" --xml "$artifact" > /dev/null
+          app_groups="$(plutil -convert json -o - "$app_entitlements" | \
+            jq -c '."com.apple.security.application-groups" // []')"
+          test "$app_groups" = '["group.org.rustferry.ciextensions"]'
+          widget="$artifact/PlugIns/FerryWidgetExtension.appex"
+          widget_entitlements="$RUNNER_TEMP/ci-widget-entitlements.plist"
+          codesign --display --entitlements "$widget_entitlements" --xml "$widget" > /dev/null
+          widget_groups="$(plutil -convert json -o - "$widget_entitlements" | \
+            jq -c '."com.apple.security.application-groups" // []')"
+          test "$widget_groups" = '["group.org.rustferry.ciextensions"]'
+          live_activity="$artifact/PlugIns/FerryLiveActivityExtension.appex"
+          live_entitlements="$RUNNER_TEMP/ci-live-activity-entitlements.plist"
+          codesign --display --entitlements "$live_entitlements" --xml \
+            "$live_activity" > /dev/null
+          if test -s "$live_entitlements"; then
+            live_groups="$(plutil -convert json -o - "$live_entitlements" | \
+              jq -c '."com.apple.security.application-groups" // []')"
+            test "$live_groups" = '[]'
+          fi
+          printf 'artifact=%s\n' "$artifact" >> "$GITHUB_OUTPUT"
+          printf 'result=%s\n' "$result" >> "$GITHUB_OUTPUT"
+      - name: Upload validated Apple bundles
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ios-simulator-apps
+          path: |
+            ${{ steps.slint.outputs.artifact }}
+            ${{ steps.slint.outputs.result }}
+            ${{ steps.extensions.outputs.artifact }}
+            ${{ steps.extensions.outputs.result }}
+          if-no-files-found: error
+          retention-days: 7

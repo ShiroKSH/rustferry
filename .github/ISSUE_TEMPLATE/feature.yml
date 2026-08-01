@@ -1,0 +1,48 @@
+name: Feature request
+description: Propose a concrete RustFerry workflow or capability
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the application workflow first. RustFerry keeps user-owned application code Rust-only and generated platform glue under `target/ferry/`.
+
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Use case
+      description: What are you trying to build, and what blocks you today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Show the desired CLI, `ferry.toml`, or Rust API shape when useful.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Platform scope
+      options:
+        - label: Host CLI, configuration, or code generation
+        - label: Android
+        - label: iOS Simulator
+        - label: Physical Apple device
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Existing tools, adapters, or application-side workarounds you evaluated.
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Acceptance evidence
+      description: What compile, artifact, simulator/emulator, or device evidence would demonstrate that this works?

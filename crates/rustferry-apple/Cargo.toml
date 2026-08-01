@@ -1,0 +1,24 @@
+[package]
+name = "rustferry-apple"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Generated Xcode host and iOS artifact backend for RustFerry"
+
+[dependencies]
+camino.workspace = true
+rustferry-core = { version = "0.1.0", path = "../rustferry-core" }
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

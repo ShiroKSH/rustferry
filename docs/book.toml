@@ -1,0 +1,16 @@
+[book]
+title = "RustFerry"
+description = "Rust-only application source with generated Android and Apple hosts"
+authors = ["RustFerry contributors"]
+language = "en"
+src = "."
+
+[build]
+build-dir = "../target/book"
+create-missing = false
+
+[output.html]
+git-repository-icon = "fa-github"
+git-repository-url = "https://github.com/ShiroKSH/rustferry"
+edit-url-template = "https://github.com/ShiroKSH/rustferry/edit/master/docs/{path}"
+site-url = "/rustferry/"

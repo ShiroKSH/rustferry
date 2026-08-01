@@ -1,0 +1,38 @@
+[package]
+name = "cargo-ferry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Build Rust applications for Android and iOS without user-maintained platform projects"
+
+[[bin]]
+name = "cargo-ferry"
+path = "src/main.rs"
+
+[dependencies]
+camino.workspace = true
+clap.workspace = true
+clap_complete = "4.5.55"
+rustferry-android = { version = "0.1.0", path = "../rustferry-android" }
+rustferry-apple = { version = "0.1.0", path = "../rustferry-apple" }
+rustferry-codegen = { version = "0.1.0", path = "../rustferry-codegen" }
+rustferry-core = { version = "0.1.0", path = "../rustferry-core" }
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+toml_edit = "0.23.7"
+
+[dev-dependencies]
+assert_cmd = "2.0.17"
+predicates = "3.1.3"
+
+[lints]
+workspace = true

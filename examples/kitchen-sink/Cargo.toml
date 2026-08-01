@@ -1,0 +1,26 @@
+[package]
+name = "kitchen-sink"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace]
+
+[lib]
+name = "kitchen_sink"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "kitchen-sink"
+path = "src/main.rs"
+
+[dependencies]
+rustferry = { package = "rustferry", path = "../../crates/rustferry", default-features = false, features = ["storage", "network", "haptics", "notifications", "clipboard", "share", "deep-links", "widgets", "live-activity"] }
+serde = { version = "1.0", features = ["derive"] }
+slint = { version = "=1.17.1", default-features = false, features = ["std", "compat-1-2", "backend-winit", "backend-android-activity-06", "renderer-skia"] }
+thiserror = "2.0"
+
+[lints.rust]
+unsafe_code = "deny"

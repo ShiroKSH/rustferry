@@ -1,0 +1,12 @@
+App.entitlements
+FerryHost.xcodeproj/project.pbxproj
+FerryHost.xcodeproj/xcshareddata/xcschemes/FerryApp.xcscheme
+FerryResources.json
+Info.plist
+LiveActivityExtension/Info.plist
+LiveActivityExtension/LiveActivity.swift
+RuntimeBridge/FerryRuntimeBridge.swift
+RuntimeBridge/Info.plist
+WidgetExtension/Info.plist
+WidgetExtension/Widget.entitlements
+WidgetExtension/Widget.swift

@@ -1,0 +1,201 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  quality:
+    name: Linux quality and docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-bin: "false"
+      - name: License policy
+        run: python3 scripts/check-licenses.py
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: Workspace tests
+        run: cargo test --locked --workspace --all-features
+      - name: Template tests
+        run: |
+          cargo test --locked -p rustferry-codegen
+          cargo test --locked -p cargo-ferry
+      - name: Packaged CLI sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_files="$RUNNER_TEMP/cargo-ferry-package-files.txt"
+          cargo package -p cargo-ferry --allow-dirty --no-verify --list > "$package_files"
+          test "$(grep -c '^embedded-docs/' "$package_files")" -eq 16
+          isolated="$RUNNER_TEMP/cargo-ferry-package-smoke"
+          mkdir -p "$isolated"
+          cp Cargo.toml Cargo.lock "$isolated/"
+          cp -R crates "$isolated/"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/cargo-ferry-package-target" \
+            cargo check --locked --manifest-path "$isolated/Cargo.toml" -p cargo-ferry
+          embedded_result="$RUNNER_TEMP/cargo-ferry-embedded-docs.json"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/cargo-ferry-package-target" \
+            cargo run --locked --quiet --manifest-path "$isolated/Cargo.toml" \
+              -p cargo-ferry -- --json docs remote-push > "$embedded_result"
+          jq -e '
+            .status == "ok" and
+            .data.source == "embedded" and
+            (.data.content | startswith("# Remote push"))
+          ' "$embedded_result" > /dev/null
+      - name: Standalone example checks and tests
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-ferry-examples
+        run: |
+          set -euo pipefail
+          for manifest in examples/*/Cargo.toml; do
+            cargo check --locked --manifest-path "$manifest" --all-targets
+            cargo test --locked --manifest-path "$manifest" --test basic
+          done
+      - name: Rustdoc and doctests
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo doc --locked --workspace --all-features --no-deps
+          cargo test --locked --workspace --all-features --doc
+      - name: Cookbook snippets
+        shell: bash
+        run: |
+          set -euo pipefail
+          messages="$RUNNER_TEMP/runtime-build.jsonl"
+          cargo build --locked -p rustferry --message-format=json > "$messages"
+          rustferry_rlib="$(jq -r '
+            select(.reason == "compiler-artifact" and .target.name == "rustferry")
+            | .filenames[] | select(endswith(".rlib"))
+          ' "$messages" | tail -n 1)"
+          serde_rlib="$(jq -r '
+            select(.reason == "compiler-artifact" and .target.name == "serde")
+            | .filenames[] | select(endswith(".rlib"))
+          ' "$messages" | tail -n 1)"
+          test -n "$rustferry_rlib"
+          test -n "$serde_rlib"
+          for page in docs/cookbook/*.md; do
+            rustdoc --test "$page" --edition 2024 \
+              -L dependency=target/debug/deps \
+              --extern "rustferry=$rustferry_rlib" \
+              --extern "serde=$serde_rlib"
+          done
+      - name: Local documentation links
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          from urllib.parse import unquote, urlparse
+          import re
+
+          root = Path.cwd()
+          documents = [root / name for name in ("README.md", "CONTRIBUTING.md", "SECURITY.md")]
+          documents.extend((root / "docs").rglob("*.md"))
+          documents.extend((root / "examples").glob("*/README.md"))
+          failures = []
+          link_pattern = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
+
+          for document in documents:
+              for match in link_pattern.finditer(document.read_text(encoding="utf-8")):
+                  raw_target = match.group(1).strip().strip("<>")
+                  target = raw_target.split("#", 1)[0].split("?", 1)[0]
+                  if not target or urlparse(target).scheme or target.startswith("//"):
+                      continue
+                  destination = (document.parent / unquote(target)).resolve()
+                  if not destination.exists():
+                      line = document.read_text(encoding="utf-8").count("\n", 0, match.start()) + 1
+                      failures.append(f"{document.relative_to(root)}:{line}: {raw_target}")
+
+          if failures:
+              raise SystemExit("Broken local Markdown links:\n" + "\n".join(failures))
+          PY
+      - uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2
+        with:
+          tool: mdbook@0.5.4
+          fallback: none
+      - name: mdBook
+        run: mdbook build docs
+
+  msrv:
+    name: Rust 1.92 minimum version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.92.0
+      - name: Workspace check
+        run: cargo check --locked --workspace --all-targets --all-features
+
+  portability:
+    name: Tests and templates (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-bin: "false"
+      - name: Workspace tests
+        run: cargo test --locked --workspace --all-features
+      - name: Generate and check starter (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          CARGO_FERRY_RUNTIME_PATH: ${{ github.workspace }}/crates/rustferry
+        run: |
+          set -euo pipefail
+          cargo run -p cargo-ferry -- new ci-starter --parent "$RUNNER_TEMP" --no-git --no-check
+          cargo check --manifest-path "$RUNNER_TEMP/ci-starter/Cargo.toml"
+          cargo test --manifest-path "$RUNNER_TEMP/ci-starter/Cargo.toml"
+          cargo run -p cargo-ferry -- add notifications --project-dir "$RUNNER_TEMP/ci-starter"
+          cargo check --manifest-path "$RUNNER_TEMP/ci-starter/Cargo.toml"
+          cargo run -p cargo-ferry -- add widget --project-dir "$RUNNER_TEMP/ci-starter"
+          cargo check --manifest-path "$RUNNER_TEMP/ci-starter/Cargo.toml"
+      - name: Generate and check starter (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          CARGO_FERRY_RUNTIME_PATH: ${{ github.workspace }}/crates/rustferry
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo run -p cargo-ferry -- new ci-starter --parent $env:RUNNER_TEMP --no-git --no-check
+          cargo check --manifest-path (Join-Path $env:RUNNER_TEMP 'ci-starter/Cargo.toml')
+          cargo test --manifest-path (Join-Path $env:RUNNER_TEMP 'ci-starter/Cargo.toml')
+          cargo run -p cargo-ferry -- add notifications --project-dir (Join-Path $env:RUNNER_TEMP 'ci-starter')
+          cargo check --manifest-path (Join-Path $env:RUNNER_TEMP 'ci-starter/Cargo.toml')
+          cargo run -p cargo-ferry -- add widget --project-dir (Join-Path $env:RUNNER_TEMP 'ci-starter')
+          cargo check --manifest-path (Join-Path $env:RUNNER_TEMP 'ci-starter/Cargo.toml')
