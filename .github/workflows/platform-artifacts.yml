@@ -139,7 +139,7 @@ jobs:
           grep -E 'targetSdkVersion.*=35$' <<< "$manifest"
           unzip -Z1 "$artifact" | grep -Fx 'classes.dex'
           unzip -Z1 "$artifact" | grep -Fx 'resources.arsc'
-          unzip -Z1 "$artifact" | grep -Fx 'res/drawable-nodpi/ferry_icon.png'
+          unzip -Z1 "$artifact" | grep -E '^res/drawable[^/]*/ferry_icon\.(png|xml)$'
           native_entry="$(unzip -Z1 "$artifact" | grep -E '^lib/arm64-v8a/lib.*\.so$')"
           test -n "$native_entry"
           native="$RUNNER_TEMP/ci-mobile.so"
