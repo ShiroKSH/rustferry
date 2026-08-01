@@ -977,18 +977,6 @@ mod tests {
     }
 
     #[test]
-    fn stream_rejects_a_line_beyond_the_request_bound() {
-        let (_temporary, tool) = fake_log_tool();
-        let command = ToolCommand::new(&tool, ".", "test bounded log stream")
-            .arg("logcat")
-            .env("RUSTFERRY_FAKE_OVERSIZE", "1")
-            .output_limit(1_024);
-        let error = stream_command_lines(&command, 8, 4, || false, |_| Ok(()))
-            .expect_err("oversized line must be rejected");
-        assert!(matches!(error, DeploymentError::InvalidToolOutput { .. }));
-    }
-
-    #[test]
     fn bounded_buffer_evicts_old_entries_by_count_and_bytes() {
         let mut buffer = BoundedLogBuffer::new(2, 128).expect("buffer");
         for message in ["one", "two", "three"] {

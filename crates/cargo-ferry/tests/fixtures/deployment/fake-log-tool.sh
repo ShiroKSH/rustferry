@@ -18,13 +18,9 @@ case "$arguments" in
       (trap '' INT TERM; while :; do sleep 1; done) &
       printf '%s\n' "$!" > "$RUSTFERRY_FAKE_DESCENDANT_PID"
     fi
-    if [ "${RUSTFERRY_FAKE_OVERSIZE:-0}" = 1 ]; then
-      printf '%s\n' '01234567890123456789'
-    else
-      printf '%s\n' \
-        '1754049999.100 4242 4243 D Ferry: hidden debug' \
-        '1754049999.200 4242 4243 I Ferry: android ready'
-    fi
+    printf '%s\n' \
+      '1754049999.100 4242 4243 D Ferry: hidden debug' \
+      '1754049999.200 4242 4243 I Ferry: android ready'
     if [ "${RUSTFERRY_FAKE_HOLD:-0}" = 1 ]; then
       while :; do sleep 1; done
     fi

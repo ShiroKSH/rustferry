@@ -139,7 +139,38 @@ jobs:
           grep -E 'targetSdkVersion.*=35$' <<< "$manifest"
           unzip -Z1 "$artifact" | grep -Fx 'classes.dex'
           unzip -Z1 "$artifact" | grep -Fx 'resources.arsc'
-          unzip -Z1 "$artifact" | grep -E '^res/drawable[^/]*/ferry_icon\.(png|xml)$'
+          python3 - "$artifact" <<'PY'
+          import re
+          import sys
+          from zipfile import ZipFile
+
+          densities = {"mdpi", "hdpi", "xhdpi", "xxhdpi", "xxxhdpi"}
+          icon_pattern = re.compile(
+              r"res/mipmap-(mdpi|hdpi|xhdpi|xxhdpi|xxxhdpi)(?:-v\d+)?/ferry_icon\.png"
+          )
+          splash_pattern = re.compile(
+              r"res/drawable-nodpi(?:-v\d+)?/ferry_splash\.png"
+          )
+          with ZipFile(sys.argv[1]) as archive:
+              entries = archive.namelist()
+
+          icon_entries = [entry for entry in entries if icon_pattern.fullmatch(entry)]
+          icon_densities = [icon_pattern.fullmatch(entry).group(1) for entry in icon_entries]
+          if len(icon_entries) != 5 or set(icon_densities) != densities:
+              raise SystemExit(
+                  "expected exactly one compiled ferry_icon.png for each Android density; "
+                  f"found {icon_entries!r}"
+              )
+
+          splash_entries = [entry for entry in entries if splash_pattern.fullmatch(entry)]
+          if len(splash_entries) != 1:
+              raise SystemExit(
+                  "expected exactly one compiled drawable-nodpi ferry_splash.png; "
+                  f"found {splash_entries!r}"
+              )
+
+          print(*icon_entries, *splash_entries, sep="\n")
+          PY
           native_entry="$(unzip -Z1 "$artifact" | grep -E '^lib/arm64-v8a/lib.*\.so$')"
           test -n "$native_entry"
           native="$RUNNER_TEMP/ci-mobile.so"
@@ -286,7 +317,7 @@ jobs:
           jq -e '
             .status == "ok" and
             .data.validated == true and
-            .data.validation.schema_version == 5 and
+            .data.validation.schema_version == 8 and
             .data.validation.bundle_identifier == "org.rustferry.cimobile" and
             .data.validation.rust_binary_embedded == true and
             .data.validation.code_signature.identifier == "org.rustferry.cimobile" and
@@ -376,7 +407,7 @@ jobs:
           jq -e '
             .status == "ok" and
             .data.validated == true and
-            .data.validation.schema_version == 5 and
+            .data.validation.schema_version == 8 and
             .data.validation.bundle_identifier == "org.rustferry.ciextensions" and
             .data.validation.code_signature.identifier == "org.rustferry.ciextensions" and
             .data.validation.code_signature.ad_hoc == true and

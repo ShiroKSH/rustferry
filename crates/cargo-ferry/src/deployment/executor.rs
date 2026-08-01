@@ -15,6 +15,7 @@ const STREAM_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const STREAM_DRAIN_GRACE: Duration = Duration::from_secs(1);
 type ReaderResult = Result<(Vec<u8>, bool), std::io::Error>;
 
+#[derive(Debug)]
 enum LineReaderEvent {
     Line(Vec<u8>),
     LineLimitExceeded,
@@ -444,27 +445,42 @@ where
     OnLine: FnMut(&[u8]) -> DeploymentResult<()>,
 {
     match stream.lines.recv_timeout(STREAM_POLL_INTERVAL) {
-        Ok(LineReaderEvent::Line(line)) => on_line(&line),
-        Ok(LineReaderEvent::LineLimitExceeded) => Err(DeploymentError::InvalidToolOutput {
-            tool: "platform log stream",
-            operation: spec.operation,
-            message: format!("one output line exceeded the {max_line_bytes}-byte limit"),
-        }),
-        Ok(LineReaderEvent::Finished) => {
-            state.stdout_finished = true;
-            Ok(())
-        }
-        Ok(LineReaderEvent::Failed(source)) => Err(DeploymentError::Io {
-            action: "read streamed deployment stdout",
-            path: spec.program.clone(),
-            source,
-        }),
+        Ok(event) => handle_line_reader_event(spec, max_line_bytes, event, state, on_line),
         Err(RecvTimeoutError::Timeout) => Ok(()),
         Err(RecvTimeoutError::Disconnected) if state.stdout_finished => Ok(()),
         Err(RecvTimeoutError::Disconnected) => Err(DeploymentError::Io {
             action: "read streamed deployment stdout",
             path: spec.program.clone(),
             source: std::io::Error::other("stream reader disconnected before EOF"),
+        }),
+    }
+}
+
+fn handle_line_reader_event<OnLine>(
+    spec: &ToolCommand,
+    max_line_bytes: usize,
+    event: LineReaderEvent,
+    state: &mut LineStreamState,
+    on_line: &mut OnLine,
+) -> DeploymentResult<()>
+where
+    OnLine: FnMut(&[u8]) -> DeploymentResult<()>,
+{
+    match event {
+        LineReaderEvent::Line(line) => on_line(&line),
+        LineReaderEvent::LineLimitExceeded => Err(DeploymentError::InvalidToolOutput {
+            tool: "platform log stream",
+            operation: spec.operation,
+            message: format!("one output line exceeded the {max_line_bytes}-byte limit"),
+        }),
+        LineReaderEvent::Finished => {
+            state.stdout_finished = true;
+            Ok(())
+        }
+        LineReaderEvent::Failed(source) => Err(DeploymentError::Io {
+            action: "read streamed deployment stdout",
+            path: spec.program.clone(),
+            source,
         }),
     }
 }
@@ -734,6 +750,8 @@ fn tool_help(program: &Utf8Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use super::*;
 
     #[test]
@@ -744,6 +762,43 @@ mod tests {
         assert_eq!(command.arguments.len(), 4);
         assert_eq!(command.arguments[1], "serial with spaces");
         assert_eq!(command.arguments[3], "echo;not-a-shell");
+    }
+
+    #[test]
+    fn bounded_line_reader_reports_the_limit_before_disconnect_repeatedly() {
+        for iteration in 0..64 {
+            let events = spawn_line_reader(Cursor::new(b"0123456789\n"), 8, 1)
+                .expect("spawn bounded line reader");
+            let event = events
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap_or_else(|error| panic!("reader iteration {iteration} failed: {error}"));
+            assert!(
+                matches!(event, LineReaderEvent::LineLimitExceeded),
+                "reader iteration {iteration} returned {event:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn line_limit_event_maps_to_invalid_tool_output() {
+        let spec = ToolCommand::new("fake-log-tool", ".", "test bounded log stream");
+        let mut state = LineStreamState::default();
+        let error = handle_line_reader_event(
+            &spec,
+            8,
+            LineReaderEvent::LineLimitExceeded,
+            &mut state,
+            &mut |_| panic!("line callback must not run for an oversized line"),
+        )
+        .expect_err("oversized line event must be rejected");
+        assert!(matches!(
+            error,
+            DeploymentError::InvalidToolOutput {
+                tool: "platform log stream",
+                operation: "test bounded log stream",
+                ref message,
+            } if message == "one output line exceeded the 8-byte limit"
+        ));
     }
 
     #[cfg(unix)]

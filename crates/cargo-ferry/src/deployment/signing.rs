@@ -1917,12 +1917,6 @@ fn profile_expired(source: &str) -> DeploymentResult<bool> {
 }
 
 fn profile_expired_at(source: &str, now: SystemTime) -> DeploymentResult<bool> {
-    let expiration =
-        parse_rfc3339_unix_nanos(source).ok_or_else(|| DeploymentError::InvalidToolOutput {
-            tool: "plutil",
-            operation: "inspect provisioning expiration",
-            message: format!("unsupported RFC3339 expiration date `{source}`"),
-        })?;
     let now = match now.duration_since(UNIX_EPOCH) {
         Ok(duration) => {
             i128::from(duration.as_secs()) * 1_000_000_000 + i128::from(duration.subsec_nanos())
@@ -1932,6 +1926,16 @@ fn profile_expired_at(source: &str, now: SystemTime) -> DeploymentResult<bool> {
             -(i128::from(duration.as_secs()) * 1_000_000_000 + i128::from(duration.subsec_nanos()))
         }
     };
+    profile_expired_at_unix_nanos(source, now)
+}
+
+fn profile_expired_at_unix_nanos(source: &str, now: i128) -> DeploymentResult<bool> {
+    let expiration =
+        parse_rfc3339_unix_nanos(source).ok_or_else(|| DeploymentError::InvalidToolOutput {
+            tool: "plutil",
+            operation: "inspect provisioning expiration",
+            message: format!("unsupported RFC3339 expiration date `{source}`"),
+        })?;
     Ok(expiration <= now)
 }
 
@@ -2090,24 +2094,29 @@ mod tests {
         assert!(days_from_civil(2024, 2, 29).is_some());
         assert!(days_from_civil(2023, 2, 29).is_none());
         let expiration = "2026-08-01T12:34:56.125Z";
-        let expiration_nanos =
-            u64::try_from(parse_rfc3339_unix_nanos(expiration).expect("timestamp"))
-                .expect("positive timestamp");
-        let expiration_time = UNIX_EPOCH + Duration::from_nanos(expiration_nanos);
+        let expiration_nanos = parse_rfc3339_unix_nanos(expiration).expect("timestamp");
         assert!(
-            !profile_expired_at(expiration, expiration_time - Duration::from_nanos(1))
+            !profile_expired_at_unix_nanos(expiration, expiration_nanos - 1)
                 .expect("before expiration")
         );
-        assert!(profile_expired_at(expiration, expiration_time).expect("at expiration"));
         assert!(
-            profile_expired_at(expiration, expiration_time + Duration::from_nanos(1))
+            profile_expired_at_unix_nanos(expiration, expiration_nanos).expect("at expiration")
+        );
+        assert!(
+            profile_expired_at_unix_nanos(expiration, expiration_nanos + 1)
                 .expect("after expiration")
+        );
+        let expiration_duration =
+            Duration::from_nanos(u64::try_from(expiration_nanos).expect("positive timestamp"));
+        assert!(
+            profile_expired_at(expiration, UNIX_EPOCH + expiration_duration)
+                .expect("system time at expiration")
         );
         assert_eq!(
             parse_rfc3339_unix_nanos("2026-08-01T14:34:56.125+02:00"),
             parse_rfc3339_unix_nanos(expiration)
         );
-        assert!(profile_expired_at("2026-08-01", expiration_time).is_err());
+        assert!(profile_expired_at_unix_nanos("2026-08-01", expiration_nanos).is_err());
     }
 
     #[test]
