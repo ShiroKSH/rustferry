@@ -1,0 +1,70 @@
+//! Cross-platform contracts for `RustFerry` remote Apple builds.
+//!
+//! This crate contains data and provider boundaries only. Provider implementations own
+//! networking and process execution; callers choose the async runtime, if any.
+
+#![forbid(unsafe_code)]
+
+/// Artifact manifests and independent artifact validation.
+pub mod artifact;
+/// Runtime-neutral cooperative cancellation.
+pub mod cancellation;
+/// Typed protocol and provider failures.
+pub mod error;
+/// Ferry Remote Build Protocol v1 data and NDJSON events.
+pub mod protocol;
+/// Runtime-neutral asynchronous build-provider boundary.
+pub mod provider;
+/// Chunk-safe secret redaction.
+pub mod redaction;
+/// Checked-in JSON Schema generation.
+pub mod schema;
+/// Non-serializable secret values and serializable opaque references.
+pub mod secret;
+/// Apple signing plans and validation models.
+pub mod signing;
+/// Deterministic Git and snapshot source manifests.
+pub mod source;
+
+pub use artifact::{
+    ARTIFACT_MANIFEST_SCHEMA_VERSION, ApplePlatform, AppleToolchainEvidence, ArtifactError,
+    ArtifactKind, ArtifactManifest, ArtifactRecord, ArtifactSigningEvidence, CleanupStatus,
+    IpaExpectation, IpaInspection, MachOSliceEvidence, ValidationLevel, inspect_ipa,
+    inspect_physical_iphone_macho, verify_downloaded_file,
+};
+pub use cancellation::CancellationToken;
+pub use error::{RemoteBuildError, RemoteBuildResult};
+pub use protocol::{
+    BuildProfile, CURRENT_PROTOCOL_VERSION, CleanupConfirmation, DiagnosticSeverity,
+    IOS_DEVICE_RUST_TARGET, IOS_DEVICE_SDK, IosArtifactType, IosDeviceBuildRequest,
+    IosDeviceBuildResult, JobState, ProtocolPath, ProtocolPathSemantics, ProtocolVersion,
+    REMOTE_BUILD_EVENT_TYPES, RemoteBuildEvent, RemoteBuildEventKind, RemoteDiagnostic,
+    RemoteErrorInfo,
+};
+pub use provider::{
+    ArtifactDownloadRequest, ArtifactDownloadResult, ArtifactListRequest, BuildProvider,
+    CancellationAck, CancellationRequest, CleanupRequest, EventPage, EventRequest,
+    HandshakeRequest, HandshakeResponse, JobHandle, ProviderCapabilities, ProviderCheck,
+    ProviderCheckStatus, ProviderDoctorReport, ProviderDoctorRequest, ProviderFeature,
+    ProviderFuture,
+};
+pub use redaction::{
+    CommandOutputRedactor, OutputStream, REDACTION_MARKER, RedactionError, SecretRedactor,
+    StreamingRedactor,
+};
+pub use schema::{RemoteProtocolV1Document, protocol_v1_schema_json};
+pub use secret::{Secret, SecretBytes, SecretReference, SecretReferenceError, SecretReferenceKind};
+pub use signing::{
+    BundleIdentifier, DevelopmentTeam, DevelopmentTeamPlan, DevicePlan, EntitlementPlan,
+    EntitlementSet, EntitlementValueError, ProvisioningPlan, ProvisioningPlatform,
+    ProvisioningProfile, ProvisioningProfileType, SigningCertificate, SigningIdentity, SigningMode,
+    SigningPlan, SigningPrivateKeyReference, SigningReference, SigningStatus, SigningTarget,
+    SigningTargetKind, SigningValidationError, SigningValidationErrors, SigningValidationReport,
+    ValidationComponent, ValidationStatus,
+};
+pub use source::{
+    IgnoreRuleReason, PlannedSourceFile, PortablePathReason, SourceBundlePlan, SourceBundleRequest,
+    SourceError, SourceLimitKind, SourceLimits, SourceManifest, SourceManifestEntry, SourceMode,
+    create_source_bundle_archive, plan_source_bundle, validate_source_manifest,
+    verify_materialized_bundle, verify_source_bundle_plan, verify_source_manifest,
+};

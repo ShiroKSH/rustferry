@@ -2,6 +2,8 @@
 
 ## Goal 3 additions
 
+- `crates/rustferry-remote/`: protocol v1, provider contracts, source manifests, signing plans, redaction, artifact manifests and cross-platform inspection.
+- `schemas/ferry-remote-protocol-v1.schema.json` and `docs/remote/protocol.md`.
 - Remote build protocol and provider contracts.
 - Physical-iPhone compile, signing, provisioning, artifact inspection, and worker components.
 - GitHub Actions, SSH Mac, and local Mac providers.
@@ -20,6 +22,8 @@
 - Root workspace membership/dependencies.
 - Existing process, artifact, diagnostic, and cancellation models.
 - Generic GitHub workflows and user-facing status documentation.
+
+Current additive remote-contract files have no Goal 2 textual overlap. Root `Cargo.toml` and `Cargo.lock` already overlap. Goal 3 physical-device work also targets `crates/rustferry-apple/`; Goal 2 currently changes that crate's manifest but not its implementation files.
 
 ## Goal 2 boundary
 

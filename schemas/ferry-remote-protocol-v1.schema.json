@@ -1,0 +1,2759 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Ferry Remote Build Protocol v1",
+  "description": "Every standalone document exchanged or persisted by protocol v1.\n\nThe generated schema is a catalog expressed as `anyOf`; transport operations still determine\nwhich concrete document is valid at each boundary.",
+  "anyOf": [
+    {
+      "description": "Client-to-provider compatibility request.",
+      "$ref": "#/$defs/HandshakeRequest"
+    },
+    {
+      "description": "Provider-to-client compatibility response.",
+      "$ref": "#/$defs/HandshakeResponse"
+    },
+    {
+      "description": "Client-to-provider readiness request.",
+      "$ref": "#/$defs/ProviderDoctorRequest"
+    },
+    {
+      "description": "Provider-to-client readiness report.",
+      "$ref": "#/$defs/ProviderDoctorReport"
+    },
+    {
+      "description": "Declarative physical-iPhone build request.",
+      "$ref": "#/$defs/IosDeviceBuildRequest"
+    },
+    {
+      "description": "Accepted provider job handle.",
+      "$ref": "#/$defs/JobHandle"
+    },
+    {
+      "description": "One NDJSON event envelope.",
+      "$ref": "#/$defs/RemoteBuildEvent"
+    },
+    {
+      "description": "Bounded event page.",
+      "$ref": "#/$defs/EventPage"
+    },
+    {
+      "description": "Event-page request.",
+      "$ref": "#/$defs/EventRequest"
+    },
+    {
+      "description": "Cancellation request.",
+      "$ref": "#/$defs/CancellationRequest"
+    },
+    {
+      "description": "Cancellation acknowledgement.",
+      "$ref": "#/$defs/CancellationAck"
+    },
+    {
+      "description": "Artifact-list request.",
+      "$ref": "#/$defs/ArtifactListRequest"
+    },
+    {
+      "description": "Artifact download request.",
+      "$ref": "#/$defs/ArtifactDownloadRequest"
+    },
+    {
+      "description": "Verified artifact download result.",
+      "$ref": "#/$defs/ArtifactDownloadResult"
+    },
+    {
+      "description": "Provider cleanup request.",
+      "$ref": "#/$defs/CleanupRequest"
+    },
+    {
+      "description": "Provider cleanup proof.",
+      "$ref": "#/$defs/CleanupConfirmation"
+    },
+    {
+      "description": "Terminal build result.",
+      "$ref": "#/$defs/IosDeviceBuildResult"
+    },
+    {
+      "description": "Persisted artifact provenance and integrity manifest.",
+      "$ref": "#/$defs/ArtifactManifest"
+    }
+  ],
+  "$defs": {
+    "AppleToolchainEvidence": {
+      "description": "Worker and Apple toolchain evidence.",
+      "type": "object",
+      "properties": {
+        "iphoneos_sdk_version": {
+          "description": "iPhoneOS SDK version selected for the job.",
+          "type": "string"
+        },
+        "rust_target": {
+          "description": "Rust target triple; physical builds require `aarch64-apple-ios`.",
+          "type": "string"
+        },
+        "rust_version": {
+          "description": "Rust compiler version.",
+          "type": "string"
+        },
+        "worker_architecture": {
+          "description": "Worker architecture.",
+          "type": "string"
+        },
+        "worker_os": {
+          "description": "Worker operating-system version.",
+          "type": "string"
+        },
+        "xcode_version": {
+          "description": "Xcode version selected for the job.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "worker_os",
+        "worker_architecture",
+        "xcode_version",
+        "iphoneos_sdk_version",
+        "rust_version",
+        "rust_target"
+      ]
+    },
+    "ArtifactDownloadRequest": {
+      "description": "Request to download one artifact to an explicit client path.",
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "description": "Stable artifact identifier from its manifest.",
+          "type": "string"
+        },
+        "destination": {
+          "description": "Absolute client destination. Providers must not reinterpret it as a worker path.",
+          "$ref": "#/$defs/ProtocolPath"
+        },
+        "job_id": {
+          "description": "Stable provider job identifier.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "job_id",
+        "artifact_id",
+        "destination"
+      ]
+    },
+    "ArtifactDownloadResult": {
+      "description": "Verified result of one provider artifact download.",
+      "type": "object",
+      "properties": {
+        "local_path": {
+          "description": "Absolute client path containing verified bytes.",
+          "$ref": "#/$defs/ProtocolPath"
+        },
+        "manifest": {
+          "description": "Verified manifest supplied by the worker.",
+          "$ref": "#/$defs/ArtifactManifest"
+        }
+      },
+      "required": [
+        "manifest",
+        "local_path"
+      ]
+    },
+    "ArtifactKind": {
+      "description": "Artifact kind returned by a remote build.",
+      "oneOf": [
+        {
+          "description": "Built `.app` directory, normally transported as an archive.",
+          "type": "string",
+          "const": "app"
+        },
+        {
+          "description": "Xcode `.xcarchive` directory, normally transported as an archive.",
+          "type": "string",
+          "const": "xcarchive"
+        },
+        {
+          "description": "Installable iPhone application archive.",
+          "type": "string",
+          "const": "ipa"
+        },
+        {
+          "description": "Compressed debug symbols.",
+          "type": "string",
+          "const": "dsym"
+        },
+        {
+          "description": "Artifact manifest.",
+          "type": "string",
+          "const": "manifest"
+        },
+        {
+          "description": "Signing evidence without secret material.",
+          "type": "string",
+          "const": "signing_report"
+        },
+        {
+          "description": "Independent validation evidence.",
+          "type": "string",
+          "const": "validation_report"
+        },
+        {
+          "description": "Sanitized build log.",
+          "type": "string",
+          "const": "sanitized_log"
+        }
+      ]
+    },
+    "ArtifactListRequest": {
+      "description": "Request to enumerate artifact manifests for one job.",
+      "type": "object",
+      "properties": {
+        "job_id": {
+          "description": "Stable provider job identifier.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "job_id"
+      ]
+    },
+    "ArtifactManifest": {
+      "description": "Immutable manifest binding source, worker, signing, and downloaded bytes.",
+      "type": "object",
+      "properties": {
+        "app_name": {
+          "description": "Application display name.",
+          "type": "string"
+        },
+        "app_version": {
+          "description": "Application semantic version.",
+          "type": "string"
+        },
+        "architecture": {
+          "description": "Required device architecture.",
+          "type": "string"
+        },
+        "artifacts": {
+          "description": "Downloadable artifacts.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ArtifactRecord"
+          }
+        },
+        "build_number": {
+          "description": "Application build number.",
+          "type": "string"
+        },
+        "build_profile": {
+          "description": "Cargo/Xcode build profile.",
+          "type": "string"
+        },
+        "bundle_identifier": {
+          "description": "Main bundle identifier.",
+          "type": "string"
+        },
+        "cargo_lock_sha256": {
+          "description": "Cargo lockfile digest.",
+          "type": "string"
+        },
+        "cleanup_status": {
+          "description": "Worker cleanup status.",
+          "$ref": "#/$defs/CleanupStatus"
+        },
+        "config_sha256": {
+          "description": "Project configuration digest.",
+          "type": "string"
+        },
+        "extensions": {
+          "description": "Embedded extension bundle identifiers.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "finished_at": {
+          "description": "RFC 3339 job completion time.",
+          "type": "string"
+        },
+        "job_id": {
+          "description": "Provider job ID.",
+          "type": "string"
+        },
+        "operation_id": {
+          "description": "Client operation ID.",
+          "type": "string"
+        },
+        "project_id": {
+          "description": "Stable project ID.",
+          "type": "string"
+        },
+        "provider": {
+          "description": "Provider identifier.",
+          "type": "string"
+        },
+        "rustferry_version": {
+          "description": "`RustFerry` client version.",
+          "type": "string"
+        },
+        "schema_version": {
+          "description": "Artifact schema version.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "signing": {
+          "description": "Public signing evidence.",
+          "$ref": "#/$defs/ArtifactSigningEvidence"
+        },
+        "source_repository": {
+          "description": "Source repository URL when Git source mode is used.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_revision": {
+          "description": "Exact commit SHA when Git source mode is used.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_sha256": {
+          "description": "Deterministic source-manifest digest.",
+          "type": "string"
+        },
+        "source_snapshot": {
+          "description": "Whether explicit snapshot mode represented local changes.",
+          "type": "boolean"
+        },
+        "started_at": {
+          "description": "RFC 3339 job start time.",
+          "type": "string"
+        },
+        "toolchain": {
+          "description": "Apple and Rust toolchain evidence.",
+          "$ref": "#/$defs/AppleToolchainEvidence"
+        },
+        "validation_levels": {
+          "description": "Individually proven validation levels.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ValidationLevel"
+          },
+          "uniqueItems": true
+        },
+        "worker_version": {
+          "description": "Remote worker version.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "operation_id",
+        "job_id",
+        "project_id",
+        "source_snapshot",
+        "source_sha256",
+        "cargo_lock_sha256",
+        "config_sha256",
+        "rustferry_version",
+        "worker_version",
+        "provider",
+        "toolchain",
+        "app_name",
+        "app_version",
+        "build_number",
+        "bundle_identifier",
+        "build_profile",
+        "architecture",
+        "signing",
+        "extensions",
+        "artifacts",
+        "validation_levels",
+        "started_at",
+        "finished_at",
+        "cleanup_status"
+      ]
+    },
+    "ArtifactRecord": {
+      "description": "One downloadable artifact and its integrity metadata.",
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "description": "Provider-scoped immutable artifact identifier.",
+          "type": "string"
+        },
+        "file_name": {
+          "description": "Portable filename proposed to the client.",
+          "type": "string"
+        },
+        "kind": {
+          "description": "Artifact kind.",
+          "$ref": "#/$defs/ArtifactKind"
+        },
+        "media_type": {
+          "description": "Optional content type.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sha256": {
+          "description": "Lowercase SHA-256 hex digest.",
+          "type": "string"
+        },
+        "size": {
+          "description": "Byte length reported by the producer.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "artifact_id",
+        "kind",
+        "file_name",
+        "size",
+        "sha256"
+      ]
+    },
+    "ArtifactSigningEvidence": {
+      "description": "Public, non-secret signing evidence.",
+      "type": "object",
+      "properties": {
+        "certificate_fingerprint": {
+          "description": "SHA-256 certificate fingerprint.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "entitlements_sha256": {
+          "description": "SHA-256 of canonical entitlements.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mode": {
+          "description": "Signing mode used by the worker.",
+          "$ref": "#/$defs/SigningMode"
+        },
+        "profile_expiration": {
+          "description": "RFC 3339 profile expiry.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "profile_uuid": {
+          "description": "Provisioning profile UUID.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "description": "Most advanced independently proven signing state.",
+          "$ref": "#/$defs/SigningStatus"
+        },
+        "team_id": {
+          "description": "Apple development Team ID.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "status"
+      ]
+    },
+    "BuildProfile": {
+      "description": "Optimization profile requested from the remote worker.",
+      "oneOf": [
+        {
+          "description": "Fast development build.",
+          "type": "string",
+          "const": "debug"
+        },
+        {
+          "description": "Optimized build.",
+          "type": "string",
+          "const": "release"
+        }
+      ]
+    },
+    "BundleIdentifier": {
+      "description": "Validated Apple application bundle identifier.",
+      "type": "string"
+    },
+    "CancellationAck": {
+      "description": "Provider acknowledgement of a cancellation request.",
+      "type": "object",
+      "properties": {
+        "accepted": {
+          "description": "Whether this request initiated cancellation.",
+          "type": "boolean"
+        },
+        "job_id": {
+          "description": "Stable provider job identifier.",
+          "type": "string"
+        },
+        "state": {
+          "description": "State observed after handling the request.",
+          "$ref": "#/$defs/JobState"
+        }
+      },
+      "required": [
+        "job_id",
+        "accepted",
+        "state"
+      ]
+    },
+    "CancellationRequest": {
+      "description": "Request to cancel an active provider job.",
+      "type": "object",
+      "properties": {
+        "job_id": {
+          "description": "Stable provider job identifier.",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Safe, stable cancellation reason.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "job_id",
+        "reason"
+      ]
+    },
+    "CleanupConfirmation": {
+      "description": "Proof that provider-owned job material was removed or deliberately retained.",
+      "type": "object",
+      "properties": {
+        "artifacts_retained": {
+          "description": "Whether provider retention policy deliberately kept artifact bytes.",
+          "type": "boolean"
+        },
+        "completed_at_ms": {
+          "description": "Milliseconds since Unix epoch in UTC.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "job_id": {
+          "description": "Stable job identifier.",
+          "type": "string"
+        },
+        "signing_material_removed": {
+          "description": "Whether decoded signing material and temporary keychains were removed.",
+          "type": "boolean"
+        },
+        "workspace_removed": {
+          "description": "Whether the isolated source/build workspace was removed.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "job_id",
+        "completed_at_ms",
+        "workspace_removed",
+        "signing_material_removed",
+        "artifacts_retained"
+      ]
+    },
+    "CleanupRequest": {
+      "description": "Request to remove provider-owned material for one job.",
+      "type": "object",
+      "properties": {
+        "job_id": {
+          "description": "Stable provider job identifier.",
+          "type": "string"
+        },
+        "remove_artifacts": {
+          "description": "Whether retained artifact bytes should also be removed.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "job_id",
+        "remove_artifacts"
+      ]
+    },
+    "CleanupStatus": {
+      "description": "Cleanup result from the remote worker.",
+      "oneOf": [
+        {
+          "description": "Cleanup has not run yet.",
+          "type": "string",
+          "const": "pending"
+        },
+        {
+          "description": "Source, signing inputs, and temporary keychain were removed.",
+          "type": "string",
+          "const": "confirmed"
+        },
+        {
+          "description": "Cleanup completed with a safe warning.",
+          "type": "string",
+          "const": "warning"
+        },
+        {
+          "description": "Cleanup could not be proven.",
+          "type": "string",
+          "const": "failed"
+        }
+      ]
+    },
+    "DevelopmentTeam": {
+      "description": "Apple development team selected for signing.",
+      "type": "object",
+      "properties": {
+        "display_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "DevelopmentTeamPlan": {
+      "description": "Development team expectation carried by a signing plan.",
+      "type": "object",
+      "properties": {
+        "expected": {
+          "description": "Team that certificate, profile, application, and extensions must share.",
+          "$ref": "#/$defs/DevelopmentTeam"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "expected"
+      ]
+    },
+    "DevicePlan": {
+      "description": "Registered physical iPhone selected for a development artifact.",
+      "type": "object",
+      "properties": {
+        "display_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "udid": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "udid"
+      ]
+    },
+    "DiagnosticSeverity": {
+      "description": "Normalized diagnostic severity.",
+      "oneOf": [
+        {
+          "description": "Informational message.",
+          "type": "string",
+          "const": "information"
+        },
+        {
+          "description": "Non-fatal warning.",
+          "type": "string",
+          "const": "warning"
+        },
+        {
+          "description": "Build-blocking error.",
+          "type": "string",
+          "const": "error"
+        }
+      ]
+    },
+    "EntitlementPlan": {
+      "description": "Per-target entitlement expectation.",
+      "type": "object",
+      "properties": {
+        "required": {
+          "description": "Entitlements that must remain enabled and match the profile.",
+          "$ref": "#/$defs/EntitlementSet"
+        },
+        "target": {
+          "description": "Target name from [`SigningPlan::targets`].",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "target",
+        "required"
+      ]
+    },
+    "EntitlementSet": {
+      "description": "Validated entitlement dictionary for one signing target.",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "EventPage": {
+      "description": "Ordered provider event page.",
+      "type": "object",
+      "properties": {
+        "complete": {
+          "description": "Whether the provider has no further events for this job.",
+          "type": "boolean"
+        },
+        "events": {
+          "description": "Strictly ordered events.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RemoteBuildEvent"
+          }
+        },
+        "job_id": {
+          "description": "Stable provider job identifier.",
+          "type": "string"
+        },
+        "next_sequence": {
+          "description": "Sequence to use for the next page, when more data may arrive.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "state": {
+          "description": "State observed with this page.",
+          "$ref": "#/$defs/JobState"
+        }
+      },
+      "required": [
+        "job_id",
+        "state",
+        "events",
+        "complete"
+      ]
+    },
+    "EventRequest": {
+      "description": "Request for an ordered page of job events.",
+      "type": "object",
+      "properties": {
+        "after_sequence": {
+          "description": "Last sequence already consumed, or none for the first page.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "job_id": {
+          "description": "Stable provider job identifier.",
+          "type": "string"
+        },
+        "limit": {
+          "description": "Maximum events to return; must be between 1 and 1000.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "job_id",
+        "limit"
+      ]
+    },
+    "HandshakeRequest": {
+      "description": "Versioned client handshake request.",
+      "type": "object",
+      "properties": {
+        "client_version": {
+          "description": "`RustFerry` client semantic version.",
+          "$ref": "#/$defs/SemVer"
+        },
+        "protocol_version": {
+          "description": "Highest protocol version supported by the client.",
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "required_features": {
+          "description": "Features required before the client may submit a job.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProviderFeature"
+          }
+        }
+      },
+      "required": [
+        "protocol_version",
+        "client_version",
+        "required_features"
+      ]
+    },
+    "HandshakeResponse": {
+      "description": "Versioned worker handshake response.",
+      "type": "object",
+      "properties": {
+        "capabilities": {
+          "description": "Capabilities active for this worker and provider configuration.",
+          "$ref": "#/$defs/ProviderCapabilities"
+        },
+        "protocol_version": {
+          "description": "Negotiated protocol version.",
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "provider": {
+          "description": "Stable provider identifier.",
+          "type": "string"
+        },
+        "worker_id": {
+          "description": "Stable, non-secret worker identifier.",
+          "type": "string"
+        },
+        "worker_version": {
+          "description": "`RustFerry` worker semantic version.",
+          "$ref": "#/$defs/SemVer"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "worker_version",
+        "provider",
+        "worker_id",
+        "capabilities"
+      ]
+    },
+    "IosArtifactType": {
+      "description": "Physical-iPhone artifact type requested or advertised by a provider.",
+      "oneOf": [
+        {
+          "description": "Signed installable iOS application archive.",
+          "type": "string",
+          "const": "ipa"
+        },
+        {
+          "description": "Xcode archive retained for inspection or later export.",
+          "type": "string",
+          "const": "xcarchive"
+        },
+        {
+          "description": "Unarchived application bundle.",
+          "type": "string",
+          "const": "app_bundle"
+        },
+        {
+          "description": "Sanitized signing validation report.",
+          "type": "string",
+          "const": "signing_report"
+        },
+        {
+          "description": "Sanitized provisioning validation report.",
+          "type": "string",
+          "const": "provisioning_report"
+        }
+      ]
+    },
+    "IosDeviceBuildRequest": {
+      "description": "Declarative request for an official physical-iPhone build.\n\nThe request intentionally contains no executable, argument, environment, or secret-value\nfields. Workers derive their fixed command plans from these validated inputs.",
+      "type": "object",
+      "properties": {
+        "bundle_identifier": {
+          "description": "Exact Apple application bundle identifier.",
+          "type": "string"
+        },
+        "minimum_ios_version": {
+          "description": "Minimum supported iOS version.",
+          "type": "string"
+        },
+        "operation_id": {
+          "description": "Caller-owned operation identifier copied into every event.",
+          "type": "string"
+        },
+        "product_name": {
+          "description": "Human-readable product name.",
+          "type": "string"
+        },
+        "profile": {
+          "description": "Rust/Xcode optimization profile.",
+          "$ref": "#/$defs/BuildProfile"
+        },
+        "protocol_version": {
+          "description": "Requested wire-protocol version.",
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "requested_artifacts": {
+          "description": "Requested output kinds in deterministic order.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/IosArtifactType"
+          },
+          "uniqueItems": true
+        },
+        "signing": {
+          "description": "Complete declarative signing plan containing opaque references, never secret bytes.",
+          "$ref": "#/$defs/SigningPlan"
+        },
+        "source": {
+          "description": "Required deterministic integrity and shape manifest for either source mode.",
+          "$ref": "#/$defs/SourceManifest"
+        },
+        "source_mode": {
+          "description": "How the provider obtains the source.",
+          "$ref": "#/$defs/SourceMode"
+        },
+        "source_repository": {
+          "description": "Normalized HTTPS GitHub repository URL in Git mode.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_revision": {
+          "description": "Exact lowercase 40-hex commit SHA in Git mode.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "protocol_version",
+        "operation_id",
+        "product_name",
+        "bundle_identifier",
+        "minimum_ios_version",
+        "profile",
+        "source_mode",
+        "source",
+        "signing",
+        "requested_artifacts"
+      ]
+    },
+    "IosDeviceBuildResult": {
+      "description": "Provider result after a physical-iPhone build reaches a build-terminal state.",
+      "type": "object",
+      "properties": {
+        "artifacts": {
+          "description": "Independently verifiable artifact manifests.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ArtifactManifest"
+          }
+        },
+        "cleanup": {
+          "description": "Cleanup proof when cleanup already ran.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CleanupConfirmation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "job_id": {
+          "description": "Provider-owned stable job identifier.",
+          "type": "string"
+        },
+        "operation_id": {
+          "description": "Operation identifier from the request.",
+          "type": "string"
+        },
+        "protocol_version": {
+          "description": "Negotiated wire-protocol version.",
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "state": {
+          "description": "Terminal build state.",
+          "$ref": "#/$defs/JobState"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "operation_id",
+        "job_id",
+        "state",
+        "artifacts"
+      ]
+    },
+    "JobHandle": {
+      "description": "Provider response after accepting a build request.",
+      "type": "object",
+      "properties": {
+        "created_at_ms": {
+          "description": "Milliseconds since Unix epoch in UTC.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "job_id": {
+          "description": "Stable provider job identifier.",
+          "type": "string"
+        },
+        "state": {
+          "description": "Initial provider state.",
+          "$ref": "#/$defs/JobState"
+        }
+      },
+      "required": [
+        "job_id",
+        "state",
+        "created_at_ms"
+      ]
+    },
+    "JobState": {
+      "description": "Lifecycle state of one provider job.",
+      "oneOf": [
+        {
+          "description": "Provider accepted the request and allocated an identifier.",
+          "type": "string",
+          "const": "created"
+        },
+        {
+          "description": "Job awaits a worker.",
+          "type": "string",
+          "const": "queued"
+        },
+        {
+          "description": "Worker is preparing or building the project.",
+          "type": "string",
+          "const": "running"
+        },
+        {
+          "description": "Cancellation was accepted and cleanup is pending.",
+          "type": "string",
+          "const": "cancelling"
+        },
+        {
+          "description": "Build completed successfully.",
+          "type": "string",
+          "const": "succeeded"
+        },
+        {
+          "description": "Build failed.",
+          "type": "string",
+          "const": "failed"
+        },
+        {
+          "description": "Build stopped after cancellation.",
+          "type": "string",
+          "const": "cancelled"
+        },
+        {
+          "description": "Provider is deleting remote job material.",
+          "type": "string",
+          "const": "cleaning"
+        },
+        {
+          "description": "Required cleanup completed.",
+          "type": "string",
+          "const": "cleaned"
+        },
+        {
+          "description": "Cleanup was attempted but did not complete.",
+          "type": "string",
+          "const": "cleanup_failed"
+        }
+      ]
+    },
+    "ProtocolPath": {
+      "description": "Path string paired with explicit machine and root semantics.",
+      "type": "object",
+      "properties": {
+        "semantics": {
+          "description": "How the path must be resolved.",
+          "$ref": "#/$defs/ProtocolPathSemantics"
+        },
+        "value": {
+          "description": "UTF-8 path or URI text.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "semantics",
+        "value"
+      ]
+    },
+    "ProtocolPathSemantics": {
+      "description": "Explicit interpretation of a path carried by the wire protocol.",
+      "oneOf": [
+        {
+          "description": "Path relative to the submitted `RustFerry` project root.",
+          "type": "string",
+          "const": "project_relative"
+        },
+        {
+          "description": "Path relative to the worker's isolated job root.",
+          "type": "string",
+          "const": "worker_relative"
+        },
+        {
+          "description": "Absolute path on the client that submitted the request.",
+          "type": "string",
+          "const": "client_absolute"
+        },
+        {
+          "description": "Provider-owned URI with no embedded credentials.",
+          "type": "string",
+          "const": "provider_uri"
+        }
+      ]
+    },
+    "ProtocolVersion": {
+      "description": "Semantic version of the remote-build wire protocol.\n\nPeers with the same nonzero major version are compatible. A handshake selects the lower minor\nversion. A future pre-1 protocol must match both components exactly.",
+      "type": "object",
+      "properties": {
+        "major": {
+          "description": "Breaking-change version.",
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "minor": {
+          "description": "Backward-compatible feature version.",
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "required": [
+        "major",
+        "minor"
+      ]
+    },
+    "ProviderCapabilities": {
+      "description": "Deterministic capability inventory returned during handshake and doctor.",
+      "type": "object",
+      "properties": {
+        "artifact_download": {
+          "description": "Whether verified artifact download is implemented.",
+          "type": "boolean"
+        },
+        "artifact_listing": {
+          "description": "Whether artifact manifests can be enumerated after a job.",
+          "type": "boolean"
+        },
+        "artifact_types": {
+          "description": "Artifact types the provider can return.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/IosArtifactType"
+          },
+          "uniqueItems": true
+        },
+        "cache": {
+          "description": "Whether provider-side compilation caches are enabled.",
+          "type": "boolean"
+        },
+        "cancellation": {
+          "description": "Whether the provider can cancel an active job.",
+          "type": "boolean"
+        },
+        "cleanup": {
+          "description": "Whether explicit job cleanup is implemented.",
+          "type": "boolean"
+        },
+        "ios_device_build": {
+          "description": "Whether physical-iPhone builds are implemented.",
+          "type": "boolean"
+        },
+        "ios_simulator_build": {
+          "description": "Whether iOS Simulator builds are implemented.",
+          "type": "boolean"
+        },
+        "live_events": {
+          "description": "Whether callers can retrieve incremental events.",
+          "type": "boolean"
+        },
+        "live_logs": {
+          "description": "Whether the provider exposes live log events.",
+          "type": "boolean"
+        },
+        "max_source_bytes": {
+          "description": "Maximum accepted source bytes, or no provider-advertised limit.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "personal_team": {
+          "description": "Whether Apple Personal Team provisioning is supported.",
+          "type": "boolean"
+        },
+        "physical_device_access": {
+          "description": "Whether a worker may access an attached physical device.",
+          "type": "boolean"
+        },
+        "retention_seconds": {
+          "description": "Artifact retention window in seconds, or provider-defined retention.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "signing_modes": {
+          "description": "Supported signing strategies.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SigningMode"
+          },
+          "uniqueItems": true
+        },
+        "source_modes": {
+          "description": "Supported exact source modes.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SourceMode"
+          },
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "source_modes",
+        "ios_device_build",
+        "ios_simulator_build",
+        "signing_modes",
+        "personal_team",
+        "live_events",
+        "live_logs",
+        "cancellation",
+        "artifact_types",
+        "cache",
+        "artifact_listing",
+        "artifact_download",
+        "cleanup",
+        "physical_device_access"
+      ]
+    },
+    "ProviderCheck": {
+      "description": "One safe provider doctor check.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "description": "Stable check identifier.",
+          "type": "string"
+        },
+        "help": {
+          "description": "Optional concrete remediation.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "description": "Sanitized human summary.",
+          "type": "string"
+        },
+        "status": {
+          "description": "Check result.",
+          "$ref": "#/$defs/ProviderCheckStatus"
+        }
+      },
+      "required": [
+        "code",
+        "status",
+        "message"
+      ]
+    },
+    "ProviderCheckStatus": {
+      "description": "Result status of one provider doctor check.",
+      "oneOf": [
+        {
+          "description": "Check passed.",
+          "type": "string",
+          "const": "ready"
+        },
+        {
+          "description": "Optional feature is degraded.",
+          "type": "string",
+          "const": "warning"
+        },
+        {
+          "description": "Required feature is unavailable.",
+          "type": "string",
+          "const": "error"
+        }
+      ]
+    },
+    "ProviderDoctorReport": {
+      "description": "Provider readiness and capability report.",
+      "type": "object",
+      "properties": {
+        "capabilities": {
+          "description": "Capabilities available under the checked configuration.",
+          "$ref": "#/$defs/ProviderCapabilities"
+        },
+        "checks": {
+          "description": "Deterministically ordered checks.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProviderCheck"
+          }
+        },
+        "protocol_version": {
+          "description": "Negotiated protocol version.",
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "provider": {
+          "description": "Stable provider identifier.",
+          "type": "string"
+        },
+        "ready": {
+          "description": "Whether every required check passed.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "provider",
+        "ready",
+        "checks",
+        "capabilities"
+      ]
+    },
+    "ProviderDoctorRequest": {
+      "description": "Versioned provider readiness request.",
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "description": "Caller-owned operation identifier.",
+          "type": "string"
+        },
+        "protocol_version": {
+          "description": "Negotiated protocol version.",
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "require_signing": {
+          "description": "Whether signing prerequisites must be checked.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "operation_id",
+        "require_signing"
+      ]
+    },
+    "ProviderFeature": {
+      "description": "One typed feature that a caller may require from a provider.",
+      "oneOf": [
+        {
+          "description": "Exact source transport.",
+          "type": "object",
+          "properties": {
+            "feature": {
+              "type": "string",
+              "const": "source_mode"
+            },
+            "value": {
+              "$ref": "#/$defs/SourceMode"
+            }
+          },
+          "required": [
+            "feature",
+            "value"
+          ]
+        },
+        {
+          "description": "Physical-iPhone compilation and packaging.",
+          "type": "object",
+          "properties": {
+            "feature": {
+              "type": "string",
+              "const": "ios_device_build"
+            }
+          },
+          "required": [
+            "feature"
+          ]
+        },
+        {
+          "description": "iOS Simulator compilation.",
+          "type": "object",
+          "properties": {
+            "feature": {
+              "type": "string",
+              "const": "ios_simulator_build"
+            }
+          },
+          "required": [
+            "feature"
+          ]
+        },
+        {
+          "description": "Exact signing strategy.",
+          "type": "object",
+          "properties": {
+            "feature": {
+              "type": "string",
+              "const": "signing_mode"
+            },
+            "value": {
+              "$ref": "#/$defs/SigningMode"
+            }
+          },
+          "required": [
+            "feature",
+            "value"
+          ]
+        },
+        {
+          "description": "Apple Personal Team provisioning.",
+          "type": "object",
+          "properties": {
+            "feature": {
+              "type": "string",
+              "const": "personal_team"
+            }
+          },
+          "required": [
+            "feature"
+          ]
+        },
+        {
+          "description": "Incremental job-event retrieval.",
+          "type": "object",
+          "properties": {
+            "feature": {
+              "type": "string",
+              "const": "live_events"
+            }
+          },
+          "required": [
+            "feature"
+          ]
+        },
+        {
+          "description": "Live application or build-log events.",
+          "type": "object",
+          "properties": {
+            "feature": {
+              "type": "string",
+              "const": "live_logs"
+            }
+          },
+          "required": [
+            "feature"
+          ]
+        },
+        {
+          "description": "Remote job cancellation.",
+          "type": "object",
+          "properties": {
+            "feature": {
+              "type": "string",
+              "const": "cancellation"
+            }
+          },
+          "required": [
+            "feature"
+          ]
+        },
+        {
+          "description": "Exact artifact format.",
+          "type": "object",
+          "properties": {
+            "feature": {
+              "type": "string",
+              "const": "artifact_type"
+            },
+            "value": {
+              "$ref": "#/$defs/IosArtifactType"
+            }
+          },
+          "required": [
+            "feature",
+            "value"
+          ]
+        },
+        {
+          "description": "Provider-side build cache.",
+          "type": "object",
+          "properties": {
+            "feature": {
+              "type": "string",
+              "const": "cache"
+            }
+          },
+          "required": [
+            "feature"
+          ]
+        },
+        {
+          "description": "Artifact manifest enumeration.",
+          "type": "object",
+          "properties": {
+            "feature": {
+              "type": "string",
+              "const": "artifact_listing"
+            }
+          },
+          "required": [
+            "feature"
+          ]
+        },
+        {
+          "description": "Verified artifact download.",
+          "type": "object",
+          "properties": {
+            "feature": {
+              "type": "string",
+              "const": "artifact_download"
+            }
+          },
+          "required": [
+            "feature"
+          ]
+        },
+        {
+          "description": "Explicit remote-workspace cleanup.",
+          "type": "object",
+          "properties": {
+            "feature": {
+              "type": "string",
+              "const": "cleanup"
+            }
+          },
+          "required": [
+            "feature"
+          ]
+        },
+        {
+          "description": "Access to a physical iPhone attached to the worker.",
+          "type": "object",
+          "properties": {
+            "feature": {
+              "type": "string",
+              "const": "physical_device_access"
+            }
+          },
+          "required": [
+            "feature"
+          ]
+        }
+      ]
+    },
+    "ProvisioningPlan": {
+      "description": "Per-target provisioning-profile selection.",
+      "type": "object",
+      "properties": {
+        "profile": {
+          "description": "Opaque profile reference; never raw `.mobileprovision` bytes.",
+          "$ref": "#/$defs/SecretReference"
+        },
+        "profile_type": {
+          "description": "Required profile category.",
+          "$ref": "#/$defs/ProvisioningProfileType"
+        },
+        "target": {
+          "description": "Target name from [`SigningPlan::targets`].",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "target",
+        "profile",
+        "profile_type"
+      ]
+    },
+    "ProvisioningProfileType": {
+      "description": "Provisioning profile category.",
+      "oneOf": [
+        {
+          "description": "Registered-device development profile.",
+          "type": "string",
+          "const": "development"
+        },
+        {
+          "description": "Registered-device ad-hoc distribution profile.",
+          "type": "string",
+          "const": "ad-hoc"
+        },
+        {
+          "description": "App Store distribution profile.",
+          "type": "string",
+          "const": "app-store"
+        }
+      ]
+    },
+    "RemoteBuildEvent": {
+      "description": "One self-contained NDJSON event envelope.",
+      "type": "object",
+      "properties": {
+        "job_id": {
+          "description": "Provider-owned job identifier.",
+          "type": "string"
+        },
+        "operation_id": {
+          "description": "Caller-owned operation identifier.",
+          "type": "string"
+        },
+        "phase": {
+          "description": "Stable build-phase identifier.",
+          "type": "string"
+        },
+        "protocol_version": {
+          "description": "Wire-protocol version.",
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "provider": {
+          "description": "Stable provider identifier.",
+          "type": "string"
+        },
+        "sequence": {
+          "description": "Strictly increasing event sequence within one job.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "timestamp_ms": {
+          "description": "Milliseconds since Unix epoch in UTC.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "oneOf": [
+        {
+          "description": "Operation boundary opened.",
+          "type": "object",
+          "properties": {
+            "command": {
+              "description": "Stable command name.",
+              "type": "string"
+            },
+            "event": {
+              "type": "string",
+              "const": "operation_started"
+            }
+          },
+          "required": [
+            "event",
+            "command"
+          ]
+        },
+        {
+          "description": "Provider allocated a job.",
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "string",
+              "const": "job_created"
+            },
+            "state": {
+              "description": "Initial job state; must be `created`.",
+              "$ref": "#/$defs/JobState"
+            }
+          },
+          "required": [
+            "event",
+            "state"
+          ]
+        },
+        {
+          "description": "Job entered the provider queue.",
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "string",
+              "const": "job_queued"
+            },
+            "position": {
+              "description": "One-based queue position when known.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "event"
+          ]
+        },
+        {
+          "description": "A concrete worker accepted the job.",
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "string",
+              "const": "worker_assigned"
+            },
+            "worker_id": {
+              "description": "Stable, non-secret worker identifier.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "event",
+            "worker_id"
+          ]
+        },
+        {
+          "description": "Source manifest was converted into a bounded upload.",
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "string",
+              "const": "source_prepared"
+            },
+            "file_count": {
+              "description": "Included file count.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "total_bytes": {
+              "description": "Total uncompressed source bytes.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "event",
+            "file_count",
+            "total_bytes"
+          ]
+        },
+        {
+          "description": "Source upload opened.",
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "string",
+              "const": "source_upload_started"
+            },
+            "total_bytes": {
+              "description": "Expected upload byte count.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "event",
+            "total_bytes"
+          ]
+        },
+        {
+          "description": "Source upload advanced.",
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "string",
+              "const": "source_upload_progress"
+            },
+            "total_bytes": {
+              "description": "Expected upload byte count.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "uploaded_bytes": {
+              "description": "Uploaded byte count.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "event",
+            "uploaded_bytes",
+            "total_bytes"
+          ]
+        },
+        {
+          "description": "Worker verified the exact submitted source.",
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "string",
+              "const": "source_verified"
+            },
+            "sha256": {
+              "description": "Lowercase SHA-256 digest of the source bundle or Git manifest.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "event",
+            "sha256"
+          ]
+        },
+        {
+          "description": "Named build phase opened.",
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "string",
+              "const": "phase_started"
+            },
+            "message": {
+              "description": "Optional safe UI text.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "event"
+          ]
+        },
+        {
+          "description": "Bounded progress update.",
+          "type": "object",
+          "properties": {
+            "current": {
+              "description": "Completed unit count.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
+            "event": {
+              "type": "string",
+              "const": "progress"
+            },
+            "message": {
+              "description": "Human-readable safe progress summary.",
+              "type": "string"
+            },
+            "total": {
+              "description": "Total unit count.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "event",
+            "message"
+          ]
+        },
+        {
+          "description": "Sanitized external-tool boundary.",
+          "type": "object",
+          "properties": {
+            "arguments": {
+              "description": "Tokenized arguments after provider redaction.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "event": {
+              "type": "string",
+              "const": "command_started"
+            },
+            "tool": {
+              "description": "Executable name, never a shell command string.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "event",
+            "tool",
+            "arguments"
+          ]
+        },
+        {
+          "description": "Structured compiler, signing, or validation diagnostic.",
+          "type": "object",
+          "properties": {
+            "diagnostic": {
+              "description": "Diagnostic payload.",
+              "$ref": "#/$defs/RemoteDiagnostic"
+            },
+            "event": {
+              "type": "string",
+              "const": "diagnostic"
+            }
+          },
+          "required": [
+            "event",
+            "diagnostic"
+          ]
+        },
+        {
+          "description": "Signing phase opened without exposing secret values.",
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "string",
+              "const": "signing_started"
+            },
+            "mode": {
+              "description": "Selected signing mode.",
+              "$ref": "#/$defs/SigningMode"
+            }
+          },
+          "required": [
+            "event",
+            "mode"
+          ]
+        },
+        {
+          "description": "Worker created a candidate artifact.",
+          "type": "object",
+          "properties": {
+            "artifact_id": {
+              "description": "Stable artifact identifier.",
+              "type": "string"
+            },
+            "artifact_type": {
+              "description": "Candidate artifact type.",
+              "$ref": "#/$defs/IosArtifactType"
+            },
+            "event": {
+              "type": "string",
+              "const": "artifact_created"
+            }
+          },
+          "required": [
+            "event",
+            "artifact_id",
+            "artifact_type"
+          ]
+        },
+        {
+          "description": "Worker independently validated an artifact.",
+          "type": "object",
+          "properties": {
+            "artifact": {
+              "description": "Full integrity and provenance manifest.",
+              "$ref": "#/$defs/ArtifactManifest"
+            },
+            "event": {
+              "type": "string",
+              "const": "artifact_validated"
+            }
+          },
+          "required": [
+            "event",
+            "artifact"
+          ]
+        },
+        {
+          "description": "Provider artifact upload opened.",
+          "type": "object",
+          "properties": {
+            "artifact_id": {
+              "description": "Stable artifact identifier.",
+              "type": "string"
+            },
+            "event": {
+              "type": "string",
+              "const": "artifact_upload_started"
+            },
+            "total_bytes": {
+              "description": "Expected upload byte count.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "event",
+            "artifact_id",
+            "total_bytes"
+          ]
+        },
+        {
+          "description": "Client artifact download opened.",
+          "type": "object",
+          "properties": {
+            "artifact_id": {
+              "description": "Stable artifact identifier.",
+              "type": "string"
+            },
+            "event": {
+              "type": "string",
+              "const": "artifact_download_started"
+            },
+            "total_bytes": {
+              "description": "Expected download byte count.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "event",
+            "artifact_id",
+            "total_bytes"
+          ]
+        },
+        {
+          "description": "Client artifact download advanced.",
+          "type": "object",
+          "properties": {
+            "artifact_id": {
+              "description": "Stable artifact identifier.",
+              "type": "string"
+            },
+            "downloaded_bytes": {
+              "description": "Downloaded byte count.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "event": {
+              "type": "string",
+              "const": "artifact_download_progress"
+            },
+            "total_bytes": {
+              "description": "Expected download byte count.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "event",
+            "artifact_id",
+            "downloaded_bytes",
+            "total_bytes"
+          ]
+        },
+        {
+          "description": "Client downloaded and hash-verified an artifact.",
+          "type": "object",
+          "properties": {
+            "artifact": {
+              "description": "Verified artifact manifest.",
+              "$ref": "#/$defs/ArtifactManifest"
+            },
+            "event": {
+              "type": "string",
+              "const": "artifact_downloaded"
+            },
+            "local_path": {
+              "description": "Absolute destination on the client.",
+              "$ref": "#/$defs/ProtocolPath"
+            }
+          },
+          "required": [
+            "event",
+            "artifact",
+            "local_path"
+          ]
+        },
+        {
+          "description": "Non-fatal provider warning.",
+          "type": "object",
+          "properties": {
+            "code": {
+              "description": "Stable namespaced warning code.",
+              "type": "string"
+            },
+            "event": {
+              "type": "string",
+              "const": "warning"
+            },
+            "help": {
+              "description": "Optional concrete remediation.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "message": {
+              "description": "Sanitized summary.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "event",
+            "code",
+            "message"
+          ]
+        },
+        {
+          "description": "Provider cleanup opened.",
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "string",
+              "const": "cleanup_started"
+            }
+          },
+          "required": [
+            "event"
+          ]
+        },
+        {
+          "description": "Provider cleanup completed.",
+          "type": "object",
+          "properties": {
+            "confirmation": {
+              "description": "Cleanup proof.",
+              "$ref": "#/$defs/CleanupConfirmation"
+            },
+            "event": {
+              "type": "string",
+              "const": "cleanup_finished"
+            }
+          },
+          "required": [
+            "event",
+            "confirmation"
+          ]
+        },
+        {
+          "description": "Operation completed, including typed failure.",
+          "type": "object",
+          "properties": {
+            "duration_ms": {
+              "description": "Monotonic operation duration.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "error": {
+              "description": "Typed failure when `success` is false.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/RemoteErrorInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "event": {
+              "type": "string",
+              "const": "operation_finished"
+            },
+            "result": {
+              "description": "Build result when this was a build operation.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/IosDeviceBuildResult"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "success": {
+              "description": "Whether every required phase succeeded.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "event",
+            "success",
+            "duration_ms"
+          ]
+        },
+        {
+          "description": "Operation stopped after cancellation.",
+          "type": "object",
+          "properties": {
+            "duration_ms": {
+              "description": "Monotonic operation duration.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "event": {
+              "type": "string",
+              "const": "operation_cancelled"
+            },
+            "reason": {
+              "description": "Stable cancellation reason.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "event",
+            "reason",
+            "duration_ms"
+          ]
+        },
+        {
+          "description": "A same-major future event ignored by this reader.",
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "string",
+              "const": "unknown"
+            }
+          },
+          "required": [
+            "event"
+          ]
+        }
+      ],
+      "required": [
+        "protocol_version",
+        "operation_id",
+        "job_id",
+        "timestamp_ms",
+        "provider",
+        "phase",
+        "sequence"
+      ]
+    },
+    "RemoteDiagnostic": {
+      "description": "Sanitized, optionally file-bound worker diagnostic.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "description": "Stable diagnostic category.",
+          "type": "string"
+        },
+        "column": {
+          "description": "Optional one-based source column.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "help": {
+          "description": "Optional concrete remediation.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "line": {
+          "description": "Optional one-based source line.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "message": {
+          "description": "Sanitized UTF-8 summary.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Optional path with explicit resolution semantics.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProtocolPath"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "severity": {
+          "description": "Severity consumed by CLI and IDE adapters.",
+          "$ref": "#/$defs/DiagnosticSeverity"
+        }
+      },
+      "required": [
+        "code",
+        "severity",
+        "message"
+      ]
+    },
+    "RemoteErrorInfo": {
+      "description": "Sanitized error embedded in an operation-finished event.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "description": "Stable namespaced error code.",
+          "type": "string"
+        },
+        "help": {
+          "description": "Optional recovery action.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "description": "Safe error summary.",
+          "type": "string"
+        },
+        "retryable": {
+          "description": "Whether retrying may succeed without changing the request.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "retryable"
+      ]
+    },
+    "SecretReference": {
+      "description": "Serializable reference to secret material, never the material itself.\n\nConstruction and deserialization validate the identifier. The restricted\nalphabet prevents paths, URLs, shell fragments, control characters, and\naccidental inline `NAME=value` secret material from entering a protocol.",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/SecretReferenceKind"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "name"
+      ]
+    },
+    "SecretReferenceKind": {
+      "description": "Storage namespace for an opaque secret reference.",
+      "oneOf": [
+        {
+          "description": "Name of a process environment variable populated outside the project.",
+          "type": "string",
+          "const": "environment"
+        },
+        {
+          "description": "Opaque entry in the operating-system credential store.",
+          "type": "string",
+          "const": "credential_store"
+        },
+        {
+          "description": "Name of a protected GitHub Actions secret.",
+          "type": "string",
+          "const": "github_actions"
+        },
+        {
+          "description": "Opaque secret handle understood only by the trusted remote worker.",
+          "type": "string",
+          "const": "worker"
+        }
+      ]
+    },
+    "SemVer": {
+      "type": "string",
+      "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-((?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\\.(?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\\+([0-9a-zA-Z-]+(?:\\.[0-9a-zA-Z-]+)*))?$"
+    },
+    "SigningMode": {
+      "description": "Supported Apple signing mode.",
+      "oneOf": [
+        {
+          "description": "Compile and inspect an iPhoneOS artifact without making it installable.",
+          "type": "string",
+          "const": "unsigned-compile-only"
+        },
+        {
+          "description": "Normal Apple Development signing.",
+          "type": "string",
+          "const": "development"
+        },
+        {
+          "description": "User-supplied development identity and profiles.",
+          "type": "string",
+          "const": "manual-development"
+        },
+        {
+          "description": "Persistent-Mac Personal Team flow configured interactively in Xcode.",
+          "type": "string",
+          "const": "personal-team"
+        },
+        {
+          "description": "Future registered-device ad-hoc distribution.",
+          "type": "string",
+          "const": "ad-hoc"
+        },
+        {
+          "description": "Future App Store distribution.",
+          "type": "string",
+          "const": "app-store"
+        }
+      ]
+    },
+    "SigningPlan": {
+      "description": "Complete declarative physical-iPhone signing plan.",
+      "type": "object",
+      "properties": {
+        "allow_provisioning_updates": {
+          "description": "Explicit opt-in to official Xcode profile updates.",
+          "type": "boolean"
+        },
+        "device": {
+          "description": "Required registered device for development and ad-hoc artifacts.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DevicePlan"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "entitlements": {
+          "description": "Per-target entitlement requirements.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/EntitlementPlan"
+          }
+        },
+        "mode": {
+          "description": "Requested signing mode.",
+          "$ref": "#/$defs/SigningMode"
+        },
+        "provisioning": {
+          "description": "Separate profile for each application and extension target.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProvisioningPlan"
+          }
+        },
+        "signing": {
+          "description": "Opaque identity/password references for modes that import an identity.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SigningReference"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "targets": {
+          "description": "All signable code objects.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SigningTarget"
+          }
+        },
+        "team": {
+          "description": "Expected team for all code and profiles.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DevelopmentTeamPlan"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "targets",
+        "provisioning",
+        "entitlements",
+        "allow_provisioning_updates"
+      ]
+    },
+    "SigningReference": {
+      "description": "Serializable signing inputs containing references only, never secret bytes.",
+      "type": "object",
+      "properties": {
+        "identity": {
+          "description": "Opaque reference to an encrypted identity bundle or configured identity.",
+          "$ref": "#/$defs/SecretReference"
+        },
+        "password": {
+          "description": "Opaque reference to its password or passphrase, when required.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SecretReference"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "identity"
+      ]
+    },
+    "SigningStatus": {
+      "description": "Fine-grained signing progress; never collapse this into one success boolean.",
+      "oneOf": [
+        {
+          "description": "No certificate or provisioning validation has completed.",
+          "type": "string",
+          "const": "unsigned"
+        },
+        {
+          "description": "Certificate type, expiry, team, and private-key match validated.",
+          "type": "string",
+          "const": "certificate_validated"
+        },
+        {
+          "description": "All required provisioning profiles validated.",
+          "type": "string",
+          "const": "profile_validated"
+        },
+        {
+          "description": "Frameworks, libraries, and extensions signed inside-out.",
+          "type": "string",
+          "const": "nested_code_signed"
+        },
+        {
+          "description": "Main application signed after nested code.",
+          "type": "string",
+          "const": "application_signed"
+        },
+        {
+          "description": "Development IPA exported.",
+          "type": "string",
+          "const": "ipa_exported"
+        },
+        {
+          "description": "Independent artifact validation completed.",
+          "type": "string",
+          "const": "artifact_validated"
+        },
+        {
+          "description": "A validation or signing stage failed.",
+          "type": "string",
+          "const": "invalid"
+        }
+      ]
+    },
+    "SigningTarget": {
+      "description": "One public signing target.",
+      "type": "object",
+      "properties": {
+        "bundle_identifier": {
+          "description": "Bundle identifier encoded into its signature.",
+          "$ref": "#/$defs/BundleIdentifier"
+        },
+        "kind": {
+          "description": "Code-object category determining inside-out order.",
+          "$ref": "#/$defs/SigningTargetKind"
+        },
+        "name": {
+          "description": "Stable target name used by per-target plans.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "bundle_identifier",
+        "kind"
+      ]
+    },
+    "SigningTargetKind": {
+      "description": "Kind of code object in the required inside-out signing order.",
+      "oneOf": [
+        {
+          "description": "Embedded dynamic library.",
+          "type": "string",
+          "const": "dynamic_library"
+        },
+        {
+          "description": "Embedded framework.",
+          "type": "string",
+          "const": "framework"
+        },
+        {
+          "description": "Widget, Live Activity, or other application extension.",
+          "type": "string",
+          "const": "extension"
+        },
+        {
+          "description": "Main application; always signed last.",
+          "type": "string",
+          "const": "application"
+        }
+      ]
+    },
+    "SourceManifest": {
+      "description": "Canonical description of a source snapshot.",
+      "type": "object",
+      "properties": {
+        "entries": {
+          "description": "Files sorted bytewise by portable path.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SourceManifestEntry"
+          }
+        },
+        "project_path": {
+          "description": "Portable workspace-relative project location, or dot for the workspace.",
+          "type": "string"
+        },
+        "schema_version": {
+          "description": "Manifest schema version.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "sha256": {
+          "description": "Digest of the canonical manifest fields other than this value.",
+          "type": "string"
+        },
+        "total_size": {
+          "description": "Sum of all entry sizes.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "project_path",
+        "entries",
+        "total_size",
+        "sha256"
+      ]
+    },
+    "SourceManifestEntry": {
+      "description": "One content-addressed regular file in a source manifest.",
+      "type": "object",
+      "properties": {
+        "executable": {
+          "description": "Whether any executable bit was present on Unix; false on Windows.",
+          "type": "boolean"
+        },
+        "path": {
+          "description": "Portable workspace-relative bundle path using slash separators.",
+          "type": "string"
+        },
+        "sha256": {
+          "description": "Lowercase hexadecimal SHA-256 digest of the file contents.",
+          "type": "string"
+        },
+        "size": {
+          "description": "Exact file length in bytes.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "size",
+        "sha256",
+        "executable"
+      ]
+    },
+    "SourceMode": {
+      "description": "How a remote provider obtains source input.",
+      "oneOf": [
+        {
+          "description": "The worker checks out a pinned Git revision.",
+          "type": "string",
+          "const": "git"
+        },
+        {
+          "description": "The client sends a verified content snapshot.",
+          "type": "string",
+          "const": "snapshot"
+        }
+      ]
+    },
+    "ValidationLevel": {
+      "description": "One validation level proven by a concrete build or inspection step.",
+      "oneOf": [
+        {
+          "description": "Source paths and hashes were verified.",
+          "type": "string",
+          "const": "source_validated"
+        },
+        {
+          "description": "Remote builder identity and tools were inspected.",
+          "type": "string",
+          "const": "remote_builder_validated"
+        },
+        {
+          "description": "Rust compiled for the physical-device target.",
+          "type": "string",
+          "const": "device_target_compiled"
+        },
+        {
+          "description": "A device Mach-O binary was produced.",
+          "type": "string",
+          "const": "device_binary_built"
+        },
+        {
+          "description": "A physical-device application bundle was produced.",
+          "type": "string",
+          "const": "app_bundle_built"
+        },
+        {
+          "description": "An Xcode archive was produced and inspected.",
+          "type": "string",
+          "const": "archive_built"
+        },
+        {
+          "description": "Development certificate metadata was validated.",
+          "type": "string",
+          "const": "certificate_validated"
+        },
+        {
+          "description": "Provisioning profile metadata was validated.",
+          "type": "string",
+          "const": "provisioning_validated"
+        },
+        {
+          "description": "Every nested code target was signed and checked.",
+          "type": "string",
+          "const": "nested_code_signed"
+        },
+        {
+          "description": "The main application signature was checked.",
+          "type": "string",
+          "const": "application_signed"
+        },
+        {
+          "description": "An IPA was exported by the Apple toolchain.",
+          "type": "string",
+          "const": "ipa_exported"
+        },
+        {
+          "description": "Independent remote artifact validation passed.",
+          "type": "string",
+          "const": "artifact_validated"
+        },
+        {
+          "description": "Expected bytes and SHA-256 were verified on the client.",
+          "type": "string",
+          "const": "downloaded_to_client"
+        },
+        {
+          "description": "The application was installed on a physical device.",
+          "type": "string",
+          "const": "install_validated"
+        },
+        {
+          "description": "The application launched on a physical device.",
+          "type": "string",
+          "const": "launch_validated"
+        },
+        {
+          "description": "Runtime behavior was observed on a physical device.",
+          "type": "string",
+          "const": "runtime_validated"
+        }
+      ]
+    }
+  }
+}
