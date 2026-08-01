@@ -235,9 +235,46 @@ fn assert_process_exits(process_id: u32) {
 }
 
 #[cfg(unix)]
+fn read_stdout_after_exit(
+    mut stdout_pipe: impl std::io::Read + Send + 'static,
+    descendant_pid: u32,
+) -> Vec<u8> {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let (stdout_sender, stdout_receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut stdout = Vec::new();
+        let result = stdout_pipe.read_to_end(&mut stdout).map(|_| stdout);
+        let _ = stdout_sender.send(result);
+    });
+    match stdout_receiver.recv_timeout(Duration::from_secs(2)) {
+        Ok(result) => result.expect("read cargo-ferry stdout"),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            let cleanup = Command::new("/bin/kill")
+                .arg("-KILL")
+                .arg(descendant_pid.to_string())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+            let cleanup = match cleanup {
+                Ok(_) => "started".to_owned(),
+                Err(error) => format!("failed to start: {error}"),
+            };
+            panic!(
+                "cargo-ferry stdout remained open for 2 seconds after process exit; direct SIGKILL cleanup for descendant PID {descendant_pid} {cleanup}"
+            );
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("cargo-ferry stdout reader disconnected after process exit");
+        }
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn ctrl_c_stops_descendants_during_output_drain_and_emits_json() {
-    use std::io::Read as _;
     use std::os::unix::fs::PermissionsExt as _;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
@@ -318,12 +355,7 @@ fn ctrl_c_stops_descendants_during_output_drain_and_emits_json() {
         std::thread::sleep(Duration::from_millis(20));
     };
     assert_eq!(status.code(), Some(130));
-    let mut stdout = Vec::new();
-    cli.stdout
-        .take()
-        .expect("cargo-ferry stdout")
-        .read_to_end(&mut stdout)
-        .expect("read cargo-ferry stdout");
+    let stdout = read_stdout_after_exit(cli.stdout.take().expect("cargo-ferry stdout"), child_pid);
     let document: Value = serde_json::from_slice(&stdout).expect("structured interrupt JSON");
     assert_eq!(document["schema_version"], 1);
     assert_eq!(document["status"], "error");
