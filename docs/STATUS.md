@@ -34,6 +34,12 @@ At commit `be5206c`, [Platform artifacts run 30699379465](https://github.com/Shi
 
 This is artifact validation only. The workflow did not boot an emulator or Simulator, install or launch either application, or exercise behavior on a physical device.
 
+## Isolated physical-iPhone work
+
+The Goal 3 branch implements a deterministic unsigned `aarch64-apple-ios` archive planner/executor plus a cross-platform strict `.xcarchive` validator. Host, synthetic security-matrix, generated-project, strict-clippy, and Linux/Windows planner checks pass. A real signed Simulator extension smoke also passes, but it is not physical-device evidence.
+
+Physical-device artifact validation remains blocked on this host. The isolated toolchain lacks the `aarch64-apple-ios` Rust target, and Xcode reports that the discoverable iPhoneOS 26.5 SDK's platform component is not installed. No real physical-device Mach-O, `.xcarchive`, signed IPA, install, launch, or runtime behavior is therefore claimed.
+
 ## Recorded checks
 
 The local results in this subsection predate the rename and remain historical host/test evidence. The Platform run above supplies current rename-integration artifact evidence; commands below use RustFerry names for reproduction.
@@ -79,7 +85,7 @@ See [Apple implementation status](ios/status.md) for identifiers, checks, and ru
 ## Toolchain inventory
 
 - Rust/Cargo 1.96.0; host target `aarch64-apple-darwin` installed.
-- Xcode 26.6; iPhoneOS and iPhoneSimulator 26.5 SDKs available.
+- Xcode 26.6; iPhoneSimulator 26.5 available. An iPhoneOS 26.5 SDK directory is discoverable, but `xcodebuild` reports its platform component is not installed.
 - Android SDK roots resolve to `~/Library/Android/sdk`; platforms 35 and 37.0, build-tools 34.0.0 and 37.0.0, and NDK 29.0.14206865 are available.
 - `aapt2`, `d8`, `zipalign`, `apksigner`, `adb`, Java 21, `javac`, and `keytool` available.
-- Rust targets `aarch64-linux-android` and `aarch64-apple-ios-sim` are installed. No Simulator runtime/device or physical-device validation is available.
+- Rust targets `aarch64-linux-android` and `aarch64-apple-ios-sim` are installed; `aarch64-apple-ios` is absent. No Simulator runtime/device or physical-device validation is available.

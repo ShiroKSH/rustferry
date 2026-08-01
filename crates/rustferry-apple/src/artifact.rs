@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{AppleError, AppleToolchain, CommandSpec, ExtensionKind, error::io_error, run_command};
 
+const ACTIVITY_MODEL_BUNDLE_IDENTIFIER: &str = "org.rustferry.activity-model";
+const ACTIVITY_MODEL_INSTALL_NAME: &str = "@rpath/FerryActivityModel.framework/FerryActivityModel";
+const RUNTIME_BRIDGE_INSTALL_NAME: &str = "@rpath/FerryRuntimeBridge.framework/FerryRuntimeBridge";
+
 /// Expected embedded app extension.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct IosExtensionExpectation {
@@ -81,8 +85,8 @@ pub struct IosExtensionValidation {
     pub architectures: Vec<String>,
     /// Validated extension-point identifier.
     pub extension_point_identifier: String,
-    /// Whether an `ActivityKit` extension links the shared runtime bridge type module.
-    pub runtime_bridge_linked: bool,
+    /// Whether an `ActivityKit` extension links the extension-safe shared model framework.
+    pub activity_model_linked: bool,
     /// Strictly verified extension code signature.
     pub code_signature: IosCodeSignatureValidation,
 }
@@ -293,6 +297,21 @@ pub fn validate_ios_app(
         toolchain,
         expected.log_dir.as_deref(),
     )?;
+    let live_activity_enabled = expected
+        .extensions
+        .iter()
+        .any(|extension| extension.kind == ExtensionKind::ActivityKit);
+    if live_activity_enabled {
+        validate_activity_model(
+            &expected.app_path,
+            &expected_architectures,
+            &runtime_bridge.executable,
+            toolchain,
+            expected.log_dir.as_deref(),
+        )?;
+    } else {
+        reject_unexpected_activity_model(&expected.app_path)?;
+    }
     let application_delegate = if expected.deep_link_schemes.is_empty() {
         None
     } else if runtime_bridge.application_delegate_hook {
@@ -346,7 +365,7 @@ pub fn validate_ios_app(
     )?;
 
     Ok(IosArtifactValidation {
-        schema_version: 5,
+        schema_version: 6,
         app_path: expected.app_path.clone(),
         bundle_identifier,
         executable,
@@ -478,18 +497,9 @@ fn validate_extension_at(
             format!("extension architectures are {architectures:?}, expected {required:?}"),
         );
     }
-    let runtime_bridge_linked = if extension.kind == ExtensionKind::ActivityKit {
+    let activity_model_linked = if extension.kind == ExtensionKind::ActivityKit {
         let dependencies = macho_dependencies(&executable, toolchain, log_dir, log_index + 5)?;
-        if !dependencies.iter().any(|dependency| {
-            dependency == "@rpath/FerryRuntimeBridge.framework/FerryRuntimeBridge"
-        }) {
-            return invalid(
-                &executable,
-                "ActivityKit extension does not link FerryRuntimeBridge's shared attributes module"
-                    .to_owned(),
-            );
-        }
-        true
+        validate_activity_extension_dependencies(&executable, &dependencies)?
     } else {
         false
     };
@@ -509,9 +519,139 @@ fn validate_extension_at(
         executable,
         architectures,
         extension_point_identifier,
-        runtime_bridge_linked,
+        activity_model_linked,
         code_signature,
     })
+}
+
+fn validate_activity_extension_dependencies(
+    executable: &Utf8Path,
+    dependencies: &[String],
+) -> Result<bool, AppleError> {
+    if dependencies
+        .iter()
+        .any(|dependency| dependency == RUNTIME_BRIDGE_INSTALL_NAME)
+    {
+        return invalid(
+            executable,
+            "ActivityKit extension links the app-only FerryRuntimeBridge framework; extensions may only share FerryActivityModel"
+                .to_owned(),
+        );
+    }
+    if !dependencies
+        .iter()
+        .any(|dependency| dependency == ACTIVITY_MODEL_INSTALL_NAME)
+    {
+        return invalid(
+            executable,
+            "ActivityKit extension does not link the extension-safe FerryActivityModel framework"
+                .to_owned(),
+        );
+    }
+    Ok(true)
+}
+
+fn validate_activity_model(
+    app_path: &Utf8Path,
+    expected_architectures: &[String],
+    runtime_bridge_executable: &Utf8Path,
+    toolchain: &AppleToolchain,
+    log_dir: Option<&Utf8Path>,
+) -> Result<(), AppleError> {
+    let path = app_path.join("Frameworks/FerryActivityModel.framework");
+    validate_real_directory(&path, "embedded Live Activity model framework")?;
+    let info_plist = path.join("Info.plist");
+    validate_regular_file(&info_plist, "Live Activity model framework Info.plist")?;
+    lint_plist(&info_plist, toolchain, log_dir, 170)?;
+
+    let bundle_identifier =
+        plist_value(&info_plist, "CFBundleIdentifier", toolchain, log_dir, 171)?;
+    if bundle_identifier != ACTIVITY_MODEL_BUNDLE_IDENTIFIER {
+        return invalid(
+            &path,
+            format!(
+                "Live Activity model framework bundle identifier is `{bundle_identifier}`, expected `{ACTIVITY_MODEL_BUNDLE_IDENTIFIER}`"
+            ),
+        );
+    }
+    let executable_name = plist_value(&info_plist, "CFBundleExecutable", toolchain, log_dir, 172)?;
+    if executable_name != "FerryActivityModel" {
+        return invalid(
+            &path,
+            format!(
+                "Live Activity model framework executable is `{executable_name}`, expected `FerryActivityModel`"
+            ),
+        );
+    }
+    let package_type = plist_value(&info_plist, "CFBundlePackageType", toolchain, log_dir, 173)?;
+    if package_type != "FMWK" {
+        return invalid(
+            &path,
+            format!(
+                "Live Activity model framework package type is `{package_type}`, expected `FMWK`"
+            ),
+        );
+    }
+
+    let executable = path.join(executable_name);
+    validate_executable(&executable)?;
+    let architectures = macho_architectures(&executable, toolchain, log_dir, 174)?;
+    if architectures != expected_architectures {
+        return invalid(
+            &executable,
+            format!(
+                "Live Activity model framework architectures are {architectures:?}, expected {expected_architectures:?}"
+            ),
+        );
+    }
+    let install_name = macho_install_name(&executable, toolchain, log_dir, 175)?;
+    if install_name != ACTIVITY_MODEL_INSTALL_NAME {
+        return invalid(
+            &executable,
+            format!(
+                "Live Activity model framework install name is `{install_name}`, expected `{ACTIVITY_MODEL_INSTALL_NAME}`"
+            ),
+        );
+    }
+
+    let runtime_dependencies =
+        macho_dependencies(runtime_bridge_executable, toolchain, log_dir, 176)?;
+    if !runtime_dependencies
+        .iter()
+        .any(|dependency| dependency == ACTIVITY_MODEL_INSTALL_NAME)
+    {
+        return invalid(
+            runtime_bridge_executable,
+            "FerryRuntimeBridge does not link the shared FerryActivityModel framework".to_owned(),
+        );
+    }
+    let _ = validate_code_signature(
+        &path,
+        ACTIVITY_MODEL_BUNDLE_IDENTIFIER,
+        None,
+        false,
+        toolchain,
+        log_dir,
+        177,
+    )?;
+    Ok(())
+}
+
+fn reject_unexpected_activity_model(app_path: &Utf8Path) -> Result<(), AppleError> {
+    let path = app_path.join("Frameworks/FerryActivityModel.framework");
+    match fs::symlink_metadata(&path) {
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => invalid(
+            &path,
+            "Live Activity model framework is embedded but no ActivityKit extension was requested"
+                .to_owned(),
+        ),
+        Err(source) => Err(io_error(
+            "inspect unexpected Live Activity model framework",
+            &path,
+            source,
+        )),
+    }
 }
 
 fn validate_runtime_bridge(
@@ -555,7 +695,7 @@ fn validate_runtime_bridge(
         );
     }
     let install_name = macho_install_name(&executable, toolchain, log_dir, 14)?;
-    if install_name != "@rpath/FerryRuntimeBridge.framework/FerryRuntimeBridge" {
+    if install_name != RUNTIME_BRIDGE_INSTALL_NAME {
         return invalid(
             &executable,
             format!(
@@ -1246,5 +1386,37 @@ mod tests {
                 Err(AppleError::InvalidArtifact { .. })
             ));
         }
+    }
+
+    #[test]
+    fn activity_extension_requires_only_the_safe_model_framework() {
+        let executable = Utf8Path::new("FerryLiveActivityExtension");
+        assert!(
+            validate_activity_extension_dependencies(
+                executable,
+                &[ACTIVITY_MODEL_INSTALL_NAME.to_owned()]
+            )
+            .unwrap()
+        );
+        assert!(validate_activity_extension_dependencies(executable, &[]).is_err());
+        assert!(
+            validate_activity_extension_dependencies(
+                executable,
+                &[
+                    ACTIVITY_MODEL_INSTALL_NAME.to_owned(),
+                    RUNTIME_BRIDGE_INSTALL_NAME.to_owned(),
+                ],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_stale_activity_model_without_an_activity_extension() {
+        let temporary = tempfile::tempdir().unwrap();
+        let app = Utf8Path::from_path(temporary.path()).unwrap();
+        assert!(reject_unexpected_activity_model(app).is_ok());
+        fs::create_dir_all(app.join("Frameworks/FerryActivityModel.framework")).unwrap();
+        assert!(reject_unexpected_activity_model(app).is_err());
     }
 }

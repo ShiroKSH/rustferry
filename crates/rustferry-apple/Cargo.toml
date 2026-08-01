@@ -15,8 +15,10 @@ description = "Generated Xcode host and iOS artifact backend for RustFerry"
 [dependencies]
 camino.workspace = true
 rustferry-core = { version = "0.1.0", path = "../rustferry-core" }
+rustferry-remote = { version = "0.1.0", path = "../rustferry-remote" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 

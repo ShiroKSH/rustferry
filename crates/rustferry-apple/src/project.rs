@@ -19,6 +19,26 @@ pub struct IosProjectSpec {
     pub assets: Option<ProjectAssets>,
 }
 
+/// Apple SDK and signing behavior encoded in a generated Xcode project.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IosProjectPlatform {
+    /// Apple Silicon iOS Simulator with local ad-hoc signing.
+    #[default]
+    Simulator,
+    /// Physical iOS device compilation with all code signing disabled.
+    DeviceUnsigned,
+}
+
+impl IosProjectPlatform {
+    pub(crate) const fn rust_target(self) -> &'static str {
+        match self {
+            Self::Simulator => "aarch64-apple-ios-sim",
+            Self::DeviceUnsigned => "aarch64-apple-ios",
+        }
+    }
+}
+
 impl IosProjectSpec {
     /// Construct a project specification.
     pub fn new(config: FerryConfig, binary_name: impl Into<String>) -> Self {
@@ -61,12 +81,29 @@ impl GeneratedAppleProject {
 /// binary names, application groups, or generated metadata are invalid.
 #[allow(clippy::too_many_lines)]
 pub fn generate_ios_project(spec: &IosProjectSpec) -> Result<GeneratedAppleProject, AppleError> {
+    generate_ios_project_for_platform(spec, IosProjectPlatform::Simulator)
+}
+
+/// Render an Xcode app target for an explicit simulator or physical-device platform.
+///
+/// The physical-device variant is compile-only: its generated project disables
+/// signing and therefore cannot produce an installable application on its own.
+///
+/// # Errors
+///
+/// Returns [`AppleError`] when configuration, bundle identifiers, versions,
+/// binary names, application groups, or generated metadata are invalid.
+#[allow(clippy::too_many_lines)]
+pub fn generate_ios_project_for_platform(
+    spec: &IosProjectSpec,
+    platform: IosProjectPlatform,
+) -> Result<GeneratedAppleProject, AppleError> {
     validate_spec(spec)?;
     let mut files = BTreeMap::new();
     insert_text(
         &mut files,
         "FerryHost.xcodeproj/project.pbxproj",
-        render_pbxproj(spec),
+        render_pbxproj(spec, platform),
     );
     insert_text(
         &mut files,
@@ -84,7 +121,7 @@ pub fn generate_ios_project(spec: &IosProjectSpec) -> Result<GeneratedAppleProje
     insert_text(
         &mut files,
         "FerryResources.json",
-        render_resource_metadata(spec)?,
+        render_resource_metadata(spec, platform)?,
     );
     insert_text(
         &mut files,
@@ -99,6 +136,22 @@ pub fn generate_ios_project(spec: &IosProjectSpec) -> Result<GeneratedAppleProje
             &xml_escape(&spec.config.ios.min_version),
         ),
     );
+
+    if spec.config.extensions.live_activity.enabled {
+        insert_text(
+            &mut files,
+            "ActivityModel/FerryActivityAttributes.swift",
+            render_activity_model_source(),
+        );
+        insert_text(
+            &mut files,
+            "ActivityModel/Info.plist",
+            include_str!("../templates/FerryActivityModel-Info.plist").replace(
+                "{{minimum_version}}",
+                &xml_escape(&spec.config.ios.min_version),
+            ),
+        );
+    }
 
     if spec.config.extensions.widget.enabled {
         let Some(app_group) = spec.config.extensions.widget.app_group.as_deref() else {
@@ -386,12 +439,33 @@ fn render_widget_source(app_group: &str) -> String {
 }
 
 fn render_live_activity_source() -> String {
-    "import ActivityKit\nimport FerryRuntimeBridge\nimport SwiftUI\nimport WidgetKit\n\n@main\nstruct FerryLiveActivity: Widget {\n    var body: some WidgetConfiguration {\n        ActivityConfiguration(for: FerryActivityAttributes.self) { context in\n            VStack(alignment: .leading) {\n                Text(context.state.title).font(.headline)\n                Text(context.state.status)\n                ProgressView(value: context.state.progress)\n            }\n            .widgetURL(context.state.deepLink.flatMap(URL.init(string:)))\n        } dynamicIsland: { context in\n            DynamicIsland {\n                DynamicIslandExpandedRegion(.leading) { Text(context.state.leadingText) }\n                DynamicIslandExpandedRegion(.trailing) { Text(context.state.trailingText) }\n                DynamicIslandExpandedRegion(.bottom) { ProgressView(value: context.state.progress) }\n            } compactLeading: {\n                Text(context.state.leadingText)\n            } compactTrailing: {\n                Text(context.state.trailingText)\n            } minimal: {\n                Text(context.state.status.prefix(1))\n            }\n            .widgetURL(context.state.deepLink.flatMap(URL.init(string:)))\n        }\n    }\n}\n"
+    "import ActivityKit\nimport FerryActivityModel\nimport SwiftUI\nimport WidgetKit\n\n@main\nstruct FerryLiveActivity: Widget {\n    var body: some WidgetConfiguration {\n        ActivityConfiguration(for: FerryActivityAttributes.self) { context in\n            VStack(alignment: .leading) {\n                Text(context.state.title).font(.headline)\n                Text(context.state.status)\n                ProgressView(value: context.state.progress)\n            }\n            .widgetURL(context.state.deepLink.flatMap(URL.init(string:)))\n        } dynamicIsland: { context in\n            DynamicIsland {\n                DynamicIslandExpandedRegion(.leading) { Text(context.state.leadingText) }\n                DynamicIslandExpandedRegion(.trailing) { Text(context.state.trailingText) }\n                DynamicIslandExpandedRegion(.bottom) { ProgressView(value: context.state.progress) }\n            } compactLeading: {\n                Text(context.state.leadingText)\n            } compactTrailing: {\n                Text(context.state.trailingText)\n            } minimal: {\n                Text(context.state.status.prefix(1))\n            }\n            .widgetURL(context.state.deepLink.flatMap(URL.init(string:)))\n        }\n    }\n}\n"
         .to_owned()
+}
+
+fn render_activity_model_source() -> String {
+    format!(
+        "import ActivityKit\nimport Foundation\n\n{}\n",
+        include_str!("../templates/FerryActivityAttributes.swift.tpl").trim_end()
+    )
 }
 
 fn render_runtime_bridge_source(spec: &IosProjectSpec) -> String {
     let enabled = |value: bool| if value { "true" } else { "false" };
+    let live_activity = spec.config.extensions.live_activity.enabled;
+    let model_import = if live_activity {
+        "import FerryActivityModel\n"
+    } else {
+        ""
+    };
+    let attributes_declaration = if live_activity {
+        String::new()
+    } else {
+        format!(
+            "{}\n\n",
+            include_str!("../templates/FerryActivityAttributes.swift.tpl").trim_end()
+        )
+    };
     let widget_group = spec
         .config
         .extensions
@@ -400,6 +474,11 @@ fn render_runtime_bridge_source(spec: &IosProjectSpec) -> String {
         .as_deref()
         .map_or_else(|| "nil".to_owned(), swift_string_literal);
     include_str!("../templates/FerryRuntimeBridge.swift.tpl")
+        .replace("{{activity_model_import}}\n", model_import)
+        .replace(
+            "{{activity_attributes_declaration}}\n\n",
+            &attributes_declaration,
+        )
         .replace(
             "{{storage_enabled}}",
             enabled(spec.config.capabilities.storage.enabled),
@@ -466,12 +545,15 @@ fn render_runtime_bridge_source(spec: &IosProjectSpec) -> String {
         )
 }
 
-fn render_resource_metadata(spec: &IosProjectSpec) -> Result<String, AppleError> {
+fn render_resource_metadata(
+    spec: &IosProjectSpec,
+    platform: IosProjectPlatform,
+) -> Result<String, AppleError> {
     let value = serde_json::json!({
         "schema_version": 1,
         "generator": "cargo-ferry",
         "ui_backend": "slint-1.17.1",
-        "rust_target": "aarch64-apple-ios-sim",
+        "rust_target": platform.rust_target(),
         "bundle_identifier": spec.config.app.identifier,
     });
     serde_json::to_string_pretty(&value)
@@ -494,8 +576,32 @@ fn render_scheme(binary_name: &str) -> String {
     )
 }
 
+fn render_pbxproj(spec: &IosProjectSpec, platform: IosProjectPlatform) -> String {
+    let project = render_simulator_pbxproj(spec);
+    match platform {
+        IosProjectPlatform::Simulator => project,
+        IosProjectPlatform::DeviceUnsigned => project
+            .replace("SDKROOT = iphonesimulator", "SDKROOT = iphoneos")
+            .replace(
+                "SUPPORTED_PLATFORMS = iphonesimulator",
+                "SUPPORTED_PLATFORMS = iphoneos",
+            )
+            .replace(
+                "AD_HOC_CODE_SIGNING_ALLOWED = YES",
+                "AD_HOC_CODE_SIGNING_ALLOWED = NO",
+            )
+            .replace("CODE_SIGN_IDENTITY = \"-\"", "CODE_SIGN_IDENTITY = \"\"")
+            .replace("CODE_SIGNING_ALLOWED = YES", "CODE_SIGNING_ALLOWED = NO")
+            .replace("CODE_SIGNING_REQUIRED = YES", "CODE_SIGNING_REQUIRED = NO")
+            .replace(
+                "ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, );",
+                "ATTRIBUTES = (RemoveHeadersOnCopy, );",
+            ),
+    }
+}
+
 #[allow(clippy::too_many_lines, clippy::write_with_newline)]
-fn render_pbxproj(spec: &IosProjectSpec) -> String {
+fn render_simulator_pbxproj(spec: &IosProjectSpec) -> String {
     let binary = pbx_quote(&spec.binary_name);
     let app_product = pbx_quote(&format!("{}.app", spec.binary_name));
     let bundle = pbx_quote(&spec.config.app.identifier);
@@ -570,9 +676,27 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
     if live_activity {
         let _ = writeln!(
             output,
-            "\t\t{} /* FerryRuntimeBridge.framework in Frameworks */ = {{isa = PBXBuildFile; fileRef = {} /* FerryRuntimeBridge.framework */; }};",
-            id(85),
-            id(82)
+            "\t\t{} /* FerryActivityAttributes.swift in Sources */ = {{isa = PBXBuildFile; fileRef = {} /* FerryActivityAttributes.swift */; }};",
+            id(100),
+            id(101)
+        );
+        let _ = writeln!(
+            output,
+            "\t\t{} /* FerryActivityModel.framework in Embed Frameworks */ = {{isa = PBXBuildFile; fileRef = {} /* FerryActivityModel.framework */; settings = {{ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }}; }};",
+            id(103),
+            id(102)
+        );
+        let _ = writeln!(
+            output,
+            "\t\t{} /* FerryActivityModel.framework in RuntimeBridge Frameworks */ = {{isa = PBXBuildFile; fileRef = {} /* FerryActivityModel.framework */; }};",
+            id(104),
+            id(102)
+        );
+        let _ = writeln!(
+            output,
+            "\t\t{} /* FerryActivityModel.framework in Live Activity Frameworks */ = {{isa = PBXBuildFile; fileRef = {} /* FerryActivityModel.framework */; }};",
+            id(105),
+            id(102)
         );
         let _ = writeln!(
             output,
@@ -614,13 +738,20 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
             id(1),
             id(56)
         );
-        let _ = writeln!(
-            output,
-            "\t\t{} /* PBXContainerItemProxy */ = {{isa = PBXContainerItemProxy; containerPortal = {} /* Project object */; proxyType = 1; remoteGlobalIDString = {}; remoteInfo = FerryRuntimeBridge; }};",
-            id(88),
-            id(1),
-            id(90)
-        );
+        for (proxy, target, owner) in [
+            (114, 108, "FerryActivityModel"),
+            (116, 108, "FerryActivityModel"),
+            (118, 108, "FerryActivityModel"),
+        ] {
+            let _ = writeln!(
+                output,
+                "\t\t{} /* PBXContainerItemProxy */ = {{isa = PBXContainerItemProxy; containerPortal = {} /* Project object */; proxyType = 1; remoteGlobalIDString = {}; remoteInfo = {}; }};",
+                id(proxy),
+                id(1),
+                id(target),
+                owner
+            );
+        }
     }
     output.push_str("/* End PBXContainerItemProxy section */\n\n");
 
@@ -634,9 +765,19 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
     );
     let _ = write!(
         output,
-        "\t\t{} /* Embed Frameworks */ = {{\n\t\t\tisa = PBXCopyFilesBuildPhase;\n\t\t\tbuildActionMask = 2147483647;\n\t\t\tdstPath = \"\";\n\t\t\tdstSubfolderSpec = 10;\n\t\t\tfiles = ({} /* FerryRuntimeBridge.framework in Embed Frameworks */,);\n\t\t\tname = \"Embed Frameworks\";\n\t\t\trunOnlyForDeploymentPostprocessing = 0;\n\t\t}};\n",
+        "\t\t{} /* Embed Frameworks */ = {{\n\t\t\tisa = PBXCopyFilesBuildPhase;\n\t\t\tbuildActionMask = 2147483647;\n\t\t\tdstPath = \"\";\n\t\t\tdstSubfolderSpec = 10;\n\t\t\tfiles = ({} /* FerryRuntimeBridge.framework in Embed Frameworks */,",
         id(93),
         id(84)
+    );
+    if live_activity {
+        let _ = write!(
+            output,
+            " {} /* FerryActivityModel.framework in Embed Frameworks */,",
+            id(103)
+        );
+    }
+    output.push_str(
+        ");\n\t\t\tname = \"Embed Frameworks\";\n\t\t\trunOnlyForDeploymentPostprocessing = 0;\n\t\t};\n",
     );
     if widget || live_activity {
         let _ = write!(
@@ -744,6 +885,21 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
     if live_activity {
         let _ = writeln!(
             output,
+            "\t\t{} /* FerryActivityAttributes.swift */ = {{isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FerryActivityAttributes.swift; sourceTree = \"<group>\"; }};",
+            id(101)
+        );
+        let _ = writeln!(
+            output,
+            "\t\t{} /* FerryActivityModel.framework */ = {{isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = FerryActivityModel.framework; sourceTree = BUILT_PRODUCTS_DIR; }};",
+            id(102)
+        );
+        let _ = writeln!(
+            output,
+            "\t\t{} /* Info.plist */ = {{isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = \"<group>\"; }};",
+            id(106)
+        );
+        let _ = writeln!(
+            output,
             "\t\t{} /* LiveActivity.swift */ = {{isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveActivity.swift; sourceTree = \"<group>\"; }};",
             id(50)
         );
@@ -780,6 +936,7 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
         let _ = writeln!(output, "\t\t\t\t{} /* WidgetExtension */,", id(38));
     }
     if live_activity {
+        let _ = writeln!(output, "\t\t\t\t{} /* ActivityModel */,", id(107));
         let _ = writeln!(output, "\t\t\t\t{} /* LiveActivityExtension */,", id(58));
     }
     let _ = write!(
@@ -809,6 +966,11 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
     if live_activity {
         let _ = writeln!(
             output,
+            "\t\t\t\t{} /* FerryActivityModel.framework */,",
+            id(102)
+        );
+        let _ = writeln!(
+            output,
             "\t\t\t\t{} /* FerryLiveActivityExtension.appex */,",
             id(53)
         );
@@ -832,6 +994,13 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
         );
     }
     if live_activity {
+        let _ = write!(
+            output,
+            "\t\t{} /* ActivityModel */ = {{\n\t\t\tisa = PBXGroup;\n\t\t\tchildren = (\n\t\t\t\t{} /* FerryActivityAttributes.swift */,\n\t\t\t\t{} /* Info.plist */,\n\t\t\t);\n\t\t\tpath = ActivityModel;\n\t\t\tsourceTree = \"<group>\";\n\t\t}};\n",
+            id(107),
+            id(101),
+            id(106)
+        );
         let _ = write!(
             output,
             "\t\t{} /* LiveActivityExtension */ = {{\n\t\t\tisa = PBXGroup;\n\t\t\tchildren = (\n\t\t\t\t{} /* LiveActivity.swift */,\n\t\t\t\t{} /* Info.plist */,\n\t\t\t);\n\t\t\tpath = LiveActivityExtension;\n\t\t\tsourceTree = \"<group>\";\n\t\t}};\n",
@@ -864,6 +1033,7 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
         let _ = writeln!(output, "\t\t\t\t{} /* PBXTargetDependency */,", id(42));
     }
     if live_activity {
+        let _ = writeln!(output, "\t\t\t\t{} /* PBXTargetDependency */,", id(115));
         let _ = writeln!(output, "\t\t\t\t{} /* PBXTargetDependency */,", id(62));
     }
     let _ = write!(
@@ -875,10 +1045,21 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
     );
     let _ = write!(
         output,
-        "\t\t{} /* FerryRuntimeBridge */ = {{\n\t\t\tisa = PBXNativeTarget;\n\t\t\tbuildConfigurationList = {} /* Build configuration list for PBXNativeTarget \"FerryRuntimeBridge\" */;\n\t\t\tbuildPhases = ({} /* Sources */,);\n\t\t\tbuildRules = ();\n\t\t\tdependencies = ();\n\t\t\tname = FerryRuntimeBridge;\n\t\t\tproductName = FerryRuntimeBridge;\n\t\t\tproductReference = {} /* FerryRuntimeBridge.framework */;\n\t\t\tproductType = \"com.apple.product-type.framework\";\n\t\t}};\n",
+        "\t\t{} /* FerryRuntimeBridge */ = {{\n\t\t\tisa = PBXNativeTarget;\n\t\t\tbuildConfigurationList = {} /* Build configuration list for PBXNativeTarget \"FerryRuntimeBridge\" */;\n\t\t\tbuildPhases = ({} /* Sources */,",
         id(90),
         id(95),
-        id(92),
+        id(92)
+    );
+    if live_activity {
+        let _ = write!(output, " {} /* Frameworks */,", id(113));
+    }
+    output.push_str(");\n\t\t\tbuildRules = ();\n\t\t\tdependencies = (");
+    if live_activity {
+        let _ = write!(output, "{} /* PBXTargetDependency */,", id(117));
+    }
+    let _ = write!(
+        output,
+        ");\n\t\t\tname = FerryRuntimeBridge;\n\t\t\tproductName = FerryRuntimeBridge;\n\t\t\tproductReference = {} /* FerryRuntimeBridge.framework */;\n\t\t\tproductType = \"com.apple.product-type.framework\";\n\t\t}};\n",
         id(82)
     );
     if widget {
@@ -894,12 +1075,20 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
     if live_activity {
         let _ = write!(
             output,
+            "\t\t{} /* FerryActivityModel */ = {{\n\t\t\tisa = PBXNativeTarget;\n\t\t\tbuildConfigurationList = {} /* Build configuration list for PBXNativeTarget \"FerryActivityModel\" */;\n\t\t\tbuildPhases = ({} /* Sources */,);\n\t\t\tbuildRules = ();\n\t\t\tdependencies = ();\n\t\t\tname = FerryActivityModel;\n\t\t\tproductName = FerryActivityModel;\n\t\t\tproductReference = {} /* FerryActivityModel.framework */;\n\t\t\tproductType = \"com.apple.product-type.framework\";\n\t\t}};\n",
+            id(108),
+            id(112),
+            id(109),
+            id(102)
+        );
+        let _ = write!(
+            output,
             "\t\t{} /* FerryLiveActivityExtension */ = {{\n\t\t\tisa = PBXNativeTarget;\n\t\t\tbuildConfigurationList = {} /* Build configuration list for PBXNativeTarget \"FerryLiveActivityExtension\" */;\n\t\t\tbuildPhases = ({} /* Sources */, {} /* Frameworks */,);\n\t\t\tbuildRules = ();\n\t\t\tdependencies = ({} /* PBXTargetDependency */,);\n\t\t\tname = FerryLiveActivityExtension;\n\t\t\tproductName = FerryLiveActivityExtension;\n\t\t\tproductReference = {} /* FerryLiveActivityExtension.appex */;\n\t\t\tproductType = \"com.apple.product-type.app-extension\";\n\t\t}};\n",
             id(56),
             id(59),
             id(55),
             id(94),
-            id(89),
+            id(119),
             id(53)
         );
     }
@@ -920,6 +1109,7 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
         let _ = writeln!(output, "\t\t\t\t{} /* FerryWidgetExtension */,", id(36));
     }
     if live_activity {
+        let _ = writeln!(output, "\t\t\t\t{} /* FerryActivityModel */,", id(108));
         let _ = writeln!(
             output,
             "\t\t\t\t{} /* FerryLiveActivityExtension */,",
@@ -952,9 +1142,15 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
         output.push_str("/* Begin PBXFrameworksBuildPhase section */\n");
         let _ = write!(
             output,
-            "\t\t{} /* Frameworks */ = {{isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = ({} /* FerryRuntimeBridge.framework in Frameworks */,); runOnlyForDeploymentPostprocessing = 0; }};\n",
+            "\t\t{} /* Frameworks */ = {{isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = ({} /* FerryActivityModel.framework in RuntimeBridge Frameworks */,); runOnlyForDeploymentPostprocessing = 0; }};\n",
+            id(113),
+            id(104)
+        );
+        let _ = write!(
+            output,
+            "\t\t{} /* Frameworks */ = {{isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = ({} /* FerryActivityModel.framework in Live Activity Frameworks */,); runOnlyForDeploymentPostprocessing = 0; }};\n",
             id(94),
-            id(85)
+            id(105)
         );
         output.push_str("/* End PBXFrameworksBuildPhase section */\n\n");
     }
@@ -975,6 +1171,12 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
         );
     }
     if live_activity {
+        let _ = write!(
+            output,
+            "\t\t{} /* Sources */ = {{isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = ({} /* FerryActivityAttributes.swift in Sources */,); runOnlyForDeploymentPostprocessing = 0; }};\n",
+            id(109),
+            id(100)
+        );
         let _ = write!(
             output,
             "\t\t{} /* Sources */ = {{isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = ({} /* LiveActivity.swift in Sources */,); runOnlyForDeploymentPostprocessing = 0; }};\n",
@@ -1011,10 +1213,24 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
         );
         let _ = writeln!(
             output,
-            "\t\t{} /* PBXTargetDependency */ = {{isa = PBXTargetDependency; target = {} /* FerryRuntimeBridge */; targetProxy = {} /* PBXContainerItemProxy */; }};",
-            id(89),
-            id(90),
-            id(88)
+            "\t\t{} /* PBXTargetDependency */ = {{isa = PBXTargetDependency; target = {} /* FerryActivityModel */; targetProxy = {} /* PBXContainerItemProxy */; }};",
+            id(115),
+            id(108),
+            id(114)
+        );
+        let _ = writeln!(
+            output,
+            "\t\t{} /* PBXTargetDependency */ = {{isa = PBXTargetDependency; target = {} /* FerryActivityModel */; targetProxy = {} /* PBXContainerItemProxy */; }};",
+            id(117),
+            id(108),
+            id(116)
+        );
+        let _ = writeln!(
+            output,
+            "\t\t{} /* PBXTargetDependency */ = {{isa = PBXTargetDependency; target = {} /* FerryActivityModel */; targetProxy = {} /* PBXContainerItemProxy */; }};",
+            id(119),
+            id(108),
+            id(118)
         );
     }
     output.push_str("/* End PBXTargetDependency section */\n\n");
@@ -1051,14 +1267,32 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
         );
     }
     for (config_id, name) in [(96, "Debug"), (97, "Release")] {
+        let activity_model_runpath = if live_activity {
+            "LD_RUNPATH_SEARCH_PATHS = (\"$(inherited)\", \"@loader_path\",); "
+        } else {
+            ""
+        };
         let _ = write!(
             output,
-            "\t\t{} /* {} */ = {{isa = XCBuildConfiguration; buildSettings = {{AD_HOC_CODE_SIGNING_ALLOWED = YES; APPLICATION_EXTENSION_API_ONLY = NO; ARCHS = arm64; CODE_SIGN_IDENTITY = \"-\"; CODE_SIGNING_ALLOWED = YES; CODE_SIGNING_REQUIRED = YES; CURRENT_PROJECT_VERSION = 1; DEFINES_MODULE = YES; DYLIB_INSTALL_NAME_BASE = \"@rpath\"; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = RuntimeBridge/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = {}; MARKETING_VERSION = 1.0; ONLY_ACTIVE_ARCH = NO; PRODUCT_BUNDLE_IDENTIFIER = org.rustferry.runtime-bridge; PRODUCT_NAME = FerryRuntimeBridge; SDKROOT = iphonesimulator; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = iphonesimulator; SWIFT_EMIT_LOC_STRINGS = NO; SWIFT_INSTALL_OBJC_HEADER = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = \"1,2\"; }}; name = {}; }};\n",
+            "\t\t{} /* {} */ = {{isa = XCBuildConfiguration; buildSettings = {{AD_HOC_CODE_SIGNING_ALLOWED = YES; APPLICATION_EXTENSION_API_ONLY = NO; ARCHS = arm64; CODE_SIGN_IDENTITY = \"-\"; CODE_SIGNING_ALLOWED = YES; CODE_SIGNING_REQUIRED = YES; CURRENT_PROJECT_VERSION = 1; DEFINES_MODULE = YES; DYLIB_INSTALL_NAME_BASE = \"@rpath\"; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = RuntimeBridge/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = {}; {}MARKETING_VERSION = 1.0; ONLY_ACTIVE_ARCH = NO; PRODUCT_BUNDLE_IDENTIFIER = org.rustferry.runtime-bridge; PRODUCT_NAME = FerryRuntimeBridge; SDKROOT = iphonesimulator; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = iphonesimulator; SWIFT_EMIT_LOC_STRINGS = NO; SWIFT_INSTALL_OBJC_HEADER = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = \"1,2\"; }}; name = {}; }};\n",
             id(config_id),
             name,
             min_version,
+            activity_model_runpath,
             name
         );
+    }
+    if live_activity {
+        for (config_id, name) in [(110, "Debug"), (111, "Release")] {
+            let _ = write!(
+                output,
+                "\t\t{} /* {} */ = {{isa = XCBuildConfiguration; buildSettings = {{AD_HOC_CODE_SIGNING_ALLOWED = YES; APPLICATION_EXTENSION_API_ONLY = YES; ARCHS = arm64; CODE_SIGN_IDENTITY = \"-\"; CODE_SIGNING_ALLOWED = YES; CODE_SIGNING_REQUIRED = YES; CURRENT_PROJECT_VERSION = 1; DEFINES_MODULE = YES; DYLIB_INSTALL_NAME_BASE = \"@rpath\"; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = ActivityModel/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = {}; MARKETING_VERSION = 1.0; ONLY_ACTIVE_ARCH = NO; PRODUCT_BUNDLE_IDENTIFIER = org.rustferry.activity-model; PRODUCT_NAME = FerryActivityModel; SDKROOT = iphonesimulator; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = iphonesimulator; SWIFT_EMIT_LOC_STRINGS = NO; SWIFT_INSTALL_OBJC_HEADER = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = \"1,2\"; }}; name = {}; }};\n",
+                id(config_id),
+                name,
+                min_version,
+                name
+            );
+        }
     }
     if widget {
         render_extension_build_configs(
@@ -1108,6 +1342,15 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
         id(96),
         id(97)
     );
+    if live_activity {
+        let _ = write!(
+            output,
+            "\t\t{} /* Build configuration list for PBXNativeTarget \"FerryActivityModel\" */ = {{isa = XCConfigurationList; buildConfigurations = ({} /* Debug */, {} /* Release */,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; }};\n",
+            id(112),
+            id(110),
+            id(111)
+        );
+    }
     if widget {
         let _ = write!(
             output,
@@ -1318,6 +1561,13 @@ mod tests {
         assert!(bridge.contains("@_cdecl(\"ferry_bridge_init\")"));
         assert!(bridge.contains("method_setImplementation"));
         assert!(!bridge.contains("UIApplication.shared"));
+        assert!(!bridge.contains("import FerryActivityModel"));
+        assert!(bridge.contains("public struct FerryActivityAttributes"));
+        assert!(
+            !first
+                .files
+                .contains_key(Utf8Path::new("ActivityModel/FerryActivityAttributes.swift"))
+        );
     }
 
     #[test]
@@ -1378,6 +1628,38 @@ mod tests {
                 .files
                 .contains_key(Utf8Path::new("LiveActivityExtension/LiveActivity.swift"))
         );
+        let activity_model = generated
+            .text(Utf8Path::new("ActivityModel/FerryActivityAttributes.swift"))
+            .unwrap();
+        assert!(activity_model.contains("public struct FerryActivityAttributes"));
+        assert!(activity_model.contains("import ActivityKit"));
+        assert!(!activity_model.contains("UIKit"));
+        assert!(!activity_model.contains("UIApplication"));
+        assert!(!activity_model.contains("FerryBridge"));
+        let bridge = generated
+            .text(Utf8Path::new("RuntimeBridge/FerryRuntimeBridge.swift"))
+            .unwrap();
+        assert!(bridge.contains("import FerryActivityModel"));
+        assert!(!bridge.contains("public struct FerryActivityAttributes"));
+        assert!(bridge.contains("UIApplicationDelegate"));
+        let live_activity = generated
+            .text(Utf8Path::new("LiveActivityExtension/LiveActivity.swift"))
+            .unwrap();
+        assert!(live_activity.contains("import FerryActivityModel"));
+        assert!(!live_activity.contains("FerryRuntimeBridge"));
+        assert!(pbx.contains("FerryActivityModel.framework in RuntimeBridge Frameworks"));
+        assert!(pbx.contains("FerryActivityModel.framework in Live Activity Frameworks"));
+        assert!(pbx.contains("LD_RUNPATH_SEARCH_PATHS = (\"$(inherited)\", \"@loader_path\",)"));
+        assert!(pbx.contains("@executable_path/../../Frameworks"));
+        assert!(!pbx.contains("FerryRuntimeBridge.framework in Frameworks"));
+        assert_eq!(
+            pbx.matches("APPLICATION_EXTENSION_API_ONLY = NO").count(),
+            2
+        );
+        assert_eq!(
+            pbx.matches("APPLICATION_EXTENSION_API_ONLY = YES").count(),
+            6
+        );
         let widget = generated
             .text(Utf8Path::new("WidgetExtension/Widget.swift"))
             .unwrap();
@@ -1385,6 +1667,132 @@ mod tests {
         assert!(widget.contains("ProgressView(value: progress)"));
         assert!(widget.contains("Link(action.label, destination: action.destination)"));
         assert!(widget.contains(".widgetURL(entry.deepLink)"));
+    }
+
+    #[test]
+    fn device_live_activity_model_is_extension_safe_and_iphoneos_only() {
+        let mut spec = starter();
+        spec.config.extensions.live_activity.enabled = true;
+        spec.config.ios.min_version = "16.1".into();
+        let generated =
+            generate_ios_project_for_platform(&spec, IosProjectPlatform::DeviceUnsigned).unwrap();
+        let pbx = generated
+            .text(Utf8Path::new("FerryHost.xcodeproj/project.pbxproj"))
+            .unwrap();
+
+        assert!(!pbx.contains("iphonesimulator"));
+        assert!(pbx.contains("SDKROOT = iphoneos"));
+        assert!(pbx.contains("SUPPORTED_PLATFORMS = iphoneos"));
+        assert!(pbx.contains("PRODUCT_NAME = FerryActivityModel"));
+        assert_eq!(
+            pbx.matches("APPLICATION_EXTENSION_API_ONLY = NO").count(),
+            2
+        );
+        assert_eq!(
+            pbx.matches("APPLICATION_EXTENSION_API_ONLY = YES").count(),
+            4
+        );
+        assert!(!pbx.contains("FerryRuntimeBridge.framework in Frameworks"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires full Xcode"]
+    fn xcode_builds_the_safe_activity_model_dependency_graph() {
+        let mut spec = starter();
+        spec.config.extensions.live_activity.enabled = true;
+        spec.config.ios.min_version = "16.1".into();
+        let generated = generate_ios_project(&spec).unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let root = Utf8Path::from_path(temporary.path()).unwrap();
+        write_ios_project(&generated, root).unwrap();
+
+        let output = std::process::Command::new("/usr/bin/xcrun")
+            .args(["xcodebuild", "-project"])
+            .arg(root.join("FerryHost.xcodeproj"))
+            .args(["-list", "-json"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "xcodebuild failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let listing: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let targets = listing["project"]["targets"].as_array().unwrap();
+        for expected in [
+            "FerryApp",
+            "FerryRuntimeBridge",
+            "FerryActivityModel",
+            "FerryLiveActivityExtension",
+        ] {
+            assert!(targets.iter().any(|target| target == expected));
+        }
+
+        let products = root.join("Products");
+        let intermediates = root.join("Intermediates");
+        let build = std::process::Command::new("/usr/bin/xcrun")
+            .args(["xcodebuild", "-project"])
+            .arg(root.join("FerryHost.xcodeproj"))
+            .args([
+                "-target",
+                "FerryRuntimeBridge",
+                "-target",
+                "FerryLiveActivityExtension",
+                "-configuration",
+                "Debug",
+                "-sdk",
+                "iphonesimulator",
+                "AD_HOC_CODE_SIGNING_ALLOWED=YES",
+                "CODE_SIGN_IDENTITY=-",
+                "CODE_SIGNING_ALLOWED=YES",
+                "CODE_SIGNING_REQUIRED=YES",
+                "ARCHS=arm64",
+                "ONLY_ACTIVE_ARCH=NO",
+            ])
+            .arg(format!("SYMROOT={products}"))
+            .arg(format!("OBJROOT={intermediates}"))
+            .arg(format!("CONFIGURATION_BUILD_DIR={products}"))
+            .arg("build")
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            build.status.success(),
+            "xcodebuild failed: {}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+
+        let executable =
+            products.join("FerryLiveActivityExtension.appex/FerryLiveActivityExtension");
+        assert!(executable.is_file());
+        assert!(
+            products
+                .join("FerryActivityModel.framework/FerryActivityModel")
+                .is_file()
+        );
+        let linked_libraries = |executable: &Utf8Path| {
+            let output = std::process::Command::new("/usr/bin/xcrun")
+                .args(["otool", "-L"])
+                .arg(executable)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "otool failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        let dependencies = linked_libraries(&executable);
+        assert!(dependencies.contains("@rpath/FerryActivityModel.framework/FerryActivityModel"));
+        assert!(!dependencies.contains("FerryRuntimeBridge"));
+        let runtime_dependencies =
+            linked_libraries(&products.join("FerryRuntimeBridge.framework/FerryRuntimeBridge"));
+        assert!(
+            runtime_dependencies.contains("@rpath/FerryActivityModel.framework/FerryActivityModel")
+        );
     }
 
     #[test]

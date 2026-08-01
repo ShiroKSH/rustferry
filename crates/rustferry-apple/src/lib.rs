@@ -7,6 +7,7 @@
 mod artifact;
 mod build;
 mod command;
+mod device;
 mod discovery;
 mod doctor;
 mod error;
@@ -22,15 +23,26 @@ pub use build::{
     PlannedCopy, build_ios_simulator, plan_ios_simulator,
 };
 pub use command::{CommandOutput, CommandSpec, DEFAULT_COMMAND_TIMEOUT, run_command};
+pub use device::{
+    IosDeviceArchiveOutcome, IosDeviceArchivePlan, IosDeviceArchiveRequest,
+    IosDeviceArtifactDisposition, IosDeviceMachOValidation, IosDeviceMachOValidationPlan,
+    build_ios_device_unsigned, plan_ios_device_unsigned,
+};
 pub use discovery::{
-    AppleDiscovery, AppleDiscoveryOptions, AppleHostTools, AppleToolchain, SimulatorRuntime,
-    SimulatorSdk, discover_apple,
+    AppleDiscovery, AppleDiscoveryOptions, AppleHostTools, AppleToolchain, IosDeviceSdk,
+    IosDeviceToolchain, SimulatorRuntime, SimulatorSdk, discover_apple,
 };
 pub use doctor::{
     AppleDoctorCheck, AppleDoctorOptions, AppleDoctorReport, DoctorStatus, doctor_apple,
 };
 pub use error::AppleError;
-pub use project::{GeneratedAppleProject, IosProjectSpec, generate_ios_project, write_ios_project};
+pub use project::{
+    GeneratedAppleProject, IosProjectPlatform, IosProjectSpec, generate_ios_project,
+    generate_ios_project_for_platform, write_ios_project,
+};
+
+/// Rust target used for physical iPhone artifacts.
+pub const IOS_DEVICE_TARGET: &str = "aarch64-apple-ios";
 
 /// Rust target used for Apple Silicon iOS Simulator artifacts.
 pub const IOS_SIMULATOR_TARGET: &str = "aarch64-apple-ios-sim";
