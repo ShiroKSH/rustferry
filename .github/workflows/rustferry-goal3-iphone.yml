@@ -17,7 +17,7 @@ env:
   RUST_BACKTRACE: '0'
   RUSTUP_TOOLCHAIN: '1.92.0'
   RUSTFERRY_WORKER_REPOSITORY: 'https://github.com/shiroksh/rustferry'
-  RUSTFERRY_WORKER_REVISION: '66555a41f32398d74b2e437d73aa0b2d53af0343'
+  RUSTFERRY_WORKER_REVISION: '052f6ed18d3eb95a053264e32dd7417c131e0155'
   RUSTFERRY_WORKER_VERSION: '0.1.0'
   RUSTFERRY_TRUSTED_SOURCE_REF: 'refs/heads/goal3/macless-iphone-builds'
   RUSTFERRY_TEMPORARY_REF_PREFIX: 'refs/heads/rustferry/goal3/builds'
@@ -39,7 +39,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: 'shiroksh/rustferry'
-          ref: '66555a41f32398d74b2e437d73aa0b2d53af0343'
+          ref: '052f6ed18d3eb95a053264e32dd7417c131e0155'
           fetch-depth: 1
           persist-credentials: false
           path: .rustferry-worker-source
