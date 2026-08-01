@@ -1,0 +1,569 @@
+{
+  "name": "rustferry-vscode",
+  "displayName": "RustFerry for VS Code",
+  "description": "Build, inspect, and run RustFerry mobile applications from Visual Studio Code.",
+  "version": "0.1.0",
+  "publisher": "ShiroKSH",
+  "license": "MIT",
+  "files": [
+    "CHANGELOG.md",
+    "LICENSE",
+    "README.md",
+    "SUPPORT.md",
+    "dist/extension.js",
+    "media/ferry.svg",
+    "media/walkthrough/*.md",
+    "snippets/rust.json"
+  ],
+  "homepage": "https://shiroksh.github.io/rustferry/",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ShiroKSH/rustferry.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ShiroKSH/rustferry/issues"
+  },
+  "engines": {
+    "vscode": "^1.100.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Other"
+  ],
+  "keywords": [
+    "rust",
+    "mobile",
+    "android",
+    "ios",
+    "rustferry"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "workspaceContains:**/ferry.toml",
+    "onView:rustferry.project",
+    "onView:rustferry.devices",
+    "onView:rustferry.artifacts",
+    "onCommand:rustferry.createProject",
+    "onCommand:rustferry.openDocumentation"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "Project browsing and documentation remain available. Running cargo-ferry, builds, devices, and project mutations require Workspace Trust."
+    },
+    "virtualWorkspaces": {
+      "supported": true,
+      "description": "Virtual workspaces are read-only because RustFerry commands require a local extension-host process."
+    }
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "rustferry.createProject",
+        "title": "Create New Project",
+        "category": "RustFerry",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "rustferry.refresh",
+        "title": "Refresh",
+        "category": "RustFerry",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "rustferry.selectProject",
+        "title": "Select Project",
+        "category": "RustFerry"
+      },
+      {
+        "command": "rustferry.selectTarget",
+        "title": "Select Target",
+        "category": "RustFerry",
+        "icon": "$(device-mobile)"
+      },
+      {
+        "command": "rustferry.check",
+        "title": "Check",
+        "category": "RustFerry",
+        "icon": "$(check)"
+      },
+      {
+        "command": "rustferry.doctor",
+        "title": "Doctor",
+        "category": "RustFerry",
+        "icon": "$(stethoscope)"
+      },
+      {
+        "command": "rustferry.buildAndroid",
+        "title": "Build Android",
+        "category": "RustFerry"
+      },
+      {
+        "command": "rustferry.buildIosSimulator",
+        "title": "Build iOS Simulator",
+        "category": "RustFerry"
+      },
+      {
+        "command": "rustferry.buildPhysicalIos",
+        "title": "Build for Physical iPhone",
+        "category": "RustFerry"
+      },
+      {
+        "command": "rustferry.buildSelected",
+        "title": "Build Selected Target",
+        "category": "RustFerry",
+        "icon": "$(tools)"
+      },
+      {
+        "command": "rustferry.clean",
+        "title": "Clean Generated Files",
+        "category": "RustFerry"
+      },
+      {
+        "command": "rustferry.addCapability",
+        "title": "Add Capability",
+        "category": "RustFerry",
+        "icon": "$(add)"
+      },
+      {
+        "command": "rustferry.removeCapability",
+        "title": "Remove Capability",
+        "category": "RustFerry",
+        "icon": "$(remove)"
+      },
+      {
+        "command": "rustferry.openConfig",
+        "title": "Open ferry.toml",
+        "category": "RustFerry"
+      },
+      {
+        "command": "rustferry.openApp",
+        "title": "Open src/app.rs",
+        "category": "RustFerry"
+      },
+      {
+        "command": "rustferry.openDocumentation",
+        "title": "Open Documentation",
+        "category": "RustFerry",
+        "icon": "$(book)"
+      },
+      {
+        "command": "rustferry.refreshDevices",
+        "title": "Refresh Devices",
+        "category": "RustFerry",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "rustferry.selectDevice",
+        "title": "Select Device",
+        "category": "RustFerry"
+      },
+      {
+        "command": "rustferry.selectDevelopmentTeam",
+        "title": "Select Development Team",
+        "category": "RustFerry"
+      },
+      {
+        "command": "rustferry.runIosDoctor",
+        "title": "Run iOS Doctor",
+        "category": "RustFerry"
+      },
+      {
+        "command": "rustferry.openIosSigningGuide",
+        "title": "Open iOS Signing Guide",
+        "category": "RustFerry"
+      },
+      {
+        "command": "rustferry.install",
+        "title": "Install",
+        "category": "RustFerry"
+      },
+      {
+        "command": "rustferry.run",
+        "title": "Run",
+        "category": "RustFerry"
+      },
+      {
+        "command": "rustferry.logs",
+        "title": "Open Logs",
+        "category": "RustFerry"
+      },
+      {
+        "command": "rustferry.stopLogs",
+        "title": "Stop Logs",
+        "category": "RustFerry",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "rustferry.revealArtifact",
+        "title": "Reveal Artifact",
+        "category": "RustFerry"
+      },
+      {
+        "command": "rustferry.copyArtifactPath",
+        "title": "Copy Artifact Path",
+        "category": "RustFerry"
+      },
+      {
+        "command": "rustferry.inspectArtifact",
+        "title": "Inspect Artifact Metadata",
+        "category": "RustFerry"
+      },
+      {
+        "command": "rustferry.deleteArtifact",
+        "title": "Delete Generated Artifact…",
+        "category": "RustFerry"
+      },
+      {
+        "command": "rustferry.trustWorkspace",
+        "title": "Manage Workspace Trust",
+        "category": "RustFerry"
+      },
+      {
+        "command": "rustferry.selectCli",
+        "title": "Select cargo-ferry Executable",
+        "category": "RustFerry"
+      }
+    ],
+    "configuration": {
+      "title": "RustFerry",
+      "properties": {
+        "rustferry.cliPath": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "description": "Absolute path to cargo-ferry. Leave empty to discover cargo-ferry or cargo from PATH and the standard Cargo bin directory."
+        },
+        "rustferry.developmentMode": {
+          "type": "boolean",
+          "default": false,
+          "scope": "resource",
+          "description": "Allow the extension to use this repository's target/debug/cargo-ferry binary. Never enables arbitrary workspace executables."
+        },
+        "rustferry.defaultPlatform": {
+          "type": "string",
+          "enum": [
+            "android",
+            "ios-simulator",
+            "ios-device"
+          ],
+          "enumDescriptions": [
+            "Android APK",
+            "iOS Simulator application",
+            "Officially development-signed physical iPhone application"
+          ],
+          "default": "android",
+          "scope": "resource"
+        },
+        "rustferry.defaultProfile": {
+          "type": "string",
+          "enum": [
+            "debug",
+            "release"
+          ],
+          "default": "debug",
+          "scope": "resource"
+        },
+        "rustferry.ios.developmentTeam": {
+          "type": "string",
+          "default": "",
+          "pattern": "^[A-Z0-9]{10}$|^$",
+          "scope": "machine",
+          "description": "Non-secret Apple Development Team ID used for physical iPhone builds. Select it with RustFerry: Select Development Team."
+        },
+        "rustferry.validation.debounceMs": {
+          "type": "number",
+          "default": 350,
+          "minimum": 100,
+          "maximum": 5000,
+          "scope": "resource",
+          "description": "Delay before validating a changed ferry.toml."
+        },
+        "rustferry.maxProtocolLineBytes": {
+          "type": "number",
+          "default": 1048576,
+          "minimum": 65536,
+          "maximum": 4194304,
+          "scope": "resource",
+          "description": "Maximum UTF-8 byte length of one IDE protocol event."
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "rustferry",
+          "title": "RustFerry",
+          "icon": "media/ferry.svg"
+        }
+      ]
+    },
+    "views": {
+      "rustferry": [
+        {
+          "id": "rustferry.project",
+          "name": "Project"
+        },
+        {
+          "id": "rustferry.devices",
+          "name": "Devices"
+        },
+        {
+          "id": "rustferry.artifacts",
+          "name": "Artifacts"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "rustferry.project",
+        "contents": "Open a folder containing `ferry.toml`, or create a project.\n[Create RustFerry Project](command:rustferry.createProject)\n[Open Documentation](command:rustferry.openDocumentation)",
+        "when": "!rustferry.hasProjects"
+      },
+      {
+        "view": "rustferry.project",
+        "contents": "RustFerry commands are disabled until this workspace is trusted.\n[Manage Workspace Trust](command:rustferry.trustWorkspace)",
+        "when": "rustferry.hasProjects && !isWorkspaceTrusted"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "rustferry.refresh",
+          "when": "view == rustferry.project",
+          "group": "navigation"
+        },
+        {
+          "command": "rustferry.buildSelected",
+          "when": "view == rustferry.project && isWorkspaceTrusted && rustferry.executionAvailable",
+          "group": "navigation"
+        },
+        {
+          "command": "rustferry.refreshDevices",
+          "when": "view == rustferry.devices && isWorkspaceTrusted && rustferry.executionAvailable",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "rustferry.check",
+          "when": "view == rustferry.project && viewItem == rustferry.project && isWorkspaceTrusted",
+          "group": "inline@1"
+        },
+        {
+          "command": "rustferry.buildSelected",
+          "when": "view == rustferry.project && viewItem == rustferry.project && isWorkspaceTrusted",
+          "group": "inline@2"
+        },
+        {
+          "command": "rustferry.addCapability",
+          "when": "view == rustferry.project && viewItem == rustferry.capabilities && isWorkspaceTrusted",
+          "group": "inline"
+        },
+        {
+          "command": "rustferry.selectDevice",
+          "when": "view == rustferry.devices && viewItem == rustferry.device",
+          "group": "inline"
+        },
+        {
+          "command": "rustferry.revealArtifact",
+          "when": "view == rustferry.artifacts && viewItem == rustferry.artifact",
+          "group": "inline@1"
+        },
+        {
+          "command": "rustferry.copyArtifactPath",
+          "when": "view == rustferry.artifacts && viewItem == rustferry.artifact",
+          "group": "inline@2"
+        },
+        {
+          "command": "rustferry.inspectArtifact",
+          "when": "view == rustferry.artifacts && viewItem == rustferry.artifact",
+          "group": "rustferry@1"
+        },
+        {
+          "command": "rustferry.deleteArtifact",
+          "when": "view == rustferry.artifacts && viewItem == rustferry.artifact && isWorkspaceTrusted",
+          "group": "rustferry@9"
+        }
+      ]
+    },
+    "taskDefinitions": [
+      {
+        "type": "rustferry",
+        "required": [
+          "action"
+        ],
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "check",
+              "doctor",
+              "build",
+              "install",
+              "run",
+              "logs",
+              "clean"
+            ],
+            "description": "RustFerry operation."
+          },
+          "project": {
+            "type": "string",
+            "description": "Absolute project root or workspace-relative project path."
+          },
+          "platform": {
+            "type": "string",
+            "enum": [
+              "android",
+              "ios-simulator",
+              "ios-device"
+            ]
+          },
+          "profile": {
+            "type": "string",
+            "enum": [
+              "debug",
+              "release"
+            ]
+          },
+          "device": {
+            "type": "string",
+            "description": "Stable device identifier."
+          },
+          "team": {
+            "type": "string",
+            "description": "Apple Development Team ID for physical iPhone build/install/run tasks."
+          }
+        }
+      }
+    ],
+    "walkthroughs": [
+      {
+        "id": "rustferry.gettingStarted",
+        "title": "Getting Started with RustFerry",
+        "description": "From tool discovery to a validated mobile artifact.",
+        "steps": [
+          {
+            "id": "rustferry.gettingStarted.locate",
+            "title": "Locate cargo-ferry",
+            "description": "[Select an executable](command:rustferry.selectCli) or install cargo-ferry with Cargo.",
+            "media": {
+              "markdown": "media/walkthrough/locate.md"
+            }
+          },
+          {
+            "id": "rustferry.gettingStarted.project",
+            "title": "Open or create a project",
+            "description": "[Create a RustFerry project](command:rustferry.createProject), or open a folder containing ferry.toml.",
+            "media": {
+              "markdown": "media/walkthrough/project.md"
+            },
+            "completionEvents": [
+              "onCommand:rustferry.createProject"
+            ]
+          },
+          {
+            "id": "rustferry.gettingStarted.doctor",
+            "title": "Check the toolchains",
+            "description": "[Run RustFerry Doctor](command:rustferry.doctor) for actionable Android and Apple setup checks.",
+            "media": {
+              "markdown": "media/walkthrough/doctor.md"
+            },
+            "completionEvents": [
+              "onCommand:rustferry.doctor"
+            ]
+          },
+          {
+            "id": "rustferry.gettingStarted.edit",
+            "title": "Edit src/app.rs",
+            "description": "[Open the application entry point](command:rustferry.openApp). rust-analyzer continues to provide Rust language features.",
+            "media": {
+              "markdown": "media/walkthrough/edit.md"
+            },
+            "completionEvents": [
+              "onCommand:rustferry.openApp"
+            ]
+          },
+          {
+            "id": "rustferry.gettingStarted.target",
+            "title": "Select a target",
+            "description": "[Choose Android or iOS Simulator](command:rustferry.selectTarget).",
+            "media": {
+              "markdown": "media/walkthrough/target.md"
+            },
+            "completionEvents": [
+              "onCommand:rustferry.selectTarget"
+            ]
+          },
+          {
+            "id": "rustferry.gettingStarted.build",
+            "title": "Build an application",
+            "description": "[Build the selected target](command:rustferry.buildSelected) and inspect the validated artifact.",
+            "media": {
+              "markdown": "media/walkthrough/build.md"
+            },
+            "completionEvents": [
+              "onCommand:rustferry.buildSelected"
+            ]
+          },
+          {
+            "id": "rustferry.gettingStarted.device",
+            "title": "Select a device and run",
+            "description": "[Refresh devices](command:rustferry.refreshDevices), then select, install, and run when the CLI reports support.",
+            "media": {
+              "markdown": "media/walkthrough/device.md"
+            },
+            "completionEvents": [
+              "onCommand:rustferry.selectDevice"
+            ]
+          },
+          {
+            "id": "rustferry.gettingStarted.docs",
+            "title": "Open the documentation",
+            "description": "[Browse the RustFerry guide](command:rustferry.openDocumentation).",
+            "media": {
+              "markdown": "media/walkthrough/docs.md"
+            },
+            "completionEvents": [
+              "onCommand:rustferry.openDocumentation"
+            ]
+          }
+        ]
+      }
+    ],
+    "snippets": [
+      {
+        "language": "rust",
+        "path": "./snippets/rust.json"
+      }
+    ]
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:host": "npm run build && node scripts/run-host-tests.mjs",
+    "perf": "node scripts/measure-performance.mjs",
+    "package": "npm run build && vsce package --no-dependencies --out dist/rustferry-vscode.vsix",
+    "vsix:smoke": "node scripts/smoke-vsix.mjs dist/rustferry-vscode.vsix",
+    "check": "npm run typecheck && npm run lint && npm test && npm run package && npm run vsix:smoke"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "26.1.2",
+    "@types/vscode": "1.100.0",
+    "@vscode/test-electron": "3.1.0",
+    "@vscode/vsce": "3.9.2",
+    "esbuild": "0.28.1",
+    "eslint": "10.8.0",
+    "fflate": "0.8.3",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.65.0",
+    "vitest": "4.1.10"
+  }
+}

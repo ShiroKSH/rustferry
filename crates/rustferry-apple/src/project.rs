@@ -1,12 +1,27 @@
 use std::{collections::BTreeMap, fmt::Write as _, fs};
 
 use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
+use rustferry_codegen::{
+    GeneratedAssetPlatform, GeneratedAssetSet, read_generated_platform_assets,
+    render_platform_assets_for,
+};
 use rustferry_core::{
     FerryConfig, Orientation, ProjectAssets, Theme, validate_application_identifier,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::{AppleError, error::io_error};
+
+/// How generated iOS image assets are packaged into a Simulator application.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IosAssetPackaging {
+    /// Compile `Assets.xcassets` with Xcode when an iOS Simulator runtime is available.
+    #[default]
+    CompiledCatalog,
+    /// Preserve SDK-only builds with validated PNG resources when no runtime is installed.
+    SdkOnlyResources,
+}
 
 /// Inputs for deterministic hidden Xcode project generation.
 #[derive(Clone, Debug, PartialEq)]
@@ -17,6 +32,8 @@ pub struct IosProjectSpec {
     pub binary_name: String,
     /// Validated project icon and splash inputs, when generating a build host.
     pub assets: Option<ProjectAssets>,
+    /// Asset representation emitted into the hidden Xcode project.
+    pub asset_packaging: IosAssetPackaging,
 }
 
 impl IosProjectSpec {
@@ -26,6 +43,7 @@ impl IosProjectSpec {
             config,
             binary_name: binary_name.into(),
             assets: None,
+            asset_packaging: IosAssetPackaging::CompiledCatalog,
         }
     }
 
@@ -33,6 +51,13 @@ impl IosProjectSpec {
     #[must_use]
     pub fn with_assets(mut self, assets: ProjectAssets) -> Self {
         self.assets = Some(assets);
+        self
+    }
+
+    /// Select the generated Xcode project's asset representation.
+    #[must_use]
+    pub fn with_asset_packaging(mut self, asset_packaging: IosAssetPackaging) -> Self {
+        self.asset_packaging = asset_packaging;
         self
     }
 }
@@ -61,6 +86,63 @@ impl GeneratedAppleProject {
 /// binary names, application groups, or generated metadata are invalid.
 #[allow(clippy::too_many_lines)]
 pub fn generate_ios_project(spec: &IosProjectSpec) -> Result<GeneratedAppleProject, AppleError> {
+    let asset_catalog = if spec.asset_packaging == IosAssetPackaging::CompiledCatalog {
+        spec.assets.as_ref().map(rendered_ios_catalog).transpose()?
+    } else {
+        None
+    };
+    generate_ios_project_with_catalog(spec, asset_catalog)
+}
+
+pub(crate) fn generate_ios_project_from_asset_set(
+    spec: &IosProjectSpec,
+    generated: &GeneratedAssetSet,
+) -> Result<GeneratedAppleProject, AppleError> {
+    if spec.asset_packaging != IosAssetPackaging::CompiledCatalog {
+        return Err(AppleError::InvalidRequest(
+            "a generated iOS asset set can only back compiled-catalog packaging".to_owned(),
+        ));
+    }
+    let assets = spec.assets.as_ref().ok_or_else(|| {
+        AppleError::InvalidRequest(
+            "an iOS generated asset set requires a validated project asset snapshot".to_owned(),
+        )
+    })?;
+    if generated.fingerprint != assets.fingerprint() {
+        return Err(AppleError::InvalidRequest(format!(
+            "generated iOS asset cache {} differs from the planned source snapshot",
+            generated.root
+        )));
+    }
+    let expected = rendered_ios_catalog(assets)?;
+    let cached = read_generated_platform_assets(generated, GeneratedAssetPlatform::Ios)?;
+    if cached != expected {
+        return Err(AppleError::InvalidRequest(format!(
+            "generated iOS asset cache {} differs from deterministic catalog output",
+            generated.root
+        )));
+    }
+    generate_ios_project_with_catalog(spec, Some(cached))
+}
+
+fn rendered_ios_catalog(assets: &ProjectAssets) -> Result<Vec<(Utf8PathBuf, Vec<u8>)>, AppleError> {
+    let mut catalog = render_platform_assets_for(assets, GeneratedAssetPlatform::Ios)?
+        .files
+        .into_iter()
+        .filter_map(|(path, bytes)| {
+            path.strip_prefix("ios")
+                .ok()
+                .map(|relative| (relative.to_owned(), bytes))
+        })
+        .collect::<Vec<_>>();
+    catalog.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(catalog)
+}
+
+fn generate_ios_project_with_catalog(
+    spec: &IosProjectSpec,
+    asset_catalog: Option<Vec<(Utf8PathBuf, Vec<u8>)>>,
+) -> Result<GeneratedAppleProject, AppleError> {
     validate_spec(spec)?;
     let mut files = BTreeMap::new();
     insert_text(
@@ -74,13 +156,7 @@ pub fn generate_ios_project(spec: &IosProjectSpec) -> Result<GeneratedAppleProje
         render_scheme(&spec.binary_name),
     );
     insert_text(&mut files, "Info.plist", render_app_info_plist(spec));
-    if let Some(assets) = &spec.assets {
-        files.insert(Utf8PathBuf::from("FerryIcon.png"), assets.icon().to_vec());
-        files.insert(
-            Utf8PathBuf::from("FerrySplash.png"),
-            assets.splash().to_vec(),
-        );
-    }
+    insert_app_assets(&mut files, spec, asset_catalog)?;
     insert_text(
         &mut files,
         "FerryResources.json",
@@ -162,6 +238,28 @@ pub fn generate_ios_project(spec: &IosProjectSpec) -> Result<GeneratedAppleProje
     }
 
     Ok(GeneratedAppleProject { files })
+}
+
+fn insert_app_assets(
+    files: &mut BTreeMap<Utf8PathBuf, Vec<u8>>,
+    spec: &IosProjectSpec,
+    asset_catalog: Option<Vec<(Utf8PathBuf, Vec<u8>)>>,
+) -> Result<(), AppleError> {
+    if let Some(asset_catalog) = asset_catalog {
+        for (relative, bytes) in asset_catalog {
+            validate_relative_path(&relative)?;
+            files.insert(relative, bytes);
+        }
+    } else if spec.asset_packaging == IosAssetPackaging::SdkOnlyResources
+        && let Some(assets) = &spec.assets
+    {
+        files.insert(Utf8PathBuf::from("FerryIcon.png"), assets.icon().to_vec());
+        files.insert(
+            Utf8PathBuf::from("FerrySplash.png"),
+            assets.splash().to_vec(),
+        );
+    }
+    Ok(())
 }
 
 /// Write generated files below an internal root, rejecting absolute paths, traversal, and symlinks.
@@ -265,11 +363,16 @@ fn insert_text(files: &mut BTreeMap<Utf8PathBuf, Vec<u8>>, path: &str, contents:
 fn render_app_info_plist(spec: &IosProjectSpec) -> String {
     let app = &spec.config.app;
     let mut extra = String::new();
-    let launch_screen = if spec.assets.is_some() {
-        extra.push_str("  <key>CFBundleIconFile</key>\n  <string>FerryIcon</string>\n  <key>UILaunchImageFile</key>\n  <string>FerrySplash</string>\n");
-        "  <dict>\n    <key>UIImageName</key>\n    <string>FerrySplash</string>\n  </dict>"
-    } else {
-        "  <dict/>"
+    let launch_screen = match (spec.assets.is_some(), spec.asset_packaging) {
+        (true, IosAssetPackaging::CompiledCatalog) => {
+            extra.push_str("  <key>CFBundleIconName</key>\n  <string>AppIcon</string>\n");
+            "  <dict>\n    <key>UIImageName</key>\n    <string>FerryLaunch</string>\n  </dict>"
+        }
+        (true, IosAssetPackaging::SdkOnlyResources) => {
+            extra.push_str("  <key>CFBundleIconFile</key>\n  <string>FerryIcon</string>\n  <key>UILaunchImageFile</key>\n  <string>FerrySplash</string>\n");
+            "  <dict>\n    <key>UIImageName</key>\n    <string>FerrySplash</string>\n  </dict>"
+        }
+        (false, _) => "  <dict/>",
     };
     if !spec.config.capabilities.deep_links.schemes.is_empty() {
         extra.push_str("  <key>CFBundleURLTypes</key>\n  <array>\n    <dict>\n      <key>CFBundleURLName</key>\n      <string>");
@@ -508,6 +611,8 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
     let widget = spec.config.extensions.widget.enabled;
     let live_activity = spec.config.extensions.live_activity.enabled;
     let assets = spec.assets.is_some();
+    let compiled_assets = assets && spec.asset_packaging == IosAssetPackaging::CompiledCatalog;
+    let sdk_only_assets = assets && spec.asset_packaging == IosAssetPackaging::SdkOnlyResources;
     let mut output = String::from(
         "// !$*UTF8*$!\n{\n\tarchiveVersion = 1;\n\tclasses = {};\n\tobjectVersion = 77;\n\tobjects = {\n\n",
     );
@@ -527,7 +632,14 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
         id(12),
         id(6)
     );
-    if assets {
+    if compiled_assets {
+        let _ = writeln!(
+            output,
+            "\t\t{} /* Assets.xcassets in Resources */ = {{isa = PBXBuildFile; fileRef = {} /* Assets.xcassets */; }};",
+            id(9),
+            id(5)
+        );
+    } else if sdk_only_assets {
         let _ = writeln!(
             output,
             "\t\t{} /* FerryIcon.png in Resources */ = {{isa = PBXBuildFile; fileRef = {} /* FerryIcon.png */; }};",
@@ -677,15 +789,21 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
         spec.binary_name,
         app_product
     );
-    if assets {
+    if compiled_assets {
         let _ = writeln!(
             output,
-            "\t\t{} /* FerryIcon.png */ = {{isa = PBXFileReference; lastKnownFileType = file; path = FerryIcon.png; sourceTree = \"<group>\"; }};",
+            "\t\t{} /* Assets.xcassets */ = {{isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = \"<group>\"; }};",
+            id(5)
+        );
+    } else if sdk_only_assets {
+        let _ = writeln!(
+            output,
+            "\t\t{} /* FerryIcon.png */ = {{isa = PBXFileReference; lastKnownFileType = image.png; path = FerryIcon.png; sourceTree = \"<group>\"; }};",
             id(5)
         );
         let _ = writeln!(
             output,
-            "\t\t{} /* FerrySplash.png */ = {{isa = PBXFileReference; lastKnownFileType = file; path = FerrySplash.png; sourceTree = \"<group>\"; }};",
+            "\t\t{} /* FerrySplash.png */ = {{isa = PBXFileReference; lastKnownFileType = image.png; path = FerrySplash.png; sourceTree = \"<group>\"; }};",
             id(19)
         );
     }
@@ -770,7 +888,9 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
         id(7),
         id(6)
     );
-    if assets {
+    if compiled_assets {
+        let _ = writeln!(output, "\t\t\t\t{} /* Assets.xcassets */,", id(5));
+    } else if sdk_only_assets {
         let _ = writeln!(output, "\t\t\t\t{} /* FerryIcon.png */,", id(5));
         let _ = writeln!(output, "\t\t\t\t{} /* FerrySplash.png */,", id(19));
     }
@@ -929,7 +1049,15 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
     output.push_str("\t\t\t);\n\t\t};\n/* End PBXProject section */\n\n");
 
     output.push_str("/* Begin PBXResourcesBuildPhase section */\n");
-    if assets {
+    if compiled_assets {
+        let _ = write!(
+            output,
+            "\t\t{} /* Resources */ = {{isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = ({} /* Assets.xcassets in Resources */, {} /* FerryResources.json in Resources */,); runOnlyForDeploymentPostprocessing = 0; }};\n",
+            id(13),
+            id(9),
+            id(12)
+        );
+    } else if sdk_only_assets {
         let _ = write!(
             output,
             "\t\t{} /* Resources */ = {{isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = ({} /* FerryIcon.png in Resources */, {} /* FerrySplash.png in Resources */, {} /* FerryResources.json in Resources */,); runOnlyForDeploymentPostprocessing = 0; }};\n",
@@ -1036,11 +1164,17 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
         } else {
             ""
         };
+        let asset_catalog_settings = if compiled_assets {
+            "ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; "
+        } else {
+            ""
+        };
         let _ = write!(
             output,
-            "\t\t{} /* {} */ = {{isa = XCBuildConfiguration; buildSettings = {{AD_HOC_CODE_SIGNING_ALLOWED = YES; ARCHS = arm64; ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = NO; CODE_SIGN_IDENTITY = \"-\"; CODE_SIGNING_ALLOWED = YES; CODE_SIGNING_REQUIRED = YES; {}COMPRESS_PNG_FILES = NO; CURRENT_PROJECT_VERSION = {}; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = Info.plist; IPHONEOS_DEPLOYMENT_TARGET = {}; LD_RUNPATH_SEARCH_PATHS = (\"$(inherited)\", \"@executable_path/Frameworks\",); MARKETING_VERSION = {}; ONLY_ACTIVE_ARCH = NO; PRODUCT_BUNDLE_IDENTIFIER = {}; PRODUCT_NAME = {}; SDKROOT = iphonesimulator; SKIP_INSTALL = NO; STRIP_PNG_TEXT = NO; SUPPORTED_PLATFORMS = iphonesimulator; TARGETED_DEVICE_FAMILY = \"1,2\"; }}; name = {}; }};\n",
+            "\t\t{} /* {} */ = {{isa = XCBuildConfiguration; buildSettings = {{AD_HOC_CODE_SIGNING_ALLOWED = YES; ARCHS = arm64; {}ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = NO; CODE_SIGN_IDENTITY = \"-\"; CODE_SIGNING_ALLOWED = YES; CODE_SIGNING_REQUIRED = YES; {}COMPRESS_PNG_FILES = NO; CURRENT_PROJECT_VERSION = {}; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = Info.plist; IPHONEOS_DEPLOYMENT_TARGET = {}; LD_RUNPATH_SEARCH_PATHS = (\"$(inherited)\", \"@executable_path/Frameworks\",); MARKETING_VERSION = {}; ONLY_ACTIVE_ARCH = NO; PRODUCT_BUNDLE_IDENTIFIER = {}; PRODUCT_NAME = {}; SDKROOT = iphonesimulator; SKIP_INSTALL = NO; STRIP_PNG_TEXT = NO; SUPPORTED_PLATFORMS = iphonesimulator; TARGETED_DEVICE_FAMILY = \"1,2\"; }}; name = {}; }};\n",
             id(config_id),
             name,
+            asset_catalog_settings,
             code_sign_entitlements,
             build_version,
             min_version,
@@ -1282,6 +1416,15 @@ fn create_directories_without_symlinks(
 mod tests {
     use super::*;
 
+    mod png_fixture {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/opaque_png.rs"
+        ));
+    }
+
+    use png_fixture::OPAQUE_1024_PNG as PNG;
+
     fn starter() -> IosProjectSpec {
         IosProjectSpec::new(
             FerryConfig::starter("Weather & Wind", "com.example.weather"),
@@ -1321,8 +1464,7 @@ mod tests {
     }
 
     #[test]
-    fn project_assets_are_compiled_and_referenced_by_plist() {
-        const PNG: &[u8] = include_bytes!("../../../examples/counter/assets/icon.png");
+    fn project_assets_emit_a_real_catalog_and_build_settings() {
         let temporary = tempfile::tempdir().unwrap();
         let root = Utf8Path::from_path(temporary.path()).unwrap();
         fs::create_dir(root.join("assets")).unwrap();
@@ -1331,27 +1473,90 @@ mod tests {
         let generated =
             generate_ios_project(&starter().with_assets(ProjectAssets::load(root).unwrap()))
                 .unwrap();
-        assert_eq!(
-            generated
-                .files
-                .get(Utf8Path::new("FerryIcon.png"))
-                .map(Vec::as_slice),
-            Some(PNG)
-        );
+        assert!(generated.files.contains_key(Utf8Path::new(
+            "Assets.xcassets/AppIcon.appiconset/AppIcon-1024-1x.png"
+        )));
+        assert!(generated.files.contains_key(Utf8Path::new(
+            "Assets.xcassets/AppIcon.appiconset/Contents.json"
+        )));
+        assert!(generated.files.contains_key(Utf8Path::new(
+            "Assets.xcassets/FerryLaunch.imageset/Contents.json"
+        )));
+        let plist = generated.text(Utf8Path::new("Info.plist")).unwrap();
+        assert!(plist.contains("<string>AppIcon</string>"));
+        assert!(plist.contains("<string>FerryLaunch</string>"));
+        assert!(!plist.contains("UILaunchImageFile"));
+        let pbx = generated
+            .text(Utf8Path::new("FerryHost.xcodeproj/project.pbxproj"))
+            .unwrap();
+        assert!(pbx.contains("Assets.xcassets in Resources"));
+        assert!(pbx.contains("folder.assetcatalog"));
+        assert!(pbx.contains("ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon"));
+        assert!(pbx.contains("COMPRESS_PNG_FILES = NO"));
+    }
+
+    #[test]
+    fn sdk_only_assets_preserve_runtime_free_xcode_builds() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = Utf8Path::from_path(temporary.path()).unwrap();
+        fs::create_dir(root.join("assets")).unwrap();
+        fs::write(root.join("assets/icon.png"), PNG).unwrap();
+        fs::write(root.join("assets/splash.png"), PNG).unwrap();
+        let generated = generate_ios_project(
+            &starter()
+                .with_assets(ProjectAssets::load(root).unwrap())
+                .with_asset_packaging(IosAssetPackaging::SdkOnlyResources),
+        )
+        .unwrap();
+
+        assert_eq!(generated.files[Utf8Path::new("FerryIcon.png")], PNG);
+        assert_eq!(generated.files[Utf8Path::new("FerrySplash.png")], PNG);
         assert!(
-            generated
+            !generated
                 .files
-                .contains_key(Utf8Path::new("FerrySplash.png"))
+                .keys()
+                .any(|path| path.starts_with("Assets.xcassets"))
         );
         let plist = generated.text(Utf8Path::new("Info.plist")).unwrap();
+        assert!(plist.contains("<key>CFBundleIconFile</key>"));
         assert!(plist.contains("<string>FerryIcon</string>"));
+        assert!(plist.contains("<key>UILaunchImageFile</key>"));
         assert!(plist.contains("<string>FerrySplash</string>"));
+        assert!(!plist.contains("CFBundleIconName"));
         let pbx = generated
             .text(Utf8Path::new("FerryHost.xcodeproj/project.pbxproj"))
             .unwrap();
         assert!(pbx.contains("FerryIcon.png in Resources"));
         assert!(pbx.contains("FerrySplash.png in Resources"));
-        assert!(pbx.contains("COMPRESS_PNG_FILES = NO"));
+        assert!(!pbx.contains("Assets.xcassets in Resources"));
+        assert!(!pbx.contains("ASSETCATALOG_COMPILER_APPICON_NAME"));
+    }
+
+    #[test]
+    fn cached_catalog_is_consumed_and_tampering_is_rejected() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = Utf8Path::from_path(temporary.path()).unwrap();
+        fs::create_dir(root.join("assets")).unwrap();
+        fs::write(root.join("assets/icon.png"), PNG).unwrap();
+        fs::write(root.join("assets/splash.png"), PNG).unwrap();
+        let assets = ProjectAssets::load(root).unwrap();
+        let generated_assets = rustferry_codegen::generate_platform_assets(root, None).unwrap();
+        let spec = starter().with_assets(assets);
+        let generated = generate_ios_project_from_asset_set(&spec, &generated_assets).unwrap();
+        let catalog_path = Utf8Path::new("Assets.xcassets/AppIcon.appiconset/AppIcon-1024-1x.png");
+        assert_eq!(
+            generated.files.get(catalog_path),
+            Some(&fs::read(generated_assets.root.join("ios").join(catalog_path)).unwrap())
+        );
+
+        fs::write(
+            generated_assets
+                .root
+                .join("ios/Assets.xcassets/AppIcon.appiconset/AppIcon-1024-1x.png"),
+            b"tampered",
+        )
+        .unwrap();
+        assert!(generate_ios_project_from_asset_set(&spec, &generated_assets).is_err());
     }
 
     #[test]

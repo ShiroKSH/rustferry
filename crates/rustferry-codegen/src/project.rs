@@ -73,8 +73,10 @@ impl PlatformSelection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeDependency {
     /// A crates.io version used by installed releases.
-    Version(String),
-    /// A local source checkout used by repository development and tests.
+    Registry(String),
+    /// Inherit `rustferry` from the containing Cargo workspace.
+    Workspace,
+    /// An explicit local source checkout used by development and tests.
     Path(Utf8PathBuf),
 }
 
@@ -83,6 +85,8 @@ pub enum RuntimeDependency {
 pub struct ProjectRequest {
     /// Directory/display/package name supplied by the user.
     pub name: String,
+    /// Optional human-readable application name, independent of the directory/package name.
+    pub display_name: Option<String>,
     /// Explicit application identifier, or a safe derived default.
     pub identifier: Option<String>,
     /// Base template plus capability fragments.
@@ -208,7 +212,12 @@ impl ProjectGenerator {
     }
 
     fn context(&self) -> Result<(ProjectNames, TemplateContext), GenerationError> {
-        let names = derive_project_names(&self.request.name, self.request.identifier.as_deref())?;
+        let mut names =
+            derive_project_names(&self.request.name, self.request.identifier.as_deref())?;
+        if let Some(display_name) = &self.request.display_name {
+            validate_display_name(display_name)?;
+            names.display_name.clone_from(display_name);
+        }
         let mut config = config_for_template(&names, self.request.template);
         config.platforms = self.request.platforms.platforms();
         config.validate_or_error()?;
@@ -220,6 +229,21 @@ impl ProjectGenerator {
         };
         Ok((names, context))
     }
+}
+
+fn validate_display_name(display_name: &str) -> Result<(), GenerationError> {
+    let length = display_name.chars().count();
+    if display_name.trim() != display_name
+        || !(1..=128).contains(&length)
+        || display_name.chars().any(char::is_control)
+    {
+        return Err(GenerationError::InvalidDisplayName {
+            message:
+                "use 1–128 characters without leading/trailing whitespace or control characters"
+                    .to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn config_for_template(names: &ProjectNames, kind: TemplateKind) -> FerryConfig {
@@ -304,6 +328,12 @@ pub enum GenerationError {
     /// Invalid project or application identifier.
     #[error(transparent)]
     Naming(#[from] rustferry_core::NamingError),
+    /// An explicit user-facing application name was empty or unsafe for platform metadata.
+    #[error("invalid display name: {message}")]
+    InvalidDisplayName {
+        /// Exact portable display-name requirement.
+        message: String,
+    },
     /// Invalid generated configuration.
     #[error(transparent)]
     Config(#[from] rustferry_core::ConfigError),
@@ -372,10 +402,11 @@ mod tests {
     fn request(name: &str) -> ProjectRequest {
         ProjectRequest {
             name: name.to_owned(),
+            display_name: None,
             identifier: None,
             template: TemplateKind::Starter,
             platforms: PlatformSelection::Both,
-            runtime_dependency: RuntimeDependency::Version("0.1.0".to_owned()),
+            runtime_dependency: RuntimeDependency::Registry("0.1.0".to_owned()),
         }
     }
 
@@ -456,6 +487,58 @@ mod tests {
             .unwrap();
         let config = FerryConfig::load(&generated.destination.join("ferry.toml")).unwrap();
         assert_eq!(config.platforms, vec![TargetPlatform::Android]);
+    }
+
+    #[test]
+    fn runtime_dependency_sources_render_explicitly() {
+        let parent = tempfile::tempdir().unwrap();
+        let parent = Utf8Path::from_path(parent.path()).unwrap();
+
+        let mut registry = request("registry-runtime");
+        registry.runtime_dependency = RuntimeDependency::Registry("1.2.3".to_owned());
+        let registry = ProjectGenerator::new(parent, registry).generate().unwrap();
+        let registry_manifest =
+            fs::read_to_string(registry.destination.join("Cargo.toml")).unwrap();
+        assert!(registry_manifest.contains("version = \"=1.2.3\""));
+        assert!(registry_manifest.contains("[workspace]"));
+        assert!(!registry_manifest.contains("workspace = true"));
+        assert!(!registry_manifest.contains(parent.as_str()));
+
+        let mut workspace = request("workspace-runtime");
+        workspace.runtime_dependency = RuntimeDependency::Workspace;
+        let workspace = ProjectGenerator::new(parent, workspace).generate().unwrap();
+        let workspace_manifest =
+            fs::read_to_string(workspace.destination.join("Cargo.toml")).unwrap();
+        assert!(workspace_manifest.contains("workspace = true"));
+        assert!(!workspace_manifest.contains("[workspace]"));
+
+        let runtime = parent.join("runtime with spaces");
+        let mut path = request("path-runtime");
+        path.runtime_dependency = RuntimeDependency::Path(runtime.clone());
+        let path = ProjectGenerator::new(parent, path).generate().unwrap();
+        let path_manifest = fs::read_to_string(path.destination.join("Cargo.toml")).unwrap();
+        assert!(path_manifest.contains("[workspace]"));
+        assert!(path_manifest.contains(&format!("path = {:?}", runtime.as_str())));
+    }
+
+    #[test]
+    fn explicit_display_name_is_written_without_changing_package_name() {
+        let parent = tempfile::tempdir().unwrap();
+        let parent = Utf8Path::from_path(parent.path()).unwrap();
+        let mut named = request("weather-client");
+        named.display_name = Some("Weather · Europe".to_owned());
+        let generated = ProjectGenerator::new(parent, named).generate().unwrap();
+        assert_eq!(generated.names.crate_name, "weather-client");
+        assert_eq!(generated.names.display_name, "Weather · Europe");
+        let config = FerryConfig::load(&generated.destination.join("ferry.toml")).unwrap();
+        assert_eq!(config.app.name, "Weather · Europe");
+
+        let mut invalid = request("invalid-display");
+        invalid.display_name = Some(" trailing ".to_owned());
+        assert!(matches!(
+            ProjectGenerator::new(parent, invalid).plan(),
+            Err(GenerationError::InvalidDisplayName { .. })
+        ));
     }
 
     #[test]

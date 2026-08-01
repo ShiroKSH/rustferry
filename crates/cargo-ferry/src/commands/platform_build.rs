@@ -11,36 +11,52 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use toml_edit::DocumentMut;
 
+use cargo_ferry::deployment::{
+    PhysicalBuildRequest, SigningService, SystemExecutor, ToolCommand, ValidatedArtifact,
+};
+
 use crate::cli::{AndroidBuildArgs, BuildArgs, BuildPlatform, IosBuildArgs};
 use crate::error::CliError;
 use crate::output::Reporter;
 use crate::project::find_project_root;
 
 #[derive(Debug, Serialize)]
-struct BuildOutput {
-    project: String,
-    platform: &'static str,
-    profile: &'static str,
-    artifact: Option<String>,
-    expected_artifact: String,
-    validated: bool,
-    validation: Option<Value>,
-    plan: Option<Value>,
-    log_directory: Option<String>,
-    cache_hits: Vec<String>,
-    cache_misses: Vec<String>,
-    device_required: bool,
-    dry_run: bool,
+pub(crate) struct BuildOutput {
+    pub(crate) project: String,
+    pub(crate) platform: &'static str,
+    pub(crate) profile: &'static str,
+    pub(crate) artifact: Option<String>,
+    #[serde(skip)]
+    pub(crate) deployment_artifact: Option<ValidatedArtifact>,
+    pub(crate) expected_artifact: String,
+    pub(crate) validated: bool,
+    pub(crate) validation: Option<Value>,
+    pub(crate) plan: Option<Value>,
+    pub(crate) log_directory: Option<String>,
+    pub(crate) cache_hits: Vec<String>,
+    pub(crate) cache_misses: Vec<String>,
+    pub(crate) device_required: bool,
+    pub(crate) dry_run: bool,
 }
 
 #[derive(Debug)]
-struct CargoTargets {
-    package: String,
-    library: String,
-    binary: String,
+pub(crate) struct CargoTargets {
+    pub(crate) package: String,
+    pub(crate) library: String,
+    pub(crate) binary: String,
 }
 
 pub fn run(arguments: BuildArgs, dry_run: bool, reporter: &Reporter) -> Result<(), CliError> {
+    let output = execute(arguments, dry_run, reporter)?;
+    report_build(&output, reporter);
+    Ok(())
+}
+
+pub(crate) fn execute(
+    arguments: BuildArgs,
+    dry_run: bool,
+    reporter: &Reporter,
+) -> Result<BuildOutput, CliError> {
     let root = find_project_root(arguments.project_dir.as_deref())?;
     let config = rustferry_core::FerryConfig::load(&root.join("ferry.toml"))?;
     let targets = read_cargo_targets(&root)?;
@@ -74,7 +90,7 @@ fn build_android(
     release: bool,
     dry_run: bool,
     reporter: &Reporter,
-) -> Result<(), CliError> {
+) -> Result<BuildOutput, CliError> {
     require_platform(&config, TargetPlatform::Android, "android")?;
     let mut request = AndroidBuildRequest::new(
         root,
@@ -117,6 +133,7 @@ fn build_android(
             platform: "android",
             profile: profile_name(release),
             artifact: None,
+            deployment_artifact: None,
             expected_artifact,
             validated: false,
             validation: None,
@@ -127,8 +144,7 @@ fn build_android(
             device_required: false,
             dry_run: true,
         };
-        report_build(&output, reporter);
-        return Ok(());
+        return Ok(output);
     }
 
     request.dry_run = false;
@@ -136,14 +152,15 @@ fn build_android(
         AndroidBuildOutcome::Built(artifact) => artifact,
         AndroidBuildOutcome::DryRun(_) => unreachable!("build request returned a dry-run plan"),
     };
+    let deployment_artifact = ValidatedArtifact::from_android_build(&artifact)?;
     let cacheable_stages = ["aapt2-compile", "aapt2-link", "d8"];
     let cache_misses = cacheable_stages
         .iter()
-        .filter(|stage| !artifact.cache_hits.iter().any(|hit| hit == **stage))
+        .filter(|stage| !artifact.cache_hits().iter().any(|hit| hit == **stage))
         .map(ToString::to_string)
         .collect::<Vec<_>>();
     for stage in cacheable_stages {
-        let result = if artifact.cache_hits.iter().any(|hit| hit == stage) {
+        let result = if artifact.cache_hits().iter().any(|hit| hit == stage) {
             "hit"
         } else {
             "miss"
@@ -154,19 +171,19 @@ fn build_android(
         project: root.to_string(),
         platform: "android",
         profile: profile_name(release),
-        artifact: Some(artifact.apk.to_string()),
+        artifact: Some(artifact.apk().to_string()),
+        deployment_artifact: Some(deployment_artifact),
         expected_artifact,
         validated: true,
-        validation: Some(serde_json::to_value(&artifact.validation).unwrap_or(Value::Null)),
+        validation: Some(serde_json::to_value(artifact.validation()).unwrap_or(Value::Null)),
         plan: None,
-        log_directory: Some(artifact.log_dir.to_string()),
-        cache_hits: artifact.cache_hits,
+        log_directory: Some(artifact.log_dir().to_string()),
+        cache_hits: artifact.cache_hits().to_vec(),
         cache_misses,
         device_required: false,
         dry_run: false,
     };
-    report_build(&output, reporter);
-    Ok(())
+    Ok(output)
 }
 
 fn ios_request(
@@ -193,42 +210,37 @@ fn build_ios(
     release: bool,
     dry_run: bool,
     reporter: &Reporter,
-) -> Result<(), CliError> {
+) -> Result<BuildOutput, CliError> {
     require_platform(&config, TargetPlatform::Ios, "ios")?;
     if arguments.device {
-        let team = arguments.team.as_deref().unwrap_or("<missing>");
-        return Err(CliError::Unsupported {
-            message: format!(
-                "physical iPhone builds are not implemented; requested development team `{team}`"
-            ),
-            help: "Build a real, locally ad-hoc-signed Simulator bundle with `cargo ferry build ios --simulator`. Physical-device support will use only official Xcode signing and provisioning when implemented.".to_owned(),
-        });
+        return build_ios_device(root, config, targets, arguments, release, dry_run, reporter);
     }
     if !arguments.simulator {
         return Err(CliError::Unsupported {
             message: "an iOS build mode was not selected".to_owned(),
-            help: "Pass `--simulator`, or use `--device --team TEAM` when physical-device support becomes available.".to_owned(),
+            help: "Pass `--simulator`, or use `--device --team TEAM` for an officially signed physical-device build.".to_owned(),
         });
     }
 
     let mut request = ios_request(root, config, targets, release);
     request.dry_run = true;
     let planned = rustferry_apple::build_ios_simulator(&request)?;
-    for command in &planned.plan.commands {
+    let planned_plan = planned.plan();
+    for command in &planned_plan.commands {
         reporter.verbose(format!(
             "{}: {}",
             command.stage,
             command.redacted_argv().join(" ")
         ));
     }
-    let expected_artifact = planned.plan.artifact_path.to_string();
+    let expected_artifact = planned_plan.artifact_path.to_string();
     let log_directory = root
         .join("target/ferry/ios/logs")
         .join(profile_name(release))
         .to_string();
     if dry_run {
         let commands = planned
-            .plan
+            .plan()
             .commands
             .iter()
             .map(|command| {
@@ -244,13 +256,14 @@ fn build_ios(
             platform: "ios-simulator",
             profile: profile_name(release),
             artifact: None,
+            deployment_artifact: None,
             expected_artifact,
             validated: false,
             validation: None,
             plan: Some(json!({
-                "rust_target": planned.plan.rust_target,
+                "rust_target": &planned_plan.rust_target,
                 "commands": commands,
-                "generated_files": planned.plan.generated_files,
+                "generated_files": &planned_plan.generated_files,
             })),
             log_directory: Some(log_directory),
             cache_hits: Vec::new(),
@@ -258,17 +271,17 @@ fn build_ios(
             device_required: false,
             dry_run: true,
         };
-        report_build(&output, reporter);
-        return Ok(());
+        return Ok(output);
     }
 
     request.dry_run = false;
     let built = rustferry_apple::build_ios_simulator(&request)?;
-    let artifact = built.artifact.ok_or_else(|| CliError::Unsupported {
+    let deployment_artifact = ValidatedArtifact::from_ios_simulator_build(&built)?;
+    let artifact = built.artifact().ok_or_else(|| CliError::Unsupported {
         message: "the iOS builder completed without an artifact".to_owned(),
         help: "Inspect the iOS build logs and rerun `cargo ferry doctor`.".to_owned(),
     })?;
-    let validation = built.validation.ok_or_else(|| CliError::Unsupported {
+    let validation = built.validation().ok_or_else(|| CliError::Unsupported {
         message: "the iOS builder completed without artifact validation".to_owned(),
         help:
             "Inspect the iOS validation logs; unvalidated bundles are never reported as successful."
@@ -279,6 +292,7 @@ fn build_ios(
         platform: "ios-simulator",
         profile: profile_name(release),
         artifact: Some(artifact.to_string()),
+        deployment_artifact: Some(deployment_artifact),
         expected_artifact,
         validated: true,
         validation: Some(serde_json::to_value(validation).unwrap_or(Value::Null)),
@@ -289,8 +303,104 @@ fn build_ios(
         device_required: false,
         dry_run: false,
     };
-    report_build(&output, reporter);
-    Ok(())
+    Ok(output)
+}
+
+fn build_ios_device(
+    root: &Utf8Path,
+    config: rustferry_core::FerryConfig,
+    targets: &CargoTargets,
+    arguments: &IosBuildArgs,
+    release: bool,
+    dry_run: bool,
+    reporter: &Reporter,
+) -> Result<BuildOutput, CliError> {
+    let team = arguments
+        .team
+        .as_deref()
+        .ok_or_else(|| CliError::Unsupported {
+            message: "physical iOS builds require an explicit Apple Development Team".to_owned(),
+            help: "Run `cargo ferry signing teams`, then pass `--device --team TEAM_ID`."
+                .to_owned(),
+        })?;
+    let mut request = PhysicalBuildRequest::new(root, config, targets.binary.clone(), team);
+    request.package_name = Some(targets.package.clone());
+    request.release = release;
+    request.allow_provisioning_updates = arguments.allow_provisioning_updates;
+    request
+        .provisioning_profile
+        .clone_from(&arguments.provisioning_profile);
+
+    let service = SigningService::new(SystemExecutor);
+    let plan = service.plan(&request)?;
+    reporter.verbose(format!(
+        "physical-ios-rust: {}",
+        display_tool_command(&plan.cargo_command).join(" ")
+    ));
+    reporter.verbose(format!(
+        "physical-ios-xcode: {}",
+        display_tool_command(&plan.xcodebuild_command).join(" ")
+    ));
+    let expected_artifact = plan.artifact_path.to_string();
+    if dry_run {
+        return Ok(BuildOutput {
+            project: root.to_string(),
+            platform: "ios-device",
+            profile: profile_name(release),
+            artifact: None,
+            deployment_artifact: None,
+            expected_artifact,
+            validated: false,
+            validation: None,
+            plan: Some(json!({
+                "schema_version": plan.schema_version,
+                "rust_target": plan.rust_target,
+                "generated_root": plan.generated_root,
+                "artifact": plan.artifact_path,
+                "allow_provisioning_updates": plan.allow_provisioning_updates,
+                "commands": [
+                    display_tool_command(&plan.cargo_command),
+                    display_tool_command(&plan.xcodebuild_command),
+                ],
+            })),
+            log_directory: None,
+            cache_hits: Vec::new(),
+            cache_misses: Vec::new(),
+            device_required: false,
+            dry_run: true,
+        });
+    }
+
+    let built = service.build(&request)?;
+    let artifact_path = built.artifact.path().to_string();
+    let validation = serde_json::to_value(&built.validation).unwrap_or(Value::Null);
+    Ok(BuildOutput {
+        project: root.to_string(),
+        platform: "ios-device",
+        profile: profile_name(release),
+        artifact: Some(artifact_path),
+        deployment_artifact: Some(built.artifact),
+        expected_artifact,
+        validated: true,
+        validation: Some(validation),
+        plan: None,
+        log_directory: None,
+        cache_hits: Vec::new(),
+        cache_misses: Vec::new(),
+        device_required: false,
+        dry_run: false,
+    })
+}
+
+fn display_tool_command(command: &ToolCommand) -> Vec<String> {
+    std::iter::once(command.program.to_string())
+        .chain(
+            command
+                .arguments
+                .iter()
+                .map(|argument| argument.to_string_lossy().into_owned()),
+        )
+        .collect()
 }
 
 fn report_build(output: &BuildOutput, reporter: &Reporter) {
@@ -316,7 +426,7 @@ fn report_build(output: &BuildOutput, reporter: &Reporter) {
     );
 }
 
-fn read_cargo_targets(root: &Utf8Path) -> Result<CargoTargets, CliError> {
+pub(crate) fn read_cargo_targets(root: &Utf8Path) -> Result<CargoTargets, CliError> {
     let path = root.join("Cargo.toml");
     let source = fs::read_to_string(&path).map_err(|source| CliError::Io {
         action: "read Cargo manifest",

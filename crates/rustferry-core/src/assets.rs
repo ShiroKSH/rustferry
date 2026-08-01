@@ -15,8 +15,25 @@ const MAX_DECODED_ASSET_BYTES: u64 = 128 * 1024 * 1024;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectAssets {
     icon: Vec<u8>,
+    icon_metadata: PngMetadata,
     splash: Vec<u8>,
+    splash_metadata: PngMetadata,
     fingerprint: String,
+}
+
+/// Metadata read from a validated PNG without trusting filename extensions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct PngMetadata {
+    /// Pixel width.
+    pub width: u32,
+    /// Pixel height.
+    pub height: u32,
+    /// PNG bit depth.
+    pub bit_depth: u8,
+    /// PNG color-type number from the IHDR chunk.
+    pub color_type: u8,
+    /// Whether pixels can carry transparency through alpha or a `tRNS` chunk.
+    pub has_alpha: bool,
 }
 
 impl ProjectAssets {
@@ -29,8 +46,8 @@ impl ProjectAssets {
     pub fn load(project_dir: &Utf8Path) -> Result<Self, AssetError> {
         let icon_path = project_dir.join("assets/icon.png");
         let splash_path = project_dir.join("assets/splash.png");
-        let icon = read_png(&icon_path, "icon")?;
-        let splash = read_png(&splash_path, "splash")?;
+        let (icon, icon_metadata) = read_png(&icon_path, "icon")?;
+        let (splash, splash_metadata) = read_png(&splash_path, "splash")?;
         let mut hasher = Sha256::new();
         hasher.update(b"cargo-ferry-project-assets-v1");
         hasher.update(b"icon.png\0");
@@ -40,7 +57,9 @@ impl ProjectAssets {
         let fingerprint = hex::encode(&hasher.finalize()[..12]);
         Ok(Self {
             icon,
+            icon_metadata,
             splash,
+            splash_metadata,
             fingerprint,
         })
     }
@@ -50,9 +69,19 @@ impl ProjectAssets {
         &self.icon
     }
 
+    /// Validated icon dimensions and color representation.
+    pub const fn icon_metadata(&self) -> PngMetadata {
+        self.icon_metadata
+    }
+
     /// Validated splash PNG bytes.
     pub fn splash(&self) -> &[u8] {
         &self.splash
+    }
+
+    /// Validated splash dimensions and color representation.
+    pub const fn splash_metadata(&self) -> PngMetadata {
+        self.splash_metadata
     }
 
     /// Stable digest of both filenames and file contents.
@@ -109,7 +138,7 @@ pub enum AssetError {
     },
 }
 
-fn read_png(path: &Utf8Path, kind: &'static str) -> Result<Vec<u8>, AssetError> {
+fn read_png(path: &Utf8Path, kind: &'static str) -> Result<(Vec<u8>, PngMetadata), AssetError> {
     let metadata = fs::symlink_metadata(path).map_err(|source| {
         if source.kind() == io::ErrorKind::NotFound {
             AssetError::NotRegular {
@@ -145,11 +174,15 @@ fn read_png(path: &Utf8Path, kind: &'static str) -> Result<Vec<u8>, AssetError> 
         path: path.to_owned(),
         source,
     })?;
-    validate_png(&bytes, path, kind)?;
-    Ok(bytes)
+    let png_metadata = validate_png(&bytes, path, kind)?;
+    Ok((bytes, png_metadata))
 }
 
-fn validate_png(bytes: &[u8], path: &Utf8Path, kind: &'static str) -> Result<(), AssetError> {
+fn validate_png(
+    bytes: &[u8],
+    path: &Utf8Path,
+    kind: &'static str,
+) -> Result<PngMetadata, AssetError> {
     let invalid = |reason| AssetError::InvalidPng {
         kind,
         path: path.to_owned(),
@@ -159,7 +192,8 @@ fn validate_png(bytes: &[u8], path: &Utf8Path, kind: &'static str) -> Result<(),
         return Err(invalid("missing PNG signature or required chunks"));
     }
     let mut offset = PNG_SIGNATURE.len();
-    let mut dimensions = None;
+    let mut png_metadata = None;
+    let mut transparency = false;
     let mut idat = Vec::new();
     let mut finished = false;
     while offset < bytes.len() {
@@ -207,19 +241,28 @@ fn validate_png(bytes: &[u8], path: &Utf8Path, kind: &'static str) -> Result<(),
                 {
                     return Err(invalid("unsupported or invalid IHDR encoding"));
                 }
-                dimensions = Some((width, height));
+                png_metadata = Some(PngMetadata {
+                    width,
+                    height,
+                    bit_depth: data[8],
+                    color_type: data[9],
+                    has_alpha: matches!(data[9], 4 | 6),
+                });
             }
             b"IHDR" => return Err(invalid("first chunk is not a 13-byte IHDR")),
-            b"IDAT" if dimensions.is_some() && !finished => {
+            b"tRNS" if png_metadata.is_some() && idat.is_empty() && !finished => {
+                transparency = true;
+            }
+            b"IDAT" if png_metadata.is_some() && !finished => {
                 idat.extend_from_slice(&bytes[header_end..data_end]);
             }
-            b"IEND" if length == 0 && dimensions.is_some() && !idat.is_empty() => {
+            b"IEND" if length == 0 && png_metadata.is_some() && !idat.is_empty() => {
                 finished = true;
                 offset = chunk_end;
                 break;
             }
             b"IEND" => return Err(invalid("invalid IEND ordering or length")),
-            _ if dimensions.is_none() => return Err(invalid("IHDR is not the first chunk")),
+            _ if png_metadata.is_none() => return Err(invalid("IHDR is not the first chunk")),
             _ => {}
         }
         offset = chunk_end;
@@ -237,7 +280,9 @@ fn validate_png(bytes: &[u8], path: &Utf8Path, kind: &'static str) -> Result<(),
     {
         return Err(invalid("decoded image data is empty or exceeds 128 MiB"));
     }
-    Ok(())
+    let mut png_metadata = png_metadata.expect("validated PNG contains IHDR");
+    png_metadata.has_alpha |= transparency;
+    Ok(png_metadata)
 }
 
 fn valid_png_color_format(bit_depth: u8, color_type: u8) -> bool {
@@ -268,7 +313,14 @@ fn png_crc32(bytes: &[u8]) -> u32 {
 mod tests {
     use super::*;
 
-    const PNG: &[u8] = include_bytes!("../../../examples/counter/assets/icon.png");
+    mod png_fixture {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/opaque_png.rs"
+        ));
+    }
+
+    use png_fixture::OPAQUE_1024_PNG as PNG;
 
     fn fixture() -> (tempfile::TempDir, Utf8PathBuf) {
         let temporary = tempfile::tempdir().unwrap();
@@ -294,6 +346,11 @@ mod tests {
         let second = ProjectAssets::load(&root).unwrap();
         assert_eq!(first.fingerprint(), second.fingerprint());
         assert_eq!(first.icon(), PNG);
+        assert_eq!(
+            (first.icon_metadata().width, first.icon_metadata().height),
+            (1024, 1024)
+        );
+        assert!(!first.icon_metadata().has_alpha);
     }
 
     #[test]

@@ -1,0 +1,2 @@
+{"protocol_version":1,"operation_id":"vscode:cancel-1","timestamp_ms":1700000000000,"event":"operation_started","command":"build","workspace":"/tmp/RustFerry App"}
+{"protocol_version":1,"operation_id":"vscode:cancel-1","timestamp_ms":1700000000001,"event":"operation_cancelled","reason":"requested","duration_ms":1}

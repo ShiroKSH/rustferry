@@ -8,15 +8,17 @@ From the cargo-ferry checkout:
 
 ```console
 cargo install --path crates/cargo-ferry
-export CARGO_FERRY_RUNTIME_PATH="$PWD/crates/rustferry"
 ```
 
-The runtime override is required for projects generated from this pre-release checkout because `rustferry` 0.1.0 is not published. The package requires Rust 1.92 or newer. See [Installation](installation.md) for PowerShell syntax and mobile toolchains.
+The package requires Rust 1.92 or newer. Because `rustferry` 0.1.0 is not published yet, the contributor command below selects the checkout explicitly. A published release defaults to the registry and needs no path override. See [Installation](installation.md) for PowerShell syntax and mobile toolchains.
 
 ## 2. Generate the starter
 
 ```console
-cargo ferry new weather --id com.example.weather
+cargo ferry new weather \
+  --id com.example.weather \
+  --runtime-source path \
+  --runtime-path "$PWD/crates/rustferry"
 cd weather
 ```
 
@@ -56,6 +58,16 @@ cargo ferry build ios --simulator
 ```
 
 A zero exit from a finished platform build means the produced artifact passed the pipeline's inspections. Dry-run output, generated manifests, or skipped CI jobs are not artifact evidence. Check [Support matrix](support-matrix.md) and [Implementation status](STATUS.md) for the exact validated level in this revision.
+
+Deployment is a separate, explicit level:
+
+```console
+cargo ferry devices
+cargo ferry install android --device SERIAL
+cargo ferry run ios --simulator SIMULATOR_UDID
+```
+
+The current evidence does not include a running emulator, Simulator, or physical device.
 
 ## 6. Add capabilities deliberately
 

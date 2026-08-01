@@ -1,3 +1,4 @@
+use camino::Utf8Path;
 use rustferry_android::{DoctorOptions as AndroidDoctorOptions, doctor_android};
 use rustferry_apple::{AppleDoctorOptions, doctor_apple};
 use serde::Serialize;
@@ -9,18 +10,33 @@ use crate::project::find_project_root;
 
 #[derive(Debug, Serialize)]
 #[allow(clippy::struct_excessive_bools)]
-struct DoctorResult {
-    schema_version: u32,
-    ready_for_android_build: bool,
-    ready_for_ios_simulator_build: bool,
-    ready_for_ios_simulator_run: bool,
-    include_optional_tools: bool,
-    android: rustferry_android::DoctorReport,
-    ios: rustferry_apple::AppleDoctorReport,
+pub(crate) struct DoctorResult {
+    pub(crate) schema_version: u32,
+    pub(crate) ready_for_android_build: bool,
+    pub(crate) ready_for_ios_simulator_build: bool,
+    pub(crate) ready_for_ios_simulator_run: bool,
+    pub(crate) include_optional_tools: bool,
+    pub(crate) android: rustferry_android::DoctorReport,
+    pub(crate) ios: rustferry_apple::AppleDoctorReport,
 }
 
 pub fn run(arguments: &DoctorArgs, dry_run: bool, reporter: &Reporter) -> Result<(), CliError> {
-    let android_config = project_android_config().unwrap_or_default();
+    let result = inspect(arguments, dry_run, None)?;
+    reporter.success(
+        "doctor",
+        &result,
+        || human_report(&result, arguments.fix && dry_run),
+        &[],
+    );
+    Ok(())
+}
+
+pub(crate) fn inspect(
+    arguments: &DoctorArgs,
+    dry_run: bool,
+    project_dir: Option<&Utf8Path>,
+) -> Result<DoctorResult, CliError> {
+    let android_config = project_android_config(project_dir)?;
     let android = doctor_android(&AndroidDoctorOptions {
         android: android_config,
         ..AndroidDoctorOptions::default()
@@ -50,20 +66,24 @@ pub fn run(arguments: &DoctorArgs, dry_run: bool, reporter: &Reporter) -> Result
         }
     }
 
-    reporter.success(
-        "doctor",
-        &result,
-        || human_report(&result, arguments.fix && dry_run),
-        &[],
-    );
-    Ok(())
+    Ok(result)
 }
 
-fn project_android_config() -> Option<rustferry_core::AndroidConfig> {
-    let root = find_project_root(None).ok()?;
-    rustferry_core::FerryConfig::load(&root.join("ferry.toml"))
-        .ok()
-        .map(|config| config.android)
+fn project_android_config(
+    project_dir: Option<&Utf8Path>,
+) -> Result<rustferry_core::AndroidConfig, CliError> {
+    let root = match find_project_root(project_dir) {
+        Ok(root) => root,
+        Err(CliError::ProjectNotFound { .. }) if project_dir.is_none() => {
+            return Ok(rustferry_core::AndroidConfig::default());
+        }
+        Err(error) => return Err(error),
+    };
+    match rustferry_core::FerryConfig::load(&root.join("ferry.toml")) {
+        Ok(config) => Ok(config.android),
+        Err(_) if project_dir.is_none() => Ok(rustferry_core::AndroidConfig::default()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn fixes(result: &DoctorResult) -> Vec<String> {

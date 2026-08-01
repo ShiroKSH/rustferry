@@ -11,6 +11,7 @@
 <p align="center">
   <a href="https://github.com/ShiroKSH/rustferry/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/ShiroKSH/rustferry/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/ShiroKSH/rustferry/actions/workflows/platform-artifacts.yml"><img alt="Platform artifacts" src="https://github.com/ShiroKSH/rustferry/actions/workflows/platform-artifacts.yml/badge.svg"></a>
+  <a href="https://github.com/ShiroKSH/rustferry/actions/workflows/vscode-extension.yml"><img alt="VS Code extension" src="https://github.com/ShiroKSH/rustferry/actions/workflows/vscode-extension.yml/badge.svg"></a>
   <a href="#license"><img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-2f7d73"></a>
   <a href="https://www.rust-lang.org/tools/install"><img alt="Rust 1.92 or newer" src="https://img.shields.io/badge/rust-1.92%2B-cb5a31?logo=rust"></a>
 </p>
@@ -18,13 +19,16 @@
 RustFerry keeps application code and assets in an ordinary Rust project. When you build, it creates the required platform host below `target/ferry/`; that generated glue is disposable and stays out of your source tree.
 
 > [!IMPORTANT]
-> RustFerry is pre-release and build-only. [Platform artifacts run 30699379465](https://github.com/ShiroKSH/rustferry/actions/runs/30699379465) generated and inspected RustFerry-named Starter and Kitchen Sink projects: signed and aligned arm64 Android APKs, plus arm64 iOS Simulator `.app` bundles containing `FerryRuntimeBridge.framework` and signed WidgetKit/ActivityKit `.appex` products with checked entitlements. Runtime behavior has not been observed on an emulator, Simulator, or physical device. See the [support matrix](docs/support-matrix.md) and [evidence log](docs/STATUS.md).
+> RustFerry is pre-release. Real signed/aligned arm64 Android APKs and arm64 iOS Simulator `.app`/`.appex` bundles have been built and independently inspected. Device discovery, install, run, logs, the VS Code extension, and the official physical-iOS development pipeline are implemented, but runtime behavior has not yet been observed on an emulator, Simulator, or physical device. See the [support matrix](docs/support-matrix.md) and [evidence log](docs/STATUS.md).
 
 ## What it does
 
 - Generates Rust application projects from small, capability-aware templates.
 - Builds Android APKs directly with Cargo, the NDK, `aapt2`, `d8`, `zipalign`, and `apksigner`; no Gradle project to maintain.
 - Generates an Apple host under `target/ferry/` and invokes Xcode tooling for iOS Simulator builds; no Xcode project in application source.
+- Discovers devices and composes artifact-validated builds with typed install and launch operations through ADB, simctl, and devicectl, with bounded application-filtered logs.
+- Provides a native, trust-aware Visual Studio Code extension driven by a stable versioned JSON/NDJSON protocol.
+- Generates deterministic Android density assets plus tested iOS compiled-catalog and SDK-only resources from validated opaque PNG sources.
 - Exposes typed APIs for lifecycle events, network state, storage, permissions, haptics, clipboard, sharing, deep links, local notifications, widgets, and Live Activities.
 - Keeps host-side behavior testable with a deterministic runtime.
 
@@ -32,16 +36,25 @@ Capability availability and validation depth differ by platform. An API or gener
 
 ## Install from source
 
-RustFerry is not published to crates.io yet. Install it from a source checkout:
+RustFerry is not published to crates.io yet. The release path is registry-first:
+
+```console
+cargo install cargo-ferry
+cargo ferry new weather
+```
+
+That path becomes usable when the coordinated crates are published. For a contributor checkout, select the local runtime explicitly:
 
 ```console
 git clone https://github.com/ShiroKSH/rustferry.git
 cd rustferry
 cargo install --locked --path crates/cargo-ferry
-export CARGO_FERRY_RUNTIME_PATH="$PWD/crates/rustferry"
+cargo ferry new weather \
+  --runtime-source path \
+  --runtime-path "$PWD/crates/rustferry"
 ```
 
-`CARGO_FERRY_RUNTIME_PATH` must remain set while generating projects from this pre-release checkout. Rust 1.92 or newer is required. Mobile builds also need the relevant Android SDK/NDK or a full Xcode installation.
+`--runtime-source workspace` supports monorepo development. `CARGO_FERRY_RUNTIME_PATH` remains an optional contributor-only development override when no explicit source is supplied; normal published installations do not require it. Rust 1.92 or newer is required. Mobile builds also need the relevant Android SDK/NDK or a full Xcode installation.
 
 ## Create a project
 
@@ -84,7 +97,43 @@ On macOS, build an arm64 iOS Simulator application:
 cargo ferry build ios --simulator
 ```
 
-These commands build and inspect artifacts. RustFerry does not currently provide install, launch, or device-management commands.
+Build for a physical iPhone with official development signing:
+
+```console
+cargo ferry signing teams
+cargo ferry build ios --device --team ABCDE12345
+```
+
+Build never touches a device. Deployment is explicit:
+
+```console
+cargo ferry devices
+cargo ferry install android --device SERIAL
+cargo ferry run ios --simulator SIMULATOR_UDID
+cargo ferry logs android --device SERIAL
+```
+
+The current environment had no emulator, Simulator runtime, signing identity, or physical device, so these deployment backends are implemented and deterministically tested but not runtime-validated.
+
+## Visual Studio Code
+
+Build and install the packaged extension:
+
+```console
+cd editors/vscode
+npm ci
+npm run package
+code --install-extension dist/rustferry-vscode.vsix
+```
+
+After the coordinated crates are published, the normal editor flow is:
+
+```console
+cargo ferry new weather
+code weather
+```
+
+In the opened workspace, run **RustFerry: Doctor**, then **RustFerry: Build Android**. The extension discovers trusted `ferry.toml` workspaces and exposes project/device/artifact trees, diagnostics, Check, Install, Run, Logs, capability changes, and a native Create Project wizard. It delegates all build and deployment logic to `cargo-ferry` protocol v1.
 
 ## Add capabilities
 
@@ -113,6 +162,8 @@ Configuration lives in `ferry.toml`. Generated platform files remain under `targ
 - [Architecture](docs/architecture.md)
 - [Android setup](docs/android/setup.md)
 - [iOS Simulator setup](docs/ios/simulator.md)
+- [VS Code extension](docs/editors/vscode.md)
+- [Devices, install, run, and logs](docs/deployment/install-run-logs.md)
 - [Support matrix](docs/support-matrix.md)
 - [Implementation evidence](docs/STATUS.md)
 - [Threat model](docs/THREAT_MODEL.md)

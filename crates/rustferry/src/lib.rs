@@ -59,6 +59,9 @@ pub use backend::{Operation, PlatformBackend};
 pub use error::{Error, Result};
 pub use runtime::{Runtime, RuntimeBuilder, RuntimeGuard};
 
+/// Exact runtime package version selected by Cargo.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Whether the active runtime has a concrete implementation for `operation`.
 pub fn supports(operation: Operation) -> bool {
     runtime::current_runtime().supports(operation)

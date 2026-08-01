@@ -1,6 +1,8 @@
 /target/
 /.idea/
 /.vscode/
+__pycache__/
+*.py[cod]
 *.log
 *.jks
 *.keystore

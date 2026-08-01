@@ -45,8 +45,8 @@ pub(crate) fn project_files(
             ),
         ),
         text_file("src/capabilities/mod.rs", ""),
-        binary_file("assets/icon.png", PLACEHOLDER_PNG),
-        binary_file("assets/splash.png", PLACEHOLDER_PNG),
+        binary_file("assets/icon.png", DEFAULT_ICON_PNG),
+        binary_file("assets/splash.png", DEFAULT_SPLASH_PNG),
     ];
 
     if context.kind == TemplateKind::Minimal {
@@ -129,11 +129,16 @@ pub(crate) fn project_files(
 }
 
 fn cargo_manifest(context: &TemplateContext) -> String {
-    let runtime_source = match &context.runtime_dependency {
-        RuntimeDependency::Version(version) => {
-            format!("version = {}", toml_string(version))
-        }
-        RuntimeDependency::Path(path) => format!("path = {}", toml_string(path.as_str())),
+    let (runtime_source, workspace_section) = match &context.runtime_dependency {
+        RuntimeDependency::Registry(version) => (
+            format!("version = {}", toml_string(&format!("={version}"))),
+            "[workspace]\n\n",
+        ),
+        RuntimeDependency::Workspace => ("workspace = true".to_owned(), ""),
+        RuntimeDependency::Path(path) => (
+            format!("path = {}", toml_string(path.as_str())),
+            "[workspace]\n\n",
+        ),
     };
     let mut capabilities = Vec::new();
     if context.config.capabilities.storage.enabled {
@@ -170,7 +175,7 @@ fn cargo_manifest(context: &TemplateContext) -> String {
         .join(", ");
 
     format!(
-        "[package]\nname = {crate_name}\nversion = \"0.1.0\"\nedition = \"2024\"\nrust-version = \"1.92\"\npublish = false\n\n[workspace]\n\n[lib]\nname = {crate_ident}\ncrate-type = [\"cdylib\", \"rlib\"]\n\n[[bin]]\nname = {crate_name}\npath = \"src/main.rs\"\n\n[dependencies]\nrustferry = {{ package = {runtime_package}, {runtime_source}, default-features = false, features = [{features}] }}\nserde = {{ version = \"1.0\", features = [\"derive\"] }}\nslint = {{ version = \"=1.17.1\", default-features = false, features = [\"std\", \"compat-1-2\", \"backend-winit\", \"backend-android-activity-06\", \"renderer-skia\"] }}\nthiserror = \"2.0\"\n\n[lints.rust]\nunsafe_code = \"deny\"\n",
+        "[package]\nname = {crate_name}\nversion = \"0.1.0\"\nedition = \"2024\"\nrust-version = \"1.92\"\npublish = false\n\n{workspace_section}[lib]\nname = {crate_ident}\ncrate-type = [\"cdylib\", \"rlib\"]\n\n[[bin]]\nname = {crate_name}\npath = \"src/main.rs\"\n\n[dependencies]\nrustferry = {{ package = {runtime_package}, {runtime_source}, default-features = false, features = [{features}] }}\nserde = {{ version = \"1.0\", features = [\"derive\"] }}\nslint = {{ version = \"=1.17.1\", default-features = false, features = [\"std\", \"compat-1-2\", \"backend-winit\", \"backend-android-activity-06\", \"renderer-skia\"] }}\nthiserror = \"2.0\"\n\n[lints.rust]\nunsafe_code = \"deny\"\n",
         crate_name = toml_string(&context.names.crate_name),
         crate_ident = toml_string(&context.names.crate_name.replace('-', "_")),
         runtime_package = toml_string(rustferry_core::brand::RUNTIME_PACKAGE),
@@ -300,10 +305,5 @@ fn binary_file(path: &str, contents: &[u8]) -> ProjectFile {
     }
 }
 
-const PLACEHOLDER_PNG: &[u8] = &[
-    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
-    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
-    0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x30, 0x8c, 0xf9, 0xfa,
-    0x1f, 0x00, 0x04, 0xc6, 0x02, 0x82, 0x13, 0x1b, 0x88, 0x47, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
-    0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
-];
+const DEFAULT_ICON_PNG: &[u8] = include_bytes!("../assets/default-icon.png");
+const DEFAULT_SPLASH_PNG: &[u8] = include_bytes!("../assets/default-splash.png");

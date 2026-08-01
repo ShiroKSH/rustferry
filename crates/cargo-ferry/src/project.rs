@@ -1,19 +1,22 @@
 use std::ffi::OsString;
 #[cfg(unix)]
 use std::fs;
-use std::io::{Read, Write as _};
+use std::io::Write as _;
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use camino::{Utf8Path, Utf8PathBuf};
+use rustferry_core::process_control::{
+    BoundedOutputCapture, DEFAULT_PROCESS_OUTPUT_LIMIT, OutputCaptureStatus,
+};
 
 use crate::error::CliError;
 use crate::output::Reporter;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_mins(30);
-type OutputReader = Receiver<std::io::Result<Vec<u8>>>;
+const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(1);
 
 /// Resolve a `RustFerry` project from an explicit path or the current directory.
 pub fn find_project_root(explicit: Option<&Utf8Path>) -> Result<Utf8PathBuf, CliError> {
@@ -69,6 +72,27 @@ fn run_captured_with_timeout(
     reporter: &Reporter,
     timeout: Duration,
 ) -> Result<Output, CliError> {
+    run_captured_with_limits(
+        program,
+        arguments,
+        current_directory,
+        stage,
+        reporter,
+        timeout,
+        DEFAULT_PROCESS_OUTPUT_LIMIT,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_captured_with_limits(
+    program: &Utf8Path,
+    arguments: &[OsString],
+    current_directory: &Utf8Path,
+    stage: &'static str,
+    reporter: &Reporter,
+    timeout: Duration,
+    output_limit: usize,
+) -> Result<Output, CliError> {
     reporter.verbose(format_command(program, arguments));
     let mut command = Command::new(program);
     command
@@ -86,82 +110,124 @@ fn run_captured_with_timeout(
     })?;
     let process_group = child.id();
     let _process_group_guard = track_child(&mut child, program)?;
-    let (stdout_reader, stderr_reader) = capture_output(&mut child, program)?;
+    let mut capture = match capture_output(&mut child, program, output_limit) {
+        Ok(capture) => capture,
+        Err(error) => {
+            terminate_process_tree(&mut child, process_group);
+            return Err(error);
+        }
+    };
     let started = Instant::now();
-    let status = loop {
+    let mut status = None;
+    loop {
         if rustferry_core::process_control::interrupt_requested() {
             terminate_process_tree(&mut child, process_group);
+            drain_after_termination(&mut capture);
             return Err(CliError::CommandInterrupted {
                 tool: program.to_string(),
                 stage,
             });
         }
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if started.elapsed() < timeout => {
-                thread::sleep(Duration::from_millis(25));
-            }
-            Ok(None) => {
-                terminate_process_tree(&mut child, process_group);
-                break None;
-            }
+        let capture_status = match capture.poll() {
+            Ok(capture_status) => capture_status,
             Err(source) => {
                 terminate_process_tree(&mut child, process_group);
-                return Err(CliError::Io {
-                    action: "wait for external command",
-                    path: program.to_owned(),
-                    source,
-                });
+                return Err(output_read_error(program, source));
+            }
+        };
+        if let OutputCaptureStatus::LimitExceeded(stream) = capture_status {
+            terminate_process_tree(&mut child, process_group);
+            drain_after_termination(&mut capture);
+            return Err(CliError::ProcessOutputTooLarge {
+                tool: program.to_string(),
+                stage,
+                stream: stream.to_string(),
+                limit_bytes: output_limit,
+            });
+        }
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(exit_status)) => status = Some(exit_status),
+                Ok(None) => {}
+                Err(source) => {
+                    terminate_process_tree(&mut child, process_group);
+                    return Err(CliError::Io {
+                        action: "wait for external command",
+                        path: program.to_owned(),
+                        source,
+                    });
+                }
             }
         }
-    };
-    let Some(status) = status else {
-        return Err(CliError::CommandTimedOut {
-            tool: program.to_string(),
-            stage,
-            timeout_seconds: timeout.as_secs(),
-        });
-    };
-    let stdout = receive_reader(&stdout_reader, started, timeout).map_err(|source| {
-        if source.kind() == std::io::ErrorKind::Interrupted {
+        if status.is_some() && capture.is_complete() {
+            break;
+        }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
             terminate_process_tree(&mut child, process_group);
-            return CliError::CommandInterrupted {
+            drain_after_termination(&mut capture);
+            return Err(CliError::CommandTimedOut {
                 tool: program.to_string(),
                 stage,
-            };
+                timeout_seconds: timeout.as_secs(),
+            });
         }
-        CliError::Io {
-            action: "read external command stdout",
-            path: program.to_owned(),
-            source,
-        }
-    })?;
-    let stderr = receive_reader(&stderr_reader, started, timeout).map_err(|source| {
-        if source.kind() == std::io::ErrorKind::Interrupted {
+        if capture.is_complete() {
+            thread::sleep(remaining.min(OUTPUT_POLL_INTERVAL));
+        } else if let Err(source) = capture.wait_timeout(remaining.min(OUTPUT_POLL_INTERVAL)) {
             terminate_process_tree(&mut child, process_group);
-            return CliError::CommandInterrupted {
-                tool: program.to_string(),
-                stage,
-            };
+            return Err(output_read_error(program, source));
         }
-        CliError::Io {
-            action: "read external command stderr",
-            path: program.to_owned(),
-            source,
-        }
-    })?;
-    let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
-        terminate_process_tree(&mut child, process_group);
-        return Err(CliError::CommandTimedOut {
-            tool: program.to_string(),
-            stage,
-            timeout_seconds: timeout.as_secs(),
-        });
-    };
+    }
+    let captured = capture.into_partial_output();
     Ok(Output {
-        status,
-        stdout,
-        stderr,
+        status: status.expect("completed capture requires a reaped child"),
+        stdout: captured.stdout,
+        stderr: captured.stderr,
+    })
+}
+
+fn output_read_error(program: &Utf8Path, source: std::io::Error) -> CliError {
+    CliError::Io {
+        action: "read external command output",
+        path: program.to_owned(),
+        source,
+    }
+}
+
+fn drain_after_termination(capture: &mut BoundedOutputCapture) {
+    let started = Instant::now();
+    while !capture.is_complete() {
+        let remaining = OUTPUT_DRAIN_GRACE.saturating_sub(started.elapsed());
+        if remaining.is_zero()
+            || capture
+                .wait_timeout(remaining.min(OUTPUT_POLL_INTERVAL))
+                .is_err()
+        {
+            break;
+        }
+    }
+}
+
+fn capture_output(
+    child: &mut Child,
+    program: &Utf8Path,
+    output_limit: usize,
+) -> Result<BoundedOutputCapture, CliError> {
+    let stdout = child.stdout.take().ok_or_else(|| CliError::Io {
+        action: "capture command stdout",
+        path: program.to_owned(),
+        source: std::io::Error::other("spawned process did not expose stdout"),
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| CliError::Io {
+        action: "capture command stderr",
+        path: program.to_owned(),
+        source: std::io::Error::other("spawned process did not expose stderr"),
+    })?;
+    BoundedOutputCapture::spawn(stdout, stderr, output_limit).map_err(|source| CliError::Io {
+        action: "start command output readers",
+        path: program.to_owned(),
+        source,
     })
 }
 
@@ -178,59 +244,6 @@ fn track_child(
             source,
         }
     })
-}
-
-fn capture_output(
-    child: &mut Child,
-    program: &Utf8Path,
-) -> Result<(OutputReader, OutputReader), CliError> {
-    let stdout = child.stdout.take().ok_or_else(|| CliError::Io {
-        action: "capture command stdout",
-        path: program.to_owned(),
-        source: std::io::Error::other("spawned process did not expose stdout"),
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| CliError::Io {
-        action: "capture command stderr",
-        path: program.to_owned(),
-        source: std::io::Error::other("spawned process did not expose stderr"),
-    })?;
-    Ok((spawn_reader(stdout), spawn_reader(stderr)))
-}
-
-fn spawn_reader(mut reader: impl Read + Send + 'static) -> OutputReader {
-    let (sender, receiver) = mpsc::sync_channel(1);
-    thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let result = reader.read_to_end(&mut bytes).map(|_| bytes);
-        let _ = sender.send(result);
-    });
-    receiver
-}
-
-fn receive_reader(
-    reader: &Receiver<std::io::Result<Vec<u8>>>,
-    started: Instant,
-    timeout: Duration,
-) -> std::io::Result<Option<Vec<u8>>> {
-    loop {
-        if rustferry_core::process_control::interrupt_requested() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "command output drain interrupted",
-            ));
-        }
-        let remaining = timeout.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
-            return Ok(None);
-        }
-        match reader.recv_timeout(remaining.min(Duration::from_millis(25))) {
-            Ok(result) => return result.map(Some),
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {
-                return Err(std::io::Error::other("command output reader disconnected"));
-            }
-        }
-    }
 }
 
 #[cfg(unix)]
@@ -383,6 +396,8 @@ fn shell_display(value: &str) -> String {
 mod tests {
     use super::*;
 
+    const TEST_OUTPUT_LIMIT: usize = 64 * 1024;
+
     #[test]
     fn timeout_is_not_held_open_by_descendant_pipes() {
         let temporary = tempfile::tempdir().unwrap();
@@ -400,5 +415,57 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, CliError::CommandTimedOut { .. }));
         assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    #[test]
+    fn oversized_descendant_output_stops_the_process_group() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temporary.path().to_owned()).unwrap();
+        let pid_path = root.join("writer.pid");
+        let reporter = Reporter::new(false, true, false);
+        let script = "(sleep 0.1; exec /usr/bin/yes overflow) & writer=$!; printf '%s\n' \"$writer\" > \"$1\"; wait";
+        let started = Instant::now();
+        let error = run_captured_with_limits(
+            Utf8Path::new("/bin/sh"),
+            &[
+                OsString::from("-c"),
+                OsString::from(script),
+                OsString::from("rustferry-output-test"),
+                OsString::from(pid_path.as_str()),
+            ],
+            &root,
+            "oversized descendant output",
+            &reporter,
+            Duration::from_secs(5),
+            TEST_OUTPUT_LIMIT,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CliError::ProcessOutputTooLarge {
+                ref stream,
+                limit_bytes: TEST_OUTPUT_LIMIT,
+                ..
+            } if stream == "stdout"
+        ));
+        assert!(started.elapsed() < Duration::from_secs(4));
+
+        let writer_pid = fs::read_to_string(pid_path).unwrap();
+        let writer_pid = writer_pid.trim();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while process_exists(writer_pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!process_exists(writer_pid));
+    }
+
+    fn process_exists(pid: &str) -> bool {
+        Command::new("/bin/kill")
+            .args(["-0", pid])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     }
 }

@@ -13,8 +13,9 @@ mod error;
 mod project;
 
 pub use artifact::{
-    IosArtifactExpectation, IosArtifactValidation, IosCodeSignatureValidation,
-    IosExtensionExpectation, IosExtensionValidation, IosRuntimeBridgeValidation, validate_ios_app,
+    IosArtifactExpectation, IosArtifactValidation, IosAssetCatalogValidation,
+    IosCodeSignatureValidation, IosExtensionExpectation, IosExtensionValidation,
+    IosRuntimeBridgeValidation, IosSdkOnlyAssetValidation, validate_ios_app,
     validate_ios_extension,
 };
 pub use build::{
@@ -30,7 +31,10 @@ pub use doctor::{
     AppleDoctorCheck, AppleDoctorOptions, AppleDoctorReport, DoctorStatus, doctor_apple,
 };
 pub use error::AppleError;
-pub use project::{GeneratedAppleProject, IosProjectSpec, generate_ios_project, write_ios_project};
+pub use project::{
+    GeneratedAppleProject, IosAssetPackaging, IosProjectSpec, generate_ios_project,
+    write_ios_project,
+};
 
 /// Rust target used for Apple Silicon iOS Simulator artifacts.
 pub const IOS_SIMULATOR_TARGET: &str = "aarch64-apple-ios-sim";

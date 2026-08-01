@@ -9,6 +9,9 @@ pub enum AppleError {
     /// Project icon or splash asset validation failed.
     #[error(transparent)]
     Assets(#[from] rustferry_core::AssetError),
+    /// Deterministic platform asset generation or cache validation failed.
+    #[error(transparent)]
+    AssetPipeline(#[from] rustferry_codegen::AssetPipelineError),
     /// A request value cannot safely enter a generated project or process argument.
     #[error("invalid iOS build request: {0}")]
     InvalidRequest(String),
@@ -74,6 +77,22 @@ pub enum AppleError {
         /// Executable path.
         program: Utf8PathBuf,
         /// Redacted diagnostic log, when requested.
+        log: Option<Utf8PathBuf>,
+    },
+    /// An external command exceeded the per-stream output memory limit.
+    #[error(
+        "`{program}` produced more than {limit_bytes} bytes on {stream} during {stage}; its process tree was stopped; log: {log:?}"
+    )]
+    ProcessOutputTooLarge {
+        /// Build or validation stage.
+        stage: String,
+        /// Executable path.
+        program: Utf8PathBuf,
+        /// Stream that crossed the limit.
+        stream: String,
+        /// Maximum retained bytes for each stream.
+        limit_bytes: usize,
+        /// Diagnostic log containing only the retained prefixes.
         log: Option<Utf8PathBuf>,
     },
     /// Ctrl+C interrupted an external build tool.

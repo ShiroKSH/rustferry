@@ -38,6 +38,10 @@ jobs:
           cache-bin: "false"
       - name: License policy
         run: python3 scripts/check-licenses.py
+      - name: Release contract
+        run: python3 scripts/check-release-contract.py
+      - name: Release archive guard tests
+        run: python3 -B -m unittest discover -s scripts/tests -p 'test_*.py'
       - name: Formatting
         run: cargo fmt --all -- --check
       - name: Clippy
@@ -64,6 +68,14 @@ jobs:
             .data.source == "embedded" and
             (.data.content | startswith("# Remote push"))
           ' "$embedded_result" > /dev/null
+      - name: Workspace package archives
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          cmp schemas/ferry.schema.json crates/rustferry-core/tests/fixtures/ferry.schema.json
+          cmp schemas/ide-protocol-v1.schema.json crates/cargo-ferry/tests/fixtures/ide-protocol-v1/schema.json
+          cargo package --workspace --locked --no-verify
+          python3 scripts/check-release-archives.py --check-sources target/package/*.crate
       - name: Standalone example checks and tests
         shell: bash
         env:

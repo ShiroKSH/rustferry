@@ -11,12 +11,24 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Rust-only application project and capability code generation for RustFerry"
+documentation = "https://docs.rs/rustferry-codegen"
+include = [
+    "src/**",
+    "assets/**",
+    "templates/**",
+    "benches/**",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+]
 
 [dependencies]
 camino.workspace = true
-rustferry-core = { version = "0.1.0", path = "../rustferry-core" }
+hex.workspace = true
+image.workspace = true
+rustferry-core = { version = "=0.1.0", path = "../rustferry-core" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tempfile.workspace = true
 toml.workspace = true

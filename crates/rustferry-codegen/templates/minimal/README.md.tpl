@@ -31,7 +31,7 @@ cargo ferry add notifications
 cargo ferry add widget
 ```
 
-Generated platform projects are disposable and stay under `target/ferry/`. Replace `assets/icon.png` and `assets/splash.png` before distribution.
+Generated platform projects are disposable and stay under `target/ferry/`. The icon and splash are validated RustFerry-branded defaults; replace them with product-specific artwork before distribution.
 
 ## Slint license choice
 

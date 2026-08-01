@@ -186,6 +186,7 @@ impl AppleDiscovery {
             developer_dir,
             xcode_version: self.xcode_version.clone().unwrap_or_default(),
             simulator_sdk,
+            simulator_runtime_available: has_available_ios_runtime(&self.simulator_runtimes),
             cargo,
             rustup,
             xcodebuild,
@@ -205,6 +206,8 @@ pub struct AppleToolchain {
     pub xcode_version: String,
     /// Selected iPhone Simulator SDK.
     pub simulator_sdk: SimulatorSdk,
+    /// Whether `CoreSimulator` reports at least one usable iOS runtime.
+    pub simulator_runtime_available: bool,
     /// Cargo executable.
     pub cargo: Utf8PathBuf,
     /// rustup executable used to verify targets.
@@ -402,6 +405,15 @@ fn parse_runtimes(source: &str) -> Vec<SimulatorRuntime> {
     runtimes
 }
 
+fn has_available_ios_runtime(runtimes: &[SimulatorRuntime]) -> bool {
+    runtimes.iter().any(|runtime| {
+        runtime.available
+            && runtime
+                .identifier
+                .starts_with("com.apple.CoreSimulator.SimRuntime.iOS-")
+    })
+}
+
 fn probe_text(
     stage: &str,
     program: &Utf8Path,
@@ -460,11 +472,23 @@ mod tests {
 
     #[test]
     fn parses_available_and_unavailable_runtimes() {
-        let source = r#"{"runtimes":[{"identifier":"z","name":"iOS 18","version":"18.0","isAvailable":false},{"identifier":"a","name":"iOS 17","version":"17.5","isAvailable":true}]}"#;
+        let source = r#"{"runtimes":[{"identifier":"com.apple.CoreSimulator.SimRuntime.iOS-18-0","name":"iOS 18","version":"18.0","isAvailable":false},{"identifier":"com.apple.CoreSimulator.SimRuntime.iOS-17-5","name":"iOS 17","version":"17.5","isAvailable":true}]}"#;
         let runtimes = parse_runtimes(source);
-        assert_eq!(runtimes[0].identifier, "a");
+        assert_eq!(
+            runtimes[0].identifier,
+            "com.apple.CoreSimulator.SimRuntime.iOS-17-5"
+        );
         assert!(runtimes[0].available);
         assert!(!runtimes[1].available);
+        assert!(has_available_ios_runtime(&runtimes));
+    }
+
+    #[test]
+    fn non_ios_and_unavailable_runtimes_do_not_enable_asset_compilation() {
+        let runtimes = parse_runtimes(
+            r#"{"runtimes":[{"identifier":"com.apple.CoreSimulator.SimRuntime.tvOS-26-0","name":"tvOS 26","version":"26.0","isAvailable":true},{"identifier":"com.apple.CoreSimulator.SimRuntime.iOS-26-0","name":"iOS 26","version":"26.0","isAvailable":false}]}"#,
+        );
+        assert!(!has_available_ios_runtime(&runtimes));
     }
 
     #[test]

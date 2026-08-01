@@ -1,13 +1,17 @@
 use std::{fmt, fs};
 
 use camino::{Utf8Path, Utf8PathBuf};
+use rustferry_codegen::generate_platform_assets;
 use rustferry_core::{FerryConfig, ProjectAssets, brand};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     AppleDiscoveryOptions, AppleError, AppleToolchain, CommandSpec, IOS_SIMULATOR_TARGET,
-    IosArtifactExpectation, IosArtifactValidation, IosExtensionExpectation, IosProjectSpec,
-    discover_apple, error::io_error, generate_ios_project, project::validate_binary_name,
+    IosArtifactExpectation, IosArtifactValidation, IosAssetPackaging, IosExtensionExpectation,
+    IosProjectSpec, discover_apple,
+    error::io_error,
+    generate_ios_project,
+    project::{generate_ios_project_from_asset_set, validate_binary_name},
     run_command, validate_ios_app, write_ios_project,
 };
 
@@ -125,6 +129,8 @@ pub struct IosBuildPlan {
     pub generated_files: Vec<Utf8PathBuf>,
     /// Stable identity of the icon and splash bytes embedded as app resources.
     pub asset_fingerprint: String,
+    /// Asset representation selected from installed Simulator capabilities.
+    pub asset_packaging: IosAssetPackaging,
     /// Rust executable staging copy.
     pub rust_binary_copy: PlannedCopy,
     /// Expected final `.app` bundle.
@@ -135,11 +141,31 @@ pub struct IosBuildPlan {
 #[derive(Debug)]
 pub struct IosBuildOutcome {
     /// Exact plan used by the operation.
-    pub plan: IosBuildPlan,
+    plan: IosBuildPlan,
     /// Built application path, absent for dry-run.
-    pub artifact: Option<Utf8PathBuf>,
+    artifact: Option<Utf8PathBuf>,
     /// Independent metadata/binary validation, absent for dry-run.
-    pub validation: Option<IosArtifactValidation>,
+    validation: Option<IosArtifactValidation>,
+}
+
+impl IosBuildOutcome {
+    /// Exact plan used by the operation.
+    #[must_use]
+    pub const fn plan(&self) -> &IosBuildPlan {
+        &self.plan
+    }
+
+    /// Built application path, absent for dry-run.
+    #[must_use]
+    pub fn artifact(&self) -> Option<&Utf8Path> {
+        self.artifact.as_deref()
+    }
+
+    /// Independent metadata and binary validation, absent for dry-run.
+    #[must_use]
+    pub const fn validation(&self) -> Option<&IosArtifactValidation> {
+        self.validation.as_ref()
+    }
 }
 
 /// Produce a deterministic, side-effect-free command plan using an already selected toolchain.
@@ -164,9 +190,15 @@ fn plan_ios_simulator_with_assets(
     toolchain: &AppleToolchain,
     assets: &ProjectAssets,
 ) -> Result<IosBuildPlan, AppleError> {
+    let asset_packaging = if toolchain.simulator_runtime_available {
+        IosAssetPackaging::CompiledCatalog
+    } else {
+        IosAssetPackaging::SdkOnlyResources
+    };
     let generated = generate_ios_project(
         &IosProjectSpec::new(request.config.clone(), request.binary_name.clone())
-            .with_assets(assets.clone()),
+            .with_assets(assets.clone())
+            .with_asset_packaging(asset_packaging),
     )?;
     let ios_root = request
         .project_dir
@@ -175,9 +207,14 @@ fn plan_ios_simulator_with_assets(
         .join("ios");
     let generated_root = ios_root.join("generated");
     let cargo_target_dir = ios_root.join("cargo");
+    let asset_cache_directory = match asset_packaging {
+        IosAssetPackaging::CompiledCatalog => "compiled-catalog",
+        IosAssetPackaging::SdkOnlyResources => "sdk-only-resources",
+    };
     let xcode_derived_data = ios_root
         .join("xcode")
-        .join(request.profile.cargo_directory());
+        .join(request.profile.cargo_directory())
+        .join(asset_cache_directory);
     let artifact_directory = ios_root.join(request.profile.cargo_directory());
     let artifact_path = artifact_directory.join(format!("{}.app", request.binary_name));
     let cargo_binary = cargo_target_dir
@@ -283,7 +320,7 @@ fn plan_ios_simulator_with_assets(
         .map(|relative| generated_root.join(relative))
         .collect();
     Ok(IosBuildPlan {
-        schema_version: 1,
+        schema_version: 2,
         rust_target: IOS_SIMULATOR_TARGET.to_owned(),
         profile: request.profile,
         generated_root,
@@ -292,6 +329,7 @@ fn plan_ios_simulator_with_assets(
         commands,
         generated_files,
         asset_fingerprint: assets.fingerprint().to_owned(),
+        asset_packaging,
         rust_binary_copy: PlannedCopy {
             source: cargo_binary,
             destination: staged_binary,
@@ -341,10 +379,16 @@ pub fn build_ios_simulator(
         prepare_output_directory(&request.project_dir, directory)?;
     }
     prepare_generated_root(&request.project_dir, &plan.generated_root)?;
-    let generated = generate_ios_project(
-        &IosProjectSpec::new(request.config.clone(), request.binary_name.clone())
-            .with_assets(project_assets.clone()),
-    )?;
+    let project_spec = IosProjectSpec::new(request.config.clone(), request.binary_name.clone())
+        .with_assets(project_assets.clone())
+        .with_asset_packaging(plan.asset_packaging);
+    let generated = match plan.asset_packaging {
+        IosAssetPackaging::CompiledCatalog => {
+            let generated_assets = generate_platform_assets(&request.project_dir, None)?;
+            generate_ios_project_from_asset_set(&project_spec, &generated_assets)?
+        }
+        IosAssetPackaging::SdkOnlyResources => generate_ios_project(&project_spec)?,
+    };
     write_ios_project(&generated, &plan.generated_root)?;
 
     run_command(&plan.commands[0], Some(&logs.join("01-cargo-build.log")))?;
@@ -396,6 +440,7 @@ pub fn build_ios_simulator(
                 .flatten(),
             log_dir: Some(logs.join("validation")),
             project_assets: Some(project_assets),
+            asset_packaging: Some(plan.asset_packaging),
         },
         &toolchain,
     )?;
@@ -642,6 +687,15 @@ mod tests {
     use super::*;
     use crate::{SimulatorSdk, generate_ios_project};
 
+    mod png_fixture {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/opaque_png.rs"
+        ));
+    }
+
+    use png_fixture::OPAQUE_1024_PNG as PNG;
+
     fn fake_toolchain(root: &Utf8Path) -> AppleToolchain {
         AppleToolchain {
             developer_dir: root.join("Xcode.app/Contents/Developer"),
@@ -651,6 +705,7 @@ mod tests {
                 version: "26.0".into(),
                 build_version: Some("23A1".into()),
             },
+            simulator_runtime_available: true,
             cargo: root.join("bin/cargo"),
             rustup: root.join("bin/rustup"),
             xcodebuild: root.join("bin/xcodebuild"),
@@ -661,8 +716,6 @@ mod tests {
     }
 
     fn request(root: &Utf8Path) -> IosSimulatorBuildRequest {
-        const PNG: &[u8] = include_bytes!("../../../examples/counter/assets/icon.png");
-
         fs::write(
             root.join("Cargo.toml"),
             "[package]\nname='weather'\nversion='0.1.0'\n",
@@ -724,6 +777,36 @@ mod tests {
         )));
         assert!(plan.generated_root.starts_with(root.join("target/ferry")));
         assert!(!plan.generated_files.is_empty());
+        assert_eq!(plan.asset_packaging, IosAssetPackaging::CompiledCatalog);
+    }
+
+    #[test]
+    fn missing_simulator_runtime_selects_validated_sdk_only_assets() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = Utf8Path::from_path(temporary.path()).unwrap();
+        let compiled_plan = plan_ios_simulator(&request(root), &fake_toolchain(root)).unwrap();
+        let mut toolchain = fake_toolchain(root);
+        toolchain.simulator_runtime_available = false;
+        let plan = plan_ios_simulator(&request(root), &toolchain).unwrap();
+
+        assert_eq!(plan.asset_packaging, IosAssetPackaging::SdkOnlyResources);
+        assert_ne!(plan.xcode_derived_data, compiled_plan.xcode_derived_data);
+        assert!(
+            plan.generated_files
+                .iter()
+                .any(|path| path.file_name() == Some("FerryIcon.png"))
+        );
+        assert!(
+            plan.generated_files
+                .iter()
+                .any(|path| path.file_name() == Some("FerrySplash.png"))
+        );
+        assert!(
+            !plan
+                .generated_files
+                .iter()
+                .any(|path| path.as_str().contains("Assets.xcassets"))
+        );
     }
 
     #[test]
@@ -733,7 +816,12 @@ mod tests {
         let request = request(root);
         let assets = ProjectAssets::load(root).unwrap();
         let planned_fingerprint = assets.fingerprint().to_owned();
-        let planned_icon = assets.icon().to_vec();
+        let planned_catalog = rustferry_codegen::render_platform_assets_for(
+            &assets,
+            rustferry_codegen::GeneratedAssetPlatform::Ios,
+        )
+        .unwrap()
+        .files;
         let plan =
             plan_ios_simulator_with_assets(&request, &fake_toolchain(root), &assets).unwrap();
 
@@ -750,9 +838,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.asset_fingerprint, planned_fingerprint);
+        let expected_icon = planned_catalog
+            .into_iter()
+            .find_map(|(path, bytes)| {
+                (path == "ios/Assets.xcassets/AppIcon.appiconset/AppIcon-1024-1x.png")
+                    .then_some(bytes)
+            })
+            .unwrap();
         assert_eq!(
-            generated.files[Utf8Path::new("FerryIcon.png")],
-            planned_icon
+            generated.files
+                [Utf8Path::new("Assets.xcassets/AppIcon.appiconset/AppIcon-1024-1x.png")],
+            expected_icon
         );
     }
 

@@ -35,7 +35,9 @@ Primary references:
 
 ## Licensing consequence
 
-Slint is available under GPL-3.0, a royalty-free application license with attribution, or a commercial license; it is not an MIT/Apache runtime dependency. Generated starters include the standard `AboutSlint` component in an accessible About view. The generated README explains that developers distributing binaries must deliberately choose and satisfy one of Slint's current license options. Removing attribution is not presented as a harmless template customization. See [Slint's current license terms](https://slint.dev/terms-and-conditions) and the [AboutSlint component](https://docs.slint.dev/latest/docs/slint/reference/std-widgets/misc/aboutslint/).
+Slint 1.17.1 is triple-licensed under GPL-3.0-only, the Slint Royalty-free License 2.0, or a commercial license; it is not an MIT/Apache runtime dependency. The royalty-free path covers desktop, mobile, and web applications when the application either exposes `AboutSlint` from its top-level UI or displays the Slint attribution badge on a readily discoverable public page. It excludes embedded systems, standalone Slint distribution, and applications that expose Slint APIs. The GPL path carries GPL source and redistribution obligations; the commercial path covers proprietary embedded applications and applications that cannot meet the royalty-free conditions.
+
+Generated starters retain `AboutSlint`, but RustFerry does not select a license for downstream applications. Before distributing a generated binary, its author must select a Slint path and audit the application's resolved dependency tree. The pinned royalty-free text and full dependency policy live in [`LICENSES/`](../LICENSES/README.md) and [Third-party licenses](THIRD_PARTY_LICENSES.md). Canonical versioned terms remain in [Slint 1.17.1 `LICENSE.md`](https://github.com/slint-ui/slint/blob/v1.17.1/LICENSE.md) and its [`LICENSES` directory](https://github.com/slint-ui/slint/tree/v1.17.1/LICENSES).
 
 This ADR is technical context, not legal advice. Applications with incompatible distribution requirements can use a commercial Slint license or a future backend once implemented.
 

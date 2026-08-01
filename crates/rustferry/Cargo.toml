@@ -7,10 +7,12 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
+documentation = "https://docs.rs/rustferry"
 readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Cross-platform runtime APIs for RustFerry Android and iOS applications"
+include = ["src/**", "LICENSE-MIT", "LICENSE-APACHE"]
 
 [lib]
 name = "rustferry"

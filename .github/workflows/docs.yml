@@ -4,6 +4,11 @@ on:
   push:
     branches: [master]
     paths:
+      - Cargo.toml
+      - crates/*/Cargo.toml
+      - editors/vscode/package.json
+      - editors/vscode/package-lock.json
+      - CHANGELOG.md
       - docs/**
       - README.md
       - .github/workflows/docs.yml

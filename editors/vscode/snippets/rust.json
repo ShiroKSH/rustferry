@@ -1,0 +1,104 @@
+{
+  "RustFerry application entry": {
+    "prefix": "ferry-app",
+    "description": "Create a RustFerry/Slint application run function.",
+    "body": [
+      "pub fn run() -> Result<(), AppError> {",
+      "    let window = ${1:MainWindow}::new()?;",
+      "    $0",
+      "    window.run()?;",
+      "    Ok(())",
+      "}"
+    ]
+  },
+  "RustFerry state": {
+    "prefix": "ferry-state",
+    "description": "Define serializable state for RustFerry storage.",
+    "body": [
+      "#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]",
+      "struct ${1:AppState} {",
+      "    ${2:value}: ${3:String},",
+      "}"
+    ]
+  },
+  "RustFerry application event": {
+    "prefix": "ferry-event",
+    "description": "Subscribe to typed RustFerry application events.",
+    "body": [
+      "let ${1:event_subscription} = rustferry::app_events::subscribe(move |event| {",
+      "    match event {",
+      "        rustferry::app_events::AppEvent::${2:Foregrounded} => { $0 }",
+      "        _ => {}",
+      "    }",
+      "});"
+    ]
+  },
+  "RustFerry network status": {
+    "prefix": "ferry-network",
+    "description": "Subscribe to RustFerry network status.",
+    "body": [
+      "let ${1:network_subscription} = rustferry::network::subscribe(move |status| {",
+      "    if status.is_online() {",
+      "        $0",
+      "    }",
+      "});"
+    ]
+  },
+  "RustFerry notification": {
+    "prefix": "ferry-notification",
+    "description": "Show a local RustFerry notification.",
+    "body": [
+      "let notification = rustferry::notifications::Notification::new(",
+      "    \"${1:notification-id}\",",
+      "    \"${2:Title}\",",
+      "    \"${3:Body}\",",
+      ");",
+      "rustferry::notifications::show_now(notification)?;$0"
+    ]
+  },
+  "RustFerry storage": {
+    "prefix": "ferry-storage",
+    "description": "Persist and load a typed RustFerry value.",
+    "body": [
+      "rustferry::storage::set(\"${1:key}\", &${2:value})?;",
+      "let ${3:loaded}: Option<${4:String}> = rustferry::storage::get(\"${1:key}\")?;$0"
+    ]
+  },
+  "RustFerry widget": {
+    "prefix": "ferry-widget",
+    "description": "Publish a RustFerry widget snapshot.",
+    "body": [
+      "let id = rustferry::widgets::WidgetId::parse(\"${1:widget}\")?;",
+      "let snapshot = rustferry::widgets::WidgetSnapshot::new()",
+      "    .title(\"${2:Title}\")",
+      "    .value(\"${3:Value}\");",
+      "rustferry::widgets::update(&id, snapshot)?;$0"
+    ]
+  },
+  "RustFerry Live Activity": {
+    "prefix": "ferry-live-activity",
+    "description": "Start a RustFerry Live Activity with a portable snapshot.",
+    "body": [
+      "let snapshot = rustferry::live_activity::LiveActivitySnapshot::new()",
+      "    .title(\"${1:Title}\")",
+      "    .status(\"${2:Running}\");",
+      "let ${3:activity_id} = rustferry::live_activity::start_with_snapshot(",
+      "    &${4:attributes},",
+      "    &${5:state},",
+      "    snapshot,",
+      ")?;$0"
+    ]
+  },
+  "RustFerry TestRuntime": {
+    "prefix": "ferry-test-runtime",
+    "description": "Install the deterministic RustFerry TestRuntime for a unit test.",
+    "body": [
+      "let runtime = rustferry::testing::TestRuntime::new();",
+      "let _runtime = runtime.enter();",
+      "runtime.set_network_status(rustferry::network::NetworkStatus::online(",
+      "    rustferry::network::NetworkTransport::Wifi,",
+      "));",
+      "$0"
+    ]
+  }
+}

@@ -46,4 +46,12 @@ RustFerry checks both the `lib/<abi>/` path and ELF header. This catches a libra
 
 ## Device or `adb` missing
 
-This does not affect `cargo ferry build android`. The current CLI stops after artifact validation; installation and launch require a separate manual `adb` flow and remain a different validation level.
+This does not affect `cargo ferry build android`, which stops after artifact validation and never discovers or mutates a device. Device inventory, install, and launch are separate explicit commands:
+
+```console
+cargo ferry devices --platform android
+cargo ferry install android --device SERIAL
+cargo ferry run android --device SERIAL
+```
+
+The device selector may be omitted only when exactly one compatible target exists. These ADB deployment paths are implemented and covered by host-side tests, but this repository has no emulator or physical-device runtime validation; successful APK inspection alone does not prove install or launch behavior.

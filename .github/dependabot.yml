@@ -36,3 +36,19 @@ updates:
           - "*"
     commit-message:
       prefix: "ci(deps)"
+
+  - package-ecosystem: npm
+    directory: "/editors/vscode"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+      timezone: Europe/Moscow
+    open-pull-requests-limit: 3
+    groups:
+      vscode-development-dependencies:
+        dependency-type: development
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "build(vscode-deps)"

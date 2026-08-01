@@ -33,7 +33,7 @@ This is a Rust-only application project generated from the `{{template}}` cargo-
 - `src/state.rs`: serializable state persisted by the runtime.
 - `src/services/network.rs`: isolated network service example.
 - `ferry.toml`: app identity, platforms, capabilities, permissions, and extensions.
-- `assets/`: replace the placeholder icon and splash image before distribution.
+- `assets/`: validated RustFerry-branded icon and splash defaults; replace them with product-specific artwork before distribution.
 
 ## Capabilities
 

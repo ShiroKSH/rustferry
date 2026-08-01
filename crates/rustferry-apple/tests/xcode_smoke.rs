@@ -5,11 +5,21 @@ use std::fs;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use rustferry_apple::{
-    AppleDiscoveryOptions, CommandSpec, ExtensionKind, IosExtensionExpectation, IosProjectSpec,
-    IosSimulatorBuildRequest, build_ios_simulator, discover_apple, generate_ios_project,
-    plan_ios_simulator, run_command, validate_ios_extension, write_ios_project,
+    AppleDiscoveryOptions, CommandSpec, ExtensionKind, IosAssetPackaging, IosExtensionExpectation,
+    IosProjectSpec, IosSimulatorBuildRequest, build_ios_simulator, discover_apple,
+    generate_ios_project, plan_ios_simulator, run_command, validate_ios_extension,
+    write_ios_project,
 };
 use rustferry_core::FerryConfig;
+
+mod png_fixture {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/opaque_png.rs"
+    ));
+}
+
+use png_fixture::OPAQUE_1024_PNG as PNG;
 
 fn test_project(environment_name: &str) -> (Option<tempfile::TempDir>, Utf8PathBuf) {
     let result = if let Some(path) = std::env::var_os(environment_name) {
@@ -26,7 +36,6 @@ fn test_project(environment_name: &str) -> (Option<tempfile::TempDir>, Utf8PathB
 }
 
 fn write_test_assets(project: &Utf8Path) {
-    const PNG: &[u8] = include_bytes!("../../../examples/counter/assets/icon.png");
     fs::create_dir_all(project.join("assets")).unwrap();
     fs::write(project.join("assets/icon.png"), PNG).unwrap();
     fs::write(project.join("assets/splash.png"), PNG).unwrap();
@@ -57,8 +66,9 @@ fn builds_and_validates_real_simulator_app() {
         "rustferry-ios-smoke",
     );
     let outcome = build_ios_simulator(&request).unwrap();
-    let artifact = outcome.artifact.expect("non-dry-run artifact");
-    let validation = outcome.validation.expect("artifact validation");
+    let asset_packaging = outcome.plan().asset_packaging;
+    let artifact = outcome.artifact().expect("non-dry-run artifact");
+    let validation = outcome.validation().expect("artifact validation");
     assert!(artifact.is_dir());
     assert_eq!(validation.bundle_identifier, "com.example.ferrysmoke");
     assert_eq!(validation.architectures, ["arm64"]);
@@ -95,6 +105,29 @@ fn builds_and_validates_real_simulator_app() {
             .iter()
             .any(|path| path.file_name() == Some("FerryResources.json"))
     );
+    match asset_packaging {
+        IosAssetPackaging::CompiledCatalog => {
+            let asset_catalog = validation
+                .asset_catalog
+                .as_ref()
+                .expect("compiled asset catalog evidence");
+            assert!(validation.sdk_only_assets.is_none());
+            assert!(asset_catalog.compiled_catalog.is_file());
+            assert_eq!(asset_catalog.app_icon_name, "AppIcon");
+            assert_eq!(asset_catalog.launch_image_name, "FerryLaunch");
+        }
+        IosAssetPackaging::SdkOnlyResources => {
+            let assets = validation
+                .sdk_only_assets
+                .as_ref()
+                .expect("SDK-only image resource evidence");
+            assert!(validation.asset_catalog.is_none());
+            assert!(assets.icon.is_file());
+            assert!(assets.splash.is_file());
+            assert_eq!(assets.icon_file, "FerryIcon");
+            assert_eq!(assets.launch_image_name, "FerrySplash");
+        }
+    }
 }
 
 #[test]
@@ -119,7 +152,7 @@ fn builds_and_validates_slint_simulator_app() {
         "ferry-slint-smoke",
     );
     let outcome = build_ios_simulator(&request).unwrap();
-    let validation = outcome.validation.expect("artifact validation");
+    let validation = outcome.validation().expect("artifact validation");
     assert_eq!(validation.bundle_identifier, "com.example.ferryslint");
     assert_eq!(validation.architectures, ["arm64"]);
     assert!(validation.rust_binary_embedded);
@@ -263,7 +296,7 @@ fn builds_app_with_embedded_widgetkit_and_activitykit_extensions() {
 
     let request = IosSimulatorBuildRequest::new(&project, config, "ferry-extension-app");
     let outcome = build_ios_simulator(&request).expect("build extension app");
-    let validation = outcome.validation.expect("artifact validation");
+    let validation = outcome.validation().expect("artifact validation");
     assert_eq!(validation.extensions.len(), 2);
     assert_eq!(
         validation.code_signature.app_groups,
@@ -282,7 +315,7 @@ fn builds_app_with_embedded_widgetkit_and_activitykit_extensions() {
             .iter()
             .any(|extension| extension.kind == ExtensionKind::ActivityKit)
     );
-    for extension in validation.extensions {
+    for extension in &validation.extensions {
         assert_eq!(extension.architectures, ["arm64"]);
         assert_eq!(
             extension.extension_point_identifier,

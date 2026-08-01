@@ -1,0 +1,19 @@
+{
+  "devices": {
+    "com.apple.CoreSimulator.SimRuntime.iOS-18-5": [
+      {
+        "state": "Booted",
+        "isAvailable": true,
+        "name": "iPhone 16",
+        "udid": "A-B",
+        "deviceTypeIdentifier": "phone"
+      },
+      {
+        "state": "Shutdown",
+        "isAvailable": false,
+        "name": "Old",
+        "udid": "C-D"
+      }
+    ]
+  }
+}

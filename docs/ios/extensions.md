@@ -61,6 +61,8 @@ For each enabled extension, the build requires:
 
 At commit `be5206c`, [Platform artifacts run 30699379465](https://github.com/ShiroKSH/rustferry/actions/runs/30699379465) built a RustFerry-named Kitchen Sink app embedding `FerryWidgetExtension.appex` and `FerryLiveActivityExtension.appex`. Both arm64 products passed identifier, plist, extension-point, resource-sealing, and strict ad-hoc signature checks; the ActivityKit product also passed exact runtime-framework linkage inspection, and the widget and containing app carried the exact configured application-group entitlement. Before the rename, the equivalent legacy-named targets, standalone `.appex` products, and combined app were also built and validated with Xcode 26.6/iPhoneSimulator 26.5 without a Simulator runtime.
 
-## Device-signing limitation
+## Physical-device signing status
 
-Simulator builds use local ad-hoc signing and require no team. Widget builds re-sign the widget and then the containing app with their generated application-group entitlements; non-widget builds retain Xcode's signatures unchanged. Physical-device extension signing needs official development certificates, profiles, entitlements, and an application-group capability. Device signing/install is not implemented or validated by this pipeline.
+Simulator builds use local ad-hoc signing and require no team. Widget builds re-sign the widget and then the containing app with their generated application-group entitlements; non-widget builds retain Xcode's signatures unchanged.
+
+The physical-development flow is implemented with explicit Team selection, Apple Development identity/profile resolution, generated entitlements, recursive signature/profile/entitlement inspection, and `devicectl` install/launch services. Extension-bearing device builds must preserve the configured application-group capability in the app and widget profiles. This environment had no identity, Team, provisioning profile, signed device artifact, or attached iPhone, so physical signing, installation, launch, and extension behavior remain unvalidated.

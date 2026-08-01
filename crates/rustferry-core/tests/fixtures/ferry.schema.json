@@ -1,0 +1,615 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FerryConfig",
+  "description": "Complete, versioned `ferry.toml` document.",
+  "type": "object",
+  "properties": {
+    "android": {
+      "description": "Android build settings.",
+      "$ref": "#/$defs/AndroidConfig",
+      "default": {
+        "abis": [
+          "arm64-v8a"
+        ],
+        "min_sdk": 26,
+        "target_sdk": "installed"
+      }
+    },
+    "app": {
+      "description": "Application identity and presentation settings.",
+      "$ref": "#/$defs/AppConfig"
+    },
+    "capabilities": {
+      "description": "Runtime capabilities compiled into the application.",
+      "$ref": "#/$defs/CapabilitiesConfig",
+      "default": {
+        "clipboard": {
+          "enabled": false
+        },
+        "deep_links": {
+          "allowed_actions": [],
+          "allowed_hosts": [],
+          "schemes": []
+        },
+        "haptics": {
+          "enabled": false
+        },
+        "network": {
+          "mode": "none",
+          "probe_timeout_ms": 3000,
+          "probe_url": null
+        },
+        "notifications": {
+          "local": false,
+          "push": false
+        },
+        "share": {
+          "enabled": false
+        },
+        "storage": {
+          "enabled": false
+        }
+      }
+    },
+    "extensions": {
+      "description": "Platform extension targets generated with the application.",
+      "$ref": "#/$defs/ExtensionsConfig",
+      "default": {
+        "live_activity": {
+          "android_fallback": "ongoing-notification",
+          "enabled": false
+        },
+        "widget": {
+          "app_group": null,
+          "enabled": false
+        }
+      }
+    },
+    "ios": {
+      "description": "Apple platform build settings.",
+      "$ref": "#/$defs/IosConfig",
+      "default": {
+        "min_version": "16.0"
+      }
+    },
+    "permissions": {
+      "description": "Runtime permissions with required user-facing purpose text.",
+      "$ref": "#/$defs/PermissionsConfig",
+      "default": {
+        "camera": {
+          "enabled": false,
+          "purpose": null
+        },
+        "local_network": {
+          "enabled": false,
+          "purpose": null
+        },
+        "location_when_in_use": {
+          "enabled": false,
+          "purpose": null
+        },
+        "microphone": {
+          "enabled": false,
+          "purpose": null
+        },
+        "photos": {
+          "enabled": false,
+          "purpose": null
+        }
+      }
+    },
+    "platforms": {
+      "description": "Platforms generated and validated for this project.",
+      "type": "array",
+      "default": [
+        "android",
+        "ios"
+      ],
+      "items": {
+        "$ref": "#/$defs/TargetPlatform"
+      }
+    },
+    "schema_version": {
+      "description": "Configuration schema used by this file.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "app"
+  ],
+  "$defs": {
+    "AndroidAbi": {
+      "description": "Supported Android ABI.",
+      "oneOf": [
+        {
+          "description": "64-bit ARM devices.",
+          "type": "string",
+          "const": "arm64-v8a"
+        },
+        {
+          "description": "64-bit Intel emulators.",
+          "type": "string",
+          "const": "x86_64"
+        },
+        {
+          "description": "32-bit ARM devices.",
+          "type": "string",
+          "const": "armeabi-v7a"
+        }
+      ]
+    },
+    "AndroidConfig": {
+      "description": "Android build settings.",
+      "type": "object",
+      "properties": {
+        "abis": {
+          "description": "Native architectures included in the artifact.",
+          "type": "array",
+          "default": [
+            "arm64-v8a"
+          ],
+          "items": {
+            "$ref": "#/$defs/AndroidAbi"
+          }
+        },
+        "min_sdk": {
+          "description": "Minimum Android API supported by the APK.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 26,
+          "minimum": 0
+        },
+        "target_sdk": {
+          "description": "Target API (`installed` selects the newest installed platform).",
+          "type": "string",
+          "default": "installed"
+        }
+      },
+      "additionalProperties": false
+    },
+    "AndroidLiveActivityFallback": {
+      "description": "Android presentation used when iOS Live Activities are enabled.",
+      "oneOf": [
+        {
+          "description": "Do not expose Live Activity operations on Android.",
+          "type": "string",
+          "const": "none"
+        },
+        {
+          "description": "Render the constrained state as an ordinary ongoing notification.",
+          "type": "string",
+          "const": "ongoing-notification"
+        }
+      ]
+    },
+    "AppConfig": {
+      "description": "Application identity and window defaults.",
+      "type": "object",
+      "properties": {
+        "display_version": {
+          "description": "Platform-facing user-visible version.",
+          "type": "string"
+        },
+        "identifier": {
+          "description": "Android application ID and Apple bundle identifier.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Display name shown by launchers.",
+          "type": "string"
+        },
+        "version": {
+          "description": "`SemVer` package version.",
+          "$ref": "#/$defs/SemVer"
+        },
+        "window": {
+          "description": "Initial window preferences.",
+          "$ref": "#/$defs/AppWindowConfig",
+          "default": {
+            "orientation": "automatic",
+            "theme": "system"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "identifier",
+        "version",
+        "display_version"
+      ]
+    },
+    "AppWindowConfig": {
+      "description": "Initial application window preferences.",
+      "type": "object",
+      "properties": {
+        "orientation": {
+          "description": "Supported device orientation.",
+          "$ref": "#/$defs/Orientation",
+          "default": "automatic"
+        },
+        "theme": {
+          "description": "Initial color theme.",
+          "$ref": "#/$defs/Theme",
+          "default": "system"
+        }
+      },
+      "additionalProperties": false
+    },
+    "BoolCapability": {
+      "description": "Capability represented by a single enable flag.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Whether the capability is compiled in.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "CapabilitiesConfig": {
+      "description": "Runtime capability configuration.",
+      "type": "object",
+      "properties": {
+        "clipboard": {
+          "description": "Clipboard access.",
+          "$ref": "#/$defs/BoolCapability",
+          "default": {
+            "enabled": false
+          }
+        },
+        "deep_links": {
+          "description": "Custom URL schemes and allowlists.",
+          "$ref": "#/$defs/DeepLinksCapability",
+          "default": {
+            "allowed_actions": [],
+            "allowed_hosts": [],
+            "schemes": []
+          }
+        },
+        "haptics": {
+          "description": "Platform haptic feedback.",
+          "$ref": "#/$defs/BoolCapability",
+          "default": {
+            "enabled": false
+          }
+        },
+        "network": {
+          "description": "Network status and optional internet probing.",
+          "$ref": "#/$defs/NetworkCapability",
+          "default": {
+            "mode": "none",
+            "probe_timeout_ms": 3000,
+            "probe_url": null
+          }
+        },
+        "notifications": {
+          "description": "Local and future remote notifications.",
+          "$ref": "#/$defs/NotificationCapability",
+          "default": {
+            "local": false,
+            "push": false
+          }
+        },
+        "share": {
+          "description": "System share sheets.",
+          "$ref": "#/$defs/BoolCapability",
+          "default": {
+            "enabled": false
+          }
+        },
+        "storage": {
+          "description": "JSON-backed local storage.",
+          "$ref": "#/$defs/BoolCapability",
+          "default": {
+            "enabled": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "DeepLinksCapability": {
+      "description": "Deep-link configuration and input allowlists.",
+      "type": "object",
+      "properties": {
+        "allowed_actions": {
+          "description": "First path segments accepted as actions.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "allowed_hosts": {
+          "description": "Hosts accepted by typed parsing helpers.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "schemes": {
+          "description": "Custom URL schemes accepted by the application.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "ExtensionsConfig": {
+      "description": "Platform extension targets.",
+      "type": "object",
+      "properties": {
+        "live_activity": {
+          "description": "iOS Live Activity and Android fallback configuration.",
+          "$ref": "#/$defs/LiveActivityConfig",
+          "default": {
+            "android_fallback": "ongoing-notification",
+            "enabled": false
+          }
+        },
+        "widget": {
+          "description": "Home-screen widget configuration.",
+          "$ref": "#/$defs/WidgetConfig",
+          "default": {
+            "app_group": null,
+            "enabled": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "IosConfig": {
+      "description": "Apple platform build settings.",
+      "type": "object",
+      "properties": {
+        "min_version": {
+          "description": "Minimum iOS version supported by the application.",
+          "type": "string",
+          "default": "16.0"
+        }
+      },
+      "additionalProperties": false
+    },
+    "LiveActivityConfig": {
+      "description": "Live Activity extension configuration.",
+      "type": "object",
+      "properties": {
+        "android_fallback": {
+          "description": "Honest Android equivalent for the feature.",
+          "$ref": "#/$defs/AndroidLiveActivityFallback",
+          "default": "ongoing-notification"
+        },
+        "enabled": {
+          "description": "Generate an `ActivityKit` extension.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "NetworkCapability": {
+      "description": "Network status and probe configuration.",
+      "type": "object",
+      "properties": {
+        "mode": {
+          "description": "Runtime network policy.",
+          "$ref": "#/$defs/NetworkMode",
+          "default": "none"
+        },
+        "probe_timeout_ms": {
+          "description": "Probe timeout in milliseconds.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 3000,
+          "minimum": 0
+        },
+        "probe_url": {
+          "description": "Optional backend health endpoint, separate from OS path state.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "NetworkMode": {
+      "description": "Application network policy.",
+      "oneOf": [
+        {
+          "description": "Omit network permissions and monitoring where possible.",
+          "type": "string",
+          "const": "none"
+        },
+        {
+          "description": "Observe system network status.",
+          "type": "string",
+          "const": "status"
+        },
+        {
+          "description": "Permit offline startup and online operations.",
+          "type": "string",
+          "const": "optional"
+        },
+        {
+          "description": "Require callers to pass an explicit offline gate.",
+          "type": "string",
+          "const": "required"
+        }
+      ]
+    },
+    "NotificationCapability": {
+      "description": "Notification capability configuration.",
+      "type": "object",
+      "properties": {
+        "local": {
+          "description": "Enable local notifications.",
+          "type": "boolean",
+          "default": false
+        },
+        "push": {
+          "description": "Remote push placeholder; schema version 1 rejects `true`.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "Orientation": {
+      "description": "Supported screen orientation policy.",
+      "oneOf": [
+        {
+          "description": "Follow the current device orientation.",
+          "type": "string",
+          "const": "automatic"
+        },
+        {
+          "description": "Lock the application to portrait.",
+          "type": "string",
+          "const": "portrait"
+        },
+        {
+          "description": "Lock the application to landscape.",
+          "type": "string",
+          "const": "landscape"
+        }
+      ]
+    },
+    "PermissionConfig": {
+      "description": "One optional permission and its operating-system prompt text.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Whether the platform permission is generated.",
+          "type": "boolean",
+          "default": false
+        },
+        "purpose": {
+          "description": "Non-empty, application-specific reason shown before or inside the system prompt.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "PermissionsConfig": {
+      "description": "Permission declarations that generate platform manifests and purpose strings.",
+      "type": "object",
+      "properties": {
+        "camera": {
+          "description": "Camera access.",
+          "$ref": "#/$defs/PermissionConfig",
+          "default": {
+            "enabled": false,
+            "purpose": null
+          }
+        },
+        "local_network": {
+          "description": "Apple local-network privacy permission.",
+          "$ref": "#/$defs/PermissionConfig",
+          "default": {
+            "enabled": false,
+            "purpose": null
+          }
+        },
+        "location_when_in_use": {
+          "description": "Foreground location access.",
+          "$ref": "#/$defs/PermissionConfig",
+          "default": {
+            "enabled": false,
+            "purpose": null
+          }
+        },
+        "microphone": {
+          "description": "Microphone access.",
+          "$ref": "#/$defs/PermissionConfig",
+          "default": {
+            "enabled": false,
+            "purpose": null
+          }
+        },
+        "photos": {
+          "description": "Photo-library access.",
+          "$ref": "#/$defs/PermissionConfig",
+          "default": {
+            "enabled": false,
+            "purpose": null
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "SemVer": {
+      "type": "string",
+      "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-((?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\\.(?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\\+([0-9a-zA-Z-]+(?:\\.[0-9a-zA-Z-]+)*))?$"
+    },
+    "TargetPlatform": {
+      "description": "Mobile platform generated for an application.",
+      "oneOf": [
+        {
+          "description": "Android APK.",
+          "type": "string",
+          "const": "android"
+        },
+        {
+          "description": "Apple iOS application.",
+          "type": "string",
+          "const": "ios"
+        }
+      ]
+    },
+    "Theme": {
+      "description": "Application color theme preference.",
+      "oneOf": [
+        {
+          "description": "Follow the system setting.",
+          "type": "string",
+          "const": "system"
+        },
+        {
+          "description": "Prefer a light palette.",
+          "type": "string",
+          "const": "light"
+        },
+        {
+          "description": "Prefer a dark palette.",
+          "type": "string",
+          "const": "dark"
+        }
+      ]
+    },
+    "WidgetConfig": {
+      "description": "Widget extension configuration.",
+      "type": "object",
+      "properties": {
+        "app_group": {
+          "description": "Shared application-group identifier.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "enabled": {
+          "description": "Generate widget platform components.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

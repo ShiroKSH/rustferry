@@ -17,9 +17,9 @@ This matrix deliberately separates validation levels. “Model tested” means h
 | Path | Implemented | Compile | Artifact | Simulator/emulator | Device |
 | --- | --- | --- | --- | --- | --- |
 | Host config/runtime/tests | Yes | Host workspace checks; see [STATUS](STATUS.md) | N/A | N/A | N/A |
-| Android direct APK | Yes, build-only | arm64 generated Rust app plus Java/DEX bridge | Public-CLI starter and Kitchen Sink APKs independently inspected | Not validated | Not validated |
-| iOS Simulator `.app` | Yes, build-only | arm64 Slint executables | Public-CLI starter and Kitchen Sink `.app`/`.appex` bundles independently inspected | Not validated | N/A |
-| iOS physical-device app | Not claimed complete | Not validated | Not validated | N/A | Not validated |
+| Android direct APK | Build plus typed devices/install/run/logs implemented | arm64 generated Rust app plus Java/DEX bridge | Public-CLI starter and Kitchen Sink APKs independently inspected | Deployment runtime not validated | Deployment runtime not validated |
+| iOS Simulator `.app` | Build plus typed devices/install/run/logs implemented | arm64 Slint executables | Public-CLI starter and Kitchen Sink `.app`/`.appex` bundles independently inspected | Deployment runtime not validated | N/A |
+| iOS physical-device app | Official development-signing build/install/run implemented; explicit Team and provisioning controls | Deterministic arm64/Xcode plan tested; no signing identity available | Not validated | N/A | Not validated |
 
 ## Capability evidence
 
@@ -36,7 +36,7 @@ This matrix deliberately separates validation levels. “Model tested” means h
 | Widget | Snapshot model/tests + standalone example | Provider/backend enabled and artifact-inspected | Publisher, timeline renderer, and WidgetKit `.appex` artifact-inspected | None |
 | Live Activity | State model/tests + standalone example | Ongoing-notification fallback enabled in an inspected Kitchen Sink APK | ActivityKit lifecycle bridge and `.appex` artifact-inspected | None |
 
-Remote push is unavailable; schema version 1 rejects `push = true`. Install/run/log/device flows are not current CLI commands.
+Remote push is unavailable; schema version 1 rejects `push = true`. Device discovery and deployment use exact stable IDs, validated artifacts, bounded application-filtered logs, and official ADB/simctl/devicectl commands. No device behavior is inferred from those implemented paths.
 
 ## CI interpretation
 

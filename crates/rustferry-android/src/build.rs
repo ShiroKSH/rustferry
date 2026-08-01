@@ -7,19 +7,21 @@ use std::{
 
 use camino::{Utf8Path, Utf8PathBuf};
 use fs2::FileExt as _;
+use rustferry_codegen::generate_platform_assets;
 use rustferry_core::{AndroidAbi, AndroidLiveActivityFallback, FerryConfig, ProjectAssets, brand};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::apk::apk_artifact_digest;
 use crate::error::io_error;
 use crate::{
     AndroidError, AndroidSigningConfig, AndroidToolchain, ApkExpectation, ApkValidation,
     CommandSpec, DiscoveryOptions, GeneratedAndroidContent, GeneratedAndroidFiles,
     NativeLibraryInput, apksigner_sign_command, apksigner_verify_command, cargo_build_command,
     collect_cargo_artifacts, collect_d8_outputs, collect_explicit_dex_inputs, discover_android,
-    generate::generate_android_content_with_assets, inject_apk_entries, preview_signing_config,
-    resolve_signing_config, run_command, validate_aapt2_badging, validate_aapt2_manifest,
-    validate_apk_archive, write_android_content,
+    generate::{content_from_generated_asset_set, generate_android_content_with_assets},
+    inject_apk_entries, preview_signing_config, resolve_signing_config, run_command,
+    validate_aapt2_badging, validate_aapt2_manifest, validate_apk_archive, write_android_content,
 };
 
 /// Cargo profile used for the native build and manifest debuggability.
@@ -186,20 +188,47 @@ pub struct AndroidBuildPlan {
 }
 
 /// Verified signed APK metadata.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct AndroidBuildArtifact {
     /// Final APK path.
-    pub apk: Utf8PathBuf,
+    apk: Utf8PathBuf,
     /// Independent archive/package/native validation evidence.
-    pub validation: ApkValidation,
+    validation: ApkValidation,
     /// Reused deterministic stages.
-    pub cache_hits: Vec<String>,
+    cache_hits: Vec<String>,
     /// Full command log directory.
-    pub log_dir: Utf8PathBuf,
+    log_dir: Utf8PathBuf,
+}
+
+impl AndroidBuildArtifact {
+    /// Final APK path bound to the completed build validation.
+    #[must_use]
+    pub fn apk(&self) -> &Utf8Path {
+        &self.apk
+    }
+
+    /// Independent archive, package, manifest, native-code, and digest evidence.
+    #[must_use]
+    pub const fn validation(&self) -> &ApkValidation {
+        &self.validation
+    }
+
+    /// Deterministic stages reused by this build.
+    #[must_use]
+    pub fn cache_hits(&self) -> &[String] {
+        &self.cache_hits
+    }
+
+    /// Full command log directory.
+    #[must_use]
+    pub fn log_dir(&self) -> &Utf8Path {
+        &self.log_dir
+    }
 }
 
 /// Result of build orchestration.
 #[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)] // Keep the public Built payload source-compatible.
 pub enum AndroidBuildOutcome {
     /// No mutation or external process occurred.
     DryRun(Box<AndroidBuildPlan>),
@@ -460,7 +489,9 @@ fn execute_android_build(
     })?;
     fs::create_dir_all(&plan.paths.logs)
         .map_err(|source| io_error("create Android log directory", &plan.paths.logs, source))?;
-    let generated = write_android_content(&plan.paths.generated_root, &plan.generated_content)?;
+    let asset_set = generate_platform_assets(&request.project_dir, None)?;
+    let generated_content = content_from_generated_asset_set(&plan.generated_content, &asset_set)?;
+    let generated = write_android_content(&plan.paths.generated_root, &generated_content)?;
     let bridge_class_files = compile_bridge_classes(request, plan, &generated)?;
     let mut natives = Vec::new();
     let mut dependency_dex = bridge_class_files;
@@ -573,6 +604,8 @@ fn execute_android_build(
     sign.timeout = request.command_timeout;
     run_command(&sign, &plan.paths.logs.join("apksigner-sign.log"))?;
 
+    let validated_digest = apk_artifact_digest(&plan.paths.final_apk)?;
+
     let mut signature =
         apksigner_verify_command(&plan.toolchain, &plan.paths.final_apk, &request.project_dir)?;
     signature.timeout = request.command_timeout;
@@ -616,6 +649,14 @@ fn execute_android_build(
         plan.toolchain.platform.api_level,
         &mut validation,
     )?;
+    let current_digest = apk_artifact_digest(&plan.paths.final_apk)?;
+    if validation.artifact_digest != validated_digest || current_digest != validated_digest {
+        return Err(AndroidError::InvalidArtifact {
+            path: plan.paths.final_apk.clone(),
+            reason: "APK changed while signature, alignment, archive, or manifest validation was running"
+                .to_owned(),
+        });
+    }
     Ok(AndroidBuildArtifact {
         apk: plan.paths.final_apk.clone(),
         validation,
@@ -1370,6 +1411,15 @@ mod tests {
     use super::*;
     use crate::{AndroidBuildTools, AndroidNdk, AndroidPlatform};
 
+    mod png_fixture {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/opaque_png.rs"
+        ));
+    }
+
+    use png_fixture::OPAQUE_1024_PNG as PNG;
+
     fn fixture_toolchain(root: &Utf8Path) -> AndroidToolchain {
         let tool = |name: &str| {
             let path = root.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
@@ -1431,7 +1481,6 @@ mod tests {
     }
 
     fn write_project_assets(root: &Utf8Path) {
-        const PNG: &[u8] = include_bytes!("../../../examples/counter/assets/icon.png");
         fs::create_dir_all(root.join("assets")).unwrap();
         fs::write(root.join("assets/icon.png"), PNG).unwrap();
         fs::write(root.join("assets/splash.png"), PNG).unwrap();
@@ -1545,14 +1594,6 @@ mod tests {
 
     #[test]
     fn build_cache_key_changes_with_config_and_toolchain_versions() {
-        const ALTERNATE_PNG: &[u8] = &[
-            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
-            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00,
-            0x00, 0xb5, 0x1c, 0x0c, 0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78,
-            0xda, 0x63, 0x64, 0xf8, 0x0f, 0x00, 0x01, 0x05, 0x01, 0x01, 0x27, 0x18, 0xe3, 0x66,
-            0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
-        ];
-
         let temp = TempDir::new().unwrap();
         let root = Utf8PathBuf::from_path_buf(temp.path().to_owned()).unwrap();
         let project = root.join("project");
@@ -1588,9 +1629,21 @@ mod tests {
             toolchain_plan.paths.intermediates
         );
 
-        fs::write(project.join("assets/icon.png"), ALTERNATE_PNG).unwrap();
+        let icon = fs::read(project.join("assets/icon.png")).unwrap();
+        fs::write(project.join("assets/icon.png"), png_with_text_chunk(&icon)).unwrap();
         let asset_plan = plan_android_build(&request, &toolchain).unwrap();
-        assert_ne!(original.paths.intermediates, asset_plan.paths.intermediates);
+        assert_eq!(original.paths.intermediates, asset_plan.paths.intermediates);
+    }
+
+    fn png_with_text_chunk(png: &[u8]) -> Vec<u8> {
+        const TEXT_CHUNK: &[u8] = &[
+            0, 0, 0, 3, b't', b'E', b'X', b't', b'x', 0, b'y', 0x45, 0xdb, 0xf3, 0x28,
+        ];
+        let iend_offset = png.len().checked_sub(12).expect("PNG IEND chunk");
+        let mut changed = png[..iend_offset].to_vec();
+        changed.extend_from_slice(TEXT_CHUNK);
+        changed.extend_from_slice(&png[iend_offset..]);
+        changed
     }
 
     #[test]
