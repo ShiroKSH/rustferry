@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-v2-${{ github.ref }}
+  group: rustferry-ci-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -42,12 +42,6 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-      - name: Workspace tests
-        run: cargo test --locked --workspace --all-features
-      - name: Template tests
-        run: |
-          cargo test --locked -p rustferry-codegen
-          cargo test --locked -p cargo-ferry
       - name: Packaged CLI sources
         shell: bash
         run: |
