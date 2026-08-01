@@ -2,7 +2,7 @@
 
 Last validated: 2026-08-01
 
-Current RustFerry-named Apple artifact evidence comes from [Platform artifacts run 30699379465](https://github.com/ShiroKSH/rustferry/actions/runs/30699379465) at commit `be5206c`. Exact legacy paths, identifiers, symbols, and bundle names remain below as a separate historical record.
+Current RustFerry-named Apple artifact evidence comes from [Platform artifacts run 30719811812](https://github.com/ShiroKSH/rustferry/actions/runs/30719811812) at commit `8ed0192`. Exact legacy paths, identifiers, symbols, and bundle names remain below as a separate historical record.
 
 | Area | Status | Evidence |
 | --- | --- | --- |
@@ -10,15 +10,15 @@ Current RustFerry-named Apple artifact evidence comes from [Platform artifacts r
 | Rust target discovery | Implemented and host-tested | `aarch64-apple-ios-sim` |
 | Doctor | Implemented | Build prerequisites separate from optional runtime availability |
 | Deterministic Xcode/plist/assets | Implemented; both asset modes host-tested | Compiled-catalog project tests plus a real SDK-only Xcode build |
-| Starter Simulator `.app` | Current artifact validation | Public-CLI arm64 `.app` in [Platform run 30699379465](https://github.com/ShiroKSH/rustferry/actions/runs/30699379465), plus the Developer Experience 0.2 SDK-only smoke app |
+| Starter Simulator `.app` | Current artifact validation | Public-CLI arm64 `.app` in [Platform run 30719811812](https://github.com/ShiroKSH/rustferry/actions/runs/30719811812), plus the Developer Experience 0.2 SDK-only smoke app |
 | Kitchen Sink Simulator `.app` | Current artifact validation | Public-CLI arm64 `.app` with two embedded extensions in the same run |
 | Runtime bridge | Implemented; current target compile/artifact inspection | arm64 `FerryRuntimeBridge.framework`; required exports/application hook and strict ad-hoc signature validated |
 | WidgetKit | Publisher and renderer implemented; current compile/embed/artifact inspection | Runtime app-group writer plus signed `PlugIns/FerryWidgetExtension.appex` |
 | ActivityKit | Start/update/end/list and presentation implemented; current compile/embed/artifact inspection | Runtime framework plus signed `PlugIns/FerryLiveActivityExtension.appex` |
 | Simulator install/launch/UI | CLI implemented; runtime unvalidated | Typed `simctl` install/launch services exist; no CoreSimulator runtime/device is installed |
-| Physical-device signing/install | Implemented; signing and device unvalidated | Official Xcode/Team/profile/devicectl flow and recursive verification exist; no identity, Team, profile, artifact, or device was available |
+| Physical-device signing/install | Implemented; signing and device unvalidated | Side-effect-free official-tool planning passes without Xcode; no identity, Team, profile, signed artifact, or device was available |
 
-[Platform artifacts run 30699379465](https://github.com/ShiroKSH/rustferry/actions/runs/30699379465) generated default Starter and Kitchen Sink projects with the public CLI. Both RustFerry-named application bundles have arm64 executables and passed plist/resource inspection plus deep/strict ad-hoc signature verification. The run also checked `FerryRuntimeBridge.framework`, its required exports and application hook, both embedded `.appex` products, exact identifiers and framework linkage, and the exact `group.org.rustferry.ciextensions` application-group entitlement on the Kitchen Sink app and widget.
+[Platform artifacts run 30719811812](https://github.com/ShiroKSH/rustferry/actions/runs/30719811812) generated default Starter and Kitchen Sink projects with the public CLI. Both RustFerry-named application bundles have arm64 executables and passed plist/resource inspection plus deep/strict ad-hoc signature verification. The run also checked `FerryRuntimeBridge.framework`, its required exports and application hook, both embedded `.appex` products, exact identifiers and framework linkage, and the exact `group.org.rustferry.ciextensions` application-group entitlement on the Kitchen Sink app and widget.
 
 No application was installed or launched; these checks do not establish Simulator or device runtime behavior.
 

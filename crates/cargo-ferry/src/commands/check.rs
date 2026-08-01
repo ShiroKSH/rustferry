@@ -387,7 +387,9 @@ mod tests {
 
     #[test]
     fn cargo_json_becomes_absolute_zero_based_utf16_diagnostic() {
-        let root = Utf8Path::new("/workspace with space");
+        let temporary = tempfile::tempdir().unwrap();
+        let root_path = temporary.path().join("workspace with space");
+        let root = Utf8Path::from_path(&root_path).unwrap();
         let source = serde_json::json!({
             "reason": "compiler-message",
             "message": {
@@ -416,7 +418,7 @@ mod tests {
 
         assert_eq!(diagnostics.len(), 1);
         let diagnostic = &diagnostics[0];
-        assert_eq!(diagnostic.file, "/workspace with space/src/main.rs");
+        assert_eq!(diagnostic.file, root.join("src/main.rs"));
         assert_eq!(diagnostic.code, "rustc.E0308");
         assert_eq!(
             diagnostic.range.start,

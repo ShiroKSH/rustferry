@@ -823,7 +823,8 @@ fn ide_physical_build_dry_run_uses_the_official_signing_plan() {
 
     assert!(
         output.status.success(),
-        "stderr: {}",
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(output.stderr.is_empty());
@@ -1033,7 +1034,8 @@ fn physical_ios_dry_run_uses_official_signing_plan_without_mutating_provisioning
         .expect("physical iOS plan");
     assert!(
         output.status.success(),
-        "stderr: {}",
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     let document: Value = serde_json::from_slice(&output.stdout).expect("plan JSON");

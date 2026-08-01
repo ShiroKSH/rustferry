@@ -1705,12 +1705,6 @@ fn reject_symlink_ancestors(project: &Utf8Path, path: &Utf8Path) -> DeploymentRe
 }
 
 fn validate_request(request: &PhysicalBuildRequest) -> DeploymentResult<()> {
-    if std::env::consts::OS != "macos" && !cfg!(test) {
-        return Err(DeploymentError::Unsupported {
-            message: "physical iOS builds require macOS with full Xcode".to_owned(),
-            help: "Run the build on a Mac with full Xcode selected.".to_owned(),
-        });
-    }
     if !request.project_dir.is_dir() || !request.project_dir.join("Cargo.toml").is_file() {
         return Err(DeploymentError::InvalidArtifact {
             path: request.project_dir.clone(),

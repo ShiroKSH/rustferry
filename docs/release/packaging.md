@@ -72,7 +72,7 @@ for 6/6 crates, the package Python suite passed 19/19, and the release contract
 confirmed 17/17 exact internal dependency edges. The largest archive was 152.9
 KiB, below the scanner's 10 MiB compressed-size limit. These are package-gate
 results, not a crates.io publication. The full local workspace suite separately
-passed 257 Rust tests with 0 failures and 7 deliberate platform/hardware ignores.
+passed 258 Rust tests with 0 failures and 7 deliberate platform/hardware ignores.
 
 ## Publish procedure
 

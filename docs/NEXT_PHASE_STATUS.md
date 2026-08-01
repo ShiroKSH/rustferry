@@ -12,7 +12,7 @@ This is the live execution ledger for Developer Experience 0.2. “Implemented�
 | 8–14. Deployment | Implemented; runtime unobserved | Human and IDE devices/install/run/logs use the same typed ADB/simctl/devicectl services; physical iOS official signing/build/install/launch code exists; no device/runtime claim |
 | 16. Runtime/package flow | Complete; publication pending | Normal generation is registry-first; explicit registry/workspace/path modes and no-dev-path tests pass; archive/source/handshake gates passed for 6/6 crates, package Python tests passed 19/19, all 17/17 internal dependency edges are exact, and the largest archive is 152.9 KiB |
 | 17. Assets/release hardening | Complete; runtime gate explicit | SHA-256/tamper-safe concurrent cache; five Android densities and splash artifact-inspected; iOS compiled catalog implemented/tested; zero-runtime SDK-only `.app` built and inspected |
-| 18–21. VSIX/tests/CI/release | Implemented; CI gates every push | Final 44,435-byte, 18-entry VSIX smoke-tested (`ba8cac7e…3d183ce6d`); local formatting, workspace check, strict Clippy, 257 Rust tests with 0 failures and 7 deliberate ignores, Rustdoc/doctests/cookbook, Rust 1.92, license inventory, package archives, publish dry-run, and workflow checks pass |
+| 18–21. VSIX/tests/CI/release | Implemented; CI gates every push | Final 44,435-byte, 18-entry VSIX smoke-tested (`ba8cac7e…3d183ce6d`); local formatting, workspace check, strict Clippy, 258 Rust tests with 0 failures and 7 deliberate ignores, Rustdoc/doctests/cookbook, Rust 1.92, license inventory, package archives, publish dry-run, and workflow checks pass |
 
 ## Current validation levels
 
