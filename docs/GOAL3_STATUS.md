@@ -2,7 +2,7 @@
 
 ## Current milestone
 
-Milestone -2 — isolation: complete. Milestone -1 — inherited baseline: complete. Milestone 0 — remote/signing/source/artifact contracts: complete. Milestone 1 — physical-device compile: implementation complete, real archive validation blocked by the local toolchain.
+Milestone -2 — isolation: complete. Milestone -1 — inherited baseline: complete. Milestone 0 — remote/signing/source/artifact contracts: complete. Milestone 1 — physical-device compile: implementation complete. Milestone 2 — signing engine: implementation complete with synthetic fixtures. Milestone 3 — GitHub provider: in progress; live unsigned acceptance has not run.
 
 ## Validation levels
 
@@ -10,9 +10,10 @@ Milestone -2 — isolation: complete. Milestone -1 — inherited baseline: compl
 - Isolation audit: source checkout remains read-only. Review agents bypassed the Goal 3 command wrapper for a bounded set of checks; exact commands/outcomes and recovery are recorded in `GOAL3_COMMAND_AUDIT_EXCEPTIONS.md`. Their accidental Goal 3-only root build cache was removed with an audited `cargo clean`; subsequent checks use the wrapper.
 - Remote protocol: v1.0 Rust contracts, provider boundary, cancellation, 24 typed events, and checked-in JSON Schema implemented.
 - Source snapshots: deterministic manifest selection, deterministic ZIP transport, atomic publication, strict worker extraction, and exact post-extraction verification implemented.
-- Signing/provisioning: reference-only typed plans, staged validation state, central chunk-safe redaction, and metadata validation implemented; no certificate/profile bytes or Apple signing operation validated.
-- Artifact inspection: cross-platform strict unsigned `.xcarchive`/`.app` and IPA ZIP/plist/Mach-O parsers implemented. They reject Simulator code, signing residue in unsigned input, hidden code, bundle-set drift, resource drift, links, collisions, and archive-limit violations. `rustferry-remote` reported 67 unit/integration tests plus 4 compile-fail doctests passing; strict clippy and Linux/Windows cross-target checks pass. The license review covers 238 packages and 19 expressions. Produced physical-device artifacts have not run through either validator.
-- Physical-device compile: deterministic unsigned `aarch64-apple-ios`/`iphoneos`/generic-device archive plan and executor implemented. `rustferry-apple` reported 38 passed and 8 intentionally ignored; strict clippy and macOS, Linux, and Windows planner checks passed. Local Xcode 26.6 accepted the generated device project and a real signed Simulator extension smoke passed. A real physical archive remains unvalidated: the isolated host lacks the `aarch64-apple-ios` Rust target, and `xcodebuild` reports the discoverable iPhoneOS 26.5 SDK's platform component is not installed. The executor now fails this condition before Cargo work.
+- Signing/provisioning: public certificate metadata plus opaque private-key/password/profile references, temporary-Keychain worker isolation, staged validation state, central chunk-safe redaction, and profile/entitlement/nested-code validation implemented. Device requests retain only a lowercase SHA-256 of the UDID. No real certificate/profile bytes or Apple signing operation have been validated.
+- Artifact inspection: cross-platform strict unsigned `.xcarchive`/`.app` and IPA ZIP/plist/Mach-O parsers implemented. Client-owned product identity now binds the exact app path, versions, deployment target, nested bundle graph, source manifest, and canonical request digest across compile and signing. They reject Simulator code, signing residue in unsigned input, hidden code, bundle-set drift, resource drift, links, collisions, and archive-limit violations. The current `rustferry-remote` run reports 71 unit/integration tests passing; strict clippy passes. The parent-swap regression now synchronizes its attacker before publication and passes on rerun. Produced physical-device artifacts have not run through either validator.
+- Physical-device compile: deterministic unsigned `aarch64-apple-ios`/`iphoneos`/generic-device archive plan and executor implemented. The Apple crate now exposes one pure request-product derivation shared by local and remote planners. The current `rustferry-apple` run reports 39 passed and 8 intentionally ignored; strict clippy passes. Local Xcode 26.6 accepted the generated device project and a real signed Simulator extension smoke passed. A real physical archive remains unvalidated locally: the isolated host lacks the `aarch64-apple-ios` Rust target, and `xcodebuild` reports the discoverable iPhoneOS 26.5 SDK's platform component is not installed. The remote macOS path is the acceptance target.
+- GitHub artifact ingestion: dedicated private ephemeral cache, exact run-attempt lookup, mandatory API digest, strict two-layer ZIP/JSON handling, full handoff binding, independent unsigned archive/IPA inspection, rehash-on-download, and atomic no-clobber publication implemented. Failed staging and completed per-process caches are removed by exact owned-path guards. The current `rustferry-github` run reports 101 tests passing; strict clippy passes.
 - IPA export: not validated.
 - Client download: not validated.
 - Install, launch, runtime: not validated.
@@ -23,6 +24,7 @@ Milestone -2 — isolation: complete. Milestone -1 — inherited baseline: compl
 - Repository workflows: none returned by the API at observation time.
 - Goal 3 protected environment: absent.
 - Repository signing secret names: none returned. No secret values were requested or accessed.
+- Signed setup, doctor, and submission intentionally reject this public repository; a private execution repository is required before development signing.
 - Real GitHub build/sign/download job: not run.
 
 ## Honest product status

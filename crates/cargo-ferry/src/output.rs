@@ -66,6 +66,13 @@ impl Reporter {
         }
     }
 
+    /// Emit safe long-running progress in human mode without contaminating JSON output.
+    pub fn progress(&self, message: impl AsRef<str>) {
+        if !self.quiet && !self.json {
+            eprintln!("{}", message.as_ref());
+        }
+    }
+
     /// Render a failure in the selected output mode.
     pub fn error(&self, error: &CliError) {
         if self.json {

@@ -1,5 +1,5 @@
 [package]
-name = "cargo-ferry"
+name = "rustferry-worker-macos"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,37 +7,30 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
-readme.workspace = true
-keywords.workspace = true
-categories.workspace = true
-description = "Build Rust applications for Android and iOS without user-maintained platform projects"
+description = "Hardened macOS build and signing worker for RustFerry"
 
 [[bin]]
-name = "cargo-ferry"
+name = "ferry-worker-macos"
 path = "src/main.rs"
 
 [dependencies]
 camino.workspace = true
+cap-std.workspace = true
 clap.workspace = true
-clap_complete = "4.5.55"
-rustferry-android = { version = "0.1.0", path = "../rustferry-android" }
+fs2.workspace = true
+plist.workspace = true
 rustferry-apple = { version = "0.1.0", path = "../rustferry-apple" }
-rustferry-codegen = { version = "0.1.0", path = "../rustferry-codegen" }
 rustferry-core = { version = "0.1.0", path = "../rustferry-core" }
-rustferry-github = { version = "0.1.0", path = "../rustferry-github" }
 rustferry-remote = { version = "0.1.0", path = "../rustferry-remote" }
-semver.workspace = true
+same-file.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
-toml_edit = "0.23.7"
+toml.workspace = true
 uuid.workspace = true
-
-[dev-dependencies]
-assert_cmd = "2.0.17"
-predicates = "3.1.3"
+zip.workspace = true
 
 [lints]
 workspace = true

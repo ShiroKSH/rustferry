@@ -11,10 +11,12 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use toml_edit::DocumentMut;
 
-use crate::cli::{AndroidBuildArgs, BuildArgs, BuildPlatform, IosBuildArgs};
+use crate::cli::{AndroidBuildArgs, BuildArgs, BuildPlatform, IosBuildArgs, RemoteProviderChoice};
 use crate::error::CliError;
 use crate::output::Reporter;
 use crate::project::find_project_root;
+
+use super::remote;
 
 #[derive(Debug, Serialize)]
 struct BuildOutput {
@@ -45,21 +47,48 @@ pub fn run(arguments: BuildArgs, dry_run: bool, reporter: &Reporter) -> Result<(
     let config = rustferry_core::FerryConfig::load(&root.join("ferry.toml"))?;
     let targets = read_cargo_targets(&root)?;
     match arguments.platform {
-        BuildPlatform::Android(android) => build_android(
-            &root,
-            config,
-            &targets,
-            android,
-            arguments.release,
-            dry_run,
-            reporter,
-        ),
+        BuildPlatform::Android(android) => {
+            if arguments.remote.is_some() || arguments.unsigned {
+                return Err(CliError::Unsupported {
+                    message: "remote and unsigned options apply only to physical-iPhone builds"
+                        .to_owned(),
+                    help: "Remove `--remote` and `--unsigned` from the Android build command."
+                        .to_owned(),
+                });
+            }
+            build_android(
+                &root,
+                config,
+                &targets,
+                android,
+                arguments.release,
+                dry_run,
+                reporter,
+            )
+        }
+        BuildPlatform::Iphone(iphone) => {
+            require_platform(&config, TargetPlatform::Ios, "ios")?;
+            remote::build_iphone(
+                &root,
+                &config,
+                &targets.package,
+                &targets.binary,
+                arguments.remote.unwrap_or(RemoteProviderChoice::Github),
+                iphone.team.as_deref(),
+                arguments.release,
+                arguments.unsigned,
+                dry_run,
+                reporter,
+            )
+        }
         BuildPlatform::Ios(ios) => build_ios(
             &root,
             config,
             &targets,
             &ios,
+            arguments.remote,
             arguments.release,
+            arguments.unsigned,
             dry_run,
             reporter,
         ),
@@ -185,29 +214,45 @@ fn ios_request(
     request
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn build_ios(
     root: &Utf8Path,
     config: rustferry_core::FerryConfig,
     targets: &CargoTargets,
     arguments: &IosBuildArgs,
+    remote_provider: Option<RemoteProviderChoice>,
     release: bool,
+    unsigned: bool,
     dry_run: bool,
     reporter: &Reporter,
 ) -> Result<(), CliError> {
     require_platform(&config, TargetPlatform::Ios, "ios")?;
     if arguments.device {
-        let team = arguments.team.as_deref().unwrap_or("<missing>");
-        return Err(CliError::Unsupported {
-            message: format!(
-                "physical iPhone builds are not implemented; requested development team `{team}`"
-            ),
-            help: "Build a real, locally ad-hoc-signed Simulator bundle with `cargo ferry build ios --simulator`. Physical-device support will use only official Xcode signing and provisioning when implemented.".to_owned(),
-        });
+        return remote::build_iphone(
+            root,
+            &config,
+            &targets.package,
+            &targets.binary,
+            remote_provider.unwrap_or(RemoteProviderChoice::Github),
+            arguments.team.as_deref(),
+            release,
+            unsigned,
+            dry_run,
+            reporter,
+        );
     }
     if !arguments.simulator {
         return Err(CliError::Unsupported {
             message: "an iOS build mode was not selected".to_owned(),
-            help: "Pass `--simulator`, or use `--device --team TEAM` when physical-device support becomes available.".to_owned(),
+            help:
+                "Pass `--simulator`, or use `--device --remote github` for a physical-iPhone build."
+                    .to_owned(),
+        });
+    }
+    if remote_provider.is_some() || unsigned {
+        return Err(CliError::Unsupported {
+            message: "remote and unsigned options apply only to physical-iPhone builds".to_owned(),
+            help: "Use `cargo ferry build ios --simulator` without `--remote` or `--unsigned`, or select `--device`.".to_owned(),
         });
     }
 

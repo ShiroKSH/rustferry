@@ -58,9 +58,58 @@ pub fn run_captured(
         stage,
         reporter,
         COMMAND_TIMEOUT,
+        None,
+        None,
+        false,
     )
 }
 
+/// Run an external command while bounding each captured output stream.
+pub fn run_captured_bounded(
+    program: &Utf8Path,
+    arguments: &[OsString],
+    current_directory: &Utf8Path,
+    stage: &'static str,
+    reporter: &Reporter,
+    output_limit: usize,
+) -> Result<Output, CliError> {
+    run_captured_with_timeout(
+        program,
+        arguments,
+        current_directory,
+        stage,
+        reporter,
+        COMMAND_TIMEOUT,
+        Some(output_limit),
+        None,
+        false,
+    )
+}
+
+/// Run a bounded command with a minimal environment and optional fixed stdin bytes.
+pub fn run_captured_bounded_isolated(
+    program: &Utf8Path,
+    arguments: &[OsString],
+    current_directory: &Utf8Path,
+    stage: &'static str,
+    reporter: &Reporter,
+    output_limit: usize,
+    input: Option<&[u8]>,
+) -> Result<Output, CliError> {
+    run_captured_with_timeout(
+        program,
+        arguments,
+        current_directory,
+        stage,
+        reporter,
+        COMMAND_TIMEOUT,
+        Some(output_limit),
+        input,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn run_captured_with_timeout(
     program: &Utf8Path,
     arguments: &[OsString],
@@ -68,14 +117,23 @@ fn run_captured_with_timeout(
     stage: &'static str,
     reporter: &Reporter,
     timeout: Duration,
+    output_limit: Option<usize>,
+    input: Option<&[u8]>,
+    isolated_environment: bool,
 ) -> Result<Output, CliError> {
     reporter.verbose(format_command(program, arguments));
     let mut command = Command::new(program);
+    command.args(arguments).current_dir(current_directory);
+    if isolated_environment {
+        apply_minimal_environment(&mut command);
+    }
     command
-        .args(arguments)
-        .current_dir(current_directory)
         .env("CARGO_TERM_COLOR", "never")
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_process_group(&mut command);
@@ -86,7 +144,22 @@ fn run_captured_with_timeout(
     })?;
     let process_group = child.id();
     let _process_group_guard = track_child(&mut child, program)?;
-    let (stdout_reader, stderr_reader) = capture_output(&mut child, program)?;
+    let (stdout_reader, stderr_reader) = capture_output(&mut child, program, output_limit)?;
+    if let Some(input) = input {
+        let mut stdin = child.stdin.take().ok_or_else(|| CliError::Io {
+            action: "open external command stdin",
+            path: program.to_owned(),
+            source: std::io::Error::other("spawned process did not expose stdin"),
+        })?;
+        stdin.write_all(input).map_err(|source| {
+            terminate_process_tree(&mut child, process_group);
+            CliError::Io {
+                action: "write external command stdin",
+                path: program.to_owned(),
+                source,
+            }
+        })?;
+    }
     let started = Instant::now();
     let status = loop {
         if rustferry_core::process_control::interrupt_requested() {
@@ -165,6 +238,25 @@ fn run_captured_with_timeout(
     })
 }
 
+fn apply_minimal_environment(command: &mut Command) {
+    command.env_clear();
+    for name in [
+        "PATH",
+        "PATHEXT",
+        "SystemRoot",
+        "WINDIR",
+        "COMSPEC",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+    ] {
+        if let Some(value) = std::env::var_os(name).filter(|value| !value.is_empty()) {
+            command.env(name, value);
+        }
+    }
+    command.env("LC_ALL", "C").env("LANG", "C");
+}
+
 fn track_child(
     child: &mut Child,
     program: &Utf8Path,
@@ -183,6 +275,7 @@ fn track_child(
 fn capture_output(
     child: &mut Child,
     program: &Utf8Path,
+    output_limit: Option<usize>,
 ) -> Result<(OutputReader, OutputReader), CliError> {
     let stdout = child.stdout.take().ok_or_else(|| CliError::Io {
         action: "capture command stdout",
@@ -194,14 +287,42 @@ fn capture_output(
         path: program.to_owned(),
         source: std::io::Error::other("spawned process did not expose stderr"),
     })?;
-    Ok((spawn_reader(stdout), spawn_reader(stderr)))
+    Ok((
+        spawn_reader(stdout, output_limit),
+        spawn_reader(stderr, output_limit),
+    ))
 }
 
-fn spawn_reader(mut reader: impl Read + Send + 'static) -> OutputReader {
+fn spawn_reader(
+    mut reader: impl Read + Send + 'static,
+    output_limit: Option<usize>,
+) -> OutputReader {
     let (sender, receiver) = mpsc::sync_channel(1);
     thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let result = reader.read_to_end(&mut bytes).map(|_| bytes);
+        let mut bytes = Vec::with_capacity(output_limit.unwrap_or(0).min(16 * 1024));
+        let mut buffer = [0_u8; 16 * 1024];
+        let mut exceeded = false;
+        let result = loop {
+            match reader.read(&mut buffer) {
+                Ok(0) if exceeded => {
+                    break Err(std::io::Error::new(
+                        std::io::ErrorKind::FileTooLarge,
+                        "captured command output exceeded its configured bound",
+                    ));
+                }
+                Ok(0) => break Ok(bytes),
+                Ok(read) => {
+                    if let Some(limit) = output_limit {
+                        let retained = limit.saturating_sub(bytes.len()).min(read);
+                        bytes.extend_from_slice(&buffer[..retained]);
+                        exceeded |= retained < read;
+                    } else {
+                        bytes.extend_from_slice(&buffer[..read]);
+                    }
+                }
+                Err(source) => break Err(source),
+            }
+        };
         let _ = sender.send(result);
     });
     receiver
@@ -396,9 +517,29 @@ mod tests {
             "descendant timeout",
             &reporter,
             Duration::from_millis(200),
+            None,
+            None,
+            false,
         )
         .unwrap_err();
         assert!(matches!(error, CliError::CommandTimedOut { .. }));
         assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    #[test]
+    fn bounded_capture_drains_but_rejects_oversized_output() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temporary.path().to_owned()).unwrap();
+        let reporter = Reporter::new(false, true, false);
+        let error = run_captured_bounded(
+            Utf8Path::new("/bin/sh"),
+            &[OsString::from("-c"), OsString::from("printf 123456789")],
+            &root,
+            "bounded output",
+            &reporter,
+            4,
+        )
+        .unwrap_err();
+        assert!(matches!(error, CliError::Io { .. }));
     }
 }

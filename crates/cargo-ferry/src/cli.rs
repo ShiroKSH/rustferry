@@ -41,6 +41,8 @@ pub enum Command {
     Check(ProjectArgs),
     /// Inspect host and mobile toolchain prerequisites.
     Doctor(DoctorArgs),
+    /// Configure and inspect remote Apple build providers.
+    Remote(RemoteArgs),
     /// Build a mobile artifact without installing or launching it.
     Build(BuildArgs),
     /// Remove generated build output only.
@@ -178,8 +180,14 @@ pub struct BuildArgs {
     /// Build optimized Rust code.
     #[arg(long, global = true)]
     pub release: bool,
-    /// Project root or a child directory.
+    /// Remote provider for a physical-iPhone build.
+    #[arg(long, global = true, value_enum)]
+    pub remote: Option<RemoteProviderChoice>,
+    /// Compile a physical-iPhone archive without signing or provisioning.
     #[arg(long, global = true)]
+    pub unsigned: bool,
+    /// Project root or a child directory.
+    #[arg(long, visible_alias = "project", global = true)]
     pub project_dir: Option<Utf8PathBuf>,
 }
 
@@ -188,8 +196,18 @@ pub struct BuildArgs {
 pub enum BuildPlatform {
     /// Build a signed APK without a device.
     Android(AndroidBuildArgs),
+    /// Build for a physical iPhone through the configured remote provider.
+    Iphone(IphoneBuildArgs),
     /// Build an Apple application.
     Ios(IosBuildArgs),
+}
+
+/// Physical-iPhone build options.
+#[derive(Debug, Args)]
+pub struct IphoneBuildArgs {
+    /// Expected Apple Development Team identifier; checked against the configured signing plan.
+    #[arg(long)]
+    pub team: Option<String>,
 }
 
 /// Android build options.
@@ -215,6 +233,89 @@ pub struct IosBuildArgs {
     /// Apple Development Team identifier for a physical-device build.
     #[arg(long, requires = "device")]
     pub team: Option<String>,
+}
+
+/// Remote-provider command wrapper.
+#[derive(Debug, Args)]
+pub struct RemoteArgs {
+    /// Remote-provider operation.
+    #[command(subcommand)]
+    pub command: RemoteCommand,
+}
+
+/// Supported remote-provider operations.
+#[derive(Debug, Subcommand)]
+pub enum RemoteCommand {
+    /// Authenticate, verify, and create-only install the GitHub workflow and local provider config.
+    Setup(RemoteSetupArgs),
+    /// Run bounded authentication, repository, workflow, and artifact-store checks.
+    Doctor(RemoteDoctorArgs),
+    /// Show local provider configuration and workflow integrity without mutation.
+    Status(RemoteStatusArgs),
+}
+
+/// Remote providers implemented by this CLI surface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum RemoteProviderChoice {
+    /// GitHub Actions on a GitHub-hosted macOS runner.
+    Github,
+}
+
+/// GitHub provider setup arguments.
+#[derive(Debug, Args)]
+pub struct RemoteSetupArgs {
+    /// Provider to configure.
+    #[arg(value_enum)]
+    pub provider: RemoteProviderChoice,
+    /// Project root or a child directory.
+    #[arg(long, visible_alias = "project")]
+    pub project_dir: Option<Utf8PathBuf>,
+    /// Exact GitHub owner/repository; defaults to the selected Git remote.
+    #[arg(long)]
+    pub repository: Option<String>,
+    /// Git remote used for trusted-source checks and temporary refs.
+    #[arg(long, default_value = "origin")]
+    pub remote_name: String,
+    /// Full trusted ref; defaults to the current branch under refs/heads/.
+    #[arg(long)]
+    pub trusted_ref: Option<String>,
+    /// Public `RustFerry` worker source repository or owner/repository.
+    #[arg(long, default_value = env!("CARGO_PKG_REPOSITORY"))]
+    pub worker_repository: String,
+    /// Exact lowercase 40-hex revision containing the compatible macOS worker.
+    #[arg(long)]
+    pub worker_revision: Option<String>,
+    /// Compatible worker semantic version.
+    #[arg(long, default_value = env!("CARGO_PKG_VERSION"))]
+    pub worker_version: String,
+    /// Optional public signing-plan JSON. Secret values and raw device UDIDs are not accepted.
+    #[arg(long)]
+    pub signing_plan: Option<Utf8PathBuf>,
+    /// Print the deterministic workflow and config plan without installing either file.
+    #[arg(long)]
+    pub preview: bool,
+}
+
+/// GitHub provider doctor arguments.
+#[derive(Debug, Args)]
+pub struct RemoteDoctorArgs {
+    /// Provider to inspect.
+    #[arg(value_enum)]
+    pub provider: RemoteProviderChoice,
+    /// Project root or a child directory.
+    #[arg(long, visible_alias = "project")]
+    pub project_dir: Option<Utf8PathBuf>,
+}
+
+/// GitHub provider status arguments.
+#[derive(Debug, Args)]
+pub struct RemoteStatusArgs {
+    /// Provider to inspect.
+    #[arg(value_enum)]
+    pub provider: RemoteProviderChoice,
+    /// Project root or a child directory.
+    #[arg(long, visible_alias = "project")]
+    pub project_dir: Option<Utf8PathBuf>,
 }
 
 /// Generated-output cleanup options.
@@ -287,4 +388,67 @@ pub struct CompletionArgs {
     /// Shell syntax to generate.
     #[arg(value_enum)]
     pub shell: clap_complete::Shell,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser as _;
+
+    use super::{BuildPlatform, Cli, Command, RemoteCommand, RemoteProviderChoice};
+
+    #[test]
+    fn iphone_and_ios_device_grammars_share_the_github_selector() {
+        let iphone = Cli::try_parse_from([
+            "cargo-ferry",
+            "build",
+            "iphone",
+            "--remote",
+            "github",
+            "--unsigned",
+        ])
+        .expect("iPhone grammar");
+        let Command::Build(iphone) = iphone.command else {
+            panic!("expected build command");
+        };
+        assert!(matches!(iphone.platform, BuildPlatform::Iphone(_)));
+        assert_eq!(iphone.remote, Some(RemoteProviderChoice::Github));
+        assert!(iphone.unsigned);
+
+        let ios = Cli::try_parse_from([
+            "cargo-ferry",
+            "build",
+            "ios",
+            "--device",
+            "--remote",
+            "github",
+        ])
+        .expect("iOS device grammar");
+        let Command::Build(ios) = ios.command else {
+            panic!("expected build command");
+        };
+        assert!(matches!(ios.platform, BuildPlatform::Ios(_)));
+        assert_eq!(ios.remote, Some(RemoteProviderChoice::Github));
+    }
+
+    #[test]
+    fn simulator_and_remote_management_grammars_remain_available() {
+        let simulator = Cli::try_parse_from(["cargo-ferry", "build", "ios", "--simulator"])
+            .expect("simulator grammar");
+        let Command::Build(simulator) = simulator.command else {
+            panic!("expected build command");
+        };
+        assert!(matches!(simulator.platform, BuildPlatform::Ios(_)));
+
+        for operation in ["setup", "doctor", "status"] {
+            let parsed = Cli::try_parse_from(["cargo-ferry", "remote", operation, "github"])
+                .expect("remote grammar");
+            let Command::Remote(remote) = parsed.command else {
+                panic!("expected remote command");
+            };
+            assert!(matches!(
+                remote.command,
+                RemoteCommand::Setup(_) | RemoteCommand::Doctor(_) | RemoteCommand::Status(_)
+            ));
+        }
+    }
 }

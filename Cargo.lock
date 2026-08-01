@@ -224,11 +224,16 @@ dependencies = [
  "rustferry-apple",
  "rustferry-codegen",
  "rustferry-core",
+ "rustferry-github",
+ "rustferry-remote",
+ "semver",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.19",
  "toml_edit 0.23.10+spec-1.0.0",
+ "uuid",
 ]
 
 [[package]]
@@ -1265,6 +1270,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustferry-github"
+version = "0.1.0"
+dependencies = [
+ "camino",
+ "rustferry-remote",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "unicode-normalization",
+ "zip",
+]
+
+[[package]]
 name = "rustferry-remote"
 version = "0.1.0"
 dependencies = [
@@ -1283,6 +1303,29 @@ dependencies = [
  "thiserror 2.0.19",
  "unicode-normalization",
  "url",
+ "uuid",
+ "zip",
+]
+
+[[package]]
+name = "rustferry-worker-macos"
+version = "0.1.0"
+dependencies = [
+ "camino",
+ "cap-std",
+ "clap",
+ "fs2",
+ "plist",
+ "rustferry-apple",
+ "rustferry-core",
+ "rustferry-remote",
+ "same-file",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.19",
+ "toml",
  "uuid",
  "zip",
 ]

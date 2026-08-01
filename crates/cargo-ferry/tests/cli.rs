@@ -85,6 +85,33 @@ fn help_and_version_are_successful_control_flow() {
 }
 
 #[test]
+fn macless_iphone_and_github_remote_commands_are_exposed() {
+    cargo_bin_cmd!("cargo-ferry")
+        .args(["build", "iphone", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--remote"))
+        .stdout(predicate::str::contains("--unsigned"));
+
+    cargo_bin_cmd!("cargo-ferry")
+        .args(["remote", "setup", "github", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--worker-revision"))
+        .stdout(predicate::str::contains("--preview"));
+
+    cargo_bin_cmd!("cargo-ferry")
+        .args(["remote", "doctor", "github", "--help"])
+        .assert()
+        .success();
+
+    cargo_bin_cmd!("cargo-ferry")
+        .args(["remote", "status", "github", "--help"])
+        .assert()
+        .success();
+}
+
+#[test]
 fn verbose_conflicts_with_json_and_emits_a_json_argument_error() {
     let output = cargo_bin_cmd!("cargo-ferry")
         .args(["--json", "--verbose", "examples"])

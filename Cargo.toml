@@ -6,7 +6,9 @@ members = [
     "crates/rustferry-apple",
     "crates/rustferry-codegen",
     "crates/rustferry-core",
+    "crates/rustferry-github",
     "crates/rustferry-remote",
+    "crates/rustferry-worker-macos",
 ]
 resolver = "2"
 
