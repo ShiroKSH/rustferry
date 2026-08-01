@@ -2471,11 +2471,30 @@ fn executable(name: &'static str) -> Result<Utf8PathBuf, CliError> {
         searched: vec!["PATH".to_owned()],
         help: format!("Install `{name}` and make it available in PATH."),
     })?;
-    found.canonicalize_utf8().map_err(|source| CliError::Io {
-        action: "resolve external tool",
-        path: found,
+    executable_entrypoint(&found, name)
+}
+
+fn executable_entrypoint(found: &Utf8Path, name: &'static str) -> Result<Utf8PathBuf, CliError> {
+    let parent = found.parent().unwrap_or(Utf8Path::new("."));
+    let directory = parent.canonicalize_utf8().map_err(|source| CliError::Io {
+        action: "resolve external tool directory",
+        path: parent.to_owned(),
         source,
-    })
+    })?;
+    let filename = found.file_name().ok_or_else(|| CliError::ToolMissing {
+        tool: name.to_owned(),
+        searched: vec!["PATH".to_owned()],
+        help: format!("Install `{name}` and make it available in PATH."),
+    })?;
+    let entrypoint = directory.join(filename);
+    if !entrypoint.is_file() {
+        return Err(CliError::ToolMissing {
+            tool: name.to_owned(),
+            searched: vec!["PATH".to_owned()],
+            help: format!("Install `{name}` and make it available in PATH."),
+        });
+    }
+    Ok(entrypoint)
 }
 
 fn checked_output(
@@ -3150,9 +3169,10 @@ fn safe_public_text(value: &str) -> String {
 mod tests {
     use super::{
         ArtifactDownloadRollback, ExistingFile, GithubPaths, ImmediateProviderResult,
-        downloaded_manifest, ensure_doctor_ready, expected_artifact_downloads,
-        parse_repository_spec, preflight_file, prepare_artifact_destination,
-        retry_artifact_listing, source_manifest_digest, unsigned_signing_plan, write_create_only,
+        downloaded_manifest, ensure_doctor_ready, executable_entrypoint,
+        expected_artifact_downloads, parse_repository_spec, preflight_file,
+        prepare_artifact_destination, retry_artifact_listing, source_manifest_digest,
+        unsigned_signing_plan, write_create_only,
     };
     use std::time::{Duration, Instant};
 
@@ -3176,6 +3196,27 @@ mod tests {
             assert_eq!(source, "https://github.com/ShiroKSH/rustferry");
         }
         assert!(parse_repository_spec("https://token@github.com/owner/repo").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_entrypoint_preserves_multicall_symlink_basename() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let root = camino::Utf8Path::from_path(temporary.path()).expect("UTF-8 temp path");
+        let multicall = root.join("rustup");
+        std::fs::write(&multicall, b"multicall").expect("multicall fixture");
+        let cargo = root.join("cargo");
+        symlink(&multicall, &cargo).expect("cargo proxy symlink");
+
+        let resolved = executable_entrypoint(&cargo, "cargo").expect("cargo entrypoint");
+        assert_eq!(resolved, root.join("cargo"));
+        assert_eq!(resolved.file_name(), Some("cargo"));
+        assert_ne!(
+            resolved,
+            multicall.canonicalize_utf8().expect("multicall path")
+        );
     }
 
     #[test]

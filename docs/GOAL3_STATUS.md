@@ -2,7 +2,7 @@
 
 ## Current milestone
 
-Milestone -2 — isolation: complete. Milestone -1 — inherited baseline: complete. Milestone 0 — remote/signing/source/artifact contracts: complete. Milestone 1 — physical-device compile: implementation complete. Milestone 2 — signing engine: implementation complete with synthetic fixtures. Milestone 3 — GitHub provider: in progress; live unsigned acceptance has not run.
+Milestone -2 — isolation: complete. Milestone -1 — inherited baseline: complete. Milestone 0 — remote/signing/source/artifact contracts: complete. Milestone 1 — physical-device compile: implementation complete. Milestone 2 — signing engine: implementation complete with synthetic fixtures. Milestone 3 — GitHub provider: in progress; the live Linux client has proved authentication, repository binding, trusted workflow bytes, and temporary-ref authorization. The macOS worker job and automatic archive download remain pending.
 
 ## Validation levels
 
@@ -21,12 +21,12 @@ Milestone -2 — isolation: complete. Milestone -1 — inherited baseline: compl
 ## GitHub readiness observation
 
 - Repository: public `ShiroKSH/rustferry`; current user has admin access; Actions enabled.
-- Repository workflows: none returned by the API at observation time.
+- Goal 3 branch workflows: the generated iPhone worker and Linux-client acceptance workflows are installed and have been triggered by exact branch commits.
 - Goal 3 protected environment: absent.
 - Repository signing secret names: none returned. No secret values were requested or accessed.
 - Signed setup, doctor, and submission intentionally reject this public repository; a private execution repository is required before development signing.
-- Real GitHub build/sign/download job: not run.
+- Live Linux acceptance runs `30722271351` and `30723002515` failed before submission, first on unsupported Actions-token identity lookup and then because executable canonicalization changed the Rustup `cargo` proxy basename. Both failures were fixed with focused regression coverage; neither run created a temporary ref or macOS job.
 
 ## Honest product status
 
-Goal 3 contract foundations are implemented and isolated. Physical-iPhone compilation, a real provider, development signing, IPA export, remote download, and no-Mac acceptance remain unvalidated. Existing Simulator support and synthetic fixtures are not evidence of physical-iPhone support.
+Goal 3 contract foundations are implemented and isolated. Linux-side provider setup and doctor are live-validated; physical-iPhone compilation on the remote macOS worker, development signing, IPA export, remote download, and complete no-Mac acceptance remain unvalidated. Existing Simulator support and synthetic fixtures are not evidence of physical-iPhone support.
