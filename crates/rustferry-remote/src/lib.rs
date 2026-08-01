@@ -29,8 +29,10 @@ pub mod source;
 pub use artifact::{
     ARTIFACT_MANIFEST_SCHEMA_VERSION, ApplePlatform, AppleToolchainEvidence, ArtifactError,
     ArtifactKind, ArtifactManifest, ArtifactRecord, ArtifactSigningEvidence, CleanupStatus,
-    IpaExpectation, IpaInspection, MachOSliceEvidence, ValidationLevel, inspect_ipa,
-    inspect_physical_iphone_macho, verify_downloaded_file,
+    IpaExpectation, IpaInspection, MachOSliceEvidence, UnsignedAppInspection,
+    UnsignedNestedBundleExpectation, UnsignedNestedBundleKind, UnsignedXcarchiveExpectation,
+    UnsignedXcarchiveInspection, ValidationLevel, inspect_ipa, inspect_physical_iphone_macho,
+    inspect_unsigned_app_bundle, inspect_unsigned_xcarchive, verify_downloaded_file,
 };
 pub use cancellation::CancellationToken;
 pub use error::{RemoteBuildError, RemoteBuildResult};
@@ -63,8 +65,9 @@ pub use signing::{
     ValidationComponent, ValidationStatus,
 };
 pub use source::{
-    IgnoreRuleReason, PlannedSourceFile, PortablePathReason, SourceBundlePlan, SourceBundleRequest,
-    SourceError, SourceLimitKind, SourceLimits, SourceManifest, SourceManifestEntry, SourceMode,
-    create_source_bundle_archive, plan_source_bundle, validate_source_manifest,
+    IgnoreRuleReason, PlannedSourceFile, PortablePathReason, SourceArchive, SourceArchiveLimits,
+    SourceBundlePlan, SourceBundleRequest, SourceError, SourceLimitKind, SourceLimits,
+    SourceManifest, SourceManifestEntry, SourceMode, create_source_bundle_archive,
+    plan_source_bundle, validate_source_manifest, verify_and_extract_source_bundle,
     verify_materialized_bundle, verify_source_bundle_plan, verify_source_manifest,
 };

@@ -14,26 +14,39 @@
 //! whitespace at line edges, and non-portable names are rejected. Ignore rules
 //! can never re-include built-in sensitive paths.
 //!
-//! This module plans and verifies snapshots but intentionally does not create
-//! archives. Safe cross-platform archive emission needs race-resistant file
-//! opening plus a format implementation not available in this crate's
-//! dependency set. Callers receive a typed refusal instead of a best-effort
-//! archive.
+//! Source ZIPs contain manifest files only: no embedded manifest, directory
+//! entries, links, or platform metadata beyond one normalized executable bit.
+//! ZIP metadata is fixed and entries follow manifest order, producing identical
+//! bytes for identical inputs. The separately transported manifest remains the
+//! worker's source of truth.
+//! Unix hard links are refused. Windows does not expose link counts through a
+//! stable standard API, so Windows snapshots flatten links to bytes and bind
+//! them through repeated size, timestamp, and content-digest verification.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
     fs::{self, File, Metadata},
-    io::{self, Read},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::Path,
 };
 
+#[cfg(windows)]
+use std::fs::OpenOptions;
+
 use camino::{Utf8Path, Utf8PathBuf};
+use cap_std::{
+    ambient_authority,
+    fs::{Dir as CapabilityDir, OpenOptions as CapabilityOpenOptions},
+};
+use same_file::Handle as FileIdentityHandle;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
+use uuid::Uuid;
+use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 const MANIFEST_SCHEMA_VERSION: u32 = 1;
 const MANIFEST_DOMAIN: &[u8] = b"rustferry-source-manifest-v1\0";
@@ -41,6 +54,10 @@ const MAX_PORTABLE_PATH_BYTES: usize = 4_096;
 const MAX_PORTABLE_SEGMENT_BYTES: usize = 255;
 const MAX_IGNORE_PATTERN_BYTES: usize = 1_024;
 const MAX_SUPPORTED_DEPTH: usize = 256;
+const SOURCE_ARCHIVE_TEMP_ATTEMPTS: u64 = 128;
+const SOURCE_ARCHIVE_BUFFER_SIZE: usize = 64 * 1024;
+#[cfg(windows)]
+const WINDOWS_FILE_SHARE_READ: u32 = 0x0000_0001;
 
 const WORKSPACE_BUILD_INPUTS: &[&str] = &[
     "Cargo.toml",
@@ -130,6 +147,27 @@ pub struct SourceLimits {
     pub max_ignore_file_size: u64,
     /// Maximum total number of ignore rules.
     pub max_ignore_rules: usize,
+}
+
+/// Bounds enforced for source ZIP transport and extraction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SourceArchiveLimits {
+    /// Limits for the uncompressed source represented by the manifest.
+    pub source: SourceLimits,
+    /// Maximum ZIP file size in bytes.
+    pub max_archive_size: u64,
+    /// Maximum allowed uncompressed-to-compressed ratio for one non-empty entry.
+    pub max_compression_ratio: u64,
+}
+
+impl Default for SourceArchiveLimits {
+    fn default() -> Self {
+        Self {
+            source: SourceLimits::default(),
+            max_archive_size: 640 * 1024 * 1024,
+            max_compression_ratio: 100,
+        }
+    }
 }
 
 impl Default for SourceLimits {
@@ -235,6 +273,16 @@ pub struct SourceManifest {
     pub sha256: String,
 }
 
+/// Integrity descriptor for the deterministic source ZIP transport.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceArchive {
+    /// Exact ZIP size in bytes.
+    pub size: u64,
+    /// Lowercase hexadecimal SHA-256 digest of the complete ZIP.
+    pub sha256: String,
+}
+
 /// One local file selected by a bundle plan.
 ///
 /// Deliberately not serializable: local absolute paths must not cross the
@@ -294,8 +342,6 @@ pub enum PortablePathReason {
     DotComponent,
     /// A component was empty.
     EmptyComponent,
-    /// A non-ASCII character was present.
-    NonAscii,
     /// A character forbidden by portable filesystems was present.
     InvalidCharacter,
     /// A component ended in a dot or space.
@@ -323,6 +369,10 @@ pub enum SourceLimitKind {
     IgnoreFileSize,
     /// Total ignore rules.
     IgnoreRuleCount,
+    /// ZIP transport size.
+    ArchiveSize,
+    /// ZIP entry compression ratio.
+    CompressionRatio,
 }
 
 /// Reason a .ferryignore line was rejected.
@@ -441,8 +491,47 @@ pub enum SourceError {
     },
     /// Current source or materialized contents did not exactly match a manifest.
     ManifestMismatch,
-    /// Safe archive creation is intentionally unavailable.
-    ArchiveCreationUnsupported,
+    /// An output path already exists and was not modified.
+    OutputExists {
+        /// Existing output path.
+        path: String,
+    },
+    /// An extraction destination already exists and was not modified.
+    DestinationExists {
+        /// Existing destination path.
+        path: String,
+    },
+    /// An archive or extraction destination path was unusable.
+    InvalidDestination {
+        /// Stable validation reason.
+        reason: &'static str,
+    },
+    /// ZIP structure or metadata violated the source transport contract.
+    InvalidArchive {
+        /// Stable or safely quoted rejection reason.
+        reason: String,
+    },
+    /// ZIP bytes did not match their transport descriptor.
+    ArchiveIntegrityMismatch {
+        /// Stable validation reason.
+        reason: &'static str,
+    },
+    /// Cleanup of an operation-created partial path failed.
+    CleanupFailed {
+        /// Exact operation-created path.
+        path: String,
+        /// Original failure that triggered cleanup.
+        original: String,
+        /// Cleanup failure.
+        source: io::Error,
+    },
+    /// ZIP processing failed.
+    Zip {
+        /// ZIP operation being performed.
+        operation: &'static str,
+        /// Library error without source file contents.
+        message: String,
+    },
     /// A filesystem operation failed.
     Io {
         /// Operation being performed.
@@ -516,9 +605,35 @@ impl fmt::Display for SourceError {
                 write!(formatter, "invalid source manifest: {reason}")
             }
             Self::ManifestMismatch => formatter.write_str("source manifest does not match exactly"),
-            Self::ArchiveCreationUnsupported => formatter.write_str(
-                "safe source archive creation is unavailable; use the verified bundle plan",
+            Self::OutputExists { path } => {
+                write!(formatter, "source archive output already exists: {path}")
+            }
+            Self::DestinationExists { path } => {
+                write!(
+                    formatter,
+                    "source extraction destination already exists: {path}"
+                )
+            }
+            Self::InvalidDestination { reason } => {
+                write!(formatter, "invalid source archive destination: {reason}")
+            }
+            Self::InvalidArchive { reason } => {
+                write!(formatter, "invalid source archive: {reason}")
+            }
+            Self::ArchiveIntegrityMismatch { reason } => {
+                write!(formatter, "source archive integrity mismatch: {reason}")
+            }
+            Self::CleanupFailed {
+                path,
+                original,
+                source,
+            } => write!(
+                formatter,
+                "failed to clean operation-created path {path} after {original}: {source}"
             ),
+            Self::Zip { operation, message } => {
+                write!(formatter, "failed to {operation} source ZIP: {message}")
+            }
             Self::Io {
                 operation,
                 path,
@@ -531,7 +646,7 @@ impl fmt::Display for SourceError {
 impl Error for SourceError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Io { source, .. } => Some(source),
+            Self::Io { source, .. } | Self::CleanupFailed { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -554,7 +669,6 @@ pub fn plan_source_bundle(request: &SourceBundleRequest) -> Result<SourceBundleP
         include_roots,
         &ignore_rules,
         request.limits,
-        ScanPolicy::Planning,
     )?;
     let manifest = build_manifest(project_path, scan.entries);
     let files = manifest
@@ -622,13 +736,40 @@ pub fn verify_materialized_bundle(
     check_supported_depth(limits)?;
     reject_root_symlink(bundle_root, "bundle root")?;
     let root = canonical_directory(bundle_root, "bundle root")?;
-    let scan = scan_paths(
-        &root,
-        vec![Utf8PathBuf::from(".")],
-        &[],
-        limits,
-        ScanPolicy::Verification,
-    )?;
+    let directory = CapabilityDir::open_ambient_dir(root.as_std_path(), ambient_authority())
+        .map_err(|source| SourceError::Io {
+            operation: "open verified bundle root",
+            path: bundle_root.as_str().to_owned(),
+            source,
+        })?;
+    let identity = capability_directory_identity(&directory).map_err(|source| SourceError::Io {
+        operation: "capture verified bundle root identity",
+        path: bundle_root.as_str().to_owned(),
+        source,
+    })?;
+    ensure_capability_directory_path(&directory, &root, &identity).map_err(|source| {
+        SourceError::Io {
+            operation: "bind verified bundle root handle to path",
+            path: bundle_root.as_str().to_owned(),
+            source,
+        }
+    })?;
+    verify_materialized_capability(&directory, expected, limits)?;
+    ensure_capability_directory_path(&directory, &root, &identity).map_err(|source| {
+        SourceError::Io {
+            operation: "rebind verified bundle root handle to path",
+            path: bundle_root.as_str().to_owned(),
+            source,
+        }
+    })
+}
+
+fn verify_materialized_capability(
+    directory: &CapabilityDir,
+    expected: &SourceManifest,
+    limits: SourceLimits,
+) -> Result<(), SourceError> {
+    let scan = scan_capability_paths(directory, limits)?;
     let unexpected_directory = has_unexpected_directory(&scan.directories, expected);
     let actual = build_manifest(expected.project_path.clone(), scan.entries);
     if actual == *expected && !unexpected_directory {
@@ -744,18 +885,1859 @@ pub fn validate_source_manifest(
     Ok(())
 }
 
-/// Refuse archive creation until a safe archive implementation is available.
+/// Create and atomically publish a deterministic source ZIP.
 ///
-/// The output path is never opened, created, truncated, or changed.
+/// Existing output is never replaced. Planned files are reopened and streamed
+/// through SHA-256 while ZIP bytes are written.
 ///
 /// # Errors
 ///
-/// Always returns [`SourceError::ArchiveCreationUnsupported`].
+/// Returns an error for changed source, unsafe output, exceeded bounds, ZIP
+/// failure, or inability to publish without clobbering.
 pub fn create_source_bundle_archive(
-    _plan: &SourceBundlePlan,
-    _output: &Utf8Path,
+    plan: &SourceBundlePlan,
+    output: &Utf8Path,
+    limits: SourceArchiveLimits,
+) -> Result<SourceArchive, SourceError> {
+    validate_archive_limits(limits)?;
+    validate_source_manifest(&plan.manifest, limits.source)?;
+    if plan.manifest.entries.len() != plan.files.len() {
+        return Err(SourceError::ManifestMismatch);
+    }
+    verify_source_bundle_plan(plan)?;
+
+    let temporary = create_archive_temporary(output)?;
+    let mut cleanup = PartialFileCleanup::new(
+        temporary.temporary_path.clone(),
+        temporary
+            .parent
+            .try_clone()
+            .map_err(|source| SourceError::Io {
+                operation: "clone archive output parent handle",
+                path: output.as_str().to_owned(),
+                source,
+            })?,
+        temporary.temporary_name.clone(),
+        temporary.identity,
+    );
+    let creation = (|| {
+        let mut writer = ZipWriter::new(ArchiveSizeLimitedWriter::new(
+            temporary.file,
+            limits.max_archive_size,
+        ));
+        for (planned, expected) in plan.files.iter().zip(&plan.manifest.entries) {
+            if planned.bundle_path.as_str() != expected.path {
+                return Err(SourceError::ManifestMismatch);
+            }
+            write_verified_zip_entry(&mut writer, planned, expected)?;
+        }
+        let mut file = writer
+            .finish()
+            .map_err(|error| archive_zip_error("finish", error))?
+            .into_inner();
+        file.sync_all().map_err(|source| SourceError::Io {
+            operation: "synchronize",
+            path: temporary.temporary_path.as_str().to_owned(),
+            source,
+        })?;
+        verify_source_bundle_plan(plan)?;
+        let descriptor = describe_open_archive(&mut file, limits.max_archive_size)?;
+        drop(file);
+        ensure_capability_directory_path(
+            &temporary.parent,
+            &temporary.parent_path,
+            &temporary.parent_identity,
+        )
+        .map_err(|source| SourceError::Io {
+            operation: "bind archive output parent handle to path",
+            path: output.as_str().to_owned(),
+            source,
+        })?;
+        publish_archive_no_clobber(
+            &temporary.parent,
+            &temporary.temporary_name,
+            &temporary.output_name,
+            &cleanup.identity,
+            output,
+        )?;
+        cleanup.mark_published(&temporary.output_name);
+        cleanup.remove_temporary_link_after_publish()?;
+        ensure_capability_directory_path(
+            &temporary.parent,
+            &temporary.parent_path,
+            &temporary.parent_identity,
+        )
+        .map_err(|source| SourceError::Io {
+            operation: "rebind archive output parent handle to path",
+            path: output.as_str().to_owned(),
+            source,
+        })?;
+        ensure_named_capability_file(&temporary.parent, &temporary.output_name, &cleanup.identity)
+            .map_err(|source| SourceError::Io {
+                operation: "bind published archive handle to output path",
+                path: output.as_str().to_owned(),
+                source,
+            })?;
+        cleanup.keep_published();
+        Ok(descriptor)
+    })();
+
+    match creation {
+        Ok(descriptor) => Ok(descriptor),
+        Err(error) => cleanup.fail(error),
+    }
+}
+
+/// Verify and extract an untrusted source ZIP below a fresh destination.
+///
+/// ZIP structure and metadata are fully preflighted before destination
+/// creation. Extracted bytes, hashes, sizes, paths, order, and executable bits
+/// must exactly match the separately transported manifest.
+///
+/// # Errors
+///
+/// Returns an error for transport-integrity mismatch, unsafe ZIP metadata,
+/// exceeded bounds, extraction races, or any manifest mismatch. Only a
+/// destination created by this call is removed on failure.
+pub fn verify_and_extract_source_bundle(
+    archive_path: &Utf8Path,
+    expected_archive: &SourceArchive,
+    expected_manifest: &SourceManifest,
+    destination: &Utf8Path,
+    limits: SourceArchiveLimits,
+) -> Result<SourceArchive, SourceError> {
+    validate_archive_limits(limits)?;
+    validate_source_manifest(expected_manifest, limits.source)?;
+    validate_sha256(&expected_archive.sha256)?;
+    if expected_archive.size > limits.max_archive_size {
+        return Err(limit_error(
+            SourceLimitKind::ArchiveSize,
+            None,
+            limits.max_archive_size,
+            expected_archive.size,
+        ));
+    }
+
+    let (mut archive, initial_metadata, actual_descriptor) =
+        open_verified_archive(archive_path, expected_archive, limits.max_archive_size)?;
+    preflight_archive(&mut archive, expected_manifest, limits)?;
+
+    let FreshDestination {
+        path: actual_destination,
+        parent: destination_parent,
+        parent_path: destination_parent_path,
+        parent_identity: destination_parent_identity,
+        name: destination_name,
+        directory: destination_directory,
+        identity,
+    } = create_fresh_destination(destination)?;
+    let mut cleanup = PartialDirectoryCleanup::new(
+        actual_destination,
+        destination_parent,
+        destination_parent_path,
+        destination_parent_identity,
+        destination_name,
+        destination_directory,
+        identity,
+    );
+    let extraction = (|| {
+        for (index, expected) in expected_manifest.entries.iter().enumerate() {
+            extract_verified_entry(&mut archive, index, expected, cleanup.directory()?)?;
+        }
+        let mut archive_file = archive.into_inner();
+        let final_descriptor = describe_open_archive(&mut archive_file, limits.max_archive_size)?;
+        ensure_archive_file_stable(archive_path, &initial_metadata, &archive_file)?;
+        if final_descriptor != actual_descriptor {
+            return Err(SourceError::ArchiveIntegrityMismatch {
+                reason: "archive changed during extraction",
+            });
+        }
+        verify_materialized_capability(cleanup.directory()?, expected_manifest, limits.source)?;
+        cleanup.keep()?;
+        Ok(actual_descriptor)
+    })();
+
+    match extraction {
+        Ok(descriptor) => Ok(descriptor),
+        Err(error) => cleanup.fail(error),
+    }
+}
+
+#[derive(Debug)]
+struct PartialFileCleanup {
+    path: Utf8PathBuf,
+    parent: CapabilityDir,
+    name: String,
+    identity: FileIdentityHandle,
+    published_name: Option<String>,
+    active: bool,
+}
+
+#[derive(Debug)]
+struct PartialDirectoryCleanup {
+    path: Utf8PathBuf,
+    parent: CapabilityDir,
+    parent_path: Utf8PathBuf,
+    parent_identity: FileIdentityHandle,
+    name: String,
+    directory: Option<CapabilityDir>,
+    identity: Option<FileIdentityHandle>,
+    active: bool,
+}
+
+#[derive(Debug)]
+struct FreshDestination {
+    path: Utf8PathBuf,
+    parent: CapabilityDir,
+    parent_path: Utf8PathBuf,
+    parent_identity: FileIdentityHandle,
+    name: String,
+    directory: CapabilityDir,
+    identity: FileIdentityHandle,
+}
+
+impl PartialFileCleanup {
+    fn new(
+        path: Utf8PathBuf,
+        parent: CapabilityDir,
+        name: String,
+        identity: FileIdentityHandle,
+    ) -> Self {
+        Self {
+            path,
+            parent,
+            name,
+            identity,
+            published_name: None,
+            active: true,
+        }
+    }
+
+    fn mark_published(&mut self, output_name: &str) {
+        self.published_name = Some(output_name.to_owned());
+    }
+
+    fn remove_temporary_link_after_publish(&mut self) -> Result<(), SourceError> {
+        match remove_owned_capability_file(&self.parent, &self.name, &self.identity) {
+            Ok(()) => Ok(()),
+            Err(source) => Err(SourceError::CleanupFailed {
+                path: self.path.as_str().to_owned(),
+                original: "published archive temporary-link cleanup failed".to_owned(),
+                source,
+            }),
+        }
+    }
+
+    fn keep_published(&mut self) {
+        self.published_name = None;
+        self.active = false;
+    }
+
+    fn fail<T>(&mut self, error: SourceError) -> Result<T, SourceError> {
+        if !self.active {
+            return Err(error);
+        }
+        let published_cleanup = self.published_name.as_ref().map_or(Ok(()), |name| {
+            remove_owned_capability_file(&self.parent, name, &self.identity)
+        });
+        let temporary_cleanup =
+            remove_owned_capability_file(&self.parent, &self.name, &self.identity);
+        match published_cleanup.and(temporary_cleanup) {
+            Ok(()) => {
+                self.published_name = None;
+                self.active = false;
+                Err(error)
+            }
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                self.active = false;
+                Err(error)
+            }
+            Err(source) => Err(SourceError::CleanupFailed {
+                path: self.path.as_str().to_owned(),
+                original: error.to_string(),
+                source,
+            }),
+        }
+    }
+}
+
+impl Drop for PartialFileCleanup {
+    fn drop(&mut self) {
+        if self.active {
+            if let Some(output_name) = &self.published_name {
+                let _ = remove_owned_capability_file(&self.parent, output_name, &self.identity);
+            }
+            let _ = remove_owned_capability_file(&self.parent, &self.name, &self.identity);
+        }
+    }
+}
+
+impl PartialDirectoryCleanup {
+    fn new(
+        path: Utf8PathBuf,
+        parent: CapabilityDir,
+        parent_path: Utf8PathBuf,
+        parent_identity: FileIdentityHandle,
+        name: String,
+        directory: CapabilityDir,
+        identity: FileIdentityHandle,
+    ) -> Self {
+        Self {
+            path,
+            parent,
+            parent_path,
+            parent_identity,
+            name,
+            directory: Some(directory),
+            identity: Some(identity),
+            active: true,
+        }
+    }
+
+    fn directory(&self) -> Result<&CapabilityDir, SourceError> {
+        self.directory
+            .as_ref()
+            .ok_or(SourceError::InvalidDestination {
+                reason: "extraction destination handle is unavailable",
+            })
+    }
+
+    fn keep(&mut self) -> Result<(), SourceError> {
+        ensure_capability_directory_path(&self.parent, &self.parent_path, &self.parent_identity)
+            .map_err(|source| SourceError::Io {
+                operation: "bind extraction destination parent handle to path",
+                path: self.path.as_str().to_owned(),
+                source,
+            })?;
+        let identity = self
+            .identity
+            .as_ref()
+            .ok_or(SourceError::InvalidDestination {
+                reason: "extraction destination identity is unavailable",
+            })?;
+        ensure_named_capability_directory(&self.parent, &self.name, identity).map_err(
+            |source| SourceError::Io {
+                operation: "bind extracted destination handle to final path",
+                path: self.path.as_str().to_owned(),
+                source,
+            },
+        )?;
+        drop(self.identity.take());
+        drop(self.directory.take());
+        self.active = false;
+        Ok(())
+    }
+
+    fn fail<T>(&mut self, error: SourceError) -> Result<T, SourceError> {
+        if !self.active {
+            return Err(error);
+        }
+        let Some(directory) = self.directory.take() else {
+            return Err(error);
+        };
+        drop(self.identity.take());
+        match directory.remove_open_dir_all() {
+            Ok(()) => {
+                self.active = false;
+                Err(error)
+            }
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                self.active = false;
+                Err(error)
+            }
+            Err(source) => Err(SourceError::CleanupFailed {
+                path: self.path.as_str().to_owned(),
+                original: error.to_string(),
+                source,
+            }),
+        }
+    }
+}
+
+impl Drop for PartialDirectoryCleanup {
+    fn drop(&mut self) {
+        if self.active {
+            drop(self.identity.take());
+            if let Some(directory) = self.directory.take() {
+                let _ = directory.remove_open_dir_all();
+            }
+        }
+    }
+}
+
+fn remove_owned_capability_file(
+    parent: &CapabilityDir,
+    name: &str,
+    identity: &FileIdentityHandle,
+) -> io::Result<()> {
+    let file = match parent.open(name) {
+        Ok(file) => file,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => return Err(source),
+    };
+    let current = FileIdentityHandle::from_file(file.into_std())?;
+    if &current != identity {
+        return Err(io::Error::other(
+            "cleanup target no longer identifies the operation-created file",
+        ));
+    }
+    parent.remove_file(name)
+}
+
+fn validate_archive_limits(limits: SourceArchiveLimits) -> Result<(), SourceError> {
+    check_supported_depth(limits.source)?;
+    if limits.max_compression_ratio == 0 {
+        return Err(SourceError::InvalidArchive {
+            reason: "maximum compression ratio must be positive".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ArchiveSizeExceeded {
+    maximum: u64,
+    actual: u64,
+}
+
+impl fmt::Display for ArchiveSizeExceeded {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "source archive size would exceed {} bytes: {}",
+            self.maximum, self.actual
+        )
+    }
+}
+
+impl Error for ArchiveSizeExceeded {}
+
+#[derive(Debug)]
+struct ArchiveSizeLimitedWriter {
+    file: File,
+    maximum: u64,
+}
+
+impl ArchiveSizeLimitedWriter {
+    const fn new(file: File, maximum: u64) -> Self {
+        Self { file, maximum }
+    }
+
+    fn into_inner(self) -> File {
+        self.file
+    }
+
+    fn limit_error(&self, actual: u64) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            ArchiveSizeExceeded {
+                maximum: self.maximum,
+                actual,
+            },
+        )
+    }
+}
+
+impl Write for ArchiveSizeLimitedWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let position = self.file.stream_position()?;
+        let end = position.saturating_add(buffer.len() as u64);
+        if end > self.maximum {
+            return Err(self.limit_error(end));
+        }
+        self.file.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl Seek for ArchiveSizeLimitedWriter {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        let original = self.file.stream_position()?;
+        let actual = self.file.seek(position)?;
+        if actual > self.maximum {
+            self.file.seek(SeekFrom::Start(original))?;
+            return Err(self.limit_error(actual));
+        }
+        Ok(actual)
+    }
+}
+
+fn archive_write_error(operation: &'static str, source: io::Error) -> SourceError {
+    if let Some(exceeded) = source
+        .get_ref()
+        .and_then(|error| error.downcast_ref::<ArchiveSizeExceeded>())
+    {
+        limit_error(
+            SourceLimitKind::ArchiveSize,
+            None,
+            exceeded.maximum,
+            exceeded.actual,
+        )
+    } else {
+        SourceError::Io {
+            operation,
+            path: "source archive".to_owned(),
+            source,
+        }
+    }
+}
+
+fn archive_zip_error(operation: &'static str, error: zip::result::ZipError) -> SourceError {
+    match error {
+        zip::result::ZipError::Io(source) => archive_write_error(operation, source),
+        error => SourceError::Zip {
+            operation,
+            message: error.to_string(),
+        },
+    }
+}
+
+#[derive(Debug)]
+struct ArchiveTemporary {
+    parent: CapabilityDir,
+    parent_path: Utf8PathBuf,
+    parent_identity: FileIdentityHandle,
+    output_name: String,
+    temporary_path: Utf8PathBuf,
+    temporary_name: String,
+    file: File,
+    identity: FileIdentityHandle,
+}
+
+#[allow(clippy::too_many_lines)]
+fn create_archive_temporary(output: &Utf8Path) -> Result<ArchiveTemporary, SourceError> {
+    let file_name = output.file_name().filter(|name| !name.is_empty()).ok_or(
+        SourceError::InvalidDestination {
+            reason: "archive output has no file name",
+        },
+    )?;
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_str().is_empty())
+        .unwrap_or_else(|| Utf8Path::new("."));
+    let canonical_parent = canonical_directory(parent, "archive output parent")?;
+    let parent_directory =
+        CapabilityDir::open_ambient_dir(canonical_parent.as_std_path(), ambient_authority())
+            .map_err(|source| SourceError::Io {
+                operation: "open archive output parent",
+                path: parent.as_str().to_owned(),
+                source,
+            })?;
+    let parent_identity =
+        capability_directory_identity(&parent_directory).map_err(|source| SourceError::Io {
+            operation: "capture archive output parent identity",
+            path: parent.as_str().to_owned(),
+            source,
+        })?;
+    ensure_capability_directory_path(&parent_directory, &canonical_parent, &parent_identity)
+        .map_err(|source| SourceError::Io {
+            operation: "bind archive output parent handle to path",
+            path: parent.as_str().to_owned(),
+            source,
+        })?;
+    match parent_directory.symlink_metadata(file_name) {
+        Ok(_) => {
+            return Err(SourceError::OutputExists {
+                path: output.as_str().to_owned(),
+            });
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(SourceError::Io {
+                operation: "inspect archive output",
+                path: output.as_str().to_owned(),
+                source,
+            });
+        }
+    }
+
+    for _ in 0..SOURCE_ARCHIVE_TEMP_ATTEMPTS {
+        let temporary_name = format!(".{file_name}.rustferry-partial-{}", Uuid::new_v4());
+        let temporary_path = canonical_parent.join(&temporary_name);
+        match open_new_private_capability_file(&parent_directory, &temporary_name) {
+            Ok(file) => {
+                let file = file.into_std();
+                let identity = match file.try_clone().and_then(FileIdentityHandle::from_file) {
+                    Ok(identity) => identity,
+                    Err(source) => {
+                        drop(file);
+                        let cleanup = parent_directory.remove_file(&temporary_name);
+                        if let Err(cleanup_source) = cleanup {
+                            return Err(SourceError::CleanupFailed {
+                                path: temporary_path.as_str().to_owned(),
+                                original: source.to_string(),
+                                source: cleanup_source,
+                            });
+                        }
+                        return Err(SourceError::Io {
+                            operation: "inspect archive temporary file",
+                            path: temporary_path.as_str().to_owned(),
+                            source,
+                        });
+                    }
+                };
+                let binding = ensure_capability_directory_path(
+                    &parent_directory,
+                    &canonical_parent,
+                    &parent_identity,
+                )
+                .and_then(|()| {
+                    ensure_named_capability_file(&parent_directory, &temporary_name, &identity)
+                });
+                if let Err(source) = binding {
+                    drop(file);
+                    let original = SourceError::Io {
+                        operation: "bind archive temporary handle to path",
+                        path: temporary_path.as_str().to_owned(),
+                        source,
+                    };
+                    return match remove_owned_capability_file(
+                        &parent_directory,
+                        &temporary_name,
+                        &identity,
+                    ) {
+                        Ok(()) => Err(original),
+                        Err(source) => Err(SourceError::CleanupFailed {
+                            path: temporary_path.as_str().to_owned(),
+                            original: original.to_string(),
+                            source,
+                        }),
+                    };
+                }
+                return Ok(ArchiveTemporary {
+                    parent: parent_directory,
+                    parent_path: canonical_parent,
+                    parent_identity,
+                    output_name: file_name.to_owned(),
+                    temporary_path,
+                    temporary_name,
+                    file,
+                    identity,
+                });
+            }
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(source) => {
+                return Err(SourceError::Io {
+                    operation: "create archive temporary file",
+                    path: temporary_path.as_str().to_owned(),
+                    source,
+                });
+            }
+        }
+    }
+    Err(SourceError::InvalidDestination {
+        reason: "could not allocate a unique archive temporary file",
+    })
+}
+
+#[cfg(windows)]
+fn open_read_stable(path: &Utf8Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    OpenOptions::new()
+        .read(true)
+        .share_mode(WINDOWS_FILE_SHARE_READ)
+        .open(path)
+}
+
+#[cfg(not(windows))]
+fn open_read_stable(path: &Utf8Path) -> io::Result<File> {
+    File::open(path)
+}
+
+fn publish_archive_no_clobber(
+    parent: &CapabilityDir,
+    temporary_name: &str,
+    output_name: &str,
+    identity: &FileIdentityHandle,
+    output: &Utf8Path,
 ) -> Result<(), SourceError> {
-    Err(SourceError::ArchiveCreationUnsupported)
+    ensure_named_capability_file(parent, temporary_name, identity).map_err(|source| {
+        SourceError::Io {
+            operation: "bind archive temporary handle to path",
+            path: output.as_str().to_owned(),
+            source,
+        }
+    })?;
+    parent
+        .hard_link(temporary_name, parent, output_name)
+        .map_err(|source| {
+            if source.kind() == io::ErrorKind::AlreadyExists {
+                SourceError::OutputExists {
+                    path: output.as_str().to_owned(),
+                }
+            } else {
+                SourceError::Io {
+                    operation: "atomically publish archive without clobbering",
+                    path: output.as_str().to_owned(),
+                    source,
+                }
+            }
+        })?;
+    if let Err(source) = ensure_named_capability_file(parent, output_name, identity) {
+        let original = SourceError::Io {
+            operation: "bind published archive handle to output path",
+            path: output.as_str().to_owned(),
+            source,
+        };
+        return match remove_owned_capability_file(parent, output_name, identity) {
+            Ok(()) => Err(original),
+            Err(source) => Err(SourceError::CleanupFailed {
+                path: output.as_str().to_owned(),
+                original: original.to_string(),
+                source,
+            }),
+        };
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn write_verified_zip_entry(
+    writer: &mut ZipWriter<ArchiveSizeLimitedWriter>,
+    planned: &PlannedSourceFile,
+    expected: &SourceManifestEntry,
+) -> Result<(), SourceError> {
+    let path = planned.source_path();
+    let path_display = expected.path.clone();
+    let initial = fs::symlink_metadata(path).map_err(|source| SourceError::Io {
+        operation: "inspect planned source",
+        path: path_display.clone(),
+        source,
+    })?;
+    if initial.file_type().is_symlink() {
+        return Err(SourceError::Symlink { path: path_display });
+    }
+    if !initial.is_file() {
+        return Err(SourceError::UnsupportedFileType { path: path_display });
+    }
+    reject_hard_link(&initial, &expected.path)?;
+    if initial.len() != expected.size || executable_bit(&initial) != expected.executable {
+        return Err(SourceError::ManifestMismatch);
+    }
+
+    let mut source_file = open_read_stable(path).map_err(|source| SourceError::Io {
+        operation: "reopen planned source",
+        path: expected.path.clone(),
+        source,
+    })?;
+    let opened = source_file.metadata().map_err(|source| SourceError::Io {
+        operation: "inspect reopened source",
+        path: expected.path.clone(),
+        source,
+    })?;
+    reject_hard_link(&opened, &expected.path)?;
+    if !opened.is_file()
+        || !same_file_identity(&initial, &opened)
+        || opened.len() != expected.size
+        || executable_bit(&opened) != expected.executable
+    {
+        return Err(SourceError::ChangedDuringRead {
+            path: expected.path.clone(),
+        });
+    }
+
+    let mode = if expected.executable { 0o755 } else { 0o644 };
+    let options = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Stored)
+        .compression_level(None)
+        .last_modified_time(DateTime::default())
+        .unix_permissions(mode)
+        .large_file(false);
+    writer
+        .start_file(&expected.path, options)
+        .map_err(|error| archive_zip_error("start entry", error))?;
+
+    let initial_modified = initial.modified().ok();
+    let mut digest = Sha256::new();
+    let mut count = 0_u64;
+    let mut buffer = vec![0_u8; SOURCE_ARCHIVE_BUFFER_SIZE];
+    loop {
+        let read = source_file
+            .read(&mut buffer)
+            .map_err(|source| SourceError::Io {
+                operation: "read planned source",
+                path: expected.path.clone(),
+                source,
+            })?;
+        if read == 0 {
+            break;
+        }
+        count = count
+            .checked_add(read as u64)
+            .ok_or(SourceError::ManifestMismatch)?;
+        if count > expected.size {
+            return Err(SourceError::ChangedDuringRead {
+                path: expected.path.clone(),
+            });
+        }
+        digest.update(&buffer[..read]);
+        writer
+            .write_all(&buffer[..read])
+            .map_err(|source| archive_write_error("write source ZIP entry", source))?;
+    }
+    let open_final = source_file.metadata().map_err(|source| SourceError::Io {
+        operation: "reinspect open source",
+        path: expected.path.clone(),
+        source,
+    })?;
+    let path_final = fs::symlink_metadata(path).map_err(|source| SourceError::Io {
+        operation: "reinspect source path",
+        path: expected.path.clone(),
+        source,
+    })?;
+    ensure_source_metadata_stable(
+        expected,
+        &opened,
+        &open_final,
+        &path_final,
+        initial_modified,
+    )?;
+    if count != expected.size || hex_digest(digest.finalize()) != expected.sha256 {
+        return Err(SourceError::ManifestMismatch);
+    }
+    Ok(())
+}
+
+fn ensure_source_metadata_stable(
+    expected: &SourceManifestEntry,
+    opened: &Metadata,
+    open_final: &Metadata,
+    path_final: &Metadata,
+    initial_modified: Option<std::time::SystemTime>,
+) -> Result<(), SourceError> {
+    let stable = !path_final.file_type().is_symlink()
+        && open_final.is_file()
+        && path_final.is_file()
+        && same_file_identity(opened, open_final)
+        && same_file_identity(opened, path_final)
+        && open_final.len() == expected.size
+        && path_final.len() == expected.size
+        && open_final.modified().ok() == initial_modified
+        && path_final.modified().ok() == initial_modified
+        && executable_bit(open_final) == expected.executable
+        && executable_bit(path_final) == expected.executable;
+    if stable {
+        Ok(())
+    } else {
+        Err(SourceError::ChangedDuringRead {
+            path: expected.path.clone(),
+        })
+    }
+}
+
+fn describe_open_archive(file: &mut File, maximum_size: u64) -> Result<SourceArchive, SourceError> {
+    let metadata = file.metadata().map_err(|source| SourceError::Io {
+        operation: "inspect source archive",
+        path: "source archive".to_owned(),
+        source,
+    })?;
+    if metadata.len() > maximum_size {
+        return Err(limit_error(
+            SourceLimitKind::ArchiveSize,
+            None,
+            maximum_size,
+            metadata.len(),
+        ));
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| SourceError::Io {
+            operation: "rewind source archive",
+            path: "source archive".to_owned(),
+            source,
+        })?;
+    let mut digest = Sha256::new();
+    let mut size = 0_u64;
+    let mut buffer = vec![0_u8; SOURCE_ARCHIVE_BUFFER_SIZE];
+    loop {
+        let read = file.read(&mut buffer).map_err(|source| SourceError::Io {
+            operation: "hash source archive",
+            path: "source archive".to_owned(),
+            source,
+        })?;
+        if read == 0 {
+            break;
+        }
+        size = size.checked_add(read as u64).ok_or_else(|| {
+            limit_error(SourceLimitKind::ArchiveSize, None, maximum_size, u64::MAX)
+        })?;
+        if size > maximum_size {
+            return Err(limit_error(
+                SourceLimitKind::ArchiveSize,
+                None,
+                maximum_size,
+                size,
+            ));
+        }
+        digest.update(&buffer[..read]);
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| SourceError::Io {
+            operation: "rewind source archive",
+            path: "source archive".to_owned(),
+            source,
+        })?;
+    if size != metadata.len() {
+        return Err(SourceError::ArchiveIntegrityMismatch {
+            reason: "archive size changed while hashing",
+        });
+    }
+    Ok(SourceArchive {
+        size,
+        sha256: hex_digest(digest.finalize()),
+    })
+}
+
+fn open_verified_archive(
+    archive_path: &Utf8Path,
+    expected: &SourceArchive,
+    maximum_size: u64,
+) -> Result<(ZipArchive<File>, Metadata, SourceArchive), SourceError> {
+    let path_metadata = fs::symlink_metadata(archive_path).map_err(|source| SourceError::Io {
+        operation: "inspect source archive",
+        path: archive_path.as_str().to_owned(),
+        source,
+    })?;
+    if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+        return Err(SourceError::InvalidArchive {
+            reason: "archive path is not a regular file".to_owned(),
+        });
+    }
+    if path_metadata.len() != expected.size {
+        return Err(SourceError::ArchiveIntegrityMismatch {
+            reason: "archive size differs from transport descriptor",
+        });
+    }
+    let mut file = open_read_stable(archive_path).map_err(|source| SourceError::Io {
+        operation: "open source archive",
+        path: archive_path.as_str().to_owned(),
+        source,
+    })?;
+    let opened = file.metadata().map_err(|source| SourceError::Io {
+        operation: "inspect open source archive",
+        path: archive_path.as_str().to_owned(),
+        source,
+    })?;
+    if !opened.is_file() || !same_file_identity(&path_metadata, &opened) {
+        return Err(SourceError::ArchiveIntegrityMismatch {
+            reason: "archive path changed while opening",
+        });
+    }
+    let descriptor = describe_open_archive(&mut file, maximum_size)?;
+    ensure_archive_file_stable(archive_path, &opened, &file)?;
+    if descriptor != *expected {
+        return Err(SourceError::ArchiveIntegrityMismatch {
+            reason: "archive SHA-256 differs from transport descriptor",
+        });
+    }
+    let archive = ZipArchive::new(file).map_err(|error| SourceError::Zip {
+        operation: "open",
+        message: error.to_string(),
+    })?;
+    Ok((archive, opened, descriptor))
+}
+
+fn ensure_archive_file_stable(
+    archive_path: &Utf8Path,
+    initial: &Metadata,
+    file: &File,
+) -> Result<(), SourceError> {
+    let open_final = file.metadata().map_err(|source| SourceError::Io {
+        operation: "reinspect open source archive",
+        path: archive_path.as_str().to_owned(),
+        source,
+    })?;
+    let path_final = fs::symlink_metadata(archive_path).map_err(|source| SourceError::Io {
+        operation: "reinspect source archive path",
+        path: archive_path.as_str().to_owned(),
+        source,
+    })?;
+    let stable = !path_final.file_type().is_symlink()
+        && open_final.is_file()
+        && path_final.is_file()
+        && same_file_identity(initial, &open_final)
+        && same_file_identity(initial, &path_final)
+        && open_final.len() == initial.len()
+        && path_final.len() == initial.len()
+        && open_final.modified().ok() == initial.modified().ok()
+        && path_final.modified().ok() == initial.modified().ok();
+    if stable {
+        Ok(())
+    } else {
+        Err(SourceError::ArchiveIntegrityMismatch {
+            reason: "archive changed while being read",
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ArchiveEntryMetadata {
+    path: String,
+    size: u64,
+    executable: bool,
+}
+
+#[allow(clippy::too_many_lines)]
+fn preflight_archive(
+    archive: &mut ZipArchive<File>,
+    expected_manifest: &SourceManifest,
+    limits: SourceArchiveLimits,
+) -> Result<(), SourceError> {
+    if !archive.comment().is_empty() {
+        return Err(SourceError::InvalidArchive {
+            reason: "archive comment is forbidden".to_owned(),
+        });
+    }
+    if archive.len() > limits.source.max_file_count {
+        return Err(limit_error(
+            SourceLimitKind::FileCount,
+            None,
+            limits.source.max_file_count as u64,
+            archive.len() as u64,
+        ));
+    }
+
+    let mut entries = Vec::with_capacity(archive.len());
+    let mut exact_paths = BTreeSet::new();
+    let mut collisions = BTreeMap::new();
+    let mut total_size = 0_u64;
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index).map_err(|error| SourceError::Zip {
+            operation: "read entry metadata",
+            message: error.to_string(),
+        })?;
+        let path = std::str::from_utf8(entry.name_raw())
+            .map_err(|_| SourceError::InvalidArchive {
+                reason: "entry name is not UTF-8".to_owned(),
+            })?
+            .to_owned();
+        validate_portable_path_str(&path, false).map_err(|reason| {
+            SourceError::NonPortablePath {
+                path: path.clone(),
+                reason,
+            }
+        })?;
+        reject_sensitive(&path)?;
+        check_depth(&path, limits.source.max_depth)?;
+        if !exact_paths.insert(path.clone()) {
+            return Err(SourceError::InvalidArchive {
+                reason: format!("duplicate ZIP entry {path:?}"),
+            });
+        }
+        register_path_components(&path, &mut collisions)?;
+        if entry.encrypted() {
+            return Err(SourceError::InvalidArchive {
+                reason: format!("encrypted ZIP entry is forbidden: {path:?}"),
+            });
+        }
+        if entry.is_dir() || entry.is_symlink() {
+            return Err(SourceError::InvalidArchive {
+                reason: format!("link or directory ZIP entry is forbidden: {path:?}"),
+            });
+        }
+        let mode = entry
+            .unix_mode()
+            .ok_or_else(|| SourceError::InvalidArchive {
+                reason: format!("ZIP entry has no normalized Unix mode: {path:?}"),
+            })?;
+        if mode & 0o170_000 != 0o100_000 {
+            return Err(SourceError::InvalidArchive {
+                reason: format!("special ZIP entry is forbidden: {path:?}"),
+            });
+        }
+        let permissions = mode & 0o777;
+        if !matches!(permissions, 0o644 | 0o755) {
+            return Err(SourceError::InvalidArchive {
+                reason: format!("ZIP entry has non-canonical permissions: {path:?}"),
+            });
+        }
+        if entry.last_modified() != Some(DateTime::default()) {
+            return Err(SourceError::InvalidArchive {
+                reason: format!("ZIP entry has a non-canonical timestamp: {path:?}"),
+            });
+        }
+        if !entry.comment().is_empty() || entry.extra_data().is_some_and(|data| !data.is_empty()) {
+            return Err(SourceError::InvalidArchive {
+                reason: format!("ZIP entry has forbidden auxiliary metadata: {path:?}"),
+            });
+        }
+        if entry.size() > limits.source.max_file_size {
+            return Err(limit_error(
+                SourceLimitKind::FileSize,
+                Some(path),
+                limits.source.max_file_size,
+                entry.size(),
+            ));
+        }
+        total_size =
+            total_size
+                .checked_add(entry.size())
+                .ok_or_else(|| SourceError::InvalidArchive {
+                    reason: "uncompressed source ZIP size overflow".to_owned(),
+                })?;
+        if total_size > limits.source.max_total_size {
+            return Err(limit_error(
+                SourceLimitKind::TotalSize,
+                Some(path),
+                limits.source.max_total_size,
+                total_size,
+            ));
+        }
+        if entry.size() > 0 {
+            let compressed = entry.compressed_size();
+            let ratio = if compressed == 0 {
+                u64::MAX
+            } else {
+                entry.size().div_ceil(compressed)
+            };
+            if ratio > limits.max_compression_ratio {
+                return Err(limit_error(
+                    SourceLimitKind::CompressionRatio,
+                    Some(path),
+                    limits.max_compression_ratio,
+                    ratio,
+                ));
+            }
+        }
+        if entry.compression() == CompressionMethod::Stored
+            && entry.compressed_size() != entry.size()
+        {
+            return Err(SourceError::InvalidArchive {
+                reason: format!("stored ZIP entry size is inconsistent: {path:?}"),
+            });
+        }
+        if entry.compression() != CompressionMethod::Stored {
+            return Err(SourceError::InvalidArchive {
+                reason: format!("ZIP entry uses non-canonical compression: {path:?}"),
+            });
+        }
+        entries.push(ArchiveEntryMetadata {
+            path,
+            size: entry.size(),
+            executable: permissions == 0o755,
+        });
+    }
+
+    if entries.len() != expected_manifest.entries.len() {
+        return Err(SourceError::ManifestMismatch);
+    }
+    for (actual, expected) in entries.iter().zip(&expected_manifest.entries) {
+        if actual.path != expected.path
+            || actual.size != expected.size
+            || actual.executable != expected.executable
+        {
+            return Err(SourceError::ManifestMismatch);
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn create_fresh_destination(destination: &Utf8Path) -> Result<FreshDestination, SourceError> {
+    let name = destination
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or(SourceError::InvalidDestination {
+            reason: "extraction destination has no directory name",
+        })?;
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_str().is_empty())
+        .unwrap_or_else(|| Utf8Path::new("."));
+    let canonical_parent = canonical_directory(parent, "extraction destination parent")?;
+    let actual = canonical_parent.join(name);
+    let parent_directory =
+        CapabilityDir::open_ambient_dir(canonical_parent.as_std_path(), ambient_authority())
+            .map_err(|source| SourceError::Io {
+                operation: "open extraction destination parent",
+                path: parent.as_str().to_owned(),
+                source,
+            })?;
+    let parent_identity =
+        capability_directory_identity(&parent_directory).map_err(|source| SourceError::Io {
+            operation: "capture extraction destination parent identity",
+            path: parent.as_str().to_owned(),
+            source,
+        })?;
+    ensure_capability_directory_path(&parent_directory, &canonical_parent, &parent_identity)
+        .map_err(|source| SourceError::Io {
+            operation: "bind extraction destination parent handle to path",
+            path: parent.as_str().to_owned(),
+            source,
+        })?;
+    match parent_directory.symlink_metadata(name) {
+        Ok(_) => {
+            return Err(SourceError::DestinationExists {
+                path: destination.as_str().to_owned(),
+            });
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(SourceError::Io {
+                operation: "inspect extraction destination",
+                path: destination.as_str().to_owned(),
+                source,
+            });
+        }
+    }
+    create_private_capability_directory(&parent_directory, name).map_err(|source| {
+        if source.kind() == io::ErrorKind::AlreadyExists {
+            SourceError::DestinationExists {
+                path: destination.as_str().to_owned(),
+            }
+        } else {
+            SourceError::Io {
+                operation: "create extraction destination",
+                path: destination.as_str().to_owned(),
+                source,
+            }
+        }
+    })?;
+    let directory = match parent_directory.open_dir(name) {
+        Ok(directory) => directory,
+        Err(source) => {
+            let cleanup = parent_directory.remove_dir(name);
+            if let Err(cleanup_source) = cleanup {
+                return Err(SourceError::CleanupFailed {
+                    path: actual.as_str().to_owned(),
+                    original: source.to_string(),
+                    source: cleanup_source,
+                });
+            }
+            return Err(SourceError::Io {
+                operation: "inspect created extraction destination",
+                path: destination.as_str().to_owned(),
+                source,
+            });
+        }
+    };
+    let opened_metadata = match directory.dir_metadata() {
+        Ok(metadata) => metadata,
+        Err(source) => {
+            return cleanup_created_directory(
+                directory,
+                &actual,
+                SourceError::Io {
+                    operation: "inspect created extraction destination handle",
+                    path: destination.as_str().to_owned(),
+                    source,
+                },
+            );
+        }
+    };
+    let named_metadata = match parent_directory.symlink_metadata(name) {
+        Ok(metadata) => metadata,
+        Err(source) => {
+            return cleanup_created_directory(
+                directory,
+                &actual,
+                SourceError::Io {
+                    operation: "reinspect created extraction destination",
+                    path: destination.as_str().to_owned(),
+                    source,
+                },
+            );
+        }
+    };
+    if opened_metadata.is_symlink()
+        || !opened_metadata.is_dir()
+        || named_metadata.is_symlink()
+        || !named_metadata.is_dir()
+    {
+        return cleanup_created_directory(
+            directory,
+            &actual,
+            SourceError::InvalidDestination {
+                reason: "created extraction destination is not a directory",
+            },
+        );
+    }
+    let identity = match capability_directory_identity(&directory) {
+        Ok(identity) => identity,
+        Err(source) => {
+            return cleanup_created_directory(
+                directory,
+                &actual,
+                SourceError::Io {
+                    operation: "capture extraction destination identity",
+                    path: destination.as_str().to_owned(),
+                    source,
+                },
+            );
+        }
+    };
+    let binding =
+        ensure_capability_directory_path(&parent_directory, &canonical_parent, &parent_identity)
+            .and_then(|()| ensure_named_capability_directory(&parent_directory, name, &identity));
+    if let Err(source) = binding {
+        drop(identity);
+        return cleanup_created_directory(
+            directory,
+            &actual,
+            SourceError::Io {
+                operation: "bind extraction destination handle to path",
+                path: destination.as_str().to_owned(),
+                source,
+            },
+        );
+    }
+    Ok(FreshDestination {
+        path: actual,
+        parent: parent_directory,
+        parent_path: canonical_parent,
+        parent_identity,
+        name: name.to_owned(),
+        directory,
+        identity,
+    })
+}
+
+fn cleanup_created_directory<T>(
+    directory: CapabilityDir,
+    path: &Utf8Path,
+    original: SourceError,
+) -> Result<T, SourceError> {
+    match directory.remove_open_dir_all() {
+        Ok(()) => Err(original),
+        Err(source) => Err(SourceError::CleanupFailed {
+            path: path.as_str().to_owned(),
+            original: original.to_string(),
+            source,
+        }),
+    }
+}
+
+fn capability_directory_identity(directory: &CapabilityDir) -> io::Result<FileIdentityHandle> {
+    FileIdentityHandle::from_file(directory.try_clone()?.into_std_file())
+}
+
+fn ensure_capability_directory_path(
+    directory: &CapabilityDir,
+    path: &Utf8Path,
+    expected: &FileIdentityHandle,
+) -> io::Result<()> {
+    let open = capability_directory_identity(directory)?;
+    let named = FileIdentityHandle::from_path(path.as_std_path())?;
+    if &open == expected && &named == expected {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "directory path no longer identifies the capability directory",
+        ))
+    }
+}
+
+fn ensure_named_capability_directory(
+    parent: &CapabilityDir,
+    name: &str,
+    expected: &FileIdentityHandle,
+) -> io::Result<()> {
+    let named = parent.open_dir(name)?;
+    let actual = capability_directory_identity(&named)?;
+    if &actual == expected {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "destination path no longer identifies the operation-created directory",
+        ))
+    }
+}
+
+fn ensure_named_capability_file(
+    parent: &CapabilityDir,
+    name: &str,
+    expected: &FileIdentityHandle,
+) -> io::Result<()> {
+    let metadata = parent.symlink_metadata(name)?;
+    if metadata.is_symlink() || !metadata.is_file() {
+        return Err(io::Error::other(
+            "archive path no longer identifies a regular file",
+        ));
+    }
+    let file = parent.open(name)?;
+    let actual = FileIdentityHandle::from_file(file.into_std())?;
+    if &actual == expected {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "archive path no longer identifies the operation-created file",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn create_private_capability_directory(parent: &CapabilityDir, name: &str) -> io::Result<()> {
+    use cap_std::fs::DirBuilderExt as _;
+
+    let mut builder = cap_std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    parent.create_dir_with(name, &builder)
+}
+
+#[cfg(not(unix))]
+fn create_private_capability_directory(parent: &CapabilityDir, name: &str) -> io::Result<()> {
+    parent.create_dir(name)
+}
+
+fn extract_verified_entry(
+    archive: &mut ZipArchive<File>,
+    index: usize,
+    expected: &SourceManifestEntry,
+    destination: &CapabilityDir,
+) -> Result<(), SourceError> {
+    let relative = Utf8Path::new(&expected.path);
+    let parent = create_safe_parent_directories(destination, relative)?;
+    let file_name = relative.file_name().ok_or(SourceError::ManifestMismatch)?;
+    let mut output =
+        open_new_private_capability_file(&parent, file_name).map_err(|source| SourceError::Io {
+            operation: "create extracted source file",
+            path: expected.path.clone(),
+            source,
+        })?;
+    let mut entry = archive.by_index(index).map_err(|error| SourceError::Zip {
+        operation: "open entry for extraction",
+        message: error.to_string(),
+    })?;
+    if entry.name_raw() != expected.path.as_bytes() {
+        return Err(SourceError::ManifestMismatch);
+    }
+
+    let mut digest = Sha256::new();
+    let mut size = 0_u64;
+    let mut buffer = vec![0_u8; SOURCE_ARCHIVE_BUFFER_SIZE];
+    loop {
+        let read = entry
+            .read(&mut buffer)
+            .map_err(|error| SourceError::InvalidArchive {
+                reason: format!(
+                    "ZIP entry {:?} failed integrity verification: {error}",
+                    expected.path
+                ),
+            })?;
+        if read == 0 {
+            break;
+        }
+        size = size
+            .checked_add(read as u64)
+            .ok_or(SourceError::ManifestMismatch)?;
+        if size > expected.size {
+            return Err(SourceError::ManifestMismatch);
+        }
+        digest.update(&buffer[..read]);
+        output
+            .write_all(&buffer[..read])
+            .map_err(|source| SourceError::Io {
+                operation: "write extracted source file",
+                path: expected.path.clone(),
+                source,
+            })?;
+    }
+    if size != expected.size || hex_digest(digest.finalize()) != expected.sha256 {
+        return Err(SourceError::ManifestMismatch);
+    }
+    output.sync_all().map_err(|source| SourceError::Io {
+        operation: "synchronize extracted source file",
+        path: expected.path.clone(),
+        source,
+    })?;
+    drop(entry);
+    set_extracted_permissions(&output, expected.executable).map_err(|source| SourceError::Io {
+        operation: "set extracted source permissions",
+        path: expected.path.clone(),
+        source,
+    })?;
+    Ok(())
+}
+
+fn create_safe_parent_directories(
+    destination: &CapabilityDir,
+    relative: &Utf8Path,
+) -> Result<CapabilityDir, SourceError> {
+    let mut current = destination.try_clone().map_err(|source| SourceError::Io {
+        operation: "clone extraction destination handle",
+        path: "extraction destination".to_owned(),
+        source,
+    })?;
+    let Some(parent) = relative.parent() else {
+        return Ok(current);
+    };
+    for component in parent {
+        match current.symlink_metadata(component) {
+            Ok(metadata) if metadata.is_symlink() || !metadata.is_dir() => {
+                return Err(SourceError::InvalidArchive {
+                    reason: "extraction path encountered a non-directory component".to_owned(),
+                });
+            }
+            Ok(_) => {}
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                create_private_capability_directory(&current, component).map_err(|source| {
+                    SourceError::Io {
+                        operation: "create extracted source directory",
+                        path: display_relative_path(parent),
+                        source,
+                    }
+                })?;
+            }
+            Err(source) => {
+                return Err(SourceError::Io {
+                    operation: "inspect extracted source directory",
+                    path: display_relative_path(parent),
+                    source,
+                });
+            }
+        }
+        let next = current
+            .open_dir(component)
+            .map_err(|source| SourceError::Io {
+                operation: "open extracted source directory",
+                path: display_relative_path(parent),
+                source,
+            })?;
+        if current
+            .symlink_metadata(component)
+            .map_err(|source| SourceError::Io {
+                operation: "reinspect extracted source directory",
+                path: display_relative_path(parent),
+                source,
+            })?
+            .is_symlink()
+        {
+            return Err(SourceError::InvalidArchive {
+                reason: "extraction path encountered a symbolic link".to_owned(),
+            });
+        }
+        current = next;
+    }
+    Ok(current)
+}
+
+#[cfg(unix)]
+fn set_extracted_permissions(file: &cap_std::fs::File, executable: bool) -> io::Result<()> {
+    use cap_std::fs::PermissionsExt as _;
+
+    let mode = if executable { 0o755 } else { 0o644 };
+    file.set_permissions(cap_std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn set_extracted_permissions(_file: &cap_std::fs::File, _executable: bool) -> io::Result<()> {
+    Ok(())
+}
+
+fn open_new_private_capability_file(
+    parent: &CapabilityDir,
+    name: &str,
+) -> io::Result<cap_std::fs::File> {
+    let mut options = CapabilityOpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    parent.open_with(name, &options)
+}
+
+#[allow(clippy::too_many_lines)]
+fn scan_capability_paths(
+    root: &CapabilityDir,
+    limits: SourceLimits,
+) -> Result<ScanResult, SourceError> {
+    let root = root.try_clone().map_err(|source| SourceError::Io {
+        operation: "clone verified bundle root handle",
+        path: "bundle root".to_owned(),
+        source,
+    })?;
+    let mut stack = vec![(root, Utf8PathBuf::from("."))];
+    let mut directories = BTreeSet::new();
+    let mut entries = BTreeMap::new();
+    let mut collisions = BTreeMap::new();
+    let mut total_size = 0_u64;
+
+    while let Some((directory, relative)) = stack.pop() {
+        let display = display_relative_path(&relative);
+        let iterator = directory.entries().map_err(|source| SourceError::Io {
+            operation: "read verified bundle directory",
+            path: display.clone(),
+            source,
+        })?;
+        let mut children = Vec::new();
+        for child in iterator {
+            let child = child.map_err(|source| SourceError::Io {
+                operation: "read verified bundle entry",
+                path: display.clone(),
+                source,
+            })?;
+            let name = child
+                .file_name()
+                .into_string()
+                .map_err(|_| SourceError::NonUtf8Path)?;
+            children.push(name);
+        }
+        children.sort();
+
+        for name in children.into_iter().rev() {
+            let child_relative = if relative.as_str() == "." {
+                Utf8PathBuf::from(&name)
+            } else {
+                relative.join(&name)
+            };
+            let child_display = display_relative_path(&child_relative);
+            validate_portable_path_str(&child_display, false).map_err(|reason| {
+                SourceError::NonPortablePath {
+                    path: child_display.clone(),
+                    reason,
+                }
+            })?;
+            reject_sensitive(&child_display)?;
+            check_depth(&child_display, limits.max_depth)?;
+            let metadata = directory
+                .symlink_metadata(&name)
+                .map_err(|source| SourceError::Io {
+                    operation: "inspect verified bundle entry",
+                    path: child_display.clone(),
+                    source,
+                })?;
+            if metadata.is_symlink() {
+                return Err(SourceError::Symlink {
+                    path: child_display,
+                });
+            }
+            register_collision_key(&child_display, &mut collisions)?;
+
+            if metadata.is_dir() {
+                directories.insert(child_display);
+                let child = directory
+                    .open_dir(&name)
+                    .map_err(|source| SourceError::Io {
+                        operation: "open verified bundle directory",
+                        path: display_relative_path(&child_relative),
+                        source,
+                    })?;
+                stack.push((child, child_relative));
+                continue;
+            }
+            if !metadata.is_file() {
+                return Err(SourceError::UnsupportedFileType {
+                    path: child_display,
+                });
+            }
+            reject_capability_hard_link(&metadata, &child_display)?;
+            if entries.len() >= limits.max_file_count {
+                return Err(limit_error(
+                    SourceLimitKind::FileCount,
+                    Some(child_display),
+                    limits.max_file_count as u64,
+                    (entries.len() + 1) as u64,
+                ));
+            }
+            if metadata.len() > limits.max_file_size {
+                return Err(limit_error(
+                    SourceLimitKind::FileSize,
+                    Some(child_display),
+                    limits.max_file_size,
+                    metadata.len(),
+                ));
+            }
+            let next_total = total_size.checked_add(metadata.len()).ok_or_else(|| {
+                limit_error(
+                    SourceLimitKind::TotalSize,
+                    Some(child_display.clone()),
+                    limits.max_total_size,
+                    u64::MAX,
+                )
+            })?;
+            if next_total > limits.max_total_size {
+                return Err(limit_error(
+                    SourceLimitKind::TotalSize,
+                    Some(child_display.clone()),
+                    limits.max_total_size,
+                    next_total,
+                ));
+            }
+            let contents = read_bounded_capability_file(
+                &directory,
+                &name,
+                &child_display,
+                limits.max_file_size,
+                &metadata,
+            )?;
+            let executable = capability_executable_bit(&metadata);
+            total_size = next_total;
+            entries.insert(
+                child_display.clone(),
+                SourceManifestEntry {
+                    path: child_display,
+                    size: metadata.len(),
+                    sha256: hex_digest(Sha256::digest(contents)),
+                    executable,
+                },
+            );
+        }
+    }
+
+    Ok(ScanResult {
+        entries: entries.into_values().collect(),
+        directories: directories.into_iter().collect(),
+    })
+}
+
+fn read_bounded_capability_file(
+    directory: &CapabilityDir,
+    name: &str,
+    display: &str,
+    maximum: u64,
+    initial: &cap_std::fs::Metadata,
+) -> Result<Vec<u8>, SourceError> {
+    let file = directory.open(name).map_err(|source| SourceError::Io {
+        operation: "open verified bundle file",
+        path: display.to_owned(),
+        source,
+    })?;
+    let opened = file.metadata().map_err(|source| SourceError::Io {
+        operation: "inspect open verified bundle file",
+        path: display.to_owned(),
+        source,
+    })?;
+    reject_capability_hard_link(&opened, display)?;
+    if !opened.is_file() || !same_capability_file_identity(initial, &opened) {
+        return Err(SourceError::ChangedDuringRead {
+            path: display.to_owned(),
+        });
+    }
+    let initial_modified = initial.modified().ok();
+    let mut reader = file.take(maximum.saturating_add(1));
+    let mut contents =
+        Vec::with_capacity(usize::try_from(initial.len().min(64 * 1024)).unwrap_or(64 * 1024));
+    reader
+        .read_to_end(&mut contents)
+        .map_err(|source| SourceError::Io {
+            operation: "read verified bundle file",
+            path: display.to_owned(),
+            source,
+        })?;
+    if contents.len() as u64 > maximum {
+        return Err(limit_error(
+            SourceLimitKind::FileSize,
+            Some(display.to_owned()),
+            maximum,
+            contents.len() as u64,
+        ));
+    }
+    let opened_final = reader
+        .get_ref()
+        .metadata()
+        .map_err(|source| SourceError::Io {
+            operation: "reinspect open verified bundle file",
+            path: display.to_owned(),
+            source,
+        })?;
+    let path_final = directory
+        .symlink_metadata(name)
+        .map_err(|source| SourceError::Io {
+            operation: "reinspect verified bundle file",
+            path: display.to_owned(),
+            source,
+        })?;
+    if path_final.is_symlink()
+        || !path_final.is_file()
+        || !same_capability_file_identity(&opened, &opened_final)
+        || !same_capability_file_identity(&opened, &path_final)
+        || opened_final.len() != initial.len()
+        || path_final.len() != initial.len()
+        || contents.len() as u64 != initial.len()
+        || opened_final.modified().ok() != initial_modified
+        || path_final.modified().ok() != initial_modified
+        || capability_executable_bit(&opened_final) != capability_executable_bit(initial)
+        || capability_executable_bit(&path_final) != capability_executable_bit(initial)
+    {
+        return Err(SourceError::ChangedDuringRead {
+            path: display.to_owned(),
+        });
+    }
+    Ok(contents)
+}
+
+#[cfg(unix)]
+fn reject_capability_hard_link(
+    metadata: &cap_std::fs::Metadata,
+    path: &str,
+) -> Result<(), SourceError> {
+    use cap_std::fs::MetadataExt as _;
+
+    let links = metadata.nlink();
+    if links > 1 {
+        Err(SourceError::HardLink {
+            path: path.to_owned(),
+            links,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn reject_capability_hard_link(
+    _metadata: &cap_std::fs::Metadata,
+    _path: &str,
+) -> Result<(), SourceError> {
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn reject_capability_hard_link(
+    _metadata: &cap_std::fs::Metadata,
+    path: &str,
+) -> Result<(), SourceError> {
+    Err(SourceError::HardLinkInspectionUnavailable {
+        path: path.to_owned(),
+    })
+}
+
+#[cfg(unix)]
+fn same_capability_file_identity(
+    first: &cap_std::fs::Metadata,
+    second: &cap_std::fs::Metadata,
+) -> bool {
+    use cap_std::fs::MetadataExt as _;
+
+    first.dev() == second.dev() && first.ino() == second.ino()
+}
+
+#[cfg(windows)]
+fn same_capability_file_identity(
+    first: &cap_std::fs::Metadata,
+    second: &cap_std::fs::Metadata,
+) -> bool {
+    use cap_std::fs::MetadataExt as _;
+
+    first.file_attributes() == second.file_attributes()
+        && first.creation_time() == second.creation_time()
+        && first.last_write_time() == second.last_write_time()
+        && first.file_size() == second.file_size()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_capability_file_identity(
+    _first: &cap_std::fs::Metadata,
+    _second: &cap_std::fs::Metadata,
+) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn capability_executable_bit(metadata: &cap_std::fs::Metadata) -> bool {
+    use cap_std::fs::MetadataExt as _;
+
+    metadata.mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn capability_executable_bit(_metadata: &cap_std::fs::Metadata) -> bool {
+    false
 }
 
 #[derive(Debug)]
@@ -795,12 +2777,6 @@ impl ResolvedRoots {
             project_relative,
         })
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ScanPolicy {
-    Planning,
-    Verification,
 }
 
 #[derive(Debug)]
@@ -1059,7 +3035,6 @@ fn scan_paths(
     include_roots: Vec<Utf8PathBuf>,
     ignore_rules: &[IgnoreRule],
     limits: SourceLimits,
-    policy: ScanPolicy,
 ) -> Result<ScanResult, SourceError> {
     let mut stack: Vec<_> = include_roots.into_iter().rev().collect();
     let mut visited_directories = BTreeSet::new();
@@ -1079,12 +3054,9 @@ fn scan_paths(
             })?;
             check_depth(&display, limits.max_depth)?;
             if is_sensitive_path(&display) {
-                if policy == ScanPolicy::Verification {
-                    return Err(SourceError::SensitivePath { path: display });
-                }
                 continue;
             }
-            if policy == ScanPolicy::Planning && is_ignored(&display, ignore_rules) {
+            if is_ignored(&display, ignore_rules) {
                 continue;
             }
         }
@@ -1226,7 +3198,7 @@ fn read_bounded_file(
     initial_metadata: &Metadata,
     limit_kind: SourceLimitKind,
 ) -> Result<Vec<u8>, SourceError> {
-    let file = File::open(path.as_std_path()).map_err(|source| SourceError::Io {
+    let file = open_read_stable(path).map_err(|source| SourceError::Io {
         operation: "open",
         path: display.to_owned(),
         source,
@@ -1321,22 +3293,8 @@ fn reject_hard_link(metadata: &Metadata, path: &str) -> Result<(), SourceError> 
 }
 
 #[cfg(windows)]
-fn reject_hard_link(metadata: &Metadata, path: &str) -> Result<(), SourceError> {
-    use std::os::windows::fs::MetadataExt;
-
-    let Some(links) = metadata.number_of_links() else {
-        return Err(SourceError::HardLinkInspectionUnavailable {
-            path: path.to_owned(),
-        });
-    };
-    if links > 1 {
-        Err(SourceError::HardLink {
-            path: path.to_owned(),
-            links: u64::from(links),
-        })
-    } else {
-        Ok(())
-    }
+fn reject_hard_link(_metadata: &Metadata, _path: &str) -> Result<(), SourceError> {
+    Ok(())
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1357,16 +3315,10 @@ fn same_file_identity(first: &Metadata, second: &Metadata) -> bool {
 fn same_file_identity(first: &Metadata, second: &Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
 
-    matches!(
-        (
-            first.volume_serial_number(),
-            first.file_index(),
-            second.volume_serial_number(),
-            second.file_index(),
-        ),
-        (Some(first_volume), Some(first_index), Some(second_volume), Some(second_index))
-            if first_volume == second_volume && first_index == second_index
-    )
+    first.file_attributes() == second.file_attributes()
+        && first.creation_time() == second.creation_time()
+        && first.last_write_time() == second.last_write_time()
+        && first.file_size() == second.file_size()
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1499,10 +3451,16 @@ fn is_windows_reserved_name(stem: &str) -> bool {
     let upper = stem.to_ascii_uppercase();
     matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
         || upper.strip_prefix("COM").is_some_and(|suffix| {
-            matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+            matches!(
+                suffix,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
         })
         || upper.strip_prefix("LPT").is_some_and(|suffix| {
-            matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+            matches!(
+                suffix,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
         })
 }
 
@@ -1680,4 +3638,28 @@ fn has_unexpected_directory(directories: &[String], expected: &SourceManifest) -
                 .is_some_and(|rest| rest.starts_with('/'))
         })
     })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capability_root_binding_rejects_named_replacement() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temporary.path().join("bundle")).unwrap();
+        let detached = Utf8PathBuf::from_path_buf(temporary.path().join("detached")).unwrap();
+        fs::create_dir(&root).unwrap();
+        let canonical_root = Utf8PathBuf::from_path_buf(fs::canonicalize(&root).unwrap()).unwrap();
+        let directory =
+            CapabilityDir::open_ambient_dir(canonical_root.as_std_path(), ambient_authority())
+                .unwrap();
+        let identity = capability_directory_identity(&directory).unwrap();
+        ensure_capability_directory_path(&directory, &canonical_root, &identity).unwrap();
+
+        fs::rename(&root, &detached).unwrap();
+        fs::create_dir(&root).unwrap();
+
+        assert!(ensure_capability_directory_path(&directory, &canonical_root, &identity).is_err());
+    }
 }

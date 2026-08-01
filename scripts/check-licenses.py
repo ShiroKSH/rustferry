@@ -27,10 +27,12 @@ REVIEWED_LICENSE_EXPRESSIONS = frozenset(
         "0BSD OR MIT OR Apache-2.0",
         "Apache-2.0",
         "Apache-2.0 OR MIT",
+        "Apache-2.0 WITH LLVM-exception",
         "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
         "BSD-3-Clause OR MIT OR Apache-2.0",
         "MIT",
         "MIT OR Apache-2.0",
+        "MIT OR Apache-2.0 OR Zlib",
         "MIT OR Apache-2.0 OR LGPL-2.1-or-later",
         "MIT OR Zlib OR Apache-2.0",
         "MIT/Apache-2.0",
@@ -39,6 +41,7 @@ REVIEWED_LICENSE_EXPRESSIONS = frozenset(
         "Unlicense OR MIT",
         "Unlicense/MIT",
         "Zlib",
+        "Zlib OR Apache-2.0 OR MIT",
     }
 )
 

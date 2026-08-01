@@ -14,8 +14,11 @@ description = "Versioned remote-build contracts and provider interfaces for Rust
 
 [dependencies]
 camino.workspace = true
+cap-std.workspace = true
 goblin.workspace = true
+libc.workspace = true
 plist.workspace = true
+same-file.workspace = true
 schemars.workspace = true
 semver.workspace = true
 serde.workspace = true
@@ -24,6 +27,7 @@ sha2.workspace = true
 thiserror.workspace = true
 unicode-normalization.workspace = true
 url.workspace = true
+uuid.workspace = true
 zip.workspace = true
 
 [dev-dependencies]
