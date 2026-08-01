@@ -2,16 +2,7 @@ name: VS Code extension
 
 on:
   push:
-    paths:
-      - Cargo.lock
-      - Cargo.toml
-      - crates/**
-      - editors/vscode/**
-      - examples/counter/**
-      - schemas/**
-      - LICENSES/**
-      - scripts/check-licenses.py
-      - .github/workflows/vscode-extension.yml
+    branches: [master]
   pull_request:
     paths:
       - Cargo.lock

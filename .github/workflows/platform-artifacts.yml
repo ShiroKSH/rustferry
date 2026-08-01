@@ -3,13 +3,6 @@ name: Platform artifacts
 on:
   push:
     branches: [master]
-    paths:
-      - Cargo.lock
-      - Cargo.toml
-      - crates/**
-      - examples/**
-      - schemas/**
-      - .github/workflows/platform-artifacts.yml
   pull_request:
     paths:
       - Cargo.lock
