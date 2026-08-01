@@ -38,7 +38,7 @@ jobs:
       GITHUB_TOKEN: '${{ github.token }}'
       RUST_BACKTRACE: '0'
       RUSTUP_TOOLCHAIN: '1.92.0'
-      RUSTFERRY_WORKER_REVISION: '3332f8ed850a009e70465be1a7938db68c02cec4'
+      RUSTFERRY_WORKER_REVISION: '66555a41f32398d74b2e437d73aa0b2d53af0343'
     steps:
       - name: Checkout exact acceptance source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
