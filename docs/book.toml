@@ -10,7 +10,7 @@ build-dir = "../target/book"
 create-missing = false
 
 [output.html]
-git-repository-icon = "fa-github"
+git-repository-icon = "fab-github"
 git-repository-url = "https://github.com/ShiroKSH/rustferry"
 edit-url-template = "https://github.com/ShiroKSH/rustferry/edit/master/docs/{path}"
 site-url = "/rustferry/"
