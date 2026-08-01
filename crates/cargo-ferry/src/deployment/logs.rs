@@ -896,8 +896,8 @@ mod tests {
 
     #[test]
     fn system_stream_delivers_android_and_simulator_entries_incrementally() {
-        let (_temporary, tool) = fake_log_tool();
-        let android = LogService::new(SystemExecutor, ".").with_tools(&tool, &tool);
+        let (_temporary_android, android_tool) = fake_log_tool();
+        let android = LogService::new(SystemExecutor, ".").with_tools(&android_tool, &android_tool);
         let mut android_entries = Vec::new();
         let outcome = android
             .stream(
@@ -911,7 +911,9 @@ mod tests {
         assert_eq!(outcome.entries, 1);
         assert_eq!(android_entries[0].message, "android ready");
 
-        let simulator = LogService::new(SystemExecutor, ".").with_tools(&tool, &tool);
+        let (_temporary_simulator, simulator_tool) = fake_log_tool();
+        let simulator =
+            LogService::new(SystemExecutor, ".").with_tools(&simulator_tool, &simulator_tool);
         let mut simulator_entries = Vec::new();
         let outcome = simulator
             .stream(
