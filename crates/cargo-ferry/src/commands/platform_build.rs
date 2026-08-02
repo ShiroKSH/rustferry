@@ -36,10 +36,16 @@ struct BuildOutput {
 }
 
 #[derive(Debug)]
-struct CargoTargets {
+pub(super) struct CargoTargets {
     package: String,
     library: String,
     binary: String,
+}
+
+impl CargoTargets {
+    pub(super) fn binary(&self) -> &str {
+        &self.binary
+    }
 }
 
 pub fn run(arguments: BuildArgs, dry_run: bool, reporter: &Reporter) -> Result<(), CliError> {
@@ -361,7 +367,7 @@ fn report_build(output: &BuildOutput, reporter: &Reporter) {
     );
 }
 
-fn read_cargo_targets(root: &Utf8Path) -> Result<CargoTargets, CliError> {
+pub(super) fn read_cargo_targets(root: &Utf8Path) -> Result<CargoTargets, CliError> {
     let path = root.join("Cargo.toml");
     let source = fs::read_to_string(&path).map_err(|source| CliError::Io {
         action: "read Cargo manifest",

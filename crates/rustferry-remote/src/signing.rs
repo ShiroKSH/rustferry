@@ -553,14 +553,16 @@ impl ProvisioningProfile {
     ///
     /// # Errors
     ///
-    /// Returns [`SigningValidationError::ProfileExpired`] when the profile is
-    /// no longer valid, or another typed metadata error.
+    /// Returns a typed time-validity error when the profile is not yet valid
+    /// or has expired, or another typed metadata error.
     pub fn validate_metadata_at(
         &self,
         now_unix_seconds: u64,
     ) -> Result<(), SigningValidationError> {
         self.validate_metadata()?;
-        if self.expires_at_unix_seconds <= now_unix_seconds {
+        if self.created_at_unix_seconds > now_unix_seconds {
+            Err(SigningValidationError::ProfileNotYetValid)
+        } else if self.expires_at_unix_seconds <= now_unix_seconds {
             Err(SigningValidationError::ProfileExpired)
         } else {
             Ok(())
@@ -1088,6 +1090,8 @@ pub enum SigningValidationError {
     CertificateTeamMismatch,
     /// Provisioning profile has expired.
     ProfileExpired,
+    /// Provisioning profile creation time is in the future.
+    ProfileNotYetValid,
     /// Provisioning profile is not an iOS-device profile.
     ProfilePlatformMismatch,
     /// Provisioning profile type does not match the mode.
@@ -1211,6 +1215,9 @@ impl fmt::Display for SigningValidationError {
             }
             Self::CertificateTeamMismatch => formatter.write_str("certificate team does not match"),
             Self::ProfileExpired => formatter.write_str("provisioning profile has expired"),
+            Self::ProfileNotYetValid => {
+                formatter.write_str("provisioning profile is not yet valid")
+            }
             Self::ProfilePlatformMismatch => {
                 formatter.write_str("provisioning profile is not for iOS devices")
             }

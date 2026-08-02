@@ -13,7 +13,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
-    process::{Command, ExitStatus, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::Arc,
     thread,
     time::{Duration, Instant},
@@ -24,12 +24,15 @@ use std::os::unix::fs::OpenOptionsExt as _;
 
 use sha2::{Digest, Sha256};
 
+use rustferry_remote::SecretBytes;
+
 use crate::workflow::{ProtectedEnvironment, SecretName, TemporaryBranchNamespace};
 
 const GITHUB_HOST: &str = "github.com";
 const API_ACCEPT: &str = "Accept: application/vnd.github+json";
 const API_VERSION: &str = "X-GitHub-Api-Version: 2022-11-28";
 const MAX_STDERR_BYTES: usize = 64 * 1024;
+const MAX_SECRET_SET_OUTPUT_BYTES: usize = 4 * 1024;
 const MAX_API_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_PAGES: u16 = 100;
@@ -37,6 +40,9 @@ const MAX_POLL_ATTEMPTS: u16 = 2_000;
 const MAX_DEPLOYMENT_POLICY_NAME_BYTES: usize = 255;
 const ZIP_END_RECORD_MINIMUM_BYTES: usize = 22;
 const ZIP_END_RECORD_SEARCH_BYTES: usize = 65_557;
+
+/// Maximum value accepted by GitHub Actions for one Environment secret.
+pub const MAX_ENVIRONMENT_SECRET_BYTES: usize = 48 * 1024;
 
 const USER_QUERY: &str = ".login";
 const INSTALLATION_REPOSITORY_QUERY: &str = ".repositories[] | [.id,(.full_name | @base64)] | @tsv";
@@ -567,11 +573,92 @@ impl GhRequest {
     }
 }
 
+/// Exact secret role and protected GitHub Environment selected for one write.
+///
+/// The secret value is deliberately absent. It is supplied separately to the
+/// runner so it cannot enter argv, debug output, or serialized request state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnvironmentSecretWriteRequest {
+    repository: Repository,
+    environment: ProtectedEnvironment,
+    name: SecretName,
+}
+
+impl EnvironmentSecretWriteRequest {
+    /// Bind one validated secret name to an exact repository and Environment.
+    pub const fn new(
+        repository: Repository,
+        environment: ProtectedEnvironment,
+        name: SecretName,
+    ) -> Self {
+        Self {
+            repository,
+            environment,
+            name,
+        }
+    }
+
+    /// Exact target repository.
+    pub const fn repository(&self) -> &Repository {
+        &self.repository
+    }
+
+    /// Exact protected Environment.
+    pub const fn environment(&self) -> &ProtectedEnvironment {
+        &self.environment
+    }
+
+    /// Validated secret role name.
+    pub const fn name(&self) -> &SecretName {
+        &self.name
+    }
+
+    /// Render the fixed `gh secret set` argv. The value is read from stdin.
+    pub fn arguments(&self) -> Vec<OsString> {
+        vec![
+            OsString::from("secret"),
+            OsString::from("set"),
+            OsString::from(self.name.as_str()),
+            OsString::from("--repo"),
+            OsString::from(self.repository.full_name()),
+            OsString::from("--env"),
+            OsString::from(self.environment.as_str()),
+        ]
+    }
+}
+
+/// Secret-free confirmation that `gh` accepted one exact Environment write.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnvironmentSecretWriteReceipt {
+    repository: Repository,
+    environment: ProtectedEnvironment,
+    name: SecretName,
+}
+
+impl EnvironmentSecretWriteReceipt {
+    /// Exact target repository.
+    pub const fn repository(&self) -> &Repository {
+        &self.repository
+    }
+
+    /// Exact protected Environment.
+    pub const fn environment(&self) -> &ProtectedEnvironment {
+        &self.environment
+    }
+
+    /// Secret role accepted by `gh`.
+    pub const fn name(&self) -> &SecretName {
+        &self.name
+    }
+}
+
 /// Redacted execution failure from a `gh` runner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GhExecutionError {
     /// Authentication was unavailable from the exact configured source.
     AuthenticationUnavailable,
+    /// A secret value exceeded GitHub's fixed Environment-secret limit.
+    SecretTooLarge,
     /// The child process could not be created.
     SpawnFailed,
     /// The child process exceeded its deadline and was terminated.
@@ -592,6 +679,9 @@ impl fmt::Display for GhExecutionError {
         match self {
             Self::AuthenticationUnavailable => {
                 formatter.write_str("GitHub authentication is unavailable")
+            }
+            Self::SecretTooLarge => {
+                formatter.write_str("GitHub Environment secret exceeds size limit")
             }
             Self::SpawnFailed => formatter.write_str("failed to start GitHub CLI"),
             Self::TimedOut => formatter.write_str("GitHub API request timed out"),
@@ -617,6 +707,22 @@ pub trait GhRunner {
     ///
     /// Returns only redacted process failure categories.
     fn execute(&mut self, request: &GhRequest) -> Result<Vec<u8>, GhExecutionError>;
+}
+
+/// Injectable executor for one fixed-argv Environment-secret write.
+pub trait GhSecretRunner {
+    /// Send the value only through child-process stdin.
+    ///
+    /// # Errors
+    ///
+    /// Returns only redacted process failure categories. Implementations must
+    /// reject values above [`MAX_ENVIRONMENT_SECRET_BYTES`].
+    fn set_environment_secret(
+        &mut self,
+        request: &EnvironmentSecretWriteRequest,
+        value: &SecretBytes,
+        timeout: Duration,
+    ) -> Result<(), GhExecutionError>;
 }
 
 /// Exact environment variable accepted as a GitHub token source.
@@ -721,9 +827,17 @@ impl GhProcessRunner {
     }
 
     fn command(&self, request: &GhRequest) -> Command {
+        self.command_with_arguments(request.arguments(), Stdio::null())
+    }
+
+    fn environment_secret_command(&self, request: &EnvironmentSecretWriteRequest) -> Command {
+        self.command_with_arguments(request.arguments(), Stdio::piped())
+    }
+
+    fn command_with_arguments(&self, arguments: Vec<OsString>, stdin: Stdio) -> Command {
         let mut command = Command::new(&self.executable);
         command
-            .args(request.arguments())
+            .args(arguments)
             .current_dir(&self.neutral_working_directory)
             .env_clear()
             .env("GH_CONFIG_DIR", &self.configuration_directory)
@@ -741,17 +855,14 @@ impl GhProcessRunner {
             .env("USERPROFILE", &self.private_state.root)
             .env("APPDATA", &self.private_state.root)
             .env("LOCALAPPDATA", &self.private_state.root)
-            .stdin(Stdio::null())
+            .stdin(stdin)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        configure_process_tree(&mut command);
         command
     }
-}
 
-impl GhRunner for GhProcessRunner {
-    fn execute(&mut self, request: &GhRequest) -> Result<Vec<u8>, GhExecutionError> {
-        let mut command = self.command(request);
-
+    fn apply_authentication(&self, command: &mut Command) -> Result<(), GhExecutionError> {
         if let GhAuthentication::EnvironmentToken { variable, .. } = &self.authentication {
             let name = variable.as_str();
             let value = std::env::var_os(name)
@@ -759,8 +870,31 @@ impl GhRunner for GhProcessRunner {
                 .ok_or(GhExecutionError::AuthenticationUnavailable)?;
             command.env(name, value);
         }
+        Ok(())
+    }
+}
 
+impl GhRunner for GhProcessRunner {
+    fn execute(&mut self, request: &GhRequest) -> Result<Vec<u8>, GhExecutionError> {
+        let mut command = self.command(request);
+        self.apply_authentication(&mut command)?;
         run_process(command, request.timeout, request.output_limit)
+    }
+}
+
+impl GhSecretRunner for GhProcessRunner {
+    fn set_environment_secret(
+        &mut self,
+        request: &EnvironmentSecretWriteRequest,
+        value: &SecretBytes,
+        timeout: Duration,
+    ) -> Result<(), GhExecutionError> {
+        if value.len() > MAX_ENVIRONMENT_SECRET_BYTES {
+            return Err(GhExecutionError::SecretTooLarge);
+        }
+        let mut command = self.environment_secret_command(request);
+        self.apply_authentication(&mut command)?;
+        run_process_with_secret_input(command, timeout, MAX_SECRET_SET_OUTPUT_BYTES, value)
     }
 }
 
@@ -1204,6 +1338,8 @@ impl DownloadedArtifact {
 pub enum TransportError {
     /// The underlying fixed-argv request failed.
     Execution(GhExecutionError),
+    /// One Environment-secret value exceeded GitHub's fixed 48 KiB limit.
+    EnvironmentSecretTooLarge,
     /// GitHub returned malformed or unsupported metadata.
     MalformedResponse {
         /// Stable operation name; response bytes are intentionally omitted.
@@ -1254,6 +1390,9 @@ impl fmt::Display for TransportError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Execution(error) => error.fmt(formatter),
+            Self::EnvironmentSecretTooLarge => {
+                formatter.write_str("GitHub Environment secret exceeds size limit")
+            }
             Self::MalformedResponse { operation } => {
                 write!(formatter, "GitHub returned malformed {operation} metadata")
             }
@@ -1344,6 +1483,31 @@ impl<R> GithubTransport<R> {
     /// Borrow the runner for adapter-specific inspection.
     pub fn runner(&self) -> &R {
         &self.runner
+    }
+}
+
+impl<R: GhSecretRunner> GithubTransport<R> {
+    /// Set one bounded GitHub Environment secret through fixed argv and stdin.
+    ///
+    /// # Errors
+    ///
+    /// Rejects values above GitHub's 48 KiB limit before invoking the runner.
+    /// Process failures are redacted and never include the secret value.
+    pub fn set_environment_secret(
+        &mut self,
+        request: &EnvironmentSecretWriteRequest,
+        value: &SecretBytes,
+    ) -> Result<EnvironmentSecretWriteReceipt, TransportError> {
+        if value.len() > MAX_ENVIRONMENT_SECRET_BYTES {
+            return Err(TransportError::EnvironmentSecretTooLarge);
+        }
+        self.runner
+            .set_environment_secret(request, value, self.limits.api_timeout)?;
+        Ok(EnvironmentSecretWriteReceipt {
+            repository: request.repository.clone(),
+            environment: request.environment.clone(),
+            name: request.name.clone(),
+        })
     }
 }
 
@@ -2248,26 +2412,65 @@ fn write_new_artifact(target: &ArtifactDownloadTarget, bytes: &[u8]) -> Result<(
 }
 
 fn run_process(
-    mut command: Command,
+    command: Command,
     timeout: Duration,
     stdout_limit: usize,
 ) -> Result<Vec<u8>, GhExecutionError> {
+    run_process_inner(command, timeout, stdout_limit, None, true)
+}
+
+fn run_process_with_secret_input(
+    command: Command,
+    timeout: Duration,
+    stdout_limit: usize,
+    input: &SecretBytes,
+) -> Result<(), GhExecutionError> {
+    run_process_inner(command, timeout, stdout_limit, Some(input), false).map(drop)
+}
+
+fn run_process_inner(
+    mut command: Command,
+    timeout: Duration,
+    stdout_limit: usize,
+    input: Option<&SecretBytes>,
+    retain_stdout: bool,
+) -> Result<Vec<u8>, GhExecutionError> {
     let mut child = command.spawn().map_err(|_| GhExecutionError::SpawnFailed)?;
-    let Some(stdout) = child.stdout.take() else {
+    let mut process_tree = ProcessTreeGuard::attach(&child).inspect_err(|_| {
         let _ = child.kill();
         let _ = child.wait();
+    })?;
+    let Some(stdout) = child.stdout.take() else {
+        terminate_process_tree(&mut child, &mut process_tree);
         return Err(GhExecutionError::ProcessIo);
     };
     let Some(stderr) = child.stderr.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
+        terminate_process_tree(&mut child, &mut process_tree);
         return Err(GhExecutionError::ProcessIo);
     };
-    let stdout_reader = thread::spawn(move || read_capped(stdout, stdout_limit, true));
+    let stdin_writer = if let Some(input) = input {
+        let Some(mut stdin) = child.stdin.take() else {
+            terminate_process_tree(&mut child, &mut process_tree);
+            return Err(GhExecutionError::ProcessIo);
+        };
+        // A bounded zeroizing copy lets timeout handling kill `gh` even if its
+        // stdin reader stalls while the writer thread is active.
+        let input = SecretBytes::new(input.expose_secret_bytes().to_vec());
+        Some(thread::spawn(move || {
+            stdin
+                .write_all(input.expose_secret_bytes())
+                .map_err(|_| GhExecutionError::ProcessIo)
+        }))
+    } else {
+        None
+    };
+    let stdout_reader = thread::spawn(move || read_capped(stdout, stdout_limit, retain_stdout));
     let stderr_reader = thread::spawn(move || read_capped(stderr, MAX_STDERR_BYTES, false));
     let Some(deadline) = Instant::now().checked_add(timeout) else {
-        let _ = child.kill();
-        let _ = child.wait();
+        terminate_process_tree(&mut child, &mut process_tree);
+        if let Some(writer) = stdin_writer {
+            let _ = writer.join();
+        }
         let _ = stdout_reader.join();
         let _ = stderr_reader.join();
         return Err(GhExecutionError::TimedOut);
@@ -2280,21 +2483,31 @@ fn run_process(
                 thread::sleep(Duration::from_millis(20));
             }
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_process_tree(&mut child, &mut process_tree);
+                if let Some(writer) = stdin_writer {
+                    let _ = writer.join();
+                }
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
                 return Err(GhExecutionError::TimedOut);
             }
             Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_process_tree(&mut child, &mut process_tree);
+                if let Some(writer) = stdin_writer {
+                    let _ = writer.join();
+                }
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
                 return Err(GhExecutionError::ProcessIo);
             }
         }
     };
+    // `gh` has exited, but a descendant may still hold one of its inherited
+    // pipes open. End the complete supervised tree before joining readers.
+    process_tree.terminate_descendants();
+    let stdin_result = stdin_writer
+        .map(|writer| writer.join().map_err(|_| GhExecutionError::ProcessIo)?)
+        .transpose();
     let stdout = stdout_reader
         .join()
         .map_err(|_| GhExecutionError::ProcessIo)??;
@@ -2304,10 +2517,67 @@ fn run_process(
     if !status.success() {
         return Err(command_failed(status));
     }
+    stdin_result.map(drop)?;
     if stdout.truncated || stderr.truncated {
         return Err(GhExecutionError::OutputLimitExceeded);
     }
     Ok(stdout.bytes)
+}
+
+#[cfg(unix)]
+fn configure_process_tree(command: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_process_tree(_command: &mut Command) {}
+
+struct ProcessTreeGuard {
+    #[cfg(unix)]
+    process_group: Option<u32>,
+    platform_guard: Option<rustferry_core::process_control::ProcessGroupGuard>,
+}
+
+impl ProcessTreeGuard {
+    fn attach(child: &Child) -> Result<Self, GhExecutionError> {
+        let platform_guard = Some(
+            rustferry_core::process_control::track_child(child)
+                .map_err(|_| GhExecutionError::ProcessIo)?,
+        );
+        Ok(Self {
+            #[cfg(unix)]
+            process_group: Some(child.id()),
+            platform_guard,
+        })
+    }
+
+    fn terminate_descendants(&mut self) {
+        #[cfg(unix)]
+        if let Some(process_group) = self.process_group.take() {
+            let _ = Command::new("/bin/kill")
+                .args(["-KILL", "--", &format!("-{process_group}")])
+                .env_clear()
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        drop(self.platform_guard.take());
+    }
+}
+
+impl Drop for ProcessTreeGuard {
+    fn drop(&mut self) {
+        self.terminate_descendants();
+    }
+}
+
+fn terminate_process_tree(child: &mut Child, process_tree: &mut ProcessTreeGuard) {
+    process_tree.terminate_descendants();
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn command_failed(status: ExitStatus) -> GhExecutionError {
@@ -2536,10 +2806,65 @@ mod tests {
     const PROVISIONING_PROFILE_B64: &str =
         "UlVTVEZFUlJZX0dPQUwzX0lPU19QUk9WSVNJT05JTkdfUFJPRklMRQ==";
 
+    #[cfg(target_os = "linux")]
+    fn process_is_zombie(process_id: u32) -> bool {
+        fs::read_to_string(format!("/proc/{process_id}/status"))
+            .unwrap_or_default()
+            .lines()
+            .any(|line| {
+                line.strip_prefix("State:")
+                    .is_some_and(|state| state.trim_start().starts_with('Z'))
+            })
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    const fn process_is_zombie(_: u32) -> bool {
+        false
+    }
+
+    #[cfg(unix)]
+    fn assert_process_exits(process_id: u32) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let live = Command::new("/bin/kill")
+                .args(["-0", &process_id.to_string()])
+                .env_clear()
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("probe fake gh descendant")
+                .success();
+            if !live || process_is_zombie(process_id) {
+                return;
+            }
+            if Instant::now() >= deadline {
+                let _ = Command::new("/bin/kill")
+                    .args(["-KILL", &process_id.to_string()])
+                    .env_clear()
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                panic!("fake gh descendant {process_id} remained live");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     #[derive(Debug, Default)]
     struct FakeRunner {
         responses: VecDeque<Result<Vec<u8>, GhExecutionError>>,
         requests: Vec<GhRequest>,
+        secret_responses: VecDeque<Result<(), GhExecutionError>>,
+        secret_writes: Vec<RecordedSecretWrite>,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct RecordedSecretWrite {
+        request: EnvironmentSecretWriteRequest,
+        stdin_bytes: usize,
+        stdin_sha256: String,
     }
 
     impl FakeRunner {
@@ -2547,6 +2872,14 @@ mod tests {
             Self {
                 responses: responses.into_iter().collect(),
                 requests: Vec::new(),
+                ..Self::default()
+            }
+        }
+
+        fn with_secret(responses: impl IntoIterator<Item = Result<(), GhExecutionError>>) -> Self {
+            Self {
+                secret_responses: responses.into_iter().collect(),
+                ..Self::default()
             }
         }
     }
@@ -2555,6 +2888,24 @@ mod tests {
         fn execute(&mut self, request: &GhRequest) -> Result<Vec<u8>, GhExecutionError> {
             self.requests.push(request.clone());
             self.responses.pop_front().expect("unexpected request")
+        }
+    }
+
+    impl GhSecretRunner for FakeRunner {
+        fn set_environment_secret(
+            &mut self,
+            request: &EnvironmentSecretWriteRequest,
+            value: &SecretBytes,
+            _timeout: Duration,
+        ) -> Result<(), GhExecutionError> {
+            self.secret_writes.push(RecordedSecretWrite {
+                request: request.clone(),
+                stdin_bytes: value.len(),
+                stdin_sha256: format!("{:x}", Sha256::digest(value.expose_secret_bytes())),
+            });
+            self.secret_responses
+                .pop_front()
+                .expect("unexpected secret write")
         }
     }
 
@@ -2573,6 +2924,14 @@ mod tests {
 
     fn environment() -> ProtectedEnvironment {
         ProtectedEnvironment::new("rustferry-goal3-signing").expect("environment")
+    }
+
+    fn environment_secret_write_request() -> EnvironmentSecretWriteRequest {
+        EnvironmentSecretWriteRequest::new(
+            repository(),
+            environment(),
+            SecretName::new("RUSTFERRY_GOAL3_IOS_CERTIFICATE_PASSWORD").expect("secret name"),
+        )
     }
 
     fn limits(pages: u16, per_page: u8) -> TransportLimits {
@@ -2744,6 +3103,227 @@ mod tests {
             assert_eq!(value(name), Some(runner.private_state.root.as_os_str()));
         }
         assert_eq!(environment.len(), 15);
+    }
+
+    #[test]
+    fn environment_secret_write_uses_fixed_argv_and_separate_stdin() {
+        const SENTINEL: &str = "fake-manual-signing-password-sentinel";
+
+        let request = environment_secret_write_request();
+        let value = SecretBytes::new(SENTINEL.as_bytes().to_vec());
+        let mut transport = GithubTransport::new(FakeRunner::with_secret([Ok(())]), limits(1, 2));
+        let receipt = transport
+            .set_environment_secret(&request, &value)
+            .expect("secret write");
+
+        assert_eq!(receipt.repository(), request.repository());
+        assert_eq!(receipt.environment(), request.environment());
+        assert_eq!(receipt.name(), request.name());
+        let runner = transport.into_runner();
+        assert!(runner.requests.is_empty());
+        assert_eq!(runner.secret_writes.len(), 1);
+        let write = &runner.secret_writes[0];
+        assert_eq!(write.request, request);
+        assert_eq!(write.stdin_bytes, SENTINEL.len());
+        assert_eq!(
+            write.stdin_sha256,
+            format!("{:x}", Sha256::digest(SENTINEL.as_bytes()))
+        );
+        assert_eq!(
+            write.request.arguments(),
+            [
+                "secret",
+                "set",
+                "RUSTFERRY_GOAL3_IOS_CERTIFICATE_PASSWORD",
+                "--repo",
+                "ShiroKSH/rustferry",
+                "--env",
+                "rustferry-goal3-signing",
+            ]
+            .map(OsString::from)
+        );
+        let rendered_arguments = format!("{:?}", write.request.arguments());
+        assert!(!rendered_arguments.contains("--body"));
+        assert!(!rendered_arguments.contains(SENTINEL));
+        assert!(!format!("{runner:?}").contains(SENTINEL));
+    }
+
+    #[test]
+    fn environment_secret_write_accepts_limit_and_rejects_oversize_before_runner() {
+        let request = environment_secret_write_request();
+        let maximum = SecretBytes::new(vec![b'x'; MAX_ENVIRONMENT_SECRET_BYTES]);
+        let mut at_limit = GithubTransport::new(FakeRunner::with_secret([Ok(())]), limits(1, 2));
+        at_limit
+            .set_environment_secret(&request, &maximum)
+            .expect("maximum-size secret");
+        assert_eq!(at_limit.into_runner().secret_writes.len(), 1);
+
+        let value = SecretBytes::new(vec![b'x'; MAX_ENVIRONMENT_SECRET_BYTES + 1]);
+        let mut transport = GithubTransport::new(FakeRunner::default(), limits(1, 2));
+
+        let error = transport
+            .set_environment_secret(&request, &value)
+            .expect_err("oversized secret must fail");
+
+        assert_eq!(error, TransportError::EnvironmentSecretTooLarge);
+        assert!(transport.into_runner().secret_writes.is_empty());
+    }
+
+    #[test]
+    fn environment_secret_write_failure_does_not_expose_sentinel() {
+        const SENTINEL: &str = "fake-never-log-this-secret-sentinel";
+
+        let request = environment_secret_write_request();
+        let value = SecretBytes::new(SENTINEL.as_bytes().to_vec());
+        let mut transport = GithubTransport::new(
+            FakeRunner::with_secret([Err(GhExecutionError::CommandFailed {
+                exit_code: Some(17),
+            })]),
+            limits(1, 2),
+        );
+
+        let error = transport
+            .set_environment_secret(&request, &value)
+            .expect_err("failed secret write");
+        let runner = transport.into_runner();
+        let rendered = format!("{error:?}\n{error}\n{request:?}\n{runner:?}");
+        assert!(!rendered.contains(SENTINEL));
+        assert!(rendered.contains("status 17"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh_process_runner_sends_environment_secret_only_through_stdin() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const SENTINEL: &str = "fake-process-stdin-only-secret-sentinel";
+        let executable_directory = tempfile::TempDir::new().expect("executable directory");
+        let executable = executable_directory.path().join("gh");
+        fs::write(
+            &executable,
+            b"#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > secret-argv\ncat > secret-stdin\n",
+        )
+        .expect("fake gh executable");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+            .expect("fake gh permissions");
+        let neutral = tempfile::TempDir::new().expect("neutral directory");
+        let config = tempfile::TempDir::new().expect("config directory");
+        let runner = GhProcessRunner::new(
+            &executable,
+            neutral.path(),
+            GhAuthentication::config_directory(config.path()).expect("gh config"),
+        )
+        .expect("isolated gh runner");
+        let request = environment_secret_write_request();
+        let value = SecretBytes::new(SENTINEL.as_bytes().to_vec());
+        let mut transport = GithubTransport::new(runner, limits(1, 2));
+
+        transport
+            .set_environment_secret(&request, &value)
+            .expect("secret write");
+
+        assert_eq!(
+            fs::read_to_string(neutral.path().join("secret-argv")).expect("recorded argv"),
+            "secret\nset\nRUSTFERRY_GOAL3_IOS_CERTIFICATE_PASSWORD\n--repo\nShiroKSH/rustferry\n--env\nrustferry-goal3-signing\n"
+        );
+        assert_eq!(
+            fs::read(neutral.path().join("secret-stdin")).expect("recorded stdin"),
+            SENTINEL.as_bytes()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh_process_runner_discards_secret_command_output_on_failure() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const SENTINEL: &str = "fake-secret-command-output-sentinel";
+        let executable_directory = tempfile::TempDir::new().expect("executable directory");
+        let executable = executable_directory.path().join("gh");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{SENTINEL}'\nprintf '%s' '{SENTINEL}' >&2\nexit 23\n"
+            ),
+        )
+        .expect("fake gh executable");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+            .expect("fake gh permissions");
+        let neutral = tempfile::TempDir::new().expect("neutral directory");
+        let config = tempfile::TempDir::new().expect("config directory");
+        let runner = GhProcessRunner::new(
+            &executable,
+            neutral.path(),
+            GhAuthentication::config_directory(config.path()).expect("gh config"),
+        )
+        .expect("isolated gh runner");
+        let request = environment_secret_write_request();
+        let value = SecretBytes::new(SENTINEL.as_bytes().to_vec());
+        let mut transport = GithubTransport::new(runner, limits(1, 2));
+
+        let error = transport
+            .set_environment_secret(&request, &value)
+            .expect_err("fake gh failure");
+
+        let rendered = format!("{error:?}\n{error}");
+        assert!(!rendered.contains(SENTINEL));
+        assert!(rendered.contains("status 23"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh_process_runner_timeout_kills_descendants_holding_output_pipes() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const SENTINEL: &str = "fake-timeout-secret-sentinel";
+        let executable_directory = tempfile::TempDir::new().expect("executable directory");
+        let executable = executable_directory.path().join("gh");
+        fs::write(
+            &executable,
+            b"#!/bin/sh\nset -eu\n/bin/cat >/dev/null\n/bin/sleep 30 &\nprintf '%s\\n' \"$!\" > descendant-pid\n/bin/sleep 30\n",
+        )
+        .expect("fake gh executable");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+            .expect("fake gh permissions");
+        let neutral = tempfile::TempDir::new().expect("neutral directory");
+        let config = tempfile::TempDir::new().expect("config directory");
+        let runner = GhProcessRunner::new(
+            &executable,
+            neutral.path(),
+            GhAuthentication::config_directory(config.path()).expect("gh config"),
+        )
+        .expect("isolated gh runner");
+        let limits = TransportLimits::new(
+            1,
+            1,
+            4 * 1024,
+            4 * 1024 * 1024,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .expect("one-second limits");
+        let request = environment_secret_write_request();
+        let value = SecretBytes::new(SENTINEL.as_bytes().to_vec());
+        let mut transport = GithubTransport::new(runner, limits);
+
+        let started = Instant::now();
+        let error = transport
+            .set_environment_secret(&request, &value)
+            .expect_err("fake gh must time out");
+        let elapsed = started.elapsed();
+
+        assert_eq!(error, TransportError::Execution(GhExecutionError::TimedOut));
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "process-tree timeout took {elapsed:?}"
+        );
+        assert!(!format!("{error:?}\n{error}").contains(SENTINEL));
+        let descendant_pid = fs::read_to_string(neutral.path().join("descendant-pid"))
+            .expect("recorded descendant PID")
+            .trim()
+            .parse::<u32>()
+            .expect("numeric descendant PID");
+        assert_process_exits(descendant_pid);
     }
 
     #[test]

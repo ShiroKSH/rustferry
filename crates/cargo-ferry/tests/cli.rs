@@ -98,7 +98,8 @@ fn macless_iphone_and_github_remote_commands_are_exposed() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--worker-revision"))
-        .stdout(predicate::str::contains("--preview"));
+        .stdout(predicate::str::contains("--preview"))
+        .stdout(predicate::str::contains("--signing-plan").not());
 
     cargo_bin_cmd!("cargo-ferry")
         .args(["remote", "doctor", "github", "--help"])
@@ -109,6 +110,84 @@ fn macless_iphone_and_github_remote_commands_are_exposed() {
         .args(["remote", "status", "github", "--help"])
         .assert()
         .success();
+}
+
+#[test]
+fn manual_signing_setup_help_has_exact_inputs_and_no_password_value_option() {
+    let output = cargo_bin_cmd!("cargo-ferry")
+        .args(["signing", "setup", "manual", "--help"])
+        .output()
+        .expect("show manual signing setup help");
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let help = String::from_utf8(output.stdout).expect("UTF-8 help");
+    assert!(help.contains(
+        "Usage: cargo-ferry signing setup manual [OPTIONS] --certificate <CERTIFICATE> --profile <PROFILE> --remote <REMOTE>"
+    ));
+    assert!(help.contains("--certificate <CERTIFICATE>"));
+    assert!(help.contains("--profile <PROFILE>"));
+    assert!(help.contains("--remote <REMOTE>"));
+    assert!(help.contains("--password-stdin"));
+    assert!(help.contains("--password-env <NAME>"));
+    assert!(help.contains("--password-credential <ENTRY>"));
+    assert!(!help.contains("--password <"));
+    assert!(!help.contains("--certificate-password"));
+}
+
+#[test]
+fn json_manual_signing_requires_confirmation_before_reading_assets() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let project = generate_project(temporary.path(), "manual-signing-confirmation");
+    let output = cargo_bin_cmd!("cargo-ferry")
+        .args([
+            "--json",
+            "signing",
+            "setup",
+            "manual",
+            "--certificate",
+            "does-not-exist.p12",
+            "--profile",
+            "does-not-exist.mobileprovision",
+            "--remote",
+            "github",
+        ])
+        .current_dir(&project)
+        .output()
+        .expect("run manual signing setup");
+
+    assert_eq!(output.status.code(), Some(4));
+    assert!(output.stderr.is_empty());
+    let document: Value = serde_json::from_slice(&output.stdout).expect("valid JSON output");
+    assert_eq!(document["error"]["code"], "signing_confirmation_required");
+    assert!(
+        document["error"]["help"]
+            .as_str()
+            .expect("error help")
+            .contains("--json --yes")
+    );
+}
+
+#[test]
+fn manual_password_sources_are_mutually_exclusive() {
+    cargo_bin_cmd!("cargo-ferry")
+        .args([
+            "signing",
+            "setup",
+            "manual",
+            "--certificate",
+            "certificate.p12",
+            "--profile",
+            "profile.mobileprovision",
+            "--remote",
+            "github",
+            "--password-stdin",
+            "--password-env",
+            "P12_PASSWORD",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("cannot be used with"));
 }
 
 #[test]

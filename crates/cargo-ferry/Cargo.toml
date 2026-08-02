@@ -17,15 +17,20 @@ name = "cargo-ferry"
 path = "src/main.rs"
 
 [dependencies]
+base64.workspace = true
 camino.workspace = true
 clap.workspace = true
 clap_complete = "4.5.55"
+fs2.workspace = true
+keyring.workspace = true
+libc.workspace = true
 rustferry-android = { version = "0.1.0", path = "../rustferry-android" }
 rustferry-apple = { version = "0.1.0", path = "../rustferry-apple" }
 rustferry-codegen = { version = "0.1.0", path = "../rustferry-codegen" }
 rustferry-core = { version = "0.1.0", path = "../rustferry-core" }
 rustferry-github = { version = "0.1.0", path = "../rustferry-github" }
 rustferry-remote = { version = "0.1.0", path = "../rustferry-remote" }
+rpassword.workspace = true
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true

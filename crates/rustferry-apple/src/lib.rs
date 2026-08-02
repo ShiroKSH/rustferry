@@ -12,6 +12,7 @@ mod discovery;
 mod doctor;
 mod error;
 mod project;
+mod signing_assets;
 
 pub use artifact::{
     IosArtifactExpectation, IosArtifactValidation, IosCodeSignatureValidation,
@@ -39,6 +40,13 @@ pub use error::AppleError;
 pub use project::{
     GeneratedAppleProject, IosProjectPlatform, IosProjectSpec, generate_ios_project,
     generate_ios_project_for_platform, write_ios_project,
+};
+pub use signing_assets::{
+    APPLE_ROOT_CA_G2_SHA256, APPLE_ROOT_CA_G3_SHA256, APPLE_ROOT_CA_SHA256,
+    MAX_MANUAL_SIGNING_PASSWORD_BYTES, MAX_MANUAL_SIGNING_PKCS12_BYTES,
+    MAX_MANUAL_SIGNING_PROFILE_BYTES, ManualSigningAssetError, ManualSigningAssetField,
+    ManualSigningAssetInputError, ManualSigningAssetsInput, ValidatedManualSigningAssets,
+    validate_manual_signing_assets,
 };
 
 /// Rust target used for physical iPhone artifacts.

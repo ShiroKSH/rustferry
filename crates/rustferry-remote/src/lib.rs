@@ -13,6 +13,8 @@ pub mod cancellation;
 pub mod error;
 /// Public compile-to-sign handoff evidence.
 pub mod handoff;
+/// Bounded parsing and target validation for decoded Apple provisioning profiles.
+pub mod profile;
 /// Ferry Remote Build Protocol v1 data and NDJSON events.
 pub mod protocol;
 /// Runtime-neutral asynchronous build-provider boundary.
@@ -43,6 +45,12 @@ pub use handoff::{
     COMPILE_HANDOFF_SCHEMA_VERSION, COMPILE_PHASE_EVIDENCE_SCHEMA_VERSION, CompileHandoff,
     CompilePhaseEvidence, CompileToolchainEvidence, SEALED_UNSIGNED_ARCHIVE_SCHEMA_VERSION,
     SealedUnsignedArchive,
+};
+pub use profile::{
+    MAX_DECODED_PROFILE_BYTES, ProfileField, ProfileValidationErrors, ProfileValidationIssue,
+    ProfileValidationRequest, ProvisioningProfileParseError, ValidatedProvisioningProfile,
+    parse_decoded_provisioning_profile, parse_provisioning_profile_value,
+    validate_profile_for_target,
 };
 pub use protocol::{
     BuildProfile, CURRENT_PROTOCOL_VERSION, CleanupConfirmation, DiagnosticSeverity,

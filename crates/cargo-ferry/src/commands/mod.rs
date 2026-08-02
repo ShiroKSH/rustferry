@@ -8,6 +8,7 @@ mod info;
 mod new;
 mod platform_build;
 mod remote;
+mod signing;
 
 use crate::cli::Command;
 use crate::error::CliError;
@@ -21,6 +22,7 @@ pub fn run(command: Command, dry_run: bool, reporter: &Reporter) -> Result<(), C
         Command::Check(arguments) => check::run(&arguments, dry_run, reporter),
         Command::Doctor(arguments) => doctor::run(&arguments, dry_run, reporter),
         Command::Remote(arguments) => remote::run(arguments, dry_run, reporter),
+        Command::Signing(arguments) => signing::run(arguments, dry_run, reporter),
         Command::Build(arguments) => platform_build::run(arguments, dry_run, reporter),
         Command::Clean(arguments) => clean::run(&arguments, dry_run, reporter),
         Command::Config(arguments) => config::run(arguments, dry_run, reporter),
