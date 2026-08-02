@@ -2451,9 +2451,7 @@ mod tests {
             Path::new("/tmp/rustferry-signing/job"),
             input,
             KeychainOptions::default(),
-        ) else {
-            panic!("non-macOS keychain creation unexpectedly succeeded");
-        };
+        );
         assert_eq!(error, KeychainError::UnsupportedPlatform);
     }
 }
