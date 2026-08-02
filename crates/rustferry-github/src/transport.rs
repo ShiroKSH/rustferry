@@ -1559,11 +1559,10 @@ impl<R: GhRunner> GithubTransport<R> {
         branch: &BranchName,
         event: RunEvent,
     ) -> Result<RunHandle, TransportError> {
-        let workflow_filename = validated_workflow_filename(workflow_path)?;
+        validated_workflow_filename(workflow_path)?;
         let mut matching: Option<RunSnapshot> = None;
         for page in 1..=self.limits.pages {
-            let endpoint =
-                repository.endpoint(&format!("/actions/workflows/{workflow_filename}/runs"));
+            let endpoint = repository.endpoint("/actions/runs");
             let fields = vec![
                 ("head_sha".to_owned(), head_sha.as_str().to_owned()),
                 ("branch".to_owned(), branch.as_str().to_owned()),
@@ -1998,12 +1997,7 @@ fn parse_run_row(line: &str, operation: &'static str) -> Result<RunSnapshot, Tra
         .map_err(|_| TransportError::MalformedResponse { operation })?;
     let workflow_id = WorkflowId::new(parse_nonzero_u64(columns[1], operation)?)
         .map_err(|_| TransportError::MalformedResponse { operation })?;
-    let workflow_path_bytes =
-        decode_base64(columns[2]).ok_or(TransportError::MalformedResponse { operation })?;
-    let workflow_path = String::from_utf8(workflow_path_bytes)
-        .map_err(|_| TransportError::MalformedResponse { operation })?;
-    validated_workflow_filename(&workflow_path)
-        .map_err(|_| TransportError::MalformedResponse { operation })?;
+    let workflow_path = parse_base64_metadata_name(columns[2], operation, 4_096)?;
     let run_number = parse_nonzero_u64(columns[3], operation)?;
     let run_attempt = parse_nonzero_u64(columns[4], operation)?;
     let head_sha =
@@ -3008,14 +3002,20 @@ mod tests {
 
     #[test]
     fn run_lookup_uses_exact_sha_branch_event_and_workflow() {
-        let unrelated = format!(
+        let unrelated_sha = format!(
             "40\t17\t{WORKFLOW_PATH_B64}\t8\t1\t{}\t{}\tpush\tqueued\t\n",
             "f".repeat(40),
             BRANCH_B64
         );
+        let unusual_path_b64 = "LmdpdGh1Yi93b3JrZmxvd3Mvb3RoZXIgd29ya2Zsb3cueW1s";
+        let unrelated_workflow =
+            format!("39\t16\t{unusual_path_b64}\t7\t1\t{SHA}\t{BRANCH_B64}\tpush\tqueued\t\n");
         let matching = String::from_utf8(run_row(41, "queued", "")).expect("row");
-        let runner = FakeRunner::with([Ok(format!("{unrelated}{matching}").into_bytes())]);
-        let mut transport = GithubTransport::new(runner, limits(2, 3));
+        let runner = FakeRunner::with([Ok(format!(
+            "{unrelated_sha}{unrelated_workflow}{matching}"
+        )
+        .into_bytes())]);
+        let mut transport = GithubTransport::new(runner, limits(2, 4));
         let branch = BranchName::new("rustferry/goal3/builds/job-1").expect("branch");
         let run = transport
             .find_run(
@@ -3030,9 +3030,7 @@ mod tests {
         assert_eq!(run.workflow_path(), WORKFLOW_PATH);
         let runner = transport.into_runner();
         let arguments = runner.requests[0].arguments();
-        assert!(arguments.contains(&OsString::from(
-            "/repos/ShiroKSH/rustferry/actions/workflows/rustferry-goal3-iphone.yml/runs"
-        )));
+        assert!(arguments.contains(&OsString::from("/repos/ShiroKSH/rustferry/actions/runs")));
         for expected in [
             format!("head_sha={SHA}"),
             "branch=rustferry/goal3/builds/job-1".to_owned(),
