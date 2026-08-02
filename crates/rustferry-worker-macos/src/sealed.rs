@@ -297,6 +297,9 @@ mod tests {
         let limits = sealed_limits();
         assert!(limits.max_archive_size <= 2 * 1024 * 1024 * 1024);
         assert!(limits.source.max_file_count <= 50_000);
-        assert!(Utf8Path::new("App.xcarchive").extension() == Some("xcarchive"));
+        assert_eq!(
+            Utf8Path::new("App.xcarchive").extension(),
+            Some("xcarchive")
+        );
     }
 }

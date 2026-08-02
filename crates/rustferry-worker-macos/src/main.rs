@@ -23,10 +23,11 @@ use rustferry_remote::{
     SealedUnsignedArchive, SecretBytes, SecretReference, SecretReferenceKind, SigningMode,
     SourceBundleRequest, SourceManifest, SourceMode, verify_source_manifest,
 };
+#[cfg(target_os = "macos")]
+use rustferry_worker_macos::keychain::{KeychainOptions, garbage_collect_stale_keychains};
 use rustferry_worker_macos::{
     host::{WorkerHostOptions, doctor_worker_host, worker_host_capabilities},
     job::{WorkerHookFailure, WorkerSecretResolver},
-    keychain::{KeychainOptions, garbage_collect_stale_keychains},
     pipeline::{
         CompilePhaseRequest, PipelineError, PipelinePublicMetadata, PipelineToolchainSelection,
         ProtectedSignPhaseRequest, compile_unsigned_phase, sign_protected_phase,
@@ -940,6 +941,8 @@ fn remove_owned_job_root(
     marker: &JobMarker,
     identity: &Handle,
 ) -> Result<(), CliFailure> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = worker_root;
     #[cfg(target_os = "macos")]
     if marker.phase == JobPhase::Sign {
         cleanup_stale_keychains_below(worker_root, job_root)?;

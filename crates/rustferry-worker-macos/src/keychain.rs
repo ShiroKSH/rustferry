@@ -771,7 +771,7 @@ fn validate_keychain_identity_listing(
     Ok(())
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 fn uppercase_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut output = String::with_capacity(bytes.len() * 2);
@@ -2446,14 +2446,13 @@ mod tests {
         let input =
             SigningKeychainInput::new(SecretBytes::new(vec![1_u8]), Secret::new(String::new()))
                 .expect("valid input");
-        let error = match EphemeralSigningKeychain::create(
+        let Err(error) = EphemeralSigningKeychain::create(
             Path::new("/tmp/rustferry-signing"),
             Path::new("/tmp/rustferry-signing/job"),
             input,
             KeychainOptions::default(),
-        ) {
-            Ok(_) => panic!("non-macOS keychain creation unexpectedly succeeded"),
-            Err(error) => error,
+        ) else {
+            panic!("non-macOS keychain creation unexpectedly succeeded");
         };
         assert_eq!(error, KeychainError::UnsupportedPlatform);
     }
