@@ -1,6 +1,6 @@
 # Goal 3 command-audit exceptions
 
-All commands below ran in `/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone` during the 2026-08-01 review. Review agents bypassed `scripts/goal3-run`, so these commands are absent from `GOAL3_COMMAND_AUDIT.jsonl`. This recovery record preserves the exact reported commands and outcomes; it does not reconstruct timestamps.
+All commands below ran in `/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone` during the 2026-08-01 review. These independent checks bypassed `scripts/goal3-run`, so the commands are absent from `GOAL3_COMMAND_AUDIT.jsonl`. This recovery record preserves the exact reported commands and outcomes; it does not reconstruct timestamps.
 
 - `cargo test -p rustferry-remote --test unsigned_archive` — run twice; each run passed 10 tests.
 - `cargo test -p rustferry-apple --lib --tests` — passed: library 30 passed/1 ignored; device 6 passed/3 ignored; golden 2 passed; Xcode-smoke tests ignored.

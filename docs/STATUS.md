@@ -1,6 +1,6 @@
 # Implementation status
 
-Last updated: 2026-08-01
+Last updated: 2026-08-02
 
 Source and documentation now use RustFerry. [Platform artifacts run 30699379465](https://github.com/ShiroKSH/rustferry/actions/runs/30699379465) at commit `be5206c` produced and inspected current RustFerry-named Android and iOS artifacts. Exact pre-rename `cargo-pocket`/`Pocket*` paths, identifiers, symbols, and hashes remain below as historical evidence.
 
@@ -36,9 +36,25 @@ This is artifact validation only. The workflow did not boot an emulator or Simul
 
 ## Isolated physical-iPhone work
 
-The Goal 3 branch implements a deterministic unsigned `aarch64-apple-ios` archive planner/executor plus a cross-platform strict `.xcarchive` validator. Host, synthetic security-matrix, generated-project, strict-clippy, and Linux/Windows planner checks pass. A real signed Simulator extension smoke also passes, but it is not physical-device evidence.
+The Goal 3 branch implements a deterministic unsigned `aarch64-apple-ios` archive
+planner/executor, strict cross-platform `.xcarchive` and IPA validators, and a split GitHub provider
+with public source and private signing-execution repositories. GitHub-hosted macOS run `30726432908`
+produced a real unsigned physical-iPhone archive; Linux acceptance run `30726401991` automatically
+downloaded and independently validated it. This is live no-Mac compile and artifact evidence, not a
+signed or runtime result.
 
-Physical-device artifact validation remains blocked on this host. The isolated toolchain lacks the `aarch64-apple-ios` Rust target, and Xcode reports that the discoverable iPhoneOS 26.5 SDK's platform component is not installed. No real physical-device Mach-O, `.xcarchive`, signed IPA, install, launch, or runtime behavior is therefore claimed.
+Manual GitHub signing setup is implemented for one application profile. It locally validates an
+Apple Development PKCS#12 archive and development profile, accepts bounded secure password
+sources, verifies the exact protected-Environment policy and empty initial secret set, uploads only
+after confirmation, and persists local signing configuration last. Cryptographic and policy tests
+use synthetic assets. A real development-signed IPA acceptance remains pending the external Apple
+certificate/profile/device assets and a distinct private execution repository. Widget and Live
+Activity extensions remain unsupported by this setup flow; install, launch, and physical-device
+runtime remain unvalidated.
+
+Local physical-device compilation is unavailable because this host lacks the `aarch64-apple-ios`
+Rust target and installed iPhoneOS platform component. The validated remote path does not depend on
+that local toolchain.
 
 ## Recorded checks
 
@@ -88,4 +104,4 @@ See [Apple implementation status](ios/status.md) for identifiers, checks, and ru
 - Xcode 26.6; iPhoneSimulator 26.5 available. An iPhoneOS 26.5 SDK directory is discoverable, but `xcodebuild` reports its platform component is not installed.
 - Android SDK roots resolve to `~/Library/Android/sdk`; platforms 35 and 37.0, build-tools 34.0.0 and 37.0.0, and NDK 29.0.14206865 are available.
 - `aapt2`, `d8`, `zipalign`, `apksigner`, `adb`, Java 21, `javac`, and `keytool` available.
-- Rust targets `aarch64-linux-android` and `aarch64-apple-ios-sim` are installed; `aarch64-apple-ios` is absent. No Simulator runtime/device or physical-device validation is available.
+- Rust targets `aarch64-linux-android` and `aarch64-apple-ios-sim` are installed; `aarch64-apple-ios` is absent. No Simulator runtime or local physical-device toolchain is available; remote unsigned physical-device artifact validation is recorded above.

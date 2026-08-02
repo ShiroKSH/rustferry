@@ -76,8 +76,59 @@ workflow.
 
 The repository stores only configurable secret names. Certificate private-key material, password,
 and provisioning profile values belong in the protected Environment. The request contains the
-expected public certificate, Team ID, profile, entitlement, and SHA-256 device evidence plus opaque secret
-references. Values are never request arguments, repository files, public reports, or diagnostics.
+expected public certificate, Team ID, profile, entitlement, and SHA-256 device evidence plus opaque
+secret references. Values are never request arguments, repository files, public reports, or
+diagnostics.
+
+Manual setup currently accepts one application and one iOS development profile. It rejects Widget
+and Live Activity extensions before reading assets because each extension needs its own profile. The
+PKCS#12 and profile paths must resolve to stable regular files outside every Git repository; on Unix,
+each file must also have one hard link. The client verifies the PKCS#12 private-key match,
+Apple Development certificate chain, Team ID and validity, then verifies the profile CMS signature,
+type, certificate, team, bundle identifier, selected device, entitlements, and validity.
+
+Use a dry run first:
+
+```console
+cargo ferry signing setup manual \
+  --certificate /private/signing/development.p12 \
+  --profile /private/signing/application.mobileprovision \
+  --remote github \
+  --device-sha256 <lowercase-sha256> \
+  --dry-run
+```
+
+`--device-sha256` is optional only when the profile contains one registered device. The example
+uses the interactive no-echo prompt. Password input is mutually exclusive: omit all selectors for
+that prompt, or use
+`--password-stdin`, `--password-env <NAME>`, or `--password-credential <ENTRY>`. Credential entries
+use operating-system secure storage under service `org.rustferry.cargo-ferry.signing`.
+`GH_TOKEN` and `GITHUB_TOKEN` cannot be used as password-variable names. Passwords are bounded to
+4 KiB of UTF-8 without NUL or line-break bytes and are never accepted as command arguments.
+
+The dry run performs asset validation and read-only GitHub policy checks, prints only public
+metadata, and uploads nothing. A mutating interactive run prints the same preview and asks for
+confirmation. JSON, non-interactive, and `--password-stdin` mutation require `--yes`; repeat the
+reviewed command with `--yes` only after the dry run.
+
+Initial setup requires a public source repository, a distinct active private execution repository,
+and an empty protected Environment. The Environment must require a deployment reviewer, enable
+custom branch policies, and contain exactly `rustferry/goal3/builds/*`. After rechecking local and
+remote state, the client cryptographically revalidates the retained bytes and sends canonical padded
+base64 PKCS#12 and profile values plus the raw password to these exact Environment secret names:
+
+- `RUSTFERRY_GOAL3_IOS_CERTIFICATE_P12`
+- `RUSTFERRY_GOAL3_IOS_CERTIFICATE_PASSWORD`
+- `RUSTFERRY_GOAL3_IOS_PROVISIONING_PROFILE`
+
+Each final value is limited to 48 KiB. The upload process sends secret bytes to `gh` only through
+standard input, not its arguments, environment, output, or repository files. Existing secrets are
+never replaced implicitly. A project-local exclusive lock and stable no-follow file snapshots
+serialize config writers. The client requires the exact three-name set after upload, rechecks the
+workflow and private provider config, and persists the signing plan last. Partial or indeterminate
+remote writes leave the config unsigned and list both uploaded and possibly-uploaded cleanup roles.
+A failure after atomic config replacement reports the config as possibly signed and requires
+inspection instead of claiming rollback.
 
 The worker uses a per-job private keychain and provisioning home. Changes to the user-global
 keychain search list are serialized by one worker-user-wide lock. Cleanup restores the prior search
@@ -106,10 +157,11 @@ and complete signing cleanup.
 
 - Protected Environment limited to the signing job, with custom policies enabled and the single
   `rustferry/goal3/builds/*` deployment branch policy.
+- Empty protected Environment before initial setup; exact three signing-secret names afterward.
 - Private signing repository with restricted membership and controlled visibility changes.
 - Required deployment reviewer while signing workflow bytes come from the temporary push branch.
 - Minimal repository/Actions permissions; no fork or `pull_request_target` signing path.
-- Encrypted development certificate/profile secrets with expiry monitoring and rotation.
+- Protected Environment certificate/profile secrets with expiry monitoring and rotation.
 - Immutable worker distribution or an equivalently isolated trusted worker-build provenance path.
 - Limited artifact retention and exact-operation cleanup.
 
