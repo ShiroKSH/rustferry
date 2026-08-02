@@ -17,8 +17,9 @@ env:
   RUST_BACKTRACE: '0'
   RUSTUP_TOOLCHAIN: '1.92.0'
   RUSTFERRY_WORKER_REPOSITORY: 'https://github.com/shiroksh/rustferry'
-  RUSTFERRY_WORKER_REVISION: '052f6ed18d3eb95a053264e32dd7417c131e0155'
+  RUSTFERRY_WORKER_REVISION: '9a62db39eacda0daf8f6f3951452bad7c3aad582'
   RUSTFERRY_WORKER_VERSION: '0.1.0'
+  RUSTFERRY_SOURCE_REPOSITORY: 'https://github.com/shiroksh/rustferry'
   RUSTFERRY_TRUSTED_SOURCE_REF: 'refs/heads/goal3/macless-iphone-builds'
   RUSTFERRY_TEMPORARY_REF_PREFIX: 'refs/heads/rustferry/goal3/builds'
 
@@ -39,7 +40,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: 'shiroksh/rustferry'
-          ref: '052f6ed18d3eb95a053264e32dd7417c131e0155'
+          ref: '9a62db39eacda0daf8f6f3951452bad7c3aad582'
           fetch-depth: 1
           persist-credentials: false
           path: .rustferry-worker-source
@@ -152,6 +153,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
           path: .rustferry-trusted-source
+          repository: 'shiroksh/rustferry'
       - name: Validate dispatch request and workflow revision
         id: request
         shell: bash
@@ -161,6 +163,7 @@ jobs:
             --event "$GITHUB_EVENT_PATH" \
             --dispatch-root "$GITHUB_WORKSPACE/.rustferry-dispatch" \
             --trusted-source-root "$GITHUB_WORKSPACE/.rustferry-trusted-source" \
+            --source-repository "$RUSTFERRY_SOURCE_REPOSITORY" \
             --workflow-path ".github/workflows/rustferry-goal3-iphone.yml" \
             --push-manifest "$GITHUB_WORKSPACE/.rustferry-dispatch/.rustferry/goal3/request.json" \
             --trusted-source-ref "$RUSTFERRY_TRUSTED_SOURCE_REF" \
@@ -174,6 +177,7 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
           path: source
+          repository: 'shiroksh/rustferry'
       - name: Restore source-revision-scoped Cargo cache
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
