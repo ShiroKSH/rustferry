@@ -60,7 +60,7 @@ const IPA_NAME: &str = "application-development.ipa";
 const ARTIFACT_MANIFEST_NAME: &str = "artifact-manifest.json";
 const SIGNING_REPORT_NAME: &str = "signing-report.json";
 const VALIDATION_REPORT_NAME: &str = "validation-report.json";
-const GITHUB_DISPATCH_MANIFEST_SCHEMA_VERSION: u32 = 1;
+const GITHUB_DISPATCH_MANIFEST_SCHEMA_VERSION: u32 = 2;
 const GITHUB_DISPATCH_PROVIDER: &str = "github-actions";
 
 #[derive(Debug, Parser)]
@@ -114,6 +114,9 @@ struct GithubRequestArgs {
     dispatch_root: PathBuf,
     #[arg(long)]
     trusted_source_root: PathBuf,
+    /// Exact normalized public GitHub source repository.
+    #[arg(long)]
+    source_repository: String,
     #[arg(long)]
     workflow_path: String,
     #[arg(long)]
@@ -133,6 +136,7 @@ struct GithubRequestArgs {
 struct GithubDispatchManifest {
     schema_version: u32,
     provider: String,
+    execution_repository: String,
     source_repository: String,
     trusted_source_ref: String,
     temporary_ref: String,
@@ -143,6 +147,7 @@ struct GithubDispatchManifest {
 
 #[derive(Clone, Copy, Debug)]
 struct GithubDispatchBindings<'a> {
+    execution_repository: &'a str,
     source_repository: &'a str,
     trusted_source_ref: &'a str,
     temporary_ref_prefix: &'a str,
@@ -363,6 +368,12 @@ fn run_doctor(arguments: HostArgs, capabilities_only: bool) -> Result<(), CliFai
 
 #[allow(clippy::too_many_lines)]
 fn run_github_request(arguments: GithubRequestArgs) -> Result<(), CliFailure> {
+    if !is_normalized_github_repository_url(&arguments.source_repository) {
+        return Err(CliFailure::input(
+            "invalid_source_repository",
+            "public source repository must be an exact normalized lowercase GitHub HTTPS URL",
+        ));
+    }
     let event_path = canonical_regular_file(&path_to_utf8(arguments.event)?)?;
     let dispatch_root = canonical_real_directory(&path_to_utf8(arguments.dispatch_root)?)?;
     let trusted_root = canonical_real_directory(&path_to_utf8(arguments.trusted_source_root)?)?;
@@ -457,7 +468,7 @@ fn run_github_request(arguments: GithubRequestArgs) -> Result<(), CliFailure> {
         }
     }
 
-    let repository = event_object
+    let execution_repository = event_object
         .get("repository")
         .and_then(Value::as_object)
         .and_then(|object| object.get("html_url"))
@@ -465,16 +476,37 @@ fn run_github_request(arguments: GithubRequestArgs) -> Result<(), CliFailure> {
         .ok_or_else(|| {
             CliFailure::input("invalid_event", "GitHub repository evidence is missing")
         })?;
+    let execution_slug =
+        canonical_github_repository_slug(execution_repository).ok_or_else(|| {
+            CliFailure::input(
+                "invalid_event",
+                "GitHub execution repository evidence is not canonical",
+            )
+        })?;
+    require_github_repository_environment(execution_slug)?;
     validate_github_dispatch_bindings(
         &manifest,
         GithubDispatchBindings {
-            source_repository: repository,
+            execution_repository,
+            source_repository: &arguments.source_repository,
             trusted_source_ref: &arguments.trusted_source_ref,
             temporary_ref_prefix: &arguments.temporary_ref_prefix,
             event_ref,
             workflow_path: &arguments.workflow_path,
             workflow_sha256: &workflow_sha256,
         },
+    )?;
+    verify_git_repository_identity(
+        &dispatch_root,
+        execution_repository,
+        "dispatch_repository_mismatch",
+        "dispatch checkout does not match the GitHub execution repository",
+    )?;
+    verify_git_repository_identity(
+        &trusted_root,
+        &arguments.source_repository,
+        "trusted_source_repository_mismatch",
+        "trusted source checkout does not match the public source repository",
     )?;
     ensure_revision_is_trusted(&trusted_root, source_revision)?;
 
@@ -525,6 +557,18 @@ fn run_compile(arguments: RunJobArgs) -> Result<(), CliFailure> {
     let request_bytes = read_bounded_file(&manifest_path, MAX_MANIFEST_BYTES)?;
     let request = decode_request(&request_bytes)?;
     validate_github_artifact_contract(&request)?;
+    let source_repository = request.source_repository.as_deref().ok_or_else(|| {
+        CliFailure::input(
+            "missing_source_repository",
+            "Git request has no public source repository",
+        )
+    })?;
+    if !is_normalized_github_repository_url(source_repository) {
+        return Err(CliFailure::input(
+            "invalid_source_repository",
+            "public source repository must be an exact normalized lowercase GitHub HTTPS URL",
+        ));
+    }
     let source_revision = request.source_revision.as_deref().ok_or_else(|| {
         CliFailure::input("missing_revision", "Git request has no source revision")
     })?;
@@ -538,6 +582,18 @@ fn run_compile(arguments: RunJobArgs) -> Result<(), CliFailure> {
             "source checkout does not match the immutable request revision",
         ));
     }
+    verify_git_repository_identity(
+        &source_root,
+        source_repository,
+        "source_repository_mismatch",
+        "requested source checkout does not match the public source repository",
+    )?;
+    verify_git_repository_identity(
+        &trusted_root,
+        source_repository,
+        "trusted_source_repository_mismatch",
+        "trusted source checkout does not match the public source repository",
+    )?;
     ensure_revision_is_trusted(&trusted_root, source_revision)?;
 
     let checkout_selection = source_selection(&source_root, &request.source)?;
@@ -1625,6 +1681,7 @@ fn decode_github_dispatch_manifest(bytes: &[u8]) -> Result<GithubDispatchManifes
         )
     })?;
     let expected_keys = BTreeSet::from([
+        "execution_repository",
         "provider",
         "request",
         "schema_version",
@@ -1677,12 +1734,23 @@ fn validate_github_dispatch_bindings(
     manifest: &GithubDispatchManifest,
     bindings: GithubDispatchBindings<'_>,
 ) -> Result<(), CliFailure> {
+    if canonical_github_repository_slug(&manifest.execution_repository).is_none()
+        || !github_remote_matches(
+            &manifest.execution_repository,
+            bindings.execution_repository,
+        )
+    {
+        return Err(CliFailure::input(
+            "execution_repository_mismatch",
+            "dispatch manifest execution repository differs from GitHub event evidence",
+        ));
+    }
     if manifest.source_repository != bindings.source_repository
         || manifest.request.source_repository.as_deref() != Some(bindings.source_repository)
     {
         return Err(CliFailure::input(
-            "repository_mismatch",
-            "dispatch manifest repository differs from GitHub event or request evidence",
+            "source_repository_mismatch",
+            "dispatch manifest source repository differs from workflow or request evidence",
         ));
     }
     if manifest.trusted_source_ref != bindings.trusted_source_ref {
@@ -2682,6 +2750,89 @@ fn append_github_outputs(path: &Utf8Path, values: &[(&str, &str)]) -> Result<(),
     Ok(())
 }
 
+fn canonical_github_repository_slug(value: &str) -> Option<&str> {
+    let slug = value.strip_prefix("https://github.com/")?;
+    let (owner, repository) = slug.split_once('/')?;
+    if repository.contains('/')
+        || [owner, repository]
+            .into_iter()
+            .any(|component| !valid_github_repository_component(component))
+    {
+        return None;
+    }
+    Some(slug)
+}
+
+fn is_normalized_github_repository_url(value: &str) -> bool {
+    !value
+        .get(value.len().saturating_sub(4)..)
+        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".git"))
+        && canonical_github_repository_slug(value)
+            .is_some_and(|slug| !slug.bytes().any(|byte| byte.is_ascii_uppercase()))
+}
+
+fn valid_github_repository_component(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn github_remote_matches(actual: &str, expected_https: &str) -> bool {
+    let Some(expected) = normalized_github_remote_url(expected_https) else {
+        return false;
+    };
+    normalized_github_remote_url(actual).as_deref() == Some(expected.as_str())
+}
+
+fn normalized_github_remote_url(value: &str) -> Option<String> {
+    let without_slash = value.strip_suffix('/').unwrap_or(value);
+    let normalized = without_slash.strip_suffix(".git").unwrap_or(without_slash);
+    let slug = normalized
+        .strip_prefix("https://github.com/")
+        .or_else(|| normalized.strip_prefix("git@github.com:"))
+        .or_else(|| normalized.strip_prefix("ssh://git@github.com/"))?;
+    let repository_url = format!("https://github.com/{slug}");
+    canonical_github_repository_slug(&repository_url)?;
+    Some(repository_url.to_ascii_lowercase())
+}
+
+fn verify_git_repository_identity(
+    root: &Utf8Path,
+    expected_repository: &str,
+    code: &'static str,
+    message: &'static str,
+) -> Result<(), CliFailure> {
+    if canonical_github_repository_slug(expected_repository).is_none() {
+        return Err(CliFailure::input(code, message));
+    }
+    let result = run_git(
+        root,
+        &[
+            "config",
+            "--local",
+            "--no-includes",
+            "--get-all",
+            "remote.origin.url",
+        ],
+    )?;
+    let Ok(output) = std::str::from_utf8(&result.stdout) else {
+        return Err(CliFailure::input(code, message));
+    };
+    let mut remotes = output.lines();
+    let remote = remotes.next();
+    if !result.success
+        || remote.is_none_or(str::is_empty)
+        || remotes.next().is_some()
+        || !remote.is_some_and(|actual| github_remote_matches(actual, expected_repository))
+    {
+        return Err(CliFailure::input(code, message));
+    }
+    Ok(())
+}
+
 fn git_head(root: &Utf8Path) -> Result<String, CliFailure> {
     let result = run_git(root, &["rev-parse", "--verify", "HEAD^{commit}"])?;
     if !result.success {
@@ -2847,6 +2998,26 @@ fn cross_check_exact_environment_value(name: &str, expected: &str) -> Result<(),
         ));
     }
     Ok(())
+}
+
+fn require_github_repository_environment(expected_slug: &str) -> Result<(), CliFailure> {
+    if !exact_environment_string("GITHUB_REPOSITORY")?
+        .as_deref()
+        .is_some_and(|actual| github_repository_slugs_match(actual, expected_slug))
+    {
+        return Err(CliFailure::input(
+            "environment_binding_mismatch",
+            "required workflow environment binding is inconsistent",
+        ));
+    }
+    Ok(())
+}
+
+fn github_repository_slugs_match(actual: &str, expected: &str) -> bool {
+    github_remote_matches(
+        &format!("https://github.com/{actual}"),
+        &format!("https://github.com/{expected}"),
+    )
 }
 
 fn cross_check_exact_environment_path(name: &str, expected: &Utf8Path) -> Result<(), CliFailure> {
@@ -3108,7 +3279,8 @@ mod tests {
 
     use super::*;
 
-    const TEST_REPOSITORY: &str = "https://github.com/ShiroKSH/rust-and-iphone";
+    const TEST_SOURCE_REPOSITORY: &str = "https://github.com/shiroksh/rust-and-iphone";
+    const TEST_EXECUTION_REPOSITORY: &str = "https://github.com/ShiroKSH/rustferry-signing";
     const TEST_TRUSTED_REF: &str = "refs/heads/master";
     const TEST_TEMPORARY_PREFIX: &str = "refs/heads/rustferry/goal3/builds";
     const TEST_TEMPORARY_REF: &str = "refs/heads/rustferry/goal3/builds/operation-1";
@@ -3147,7 +3319,7 @@ mod tests {
             },
             profile: BuildProfile::Release,
             source_mode: SourceMode::Git,
-            source_repository: Some(TEST_REPOSITORY.to_owned()),
+            source_repository: Some(TEST_SOURCE_REPOSITORY.to_owned()),
             source_revision: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
             source: empty_source_manifest(),
             signing: SigningPlan {
@@ -3172,7 +3344,8 @@ mod tests {
         GithubDispatchManifest {
             schema_version: GITHUB_DISPATCH_MANIFEST_SCHEMA_VERSION,
             provider: GITHUB_DISPATCH_PROVIDER.to_owned(),
-            source_repository: TEST_REPOSITORY.to_owned(),
+            execution_repository: TEST_EXECUTION_REPOSITORY.to_owned(),
+            source_repository: TEST_SOURCE_REPOSITORY.to_owned(),
             trusted_source_ref: TEST_TRUSTED_REF.to_owned(),
             temporary_ref: TEST_TEMPORARY_REF.to_owned(),
             workflow_path: TEST_WORKFLOW_PATH.to_owned(),
@@ -3183,7 +3356,8 @@ mod tests {
 
     fn valid_dispatch_bindings(workflow_sha256: &str) -> GithubDispatchBindings<'_> {
         GithubDispatchBindings {
-            source_repository: TEST_REPOSITORY,
+            execution_repository: TEST_EXECUTION_REPOSITORY,
+            source_repository: TEST_SOURCE_REPOSITORY,
             trusted_source_ref: TEST_TRUSTED_REF,
             temporary_ref_prefix: TEST_TEMPORARY_PREFIX,
             event_ref: TEST_TEMPORARY_REF,
@@ -3241,11 +3415,8 @@ unsafe_code = "deny"
 
         let manifest = valid_dispatch_manifest();
         let encoded = serde_json::to_string(&manifest).expect("manifest");
-        let duplicate_schema = encoded.replacen(
-            "\"schema_version\":1",
-            "\"schema_version\":1,\"schema_version\":1",
-            1,
-        );
+        let schema = format!("\"schema_version\":{GITHUB_DISPATCH_MANIFEST_SCHEMA_VERSION}");
+        let duplicate_schema = encoded.replacen(&schema, &format!("{schema},{schema}"), 1);
         assert!(decode_github_dispatch_manifest(duplicate_schema.as_bytes()).is_err());
 
         let mut unknown = serde_json::to_value(&manifest).expect("manifest value");
@@ -3271,6 +3442,100 @@ unsafe_code = "deny"
         validate_github_dispatch_bindings(&decoded, valid_dispatch_bindings(&workflow_sha256))
             .expect("valid bindings");
         assert_eq!(decoded.request, manifest.request);
+    }
+
+    #[test]
+    fn github_dispatch_preserves_same_repository_compatibility() {
+        let mut manifest = valid_dispatch_manifest();
+        manifest.execution_repository = TEST_SOURCE_REPOSITORY.to_owned();
+        let workflow_sha256 = sha256_bytes(TEST_WORKFLOW);
+        let mut bindings = valid_dispatch_bindings(&workflow_sha256);
+        bindings.execution_repository = TEST_SOURCE_REPOSITORY;
+
+        validate_github_dispatch_bindings(&manifest, bindings)
+            .expect("same source and execution repository");
+    }
+
+    #[test]
+    fn github_request_requires_explicit_public_source_repository() {
+        let arguments = [
+            "ferry-worker-macos",
+            "github-request",
+            "--event",
+            "/tmp/event.json",
+            "--dispatch-root",
+            "/tmp/dispatch",
+            "--trusted-source-root",
+            "/tmp/trusted",
+            "--source-repository",
+            TEST_SOURCE_REPOSITORY,
+            "--workflow-path",
+            TEST_WORKFLOW_PATH,
+            "--push-manifest",
+            "/tmp/request.json",
+            "--trusted-source-ref",
+            TEST_TRUSTED_REF,
+            "--temporary-ref-prefix",
+            TEST_TEMPORARY_PREFIX,
+            "--output-manifest",
+            "/tmp/normalized.json",
+            "--github-output",
+            "/tmp/github-output",
+        ];
+        let cli = Cli::try_parse_from(arguments).expect("explicit source repository");
+        let WorkerCommand::GithubRequest(request) = cli.command else {
+            panic!("GitHub request command");
+        };
+        assert_eq!(request.source_repository, TEST_SOURCE_REPOSITORY);
+
+        let without_source = arguments
+            .into_iter()
+            .filter(|argument| {
+                *argument != "--source-repository" && *argument != TEST_SOURCE_REPOSITORY
+            })
+            .collect::<Vec<_>>();
+        assert!(Cli::try_parse_from(without_source).is_err());
+    }
+
+    #[test]
+    fn github_repository_identity_is_canonical_and_transport_independent() {
+        assert_eq!(
+            canonical_github_repository_slug(TEST_SOURCE_REPOSITORY),
+            Some("shiroksh/rust-and-iphone")
+        );
+        assert!(is_normalized_github_repository_url(TEST_SOURCE_REPOSITORY));
+        for remote in [
+            TEST_SOURCE_REPOSITORY,
+            "https://github.com/ShiroKSH/rust-and-iphone.git",
+            "git@github.com:ShiroKSH/rust-and-iphone.git",
+            "ssh://git@github.com/ShiroKSH/rust-and-iphone",
+        ] {
+            assert!(github_remote_matches(remote, TEST_SOURCE_REPOSITORY));
+        }
+        for invalid in [
+            "http://github.com/ShiroKSH/rust-and-iphone",
+            "https://github.com/ShiroKSH/rust-and-iphone.git",
+            "https://github.com/ShiroKSH/rust-and-iphone/extra",
+            "https://github.com/ShiroKSH",
+            "https://github.com/ShiroKSH/rust-and-iphone?ref=main",
+        ] {
+            assert!(!is_normalized_github_repository_url(invalid));
+        }
+        for wrong_remote in [
+            "https://github.com/attacker/rust-and-iphone",
+            "git@github.com:attacker/rust-and-iphone.git",
+            "https://github.com/ShiroKSH/rust-and-iphone.git.git",
+        ] {
+            assert!(!github_remote_matches(wrong_remote, TEST_SOURCE_REPOSITORY));
+        }
+        assert!(github_repository_slugs_match(
+            "ShiroKSH/RustFerry-Signing",
+            "shiroksh/rustferry-signing"
+        ));
+        assert!(!github_repository_slugs_match(
+            "attacker/rustferry-signing",
+            "shiroksh/rustferry-signing"
+        ));
     }
 
     #[test]
@@ -3349,9 +3614,13 @@ unsafe_code = "deny"
         let bindings = valid_dispatch_bindings(&workflow_sha256);
         let mut mismatches = Vec::new();
 
-        let mut repository = valid_dispatch_manifest();
-        repository.source_repository = "https://github.com/example/other".to_owned();
-        mismatches.push(repository);
+        let mut execution_repository = valid_dispatch_manifest();
+        execution_repository.execution_repository = "https://github.com/example/other".to_owned();
+        mismatches.push(execution_repository);
+
+        let mut source_repository = valid_dispatch_manifest();
+        source_repository.source_repository = "https://github.com/example/other".to_owned();
+        mismatches.push(source_repository);
 
         let mut request_repository = valid_dispatch_manifest();
         request_repository.request.source_repository =

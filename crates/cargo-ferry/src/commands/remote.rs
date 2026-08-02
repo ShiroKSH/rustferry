@@ -15,6 +15,7 @@ use rustferry_github::transport::{
     GhAuthentication, GhProcessRunner, GithubTransport, Repository, TokenEnvironmentVariable,
     TransportLimits,
 };
+use rustferry_github::workflow::PublicSourceRepository;
 use rustferry_github::{
     GithubVerifiedArtifactStore, ProtectedEnvironment, SigningSecretNames,
     TemporaryBranchNamespace, TrustedSourceRef, WorkerDistribution, WorkflowConfig,
@@ -45,7 +46,7 @@ use crate::project::{
     find_in_path, find_project_root, run_captured_bounded, run_captured_bounded_isolated,
 };
 
-const CONFIG_SCHEMA_VERSION: u32 = 1;
+const CONFIG_SCHEMA_VERSION: u32 = 2;
 const CONFIG_RELATIVE_PATH: &str = "target/ferry/github/provider.json";
 const CACHE_RELATIVE_PATH: &str = "target/ferry/github/cache";
 const GIT_ISOLATION_RELATIVE_PATH: &str = "target/ferry/github/git-isolation";
@@ -75,9 +76,12 @@ type GithubProvider = GithubBuildProvider<
 #[serde(deny_unknown_fields)]
 struct StoredGithubConfig {
     schema_version: u32,
+    /// GitHub Actions execution repository slug.
     repository: String,
+    /// Public project-source repository as a canonical HTTPS URL.
     source_repository: String,
-    remote_name: String,
+    source_remote_name: String,
+    execution_remote_name: String,
     trusted_source_ref: String,
     workflow_file: String,
     protected_environment: String,
@@ -119,6 +123,13 @@ struct GitContext {
     revision: String,
 }
 
+#[derive(Debug)]
+struct GitRemoteContext {
+    repository: Repository,
+    repository_slug: String,
+    source_repository: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct CargoMetadata {
     packages: Vec<CargoMetadataPackage>,
@@ -132,7 +143,8 @@ struct CargoMetadataPackage {
 
 #[derive(Debug, Serialize)]
 struct SetupOutput {
-    repository: String,
+    source_repository: String,
+    execution_repository: String,
     authenticated_as: String,
     workflow: String,
     provider_config: String,
@@ -146,7 +158,8 @@ struct SetupOutput {
 
 #[derive(Debug, Serialize)]
 struct StatusOutput {
-    repository: String,
+    source_repository: String,
+    execution_repository: String,
     provider_config: String,
     workflow: String,
     workflow_matches: bool,
@@ -317,8 +330,9 @@ pub fn build_iphone(
     let RemoteProviderChoice::Github = provider;
     let stored = load_config(root)?;
     let signing = select_signing_plan(&stored, ferry_config, binary_name, expected_team, unsigned)?;
-    let git = git_context(root, &stored.remote_name, reporter)?;
-    ensure_configured_repository(&stored, &git)?;
+    let git = git_context(root, &stored.source_remote_name, reporter)?;
+    let execution = git_remote_context(&git.root, &stored.execution_remote_name, reporter)?;
+    ensure_configured_repositories(&stored, &git, &execution)?;
     ensure_clean(&git, reporter)?;
     let mut source = source_manifest(root, &git, reporter)?;
     bind_manifest_to_revision(&git, &mut source, reporter)?;
@@ -665,21 +679,33 @@ pub fn build_iphone(
 fn setup(arguments: RemoteSetupArgs, dry_run: bool, reporter: &Reporter) -> Result<(), CliError> {
     let RemoteProviderChoice::Github = arguments.provider;
     let root = find_project_root(arguments.project_dir.as_deref())?;
-    let git = git_context(&root, &arguments.remote_name, reporter)?;
-    let repository = match arguments.repository.as_deref() {
+    let git = git_context(&root, &arguments.source_remote_name, reporter)?;
+    let execution = git_remote_context(&git.root, &arguments.execution_remote_name, reporter)?;
+    let repository = match arguments.execution_repository.as_deref() {
         Some(specification) => {
             let (_, slug, source) = parse_repository_spec(specification)?;
-            if source != git.source_repository {
+            if source != execution.source_repository {
                 return Err(remote_error(
                     "remote_repository_mismatch",
-                    "--repository does not match the selected Git remote",
-                    "Use the exact owner/repository from the selected GitHub remote.",
+                    "--execution-repository does not match the selected execution Git remote",
+                    "Use the exact owner/repository from the selected execution GitHub remote.",
                 ));
             }
             slug
         }
-        None => git.repository_slug.clone(),
+        None => execution.repository_slug.clone(),
     };
+    let (worker_repository_identity, _, worker_repository) =
+        parse_repository_spec(&arguments.worker_repository)?;
+    if worker_repository == execution.source_repository
+        && execution.source_repository != git.source_repository
+    {
+        return Err(remote_error(
+            "private_execution_identity_exposure",
+            "the worker source repository cannot be the execution repository",
+            "Use a public worker source repository distinct from the private execution repository.",
+        ));
+    }
     let trusted_source_ref = match arguments.trusted_ref {
         Some(value) => value,
         None => format!("refs/heads/{}", current_branch(&git, reporter)?),
@@ -706,12 +732,13 @@ fn setup(arguments: RemoteSetupArgs, dry_run: bool, reporter: &Reporter) -> Resu
         schema_version: CONFIG_SCHEMA_VERSION,
         repository,
         source_repository: git.source_repository.clone(),
-        remote_name: arguments.remote_name,
+        source_remote_name: arguments.source_remote_name,
+        execution_remote_name: arguments.execution_remote_name,
         trusted_source_ref,
         workflow_file: WORKFLOW_FILE.to_owned(),
         protected_environment: PROTECTED_ENVIRONMENT.to_owned(),
         temporary_namespace: TEMPORARY_NAMESPACE.to_owned(),
-        worker_repository: arguments.worker_repository,
+        worker_repository: worker_repository.clone(),
         worker_revision,
         worker_version: arguments.worker_version,
         signing,
@@ -727,7 +754,7 @@ fn setup(arguments: RemoteSetupArgs, dry_run: bool, reporter: &Reporter) -> Resu
 
     let mut transport =
         GithubTransport::new(make_gh_runner(&root)?, TransportLimits::secure_defaults());
-    let authenticated = transport.authenticate(&git.repository).map_err(|error| {
+    let authenticated = transport.authenticate(&execution.repository).map_err(|error| {
         remote_error_with_details(
             "github_authentication_required",
             "GitHub authentication could not be verified",
@@ -735,19 +762,57 @@ fn setup(arguments: RemoteSetupArgs, dry_run: bool, reporter: &Reporter) -> Resu
             vec![error.to_string()],
         )
     })?;
-    let repository_info = transport.repository(&git.repository).map_err(|error| {
+    let source_repository_info = transport.repository(&git.repository).map_err(|error| {
         remote_error_with_details(
-            "github_repository_unavailable",
-            "the exact GitHub repository could not be inspected",
-            "Check repository identity and token access, then rerun setup.",
+            "github_source_repository_unavailable",
+            "the exact public GitHub source repository could not be inspected",
+            "Check source repository identity and token access, then rerun setup.",
             vec![error.to_string()],
         )
     })?;
+    if source_repository_info.is_private() {
+        return Err(remote_error(
+            "private_source_repository",
+            "the configured project source repository is not public",
+            "Use a public GitHub repository for trusted project source; keep signing execution and secrets in the separate private execution repository.",
+        ));
+    }
+    let worker_repository_info = if worker_repository == git.source_repository {
+        source_repository_info.clone()
+    } else {
+        transport
+            .repository(&worker_repository_identity)
+            .map_err(|error| {
+                remote_error_with_details(
+                    "github_worker_repository_unavailable",
+                    "the exact public GitHub worker source repository could not be inspected",
+                    "Check worker repository identity and token access, then rerun setup.",
+                    vec![error.to_string()],
+                )
+            })?
+    };
+    if worker_repository_info.is_private() {
+        return Err(remote_error(
+            "private_worker_repository",
+            "the configured worker source repository is not public",
+            "Use a public immutable RustFerry worker source repository; public workflow files must not expose a private repository identity.",
+        ));
+    }
+    let repository_info = transport
+        .repository(&execution.repository)
+        .map_err(|error| {
+            remote_error_with_details(
+                "github_repository_unavailable",
+                "the exact GitHub execution repository could not be inspected",
+                "Check execution repository identity and token access, then rerun setup.",
+                vec![error.to_string()],
+            )
+        })?;
     if repository_info.is_archived() || repository_info.is_disabled() {
         return Err(remote_error(
             "github_repository_read_only",
-            "the configured GitHub repository cannot run new builds",
-            "Use an active, non-archived GitHub repository.",
+            "the configured GitHub execution repository cannot run new builds",
+            "Use an active, non-archived GitHub execution repository.",
         ));
     }
     if stored.signing.is_some() && !repository_info.is_private() {
@@ -776,7 +841,8 @@ fn setup(arguments: RemoteSetupArgs, dry_run: bool, reporter: &Reporter) -> Resu
     }
 
     let output = SetupOutput {
-        repository: stored.repository.clone(),
+        source_repository: stored.source_repository.clone(),
+        execution_repository: stored.repository.clone(),
         authenticated_as: authenticated.label().to_owned(),
         workflow: paths.workflow.to_string(),
         provider_config: paths.config.to_string(),
@@ -793,8 +859,9 @@ fn setup(arguments: RemoteSetupArgs, dry_run: bool, reporter: &Reporter) -> Resu
         || {
             if preview {
                 format!(
-                    "GitHub remote setup preview\n\nRepository:\n  {}\n\nWorkflow:\n  {}\n\n{}",
-                    output.repository,
+                    "GitHub remote setup preview\n\nPublic source:\n  {}\n\nExecution:\n  {}\n\nWorkflow:\n  {}\n\n{}",
+                    output.source_repository,
+                    output.execution_repository,
                     output.workflow,
                     output.workflow_preview.as_deref().unwrap_or_default()
                 )
@@ -819,8 +886,9 @@ fn doctor(arguments: &RemoteDoctorArgs, reporter: &Reporter) -> Result<(), CliEr
     let RemoteProviderChoice::Github = arguments.provider;
     let root = find_project_root(arguments.project_dir.as_deref())?;
     let stored = load_config(&root)?;
-    let git = git_context(&root, &stored.remote_name, reporter)?;
-    ensure_configured_repository(&stored, &git)?;
+    let git = git_context(&root, &stored.source_remote_name, reporter)?;
+    let execution = git_remote_context(&git.root, &stored.execution_remote_name, reporter)?;
+    ensure_configured_repositories(&stored, &git, &execution)?;
     let provider = build_provider(&root, &git.root, &stored)?;
     let operation_id = format!("{}-doctor", operation_id());
     let report = provider_call(
@@ -885,14 +953,16 @@ fn status(arguments: &RemoteStatusArgs, reporter: &Reporter) -> Result<(), CliEr
     let RemoteProviderChoice::Github = arguments.provider;
     let root = find_project_root(arguments.project_dir.as_deref())?;
     let stored = load_config(&root)?;
-    let git = git_context(&root, &stored.remote_name, reporter)?;
-    ensure_configured_repository(&stored, &git)?;
+    let git = git_context(&root, &stored.source_remote_name, reporter)?;
+    let execution = git_remote_context(&git.root, &stored.execution_remote_name, reporter)?;
+    ensure_configured_repositories(&stored, &git, &execution)?;
     let generated = generate_workflow(&workflow_from_stored(&stored)?);
     let paths = GithubPaths::new(&root, &git.root);
     reject_linked_components(&git.root, Utf8Path::new(".github/workflows"), true)?;
     let workflow_matches = existing_file_matches(&paths.workflow, generated.yaml().as_bytes())?;
     let output = StatusOutput {
-        repository: stored.repository.clone(),
+        source_repository: stored.source_repository.clone(),
+        execution_repository: stored.repository.clone(),
         provider_config: paths.config.to_string(),
         workflow: paths.workflow.to_string(),
         workflow_matches,
@@ -905,8 +975,9 @@ fn status(arguments: &RemoteStatusArgs, reporter: &Reporter) -> Result<(), CliEr
         &output,
         || {
             format!(
-                "GitHub remote configuration\n\nRepository:\n  {}\n\nWorkflow exact:\n  {}\n\nTrusted ref:\n  {}\n\nSigning:\n  {}",
-                output.repository,
+                "GitHub remote configuration\n\nPublic source:\n  {}\n\nExecution:\n  {}\n\nWorkflow exact:\n  {}\n\nTrusted ref:\n  {}\n\nSigning:\n  {}",
+                output.source_repository,
+                output.execution_repository,
                 if output.workflow_matches { "yes" } else { "no" },
                 output.trusted_source_ref,
                 output.signing_mode
@@ -1171,22 +1242,7 @@ fn git_context(
             "Run the command from the repository containing the project.",
         ));
     }
-    let remote_url = utf8_line(
-        &checked_git_output(
-            &git,
-            &[
-                OsString::from("remote"),
-                OsString::from("get-url"),
-                OsString::from("--push"),
-                OsString::from(remote_name),
-            ],
-            &root,
-            "inspect Git remote",
-            reporter,
-        )?,
-        "Git remote URL",
-    )?;
-    let (repository, repository_slug, source_repository) = parse_repository_spec(&remote_url)?;
+    let remote = git_remote_context(&root, remote_name, reporter)?;
     let revision = utf8_line(
         &checked_git_output(
             &git,
@@ -1214,11 +1270,80 @@ fn git_context(
     }
     Ok(GitContext {
         root,
+        repository: remote.repository,
+        repository_slug: remote.repository_slug,
+        source_repository: remote.source_repository,
+        revision,
+    })
+}
+
+fn git_remote_context(
+    repository_root: &Utf8Path,
+    remote_name: &str,
+    reporter: &Reporter,
+) -> Result<GitRemoteContext, CliError> {
+    validate_git_remote_name(remote_name)?;
+    let git = executable("git")?;
+    let fetch_url = utf8_line(
+        &checked_git_output(
+            &git,
+            &[
+                OsString::from("remote"),
+                OsString::from("get-url"),
+                OsString::from(remote_name),
+            ],
+            repository_root,
+            "inspect Git fetch remote",
+            reporter,
+        )?,
+        "Git fetch remote URL",
+    )?;
+    let push_url = utf8_line(
+        &checked_git_output(
+            &git,
+            &[
+                OsString::from("remote"),
+                OsString::from("get-url"),
+                OsString::from("--push"),
+                OsString::from(remote_name),
+            ],
+            repository_root,
+            "inspect Git push remote",
+            reporter,
+        )?,
+        "Git push remote URL",
+    )?;
+    let (repository, repository_slug, source_repository) = parse_repository_spec(&fetch_url)?;
+    let (_, push_slug, push_repository) = parse_repository_spec(&push_url)?;
+    if push_slug != repository_slug || push_repository != source_repository {
+        return Err(remote_error(
+            "git_remote_identity_mismatch",
+            "the selected Git remote has different fetch and push repository identities",
+            "Configure both URLs of the selected remote for the same exact GitHub repository.",
+        ));
+    }
+    Ok(GitRemoteContext {
         repository,
         repository_slug,
         source_repository,
-        revision,
     })
+}
+
+fn validate_git_remote_name(value: &str) -> Result<(), CliError> {
+    if value.is_empty()
+        || value.len() > 64
+        || value.starts_with('-')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(remote_error(
+            "invalid_git_remote_name",
+            "the selected Git remote name is invalid",
+            "Use a 1-64 character Git remote name containing only letters, digits, dot, underscore, or hyphen.",
+        ));
+    }
+    Ok(())
 }
 
 fn ensure_clean(git: &GitContext, reporter: &Reporter) -> Result<(), CliError> {
@@ -1709,7 +1834,9 @@ fn parse_repository_spec(value: &str) -> Result<(Repository, String, String), Cl
             "Use exactly owner/repository.",
         ));
     }
-    let repository = Repository::new(owner, name).map_err(|error| {
+    let owner = owner.to_ascii_lowercase();
+    let name = name.to_ascii_lowercase();
+    let repository = Repository::new(owner.clone(), name.clone()).map_err(|error| {
         remote_error_with_details(
             "invalid_github_repository",
             "the selected GitHub owner or repository name is invalid",
@@ -1737,14 +1864,7 @@ fn build_provider(
     )?;
     require_private_directory(&paths.cache, "GitHub artifact cache")?;
     require_private_directory(&paths.git_isolation, "Git publisher isolation")?;
-    let (repository, _, source_repository) = parse_repository_spec(&stored.repository)?;
-    if source_repository != stored.source_repository {
-        return Err(remote_error(
-            "invalid_provider_config",
-            "the provider repository and source repository differ",
-            "Remove the generated provider config and rerun GitHub setup.",
-        ));
-    }
+    let (repository, _, _) = parse_repository_spec(&stored.repository)?;
     let workflow = workflow_from_stored(stored)?;
     let generated = generate_workflow(&workflow);
     let fingerprint = WorkflowFingerprint::for_workflow(&generated);
@@ -1802,7 +1922,8 @@ fn build_provider(
     let publisher = GitTemporaryRefPublisher::new(
         git_runner,
         &paths.git_isolation,
-        stored.remote_name.clone(),
+        stored.source_remote_name.clone(),
+        stored.execution_remote_name.clone(),
         Duration::from_mins(2),
     )
     .map_err(|error| {
@@ -2242,11 +2363,17 @@ fn workflow_from_stored(stored: &StoredGithubConfig) -> Result<WorkflowConfig, C
         stored.worker_revision.clone(),
         stored.worker_version.clone(),
     );
+    let public_source = PublicSourceRepository::new(stored.source_repository.clone());
     let trusted = TrustedSourceRef::new(stored.trusted_source_ref.clone());
     let namespace = TemporaryBranchNamespace::new(stored.temporary_namespace.clone());
-    let (Ok(filename), Ok(environment), Ok(worker), Ok(trusted), Ok(namespace)) =
-        (filename, environment, worker, trusted, namespace)
-    else {
+    let (Ok(filename), Ok(environment), Ok(worker), Ok(public_source), Ok(trusted), Ok(namespace)) = (
+        filename,
+        environment,
+        worker,
+        public_source,
+        trusted,
+        namespace,
+    ) else {
         return Err(remote_error(
             "invalid_provider_config",
             "the stored GitHub workflow configuration is invalid",
@@ -2258,6 +2385,7 @@ fn workflow_from_stored(stored: &StoredGithubConfig) -> Result<WorkflowConfig, C
         environment,
         SigningSecretNames::goal3_defaults(),
         worker,
+        public_source,
         trusted,
         namespace,
     )
@@ -2283,12 +2411,27 @@ fn validate_stored_config(stored: &StoredGithubConfig) -> Result<(), CliError> {
             "Remove the generated provider config and rerun GitHub setup.",
         ));
     }
-    let (_, slug, source) = parse_repository_spec(&stored.repository)?;
-    if slug != stored.repository || source != stored.source_repository {
+    validate_git_remote_name(&stored.source_remote_name)?;
+    validate_git_remote_name(&stored.execution_remote_name)?;
+    let (_, execution_slug, execution_repository) = parse_repository_spec(&stored.repository)?;
+    let (_, source_slug, source) = parse_repository_spec(&stored.source_repository)?;
+    let (_, _, worker_repository) = parse_repository_spec(&stored.worker_repository)?;
+    if execution_slug != stored.repository
+        || source != stored.source_repository
+        || worker_repository != stored.worker_repository
+        || (worker_repository == execution_repository && execution_slug != source_slug)
+    {
         return Err(remote_error(
             "invalid_provider_config",
             "the stored GitHub repository identity is inconsistent",
             "Remove the generated provider config and rerun GitHub setup.",
+        ));
+    }
+    if stored.signing.is_some() && execution_slug == source_slug {
+        return Err(remote_error(
+            "invalid_provider_config",
+            "signed builds require distinct public-source and private-execution repositories",
+            "Configure a separate private GitHub execution remote and rerun setup.",
         ));
     }
     workflow_from_stored(stored)?;
@@ -3050,17 +3193,21 @@ fn ensure_doctor_ready(
     Ok(())
 }
 
-fn ensure_configured_repository(
+fn ensure_configured_repositories(
     stored: &StoredGithubConfig,
     git: &GitContext,
+    execution: &GitRemoteContext,
 ) -> Result<(), CliError> {
-    if git.source_repository == stored.source_repository && git.repository_slug == stored.repository
+    let (_, source_slug, source_repository) = parse_repository_spec(&stored.source_repository)?;
+    if git.source_repository == source_repository
+        && git.repository_slug == source_slug
+        && execution.repository_slug == stored.repository
     {
         Ok(())
     } else {
         Err(remote_error(
             "remote_repository_changed",
-            "the configured GitHub repository no longer matches the selected Git remote",
+            "a configured GitHub source or execution repository no longer matches its selected Git remote",
             "Run `cargo ferry remote status github`, then remove the generated provider config and rerun setup if the repository intentionally changed.",
         ))
     }
@@ -3168,11 +3315,12 @@ fn safe_public_text(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactDownloadRollback, ExistingFile, GithubPaths, ImmediateProviderResult,
-        downloaded_manifest, ensure_doctor_ready, executable_entrypoint,
+        ArtifactDownloadRollback, CONFIG_SCHEMA_VERSION, ExistingFile, GithubPaths,
+        ImmediateProviderResult, PROTECTED_ENVIRONMENT, StoredGithubConfig, TEMPORARY_NAMESPACE,
+        WORKFLOW_FILE, downloaded_manifest, ensure_doctor_ready, executable_entrypoint,
         expected_artifact_downloads, parse_repository_spec, preflight_file,
         prepare_artifact_destination, retry_artifact_listing, source_manifest_digest,
-        unsigned_signing_plan, write_create_only,
+        unsigned_signing_plan, validate_git_remote_name, validate_stored_config, write_create_only,
     };
     use std::time::{Duration, Instant};
 
@@ -3192,10 +3340,43 @@ mod tests {
             "ssh://git@github.com/ShiroKSH/rustferry.git",
         ] {
             let (_, slug, source) = parse_repository_spec(remote).expect("valid remote");
-            assert_eq!(slug, "ShiroKSH/rustferry");
-            assert_eq!(source, "https://github.com/ShiroKSH/rustferry");
+            assert_eq!(slug, "shiroksh/rustferry");
+            assert_eq!(source, "https://github.com/shiroksh/rustferry");
         }
         assert!(parse_repository_spec("https://token@github.com/owner/repo").is_err());
+    }
+
+    #[test]
+    fn split_provider_config_binds_canonical_public_source_and_private_execution_names() {
+        let config = StoredGithubConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            repository: "example/private-builds".to_owned(),
+            source_repository: "https://github.com/example/public-app".to_owned(),
+            source_remote_name: "public".to_owned(),
+            execution_remote_name: "signing".to_owned(),
+            trusted_source_ref: "refs/heads/main".to_owned(),
+            workflow_file: WORKFLOW_FILE.to_owned(),
+            protected_environment: PROTECTED_ENVIRONMENT.to_owned(),
+            temporary_namespace: TEMPORARY_NAMESPACE.to_owned(),
+            worker_repository: "https://github.com/example/rustferry".to_owned(),
+            worker_revision: "a".repeat(40),
+            worker_version: "0.1.0".to_owned(),
+            signing: None,
+        };
+        validate_stored_config(&config).expect("split provider config");
+
+        let mut mixed_case_source = config.clone();
+        mixed_case_source.source_repository = "https://github.com/Example/public-app".to_owned();
+        assert!(validate_stored_config(&mixed_case_source).is_err());
+        let mut leaked_execution = config.clone();
+        leaked_execution.worker_repository = "https://github.com/example/private-builds".to_owned();
+        assert!(validate_stored_config(&leaked_execution).is_err());
+        for invalid in ["", "-origin", "owner/source", "${{ github.token }}"] {
+            assert!(
+                validate_git_remote_name(invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
     }
 
     #[cfg(unix)]

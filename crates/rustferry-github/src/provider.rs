@@ -50,7 +50,7 @@ pub const GITHUB_PROVIDER_ID: &str = "github-actions";
 /// Strict request file consumed by the generated workflow.
 pub const DISPATCH_MANIFEST_PATH: &str = ".rustferry/goal3/request.json";
 
-const DISPATCH_MANIFEST_SCHEMA_VERSION: u32 = 1;
+const DISPATCH_MANIFEST_SCHEMA_VERSION: u32 = 2;
 const MAX_JOB_RECORDS: usize = 1_024;
 const MAX_JOB_EVENTS: usize = 64;
 const MAX_DISPATCH_FILE_BYTES: usize = 2 * 1024 * 1024;
@@ -179,8 +179,8 @@ pub enum GithubProviderConfigError {
     InvalidWorkflowFingerprint,
     /// Generated workflow bytes did not match the approved fingerprint.
     WorkflowFingerprintMismatch,
-    /// The canonical source repository did not match the configured repository.
-    SourceRepositoryMismatch,
+    /// The configured source repository was not the workflow's canonical public source URL.
+    InvalidSourceRepository,
     /// The in-memory job bound was outside 1–1024.
     InvalidJobLimit,
     /// Worker distribution version was not semantic-version syntax.
@@ -198,8 +198,8 @@ impl fmt::Display for GithubProviderConfigError {
             Self::WorkflowFingerprintMismatch => {
                 formatter.write_str("generated workflow does not match its approved fingerprint")
             }
-            Self::SourceRepositoryMismatch => {
-                formatter.write_str("source repository does not match GitHub provider repository")
+            Self::InvalidSourceRepository => {
+                formatter.write_str("source repository does not match the workflow public source")
             }
             Self::InvalidJobLimit => formatter.write_str("job limit must be between 1 and 1024"),
             Self::InvalidWorkerVersion => {
@@ -232,8 +232,9 @@ impl GithubProviderConfig {
     ///
     /// # Errors
     ///
-    /// Rejects a repository URL mismatch, fingerprint mismatch, worker-version mismatch, or
-    /// invalid job bound.
+    /// Rejects a source identity mismatch, fingerprint mismatch, worker-version mismatch, or
+    /// invalid job bound. The GitHub repository is the execution repository; the source URL may
+    /// identify a distinct repository.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         repository: Repository,
@@ -249,8 +250,8 @@ impl GithubProviderConfig {
             return Err(GithubProviderConfigError::InvalidJobLimit);
         }
         let source_repository = source_repository.into();
-        if source_repository != repository_url(&repository) {
-            return Err(GithubProviderConfigError::SourceRepositoryMismatch);
+        if source_repository != workflow.public_source_repository().url() {
+            return Err(GithubProviderConfigError::InvalidSourceRepository);
         }
         let generated = generate_workflow(&workflow);
         if WorkflowFingerprint::for_workflow(&generated) != workflow_fingerprint {
@@ -273,7 +274,7 @@ impl GithubProviderConfig {
         })
     }
 
-    /// Exact GitHub repository.
+    /// Exact GitHub Actions execution repository.
     pub fn repository(&self) -> &Repository {
         &self.repository
     }
@@ -312,6 +313,8 @@ pub struct GithubDispatchManifest {
     pub schema_version: u32,
     /// Stable provider identifier.
     pub provider: String,
+    /// Exact GitHub Actions execution repository.
+    pub execution_repository: String,
     /// Exact normalized GitHub source repository.
     pub source_repository: String,
     /// Exact trusted branch or tag containing the source revision.
@@ -335,6 +338,7 @@ impl GithubDispatchManifest {
         Self {
             schema_version: DISPATCH_MANIFEST_SCHEMA_VERSION,
             provider: GITHUB_PROVIDER_ID.to_owned(),
+            execution_repository: repository_url(&config.repository),
             source_repository: config.source_repository.clone(),
             trusted_source_ref: config.workflow.trusted_source_ref().as_str().to_owned(),
             temporary_ref: format!("refs/heads/{}", temporary_ref.branch().as_str()),
@@ -352,6 +356,10 @@ impl GithubDispatchManifest {
     pub fn validate_for(&self, config: &GithubProviderConfig) -> RemoteBuildResult<()> {
         if self.schema_version != DISPATCH_MANIFEST_SCHEMA_VERSION
             || self.provider != GITHUB_PROVIDER_ID
+            || !github_remote_matches(
+                &self.execution_repository,
+                &repository_url(&config.repository),
+            )
             || self.source_repository != config.source_repository
             || self.trusted_source_ref != config.workflow.trusted_source_ref().as_str()
             || self.workflow_path != config.workflow.filename().repository_path()
@@ -827,7 +835,8 @@ impl Error for GitPublisherConfigError {}
 pub struct GitTemporaryRefPublisher<R> {
     runner: R,
     isolation_directory: PathBuf,
-    remote_name: String,
+    source_remote_name: String,
+    execution_remote_name: String,
     timeout: Duration,
 }
 
@@ -837,8 +846,14 @@ struct VerifiedGitRemote {
     push_url: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VerifiedPublisherRemotes {
+    source: VerifiedGitRemote,
+    execution: VerifiedGitRemote,
+}
+
 impl<R> GitTemporaryRefPublisher<R> {
-    /// Bind a runner to a canonical isolation directory and conservative remote name.
+    /// Bind a runner to a canonical isolation directory and conservative source/execution remotes.
     ///
     /// # Errors
     ///
@@ -846,17 +861,14 @@ impl<R> GitTemporaryRefPublisher<R> {
     pub fn new(
         runner: R,
         isolation_directory: impl AsRef<Path>,
-        remote_name: impl Into<String>,
+        source_remote_name: impl Into<String>,
+        execution_remote_name: impl Into<String>,
         timeout: Duration,
     ) -> Result<Self, GitPublisherConfigError> {
         let isolation_directory = canonical_directory(isolation_directory.as_ref())?;
-        let remote_name = remote_name.into();
-        if remote_name.is_empty()
-            || remote_name.len() > 64
-            || remote_name.starts_with('-')
-            || !remote_name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        let source_remote_name = source_remote_name.into();
+        let execution_remote_name = execution_remote_name.into();
+        if !is_safe_remote_name(&source_remote_name) || !is_safe_remote_name(&execution_remote_name)
         {
             return Err(GitPublisherConfigError::InvalidRemoteName);
         }
@@ -866,7 +878,8 @@ impl<R> GitTemporaryRefPublisher<R> {
         Ok(Self {
             runner,
             isolation_directory,
-            remote_name,
+            source_remote_name,
+            execution_remote_name,
             timeout,
         })
     }
@@ -896,15 +909,15 @@ impl<R: GitRunner> GitTemporaryRefPublisher<R> {
 
     fn verify_remote(
         &mut self,
-        source_repository: &str,
+        remote_name: &str,
+        expected_repository: &str,
     ) -> Result<VerifiedGitRemote, TemporaryRefPublishError> {
-        let remote_name = self.remote_name.clone();
-        let fetch_output = self.execute(["remote", "get-url", &remote_name])?;
+        let fetch_output = self.execute(["remote", "get-url", remote_name])?;
         let fetch_url = parse_single_line(&fetch_output)?.to_owned();
-        let push_output = self.execute(["remote", "get-url", "--push", &remote_name])?;
+        let push_output = self.execute(["remote", "get-url", "--push", remote_name])?;
         let push_url = parse_single_line(&push_output)?.to_owned();
-        if !github_remote_matches(&fetch_url, source_repository)
-            || !github_remote_matches(&push_url, source_repository)
+        if !github_remote_matches(&fetch_url, expected_repository)
+            || !github_remote_matches(&push_url, expected_repository)
         {
             return Err(TemporaryRefPublishError::RemoteMismatch);
         }
@@ -926,19 +939,30 @@ impl<R: GitRunner> GitTemporaryRefPublisher<R> {
     fn doctor_with_remote(
         &mut self,
         request: &TemporaryRefDoctorRequest<'_>,
-    ) -> Result<(TemporaryRefPublisherReadiness, VerifiedGitRemote), TemporaryRefPublishError> {
+    ) -> Result<(TemporaryRefPublisherReadiness, VerifiedPublisherRemotes), TemporaryRefPublishError>
+    {
         validate_repository_path(request.workflow_path)
             .map_err(|()| TemporaryRefPublishError::MalformedGitOutput)?;
-        let remote = self.verify_remote(request.source_repository)?;
+        let source_remote_name = self.source_remote_name.clone();
+        let execution_remote_name = self.execution_remote_name.clone();
+        let source = self.verify_remote(&source_remote_name, request.source_repository)?;
+        let execution_repository = repository_url(request.repository);
+        let execution = if source_remote_name == execution_remote_name
+            && github_remote_matches(request.source_repository, &execution_repository)
+        {
+            source.clone()
+        } else {
+            self.verify_remote(&execution_remote_name, &execution_repository)?
+        };
         let tip = self
-            .remote_ref(&remote.fetch_url, request.trusted_source_ref.as_str())?
+            .remote_ref(&source.fetch_url, request.trusted_source_ref.as_str())?
             .ok_or(TemporaryRefPublishError::TrustedRefUnavailable)?;
         self.execute([
             "fetch",
             "--quiet",
             "--no-tags",
             "--no-write-fetch-head",
-            &remote.fetch_url,
+            &source.fetch_url,
             request.trusted_source_ref.as_str(),
         ])?;
         let trusted_workflow = self
@@ -956,7 +980,7 @@ impl<R: GitRunner> GitTemporaryRefPublisher<R> {
             TemporaryRefPublisherReadiness {
                 trusted_ref_tip: tip,
             },
-            remote,
+            VerifiedPublisherRemotes { source, execution },
         ))
     }
 
@@ -973,27 +997,6 @@ impl<R: GitRunner> GitTemporaryRefPublisher<R> {
         let invocation =
             GitInvocation::new(["hash-object", "-w", "--stdin"], self.timeout).with_stdin(bytes);
         parse_object_id(&self.execute_invocation(&invocation)?)
-    }
-
-    fn remove_inherited_workflows(
-        &mut self,
-        index_path: &Path,
-    ) -> Result<(), TemporaryRefPublishError> {
-        let inherited = self.execute_invocation(
-            &self.index_invocation(["ls-files", "-z", "--", ".github/workflows"], index_path),
-        )?;
-        validate_workflow_index_paths(&inherited)?;
-        if inherited.is_empty() {
-            return Ok(());
-        }
-        let invocation = self
-            .index_invocation(
-                ["update-index", "--force-remove", "-z", "--stdin"],
-                index_path,
-            )
-            .with_stdin(&inherited);
-        self.execute_invocation(&invocation)?;
-        Ok(())
     }
 }
 
@@ -1023,7 +1026,7 @@ impl<R: GitRunner> TemporaryRefPublisher for GitTemporaryRefPublisher<R> {
         }
         validate_repository_path(request.workflow_path)
             .map_err(|()| TemporaryRefPublishError::MalformedGitOutput)?;
-        let (readiness, remote) = self.doctor_with_remote(&TemporaryRefDoctorRequest {
+        let (readiness, remotes) = self.doctor_with_remote(&TemporaryRefDoctorRequest {
             repository: request.repository,
             source_repository: request.source_repository,
             trusted_source_ref: request.trusted_source_ref,
@@ -1052,7 +1055,7 @@ impl<R: GitRunner> TemporaryRefPublisher for GitTemporaryRefPublisher<R> {
 
         let full_temporary_ref = format!("refs/heads/{}", request.temporary_ref.branch().as_str());
         if self
-            .remote_ref(&remote.fetch_url, &full_temporary_ref)?
+            .remote_ref(&remotes.execution.fetch_url, &full_temporary_ref)?
             .is_some()
         {
             return Err(TemporaryRefPublishError::TemporaryRefExists.into());
@@ -1061,10 +1064,6 @@ impl<R: GitRunner> TemporaryRefPublisher for GitTemporaryRefPublisher<R> {
         let mut reservation =
             IndexReservation::create(&self.isolation_directory, request.operation_id)?;
         let index_path = reservation.index_path().to_path_buf();
-        self.execute_invocation(
-            &self.index_invocation(["read-tree", request.source_revision.as_str()], &index_path),
-        )?;
-        self.remove_inherited_workflows(&index_path)?;
         let workflow_blob = self.hash_blob(request.workflow_bytes)?;
         let manifest_blob = self.hash_blob(request.manifest_bytes)?;
         self.execute_invocation(&self.index_invocation(
@@ -1097,17 +1096,14 @@ impl<R: GitRunner> TemporaryRefPublisher for GitTemporaryRefPublisher<R> {
             request.operation_id
         );
         let git_date = format!("@{} +0000", request.created_at_ms / 1_000);
-        let commit_invocation = GitInvocation::new(
-            ["commit-tree", &tree, "-p", request.source_revision.as_str()],
-            self.timeout,
-        )
-        .with_stdin(commit_message.as_bytes())
-        .with_environment("GIT_AUTHOR_NAME", "ShiroKSH")
-        .with_environment("GIT_AUTHOR_EMAIL", "kushidashiro@gmail.com")
-        .with_environment("GIT_COMMITTER_NAME", "ShiroKSH")
-        .with_environment("GIT_COMMITTER_EMAIL", "kushidashiro@gmail.com")
-        .with_environment("GIT_AUTHOR_DATE", &git_date)
-        .with_environment("GIT_COMMITTER_DATE", &git_date);
+        let commit_invocation = GitInvocation::new(["commit-tree", &tree], self.timeout)
+            .with_stdin(commit_message.as_bytes())
+            .with_environment("GIT_AUTHOR_NAME", "ShiroKSH")
+            .with_environment("GIT_AUTHOR_EMAIL", "kushidashiro@gmail.com")
+            .with_environment("GIT_COMMITTER_NAME", "ShiroKSH")
+            .with_environment("GIT_COMMITTER_EMAIL", "kushidashiro@gmail.com")
+            .with_environment("GIT_AUTHOR_DATE", &git_date)
+            .with_environment("GIT_COMMITTER_DATE", &git_date);
         let commit = CommitSha::new(parse_object_id(
             &self.execute_invocation(&commit_invocation)?,
         )?)
@@ -1123,13 +1119,13 @@ impl<R: GitRunner> TemporaryRefPublisher for GitTemporaryRefPublisher<R> {
             "--no-verify",
             "--atomic",
             &lease,
-            &remote.push_url,
+            &remotes.execution.push_url,
             &refspec,
         ]) {
             return Err(TemporaryRefPublishFailure::uncertain(error, publication));
         }
         let confirmed = self
-            .remote_ref(&remote.fetch_url, &full_temporary_ref)
+            .remote_ref(&remotes.execution.fetch_url, &full_temporary_ref)
             .map_err(|error| TemporaryRefPublishFailure::uncertain(error, publication.clone()))?;
         if confirmed.as_ref() != Some(&commit) {
             return Err(TemporaryRefPublishFailure::uncertain(
@@ -1147,10 +1143,9 @@ impl<R: GitRunner> TemporaryRefPublisher for GitTemporaryRefPublisher<R> {
         if !request.authorized {
             return Err(TemporaryRefPublishError::Unauthorized);
         }
-        if repository_url(request.repository) != request.source_repository {
-            return Err(TemporaryRefPublishError::RemoteMismatch);
-        }
-        let remote = self.verify_remote(request.source_repository)?;
+        let execution_remote_name = self.execution_remote_name.clone();
+        let remote =
+            self.verify_remote(&execution_remote_name, &repository_url(request.repository))?;
         let full_ref = format!("refs/heads/{}", request.temporary_ref.branch().as_str());
         let lease = format!(
             "--force-with-lease={full_ref}:{}",
@@ -1249,11 +1244,11 @@ pub struct GithubArtifactContext {
     pub job_id: String,
     /// Caller operation identifier.
     pub operation_id: String,
-    /// Exact GitHub repository.
+    /// Exact GitHub Actions execution repository used for run and artifact APIs.
     pub repository: Repository,
     /// Exact mapped run.
     pub run: RunSnapshot,
-    /// Expected request identity.
+    /// Exact configured source repository URL bound to the request provenance.
     pub source_repository: String,
     /// Exact source revision.
     pub source_revision: CommitSha,
@@ -1629,14 +1624,14 @@ where
 
     fn artifact_context(
         record: &JobRecord,
-        repository: &Repository,
+        config: &GithubProviderConfig,
     ) -> Option<GithubArtifactContext> {
         Some(GithubArtifactContext {
             job_id: record.job_id.clone(),
             operation_id: record.operation_id.clone(),
-            repository: repository.clone(),
+            repository: config.repository.clone(),
             run: record.run_snapshot.clone()?,
-            source_repository: repository_url(repository),
+            source_repository: config.source_repository.clone(),
             source_revision: record.source_revision.clone(),
             dispatch_revision: record.dispatch_commit.clone()?,
             request: record.request.clone(),
@@ -1840,7 +1835,7 @@ where
             }
             return Ok(());
         }
-        let context = Self::artifact_context(record, &self.config.repository).ok_or_else(|| {
+        let context = Self::artifact_context(record, &self.config).ok_or_else(|| {
             provider_failure(
                 "run_identity_unavailable",
                 "artifact verification requires a terminal run snapshot",
@@ -1950,7 +1945,8 @@ where
             }
             cancellation.check()?;
 
-            match self.lock_transport()?.repository(&self.config.repository) {
+            let execution_private = match self.lock_transport()?.repository(&self.config.repository)
+            {
                 Ok(repository) if repository.is_archived() || repository.is_disabled() => {
                     checks.push(ProviderCheck {
                         code: "github.repository".to_owned(),
@@ -1958,6 +1954,7 @@ where
                         message: "Configured GitHub repository cannot run new builds".to_owned(),
                         help: Some("Use an active, non-archived repository".to_owned()),
                     });
+                    Some(repository.is_private())
                 }
                 Ok(repository) if request.require_signing && !repository.is_private() => {
                     checks.push(ProviderCheck {
@@ -1967,22 +1964,82 @@ where
                             .to_owned(),
                         help: Some(
                             "Configure a private signing repository so embedded provisioning metadata is not published to public readers"
-                                .to_owned(),
+                            .to_owned(),
                         ),
                     });
+                    Some(false)
                 }
-                Ok(_) => checks.push(ProviderCheck {
-                    code: "github.repository".to_owned(),
+                Ok(repository) => {
+                    let private = repository.is_private();
+                    checks.push(ProviderCheck {
+                        code: "github.repository".to_owned(),
+                        status: ProviderCheckStatus::Ready,
+                        message: "Exact configured GitHub execution repository is available"
+                            .to_owned(),
+                        help: None,
+                    });
+                    Some(private)
+                }
+                Err(error) => {
+                    checks.push(ProviderCheck {
+                        code: "github.repository".to_owned(),
+                        status: ProviderCheckStatus::Error,
+                        message: transport_public_message(error),
+                        help: Some(
+                            "Check execution repository identity and token access".to_owned(),
+                        ),
+                    });
+                    None
+                }
+            };
+            let execution_repository_url = repository_url(&self.config.repository);
+            let source_private =
+                if github_remote_matches(&self.config.source_repository, &execution_repository_url)
+                {
+                    execution_private
+                } else {
+                    let source_repository = repository_from_url(&self.config.source_repository)
+                        .ok_or_else(|| {
+                            provider_failure(
+                                "source_repository_invalid",
+                                "configured source repository identity is invalid",
+                                false,
+                            )
+                        })?;
+                    match self.lock_transport()?.repository(&source_repository) {
+                        Ok(repository) => Some(repository.is_private()),
+                        Err(error) => {
+                            checks.push(ProviderCheck {
+                                code: "github.source_repository".to_owned(),
+                                status: ProviderCheckStatus::Error,
+                                message: transport_public_message(error),
+                                help: Some(
+                                    "Check public source repository identity and token access"
+                                        .to_owned(),
+                                ),
+                            });
+                            None
+                        }
+                    }
+                };
+            match source_private {
+                Some(false) => checks.push(ProviderCheck {
+                    code: "github.source_repository_visibility".to_owned(),
                     status: ProviderCheckStatus::Ready,
-                    message: "Exact configured GitHub repository is available".to_owned(),
+                    message: "Exact configured source repository is public".to_owned(),
                     help: None,
                 }),
-                Err(error) => checks.push(ProviderCheck {
-                    code: "github.repository".to_owned(),
+                Some(true) => checks.push(ProviderCheck {
+                    code: "github.source_repository_visibility".to_owned(),
                     status: ProviderCheckStatus::Error,
-                    message: transport_public_message(error),
-                    help: Some("Check repository identity and token access".to_owned()),
+                    message: "Trusted project source must be in a public GitHub repository"
+                        .to_owned(),
+                    help: Some(
+                        "Keep public source separate from the private signing execution repository"
+                            .to_owned(),
+                    ),
                 }),
+                None => {}
             }
             cancellation.check()?;
 
@@ -2160,6 +2217,31 @@ where
             )?;
             let pending = reservation.insert_pending(record)?;
             if request.signing.mode == SigningMode::ManualDevelopment {
+                let source_repository = repository_from_url(&self.config.source_repository)
+                    .ok_or_else(|| {
+                        provider_failure(
+                            "source_repository_invalid",
+                            "configured source repository identity is invalid",
+                            false,
+                        )
+                    })?;
+                let source = self
+                    .lock_transport()?
+                    .repository(&source_repository)
+                    .map_err(|error| {
+                        provider_failure(
+                            "source_repository_visibility_unavailable",
+                            transport_public_message(error),
+                            true,
+                        )
+                    })?;
+                if source.is_private() {
+                    return Err(provider_failure(
+                        "private_source_repository",
+                        "signed builds require a public GitHub source repository",
+                        false,
+                    ));
+                }
                 let repository = self
                     .lock_transport()?
                     .repository(&self.config.repository)
@@ -2181,6 +2263,23 @@ where
                     return Err(provider_failure(
                         "signing_repository_read_only",
                         "the private GitHub signing repository cannot run new builds",
+                        false,
+                    ));
+                }
+                let mut signing_checks = Vec::new();
+                let mut transport = self.lock_transport()?;
+                append_signing_environment_checks(
+                    &mut signing_checks,
+                    &mut transport,
+                    &self.config,
+                );
+                if signing_checks
+                    .iter()
+                    .any(|check| check.status != ProviderCheckStatus::Ready)
+                {
+                    return Err(provider_failure(
+                        "signing_environment_not_ready",
+                        "protected signing environment policy or secret metadata is not ready",
                         false,
                     ));
                 }
@@ -2387,14 +2486,13 @@ where
             if !record.manifests.is_empty() {
                 return Ok(record.manifests.clone());
             }
-            let context =
-                Self::artifact_context(record, &self.config.repository).ok_or_else(|| {
-                    provider_failure(
-                        "artifacts_pending",
-                        "GitHub run has not completed artifact production",
-                        true,
-                    )
-                })?;
+            let context = Self::artifact_context(record, &self.config).ok_or_else(|| {
+                provider_failure(
+                    "artifacts_pending",
+                    "GitHub run has not completed artifact production",
+                    true,
+                )
+            })?;
             drop(state);
             let manifests = self.lock_artifacts()?.list_verified(&context)?;
             validate_manifests_for_context(&context, &manifests)?;
@@ -2420,14 +2518,13 @@ where
                 .jobs
                 .get(&request.job_id)
                 .ok_or_else(|| job_not_found(&request.job_id))?;
-            let context =
-                Self::artifact_context(record, &self.config.repository).ok_or_else(|| {
-                    provider_failure(
-                        "artifact_pending",
-                        "GitHub run has not completed artifact production",
-                        true,
-                    )
-                })?;
+            let context = Self::artifact_context(record, &self.config).ok_or_else(|| {
+                provider_failure(
+                    "artifact_pending",
+                    "GitHub run has not completed artifact production",
+                    true,
+                )
+            })?;
             drop(state);
             let result = self
                 .lock_artifacts()?
@@ -2495,7 +2592,7 @@ where
                     false,
                 ));
             }
-            let context = Self::artifact_context(record, &self.config.repository);
+            let context = Self::artifact_context(record, &self.config);
             if request.remove_artifacts {
                 let context = context.as_ref().ok_or_else(|| {
                     provider_failure(
@@ -2803,6 +2900,16 @@ fn validate_submission(
     }
     match request.signing.mode {
         SigningMode::ManualDevelopment => {
+            if github_remote_matches(
+                config.source_repository(),
+                &repository_url(config.repository()),
+            ) {
+                return Err(provider_failure(
+                    "separate_signing_repository_required",
+                    "signed builds require a separate private execution repository",
+                    false,
+                ));
+            }
             validate_signing_secret_references(config, request)?;
             validate_exact_artifact_request(
                 request,
@@ -3142,15 +3249,34 @@ fn repository_url(repository: &Repository) -> String {
     )
 }
 
+fn repository_from_url(value: &str) -> Option<Repository> {
+    let slug = value.strip_prefix("https://github.com/")?;
+    let (owner, name) = slug.split_once('/')?;
+    if name.contains('/') {
+        return None;
+    }
+    Repository::new(owner, name).ok()
+}
+
+fn is_safe_remote_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && !value.starts_with('-')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
 fn github_remote_matches(actual: &str, expected_https: &str) -> bool {
     let actual = actual.trim_end_matches('/').trim_end_matches(".git");
-    if actual == expected_https {
+    if actual.eq_ignore_ascii_case(expected_https) {
         return true;
     }
     let Some(slug) = expected_https.strip_prefix("https://github.com/") else {
         return false;
     };
-    actual == format!("git@github.com:{slug}") || actual == format!("ssh://git@github.com/{slug}")
+    actual.eq_ignore_ascii_case(&format!("git@github.com:{slug}"))
+        || actual.eq_ignore_ascii_case(&format!("ssh://git@github.com/{slug}"))
 }
 
 fn validate_provider_identifier(field: &'static str, value: &str) -> RemoteBuildResult<()> {
@@ -3203,23 +3329,6 @@ fn validate_repository_path(value: &str) -> Result<(), ()> {
     } else {
         Ok(())
     }
-}
-
-fn validate_workflow_index_paths(paths: &[u8]) -> Result<(), TemporaryRefPublishError> {
-    if paths.is_empty() {
-        return Ok(());
-    }
-    if paths.last() != Some(&0) {
-        return Err(TemporaryRefPublishError::MalformedGitOutput);
-    }
-    for path in paths[..paths.len() - 1].split(|byte| *byte == 0) {
-        if path.is_empty()
-            || (path != b".github/workflows" && !path.starts_with(b".github/workflows/"))
-        {
-            return Err(TemporaryRefPublishError::MalformedGitOutput);
-        }
-    }
-    Ok(())
 }
 
 fn parse_single_line(output: &[u8]) -> Result<&str, TemporaryRefPublishError> {
@@ -3499,8 +3608,8 @@ mod tests {
     use crate::{
         transport::{GhRequest, TransportLimits},
         workflow::{
-            ProtectedEnvironment, SigningSecretNames, TemporaryBranchNamespace, WorkerDistribution,
-            WorkflowFileName,
+            ProtectedEnvironment, PublicSourceRepository, SigningSecretNames,
+            TemporaryBranchNamespace, WorkerDistribution, WorkflowFileName,
         },
     };
 
@@ -3593,6 +3702,48 @@ mod tests {
                 "artifact fixture rejected",
                 false,
             ))
+        }
+
+        fn download_verified(
+            &mut self,
+            _context: &GithubArtifactContext,
+            _request: &ArtifactDownloadRequest,
+        ) -> RemoteBuildResult<ArtifactDownloadResult> {
+            Err(unsupported(ProviderFeature::ArtifactDownload))
+        }
+
+        fn remove_artifacts(&mut self, _context: &GithubArtifactContext) -> RemoteBuildResult<()> {
+            Err(unsupported(ProviderFeature::Cleanup))
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct CapturingArtifactStore {
+        contexts: Arc<Mutex<Vec<GithubArtifactContext>>>,
+    }
+
+    impl VerifiedArtifactStore for CapturingArtifactStore {
+        fn supports_listing(&self) -> bool {
+            true
+        }
+
+        fn supports_download(&self) -> bool {
+            false
+        }
+
+        fn supports_removal(&self) -> bool {
+            false
+        }
+
+        fn list_verified(
+            &mut self,
+            context: &GithubArtifactContext,
+        ) -> RemoteBuildResult<Vec<ArtifactManifest>> {
+            self.contexts
+                .lock()
+                .expect("contexts")
+                .push(context.clone());
+            Ok(Vec::new())
         }
 
         fn download_verified(
@@ -3717,7 +3868,6 @@ mod tests {
     struct CapturedGitInvocation {
         arguments: Vec<OsString>,
         stdin_len: usize,
-        stdin: Vec<u8>,
         environment: Vec<(OsString, OsString)>,
     }
 
@@ -3741,7 +3891,6 @@ mod tests {
             self.invocations.push(CapturedGitInvocation {
                 arguments: invocation.arguments().to_vec(),
                 stdin_len: invocation.stdin_len(),
-                stdin: invocation.stdin.clone(),
                 environment: invocation.environment().to_vec(),
             });
             self.responses
@@ -3761,6 +3910,8 @@ mod tests {
                 "0.1.0",
             )
             .expect("worker"),
+            PublicSourceRepository::new("shiroksh/rust-and-iphone")
+                .expect("source repository"),
             TrustedSourceRef::new("refs/heads/goal3/macless-iphone-builds")
                 .expect("trusted ref"),
             TemporaryBranchNamespace::new("rustferry/goal3/builds").expect("namespace"),
@@ -3768,12 +3919,14 @@ mod tests {
         .expect("workflow config")
     }
 
-    fn provider_config(authorization: GithubMutationAuthorization) -> GithubProviderConfig {
+    fn same_repository_provider_config(
+        authorization: GithubMutationAuthorization,
+    ) -> GithubProviderConfig {
         let workflow = workflow_config();
         let fingerprint = WorkflowFingerprint::for_workflow(&generate_workflow(&workflow));
         GithubProviderConfig::new(
             Repository::new("ShiroKSH", "rust-and-iphone").expect("repository"),
-            "https://github.com/ShiroKSH/rust-and-iphone",
+            "https://github.com/shiroksh/rust-and-iphone",
             workflow,
             fingerprint,
             GithubPollingPolicy::new(3, Duration::from_millis(250)).expect("poll policy"),
@@ -3784,16 +3937,48 @@ mod tests {
         .expect("provider config")
     }
 
+    fn provider_config(authorization: GithubMutationAuthorization) -> GithubProviderConfig {
+        let workflow = workflow_config();
+        let fingerprint = WorkflowFingerprint::for_workflow(&generate_workflow(&workflow));
+        GithubProviderConfig::new(
+            Repository::new("ShiroKSH", "rustferry-signing").expect("execution repository"),
+            "https://github.com/shiroksh/rust-and-iphone",
+            workflow,
+            fingerprint,
+            GithubPollingPolicy::new(3, Duration::from_millis(250)).expect("poll policy"),
+            authorization,
+            &Version::new(0, 1, 0),
+            8,
+        )
+        .expect("split provider config")
+    }
+
     fn transport(runner: FakeGhRunner) -> GithubTransport<FakeGhRunner> {
         GithubTransport::new(runner, TransportLimits::secure_defaults())
     }
 
     fn private_repository_row() -> Vec<u8> {
-        b"991\tShiroKSH/rust-and-iphone\ttrue\tfalse\tfalse\tmain\n".to_vec()
+        b"991\tShiroKSH/rustferry-signing\ttrue\tfalse\tfalse\tmain\n".to_vec()
+    }
+
+    fn public_source_repository_row() -> Vec<u8> {
+        b"992\tShiroKSH/rust-and-iphone\tfalse\tfalse\tfalse\tmain\n".to_vec()
+    }
+
+    fn private_source_repository_row() -> Vec<u8> {
+        b"992\tShiroKSH/rust-and-iphone\ttrue\tfalse\tfalse\tmain\n".to_vec()
     }
 
     fn signed_transport(mut runner: FakeGhRunner) -> GithubTransport<FakeGhRunner> {
+        runner.responses.push_front(Ok(exact_signing_secret_rows()));
+        runner.responses.push_front(Ok(exact_signing_policy_row()));
+        runner
+            .responses
+            .push_front(Ok(signing_environment_row(false, true, true)));
         runner.responses.push_front(Ok(private_repository_row()));
+        runner
+            .responses
+            .push_front(Ok(public_source_repository_row()));
         transport(runner)
     }
 
@@ -3852,7 +4037,7 @@ mod tests {
             },
             profile: BuildProfile::Release,
             source_mode: SourceMode::Git,
-            source_repository: Some("https://github.com/ShiroKSH/rust-and-iphone".to_owned()),
+            source_repository: Some("https://github.com/shiroksh/rust-and-iphone".to_owned()),
             source_revision: Some(SOURCE_SHA.to_owned()),
             source: empty_source_manifest(),
             signing,
@@ -3958,9 +4143,10 @@ mod tests {
             transport(FakeGhRunner::with([
                 Ok(b"ShiroKSH\n".to_vec()),
                 Ok(
-                    format!("991\tShiroKSH/rust-and-iphone\t{private}\tfalse\tfalse\tmain\n")
+                    format!("991\tShiroKSH/rustferry-signing\t{private}\tfalse\tfalse\tmain\n")
                         .into_bytes(),
                 ),
+                Ok(b"992\tShiroKSH/rust-and-iphone\tfalse\tfalse\tfalse\tmain\n".to_vec()),
                 environment,
                 policies,
                 secrets,
@@ -4052,27 +4238,43 @@ mod tests {
     }
 
     #[test]
-    fn config_rejects_wrong_repository_workflow_digest_and_worker_version() {
+    fn config_accepts_distinct_source_and_rejects_invalid_source_digest_and_worker_version() {
         let workflow = workflow_config();
         let fingerprint = WorkflowFingerprint::for_workflow(&generate_workflow(&workflow));
-        let repository = Repository::new("ShiroKSH", "rust-and-iphone").expect("repository");
+        let repository = Repository::new("ShiroKSH", "rustferry-signing").expect("repository");
+        let split = GithubProviderConfig::new(
+            repository.clone(),
+            "https://github.com/shiroksh/rust-and-iphone",
+            workflow.clone(),
+            fingerprint.clone(),
+            GithubPollingPolicy::secure_defaults(),
+            all_authorized(),
+            &Version::new(0, 1, 0),
+            8,
+        )
+        .expect("distinct source and execution repositories");
+        assert_eq!(split.repository(), &repository);
         assert_eq!(
-            GithubProviderConfig::new(
-                repository.clone(),
-                "https://github.com/attacker/rust-and-iphone",
-                workflow.clone(),
-                fingerprint,
-                GithubPollingPolicy::secure_defaults(),
-                all_authorized(),
-                &Version::new(0, 1, 0),
-                8,
-            ),
-            Err(GithubProviderConfigError::SourceRepositoryMismatch)
+            split.source_repository(),
+            "https://github.com/shiroksh/rust-and-iphone"
         );
         assert_eq!(
             GithubProviderConfig::new(
                 repository.clone(),
                 "https://github.com/ShiroKSH/rust-and-iphone",
+                workflow.clone(),
+                fingerprint.clone(),
+                GithubPollingPolicy::secure_defaults(),
+                all_authorized(),
+                &Version::new(0, 1, 0),
+                8,
+            ),
+            Err(GithubProviderConfigError::InvalidSourceRepository)
+        );
+        assert_eq!(
+            GithubProviderConfig::new(
+                repository.clone(),
+                "https://github.com/shiroksh/rust-and-iphone",
                 workflow.clone(),
                 WorkflowFingerprint::new("f".repeat(64)).expect("fingerprint"),
                 GithubPollingPolicy::secure_defaults(),
@@ -4085,7 +4287,7 @@ mod tests {
         assert_eq!(
             GithubProviderConfig::new(
                 repository,
-                "https://github.com/ShiroKSH/rust-and-iphone",
+                "https://github.com/shiroksh/rust-and-iphone",
                 workflow.clone(),
                 WorkflowFingerprint::for_workflow(&generate_workflow(&workflow)),
                 GithubPollingPolicy::secure_defaults(),
@@ -4098,8 +4300,71 @@ mod tests {
     }
 
     #[test]
+    fn split_repository_artifact_context_keeps_execution_and_source_identities_separate() {
+        let workflow = workflow_config();
+        let fingerprint = WorkflowFingerprint::for_workflow(&generate_workflow(&workflow));
+        let config = GithubProviderConfig::new(
+            Repository::new("ShiroKSH", "rustferry-signing").expect("execution repository"),
+            "https://github.com/shiroksh/rust-and-iphone",
+            workflow,
+            fingerprint,
+            GithubPollingPolicy::new(3, Duration::from_millis(250)).expect("poll policy"),
+            all_authorized(),
+            &Version::new(0, 1, 0),
+            8,
+        )
+        .expect("split repository config");
+        let runner = FakeGhRunner::with([
+            Ok(completed_run_row("success")),
+            Ok(completed_run_row("success")),
+        ]);
+        let requests = Arc::clone(&runner.requests);
+        let artifacts = CapturingArtifactStore::default();
+        let contexts = Arc::clone(&artifacts.contexts);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            config,
+            transport(runner),
+            FakePublisher::default(),
+            artifacts,
+            FixedClock(1_700_000_000_000),
+        );
+
+        poll_ready(provider.submit(unsigned_request(), CancellationToken::new())).expect("submit");
+        poll_ready(provider.events(
+            EventRequest {
+                job_id: "operation-1".to_owned(),
+                after_sequence: None,
+                limit: 100,
+            },
+            CancellationToken::new(),
+        ))
+        .expect("events");
+
+        let captured = contexts.lock().expect("contexts");
+        let context = captured.first().expect("artifact context");
+        assert_eq!(context.repository.owner(), "ShiroKSH");
+        assert_eq!(context.repository.name(), "rustferry-signing");
+        assert_eq!(
+            context.source_repository,
+            "https://github.com/shiroksh/rust-and-iphone"
+        );
+        assert_eq!(
+            context.request.source_repository.as_deref(),
+            Some(context.source_repository.as_str())
+        );
+        assert_eq!(context.run.handle().head_sha(), &context.dispatch_revision);
+        let requests = requests.lock().expect("requests");
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| {
+            request
+                .endpoint()
+                .starts_with("/repos/ShiroKSH/rustferry-signing/actions/")
+        }));
+    }
+
+    #[test]
     fn production_doctor_rejects_trusted_tip_workflow_byte_mismatch() {
-        let config = provider_config(all_authorized());
+        let config = same_repository_provider_config(all_authorized());
         let workflow_path = config.workflow.filename().repository_path();
         let responses = [
             Ok(b"https://github.com/ShiroKSH/rust-and-iphone\n".to_vec()),
@@ -4116,6 +4381,7 @@ mod tests {
         let mut publisher = GitTemporaryRefPublisher::new(
             FakeGitRunner::with(responses),
             directory.path(),
+            "origin",
             "origin",
             Duration::from_secs(5),
         )
@@ -4134,7 +4400,7 @@ mod tests {
 
     #[test]
     fn git_publisher_rejects_a_mismatched_push_url_before_network_access() {
-        let config = provider_config(all_authorized());
+        let config = same_repository_provider_config(all_authorized());
         let workflow_path = config.workflow.filename().repository_path();
         let runner = FakeGitRunner::with([
             Ok(b"git@github.com:ShiroKSH/rust-and-iphone.git\n".to_vec()),
@@ -4144,6 +4410,7 @@ mod tests {
         let mut publisher = GitTemporaryRefPublisher::new(
             runner,
             directory.path(),
+            "origin",
             "origin",
             Duration::from_secs(5),
         )
@@ -4171,7 +4438,7 @@ mod tests {
             Ok(b"991\tShiroKSH/rust-and-iphone\tfalse\tfalse\tfalse\tmain\n".to_vec()),
         ];
         let provider = GithubBuildProvider::with_artifact_store_and_clock(
-            provider_config(all_authorized()),
+            same_repository_provider_config(all_authorized()),
             transport(FakeGhRunner::with(transport_responses)),
             FakePublisher::default(),
             DoctorArtifactStore,
@@ -4196,6 +4463,35 @@ mod tests {
                 .iter()
                 .all(|check| check.code != "github.workflow_registration")
         );
+    }
+
+    #[test]
+    fn provider_doctor_rejects_a_private_source_repository() {
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with([
+                Ok(b"ShiroKSH\n".to_vec()),
+                Ok(b"991\tShiroKSH/rustferry-signing\ttrue\tfalse\tfalse\tmain\n".to_vec()),
+                Ok(b"992\tShiroKSH/rust-and-iphone\ttrue\tfalse\tfalse\tmain\n".to_vec()),
+            ])),
+            FakePublisher::default(),
+            DoctorArtifactStore,
+            FixedClock(1_700_000_000_000),
+        );
+        let report = poll_ready(provider.doctor(
+            ProviderDoctorRequest {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+                operation_id: "private-source-doctor".to_owned(),
+                require_signing: false,
+            },
+            CancellationToken::new(),
+        ))
+        .expect("doctor report");
+        assert!(!report.ready);
+        assert!(report.checks.iter().any(|check| {
+            check.code == "github.source_repository_visibility"
+                && check.status == ProviderCheckStatus::Error
+        }));
     }
 
     #[test]
@@ -4328,6 +4624,14 @@ mod tests {
         .expect("temporary ref");
         let manifest = GithubDispatchManifest::new(&config, &temporary_ref, valid_request());
         manifest.validate_for(&config).expect("valid manifest");
+        assert!(github_remote_matches(
+            &manifest.execution_repository,
+            &repository_url(&config.repository)
+        ));
+        let mut wrong_execution = manifest.clone();
+        wrong_execution.execution_repository =
+            "https://github.com/shiroksh/other-signing".to_owned();
+        assert!(wrong_execution.validate_for(&config).is_err());
         let mut value = serde_json::to_value(manifest).expect("manifest value");
         value
             .as_object_mut()
@@ -4362,6 +4666,7 @@ mod tests {
             runner,
             directory.path(),
             "origin",
+            "origin",
             Duration::from_secs(5),
         )
         .expect("publisher");
@@ -4394,7 +4699,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn git_publisher_removes_inherited_workflows_before_create_only_push() {
+    fn git_publisher_creates_an_orphan_two_file_dispatch_commit() {
         let full_trusted_ref = "refs/heads/goal3/macless-iphone-builds";
         let full_temporary_ref = "refs/heads/rustferry/goal3/builds/operation-1";
         let config = provider_config(all_authorized());
@@ -4402,18 +4707,14 @@ mod tests {
         let responses = [
             Ok(b"git@github.com:ShiroKSH/rust-and-iphone.git\n".to_vec()),
             Ok(b"ssh://git@github.com/ShiroKSH/rust-and-iphone\n".to_vec()),
+            Ok(b"git@github.com:ShiroKSH/rustferry-signing.git\n".to_vec()),
+            Ok(b"ssh://git@github.com/ShiroKSH/rustferry-signing\n".to_vec()),
             Ok(format!("{TRUSTED_TIP}\t{full_trusted_ref}\n").into_bytes()),
             Ok(Vec::new()),
             Ok(workflow.yaml().as_bytes().to_vec()),
             Ok(Vec::new()),
             Ok(Vec::new()),
             Ok(Vec::new()),
-            Ok(Vec::new()),
-            Ok(Vec::new()),
-            Ok(
-                b".github/workflows/broad-push.yml\0.github/workflows/rustferry-goal3-iphone.yml\0"
-                    .to_vec(),
-            ),
             Ok(Vec::new()),
             Ok(format!("{WORKFLOW_BLOB}\n").into_bytes()),
             Ok(format!("{MANIFEST_BLOB}\n").into_bytes()),
@@ -4429,7 +4730,8 @@ mod tests {
         let mut publisher = GitTemporaryRefPublisher::new(
             runner,
             directory.path(),
-            "origin",
+            "source",
+            "execution",
             Duration::from_secs(5),
         )
         .expect("publisher");
@@ -4465,34 +4767,32 @@ mod tests {
                 )
             })
         }));
-        let removal_index = runner
-            .invocations
-            .iter()
-            .position(|invocation| {
-                invocation.arguments
-                    == ["update-index", "--force-remove", "-z", "--stdin"].map(OsString::from)
-            })
-            .expect("inherited workflow removal");
-        let workflow_removal = &runner.invocations[removal_index];
-        assert_eq!(
-            workflow_removal.stdin,
-            b".github/workflows/broad-push.yml\0.github/workflows/rustferry-goal3-iphone.yml\0"
-        );
-        let approved_workflow_index = runner
-            .invocations
-            .iter()
-            .position(|invocation| {
-                invocation.arguments.contains(&OsString::from(
-                    ".github/workflows/rustferry-goal3-iphone.yml",
-                ))
-            })
-            .expect("approved workflow addition");
-        assert!(removal_index < approved_workflow_index);
         assert!(runner.invocations.iter().all(|invocation| {
-            !invocation
+            !matches!(
+                invocation
+                    .arguments
+                    .first()
+                    .and_then(|argument| argument.to_str()),
+                Some("read-tree" | "ls-files")
+            ) && !invocation
                 .arguments
-                .contains(&OsString::from(".github/workflows/broad-push.yml"))
+                .contains(&OsString::from("--force-remove"))
         }));
+        let indexed_paths = runner
+            .invocations
+            .iter()
+            .filter(|invocation| {
+                invocation.arguments.first() == Some(&OsString::from("update-index"))
+            })
+            .filter_map(|invocation| invocation.arguments.last()?.to_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            indexed_paths,
+            [
+                ".github/workflows/rustferry-goal3-iphone.yml",
+                DISPATCH_MANIFEST_PATH,
+            ]
+        );
         let push = runner
             .invocations
             .iter()
@@ -4506,7 +4806,7 @@ mod tests {
             "{DISPATCH_SHA}:{full_temporary_ref}"
         ))));
         assert!(push.arguments.contains(&OsString::from(
-            "ssh://git@github.com/ShiroKSH/rust-and-iphone"
+            "ssh://git@github.com/ShiroKSH/rustferry-signing"
         )));
         let fetch = runner
             .invocations
@@ -4530,6 +4830,10 @@ mod tests {
             .iter()
             .find(|invocation| invocation.arguments.first() == Some(&OsString::from("commit-tree")))
             .expect("commit-tree invocation");
+        assert_eq!(
+            commit.arguments,
+            [OsString::from("commit-tree"), OsString::from(TREE_SHA)]
+        );
         assert!(commit.stdin_len > 0);
         for expected in [
             ("GIT_AUTHOR_NAME", "ShiroKSH"),
@@ -4561,8 +4865,8 @@ mod tests {
         )
         .expect("temporary ref");
         let responses = [
-            Ok(b"git@github.com:ShiroKSH/rust-and-iphone.git\n".to_vec()),
-            Ok(b"ssh://git@github.com/ShiroKSH/rust-and-iphone\n".to_vec()),
+            Ok(b"git@github.com:ShiroKSH/rustferry-signing.git\n".to_vec()),
+            Ok(b"ssh://git@github.com/ShiroKSH/rustferry-signing\n".to_vec()),
             Ok(Vec::new()),
             Ok(Vec::new()),
         ];
@@ -4570,6 +4874,7 @@ mod tests {
         let mut publisher = GitTemporaryRefPublisher::new(
             FakeGitRunner::with(responses),
             directory.path(),
+            "origin",
             "origin",
             Duration::from_secs(5),
         )
@@ -4609,8 +4914,8 @@ mod tests {
         )
         .expect("temporary ref");
         let responses = [
-            Ok(b"git@github.com:ShiroKSH/rust-and-iphone.git\n".to_vec()),
-            Ok(b"ssh://git@github.com/ShiroKSH/rust-and-iphone\n".to_vec()),
+            Ok(b"git@github.com:ShiroKSH/rustferry-signing.git\n".to_vec()),
+            Ok(b"ssh://git@github.com/ShiroKSH/rustferry-signing\n".to_vec()),
             Err(GitExecutionError::CommandFailed { exit_code: Some(1) }),
             Ok(format!("{TRUSTED_TIP}\t{full_ref}\n").into_bytes()),
         ];
@@ -4618,6 +4923,7 @@ mod tests {
         let mut publisher = GitTemporaryRefPublisher::new(
             FakeGitRunner::with(responses),
             directory.path(),
+            "origin",
             "origin",
             Duration::from_secs(5),
         )
@@ -4674,9 +4980,10 @@ mod tests {
 
     #[test]
     fn signed_submission_rechecks_private_visibility_before_publication() {
-        let runner = FakeGhRunner::with([Ok(
-            b"991\tShiroKSH/rust-and-iphone\tfalse\tfalse\tfalse\tmain\n".to_vec(),
-        )]);
+        let runner = FakeGhRunner::with([
+            Ok(public_source_repository_row()),
+            Ok(b"991\tShiroKSH/rustferry-signing\tfalse\tfalse\tfalse\tmain\n".to_vec()),
+        ]);
         let captured_requests = Arc::clone(&runner.requests);
         let provider = GithubBuildProvider::with_artifact_store_and_clock(
             provider_config(all_authorized()),
@@ -4693,7 +5000,7 @@ mod tests {
             RemoteBuildError::ProviderFailure { code, retryable: false, .. }
                 if code == "public_signing_repository"
         ));
-        assert_eq!(captured_requests.lock().expect("requests").len(), 1);
+        assert_eq!(captured_requests.lock().expect("requests").len(), 2);
         assert!(
             provider
                 .publisher
@@ -4839,7 +5146,13 @@ mod tests {
         };
         let provider = GithubBuildProvider::with_artifact_store_and_clock(
             provider_config(all_authorized()),
-            signed_transport(FakeGhRunner::with([Ok(private_repository_row())])),
+            signed_transport(FakeGhRunner::with([
+                Ok(public_source_repository_row()),
+                Ok(private_repository_row()),
+                Ok(signing_environment_row(false, true, true)),
+                Ok(exact_signing_policy_row()),
+                Ok(exact_signing_secret_rows()),
+            ])),
             publisher,
             NoVerifiedArtifactStore,
             FixedClock(1_700_000_000_000),
@@ -4876,6 +5189,102 @@ mod tests {
                 .expect("state")
                 .jobs
                 .contains_key("operation-1")
+        );
+    }
+
+    #[test]
+    fn signed_submission_rejects_same_source_and_execution_repository() {
+        let runner = FakeGhRunner::default();
+        let captured_requests = Arc::clone(&runner.requests);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            same_repository_provider_config(all_authorized()),
+            transport(runner),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        );
+
+        let error = poll_ready(provider.submit(valid_request(), CancellationToken::new()))
+            .expect_err("same-repository signing must fail closed");
+        assert!(matches!(
+            error,
+            RemoteBuildError::ProviderFailure { code, retryable: false, .. }
+                if code == "separate_signing_repository_required"
+        ));
+        assert!(captured_requests.lock().expect("requests").is_empty());
+        assert!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .published
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn signed_submission_rechecks_public_source_visibility_before_publication() {
+        let runner = FakeGhRunner::with([Ok(private_source_repository_row())]);
+        let captured_requests = Arc::clone(&runner.requests);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(runner),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        );
+
+        let error = poll_ready(provider.submit(valid_request(), CancellationToken::new()))
+            .expect_err("private source repository must fail closed");
+        assert!(matches!(
+            error,
+            RemoteBuildError::ProviderFailure { code, retryable: false, .. }
+                if code == "private_source_repository"
+        ));
+        assert_eq!(captured_requests.lock().expect("requests").len(), 1);
+        assert!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .published
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn signed_submission_rechecks_required_environment_reviewers_before_publication() {
+        let runner = FakeGhRunner::with([
+            Ok(public_source_repository_row()),
+            Ok(private_repository_row()),
+            Ok(signing_environment_row(false, true, false)),
+            Ok(exact_signing_policy_row()),
+            Ok(exact_signing_secret_rows()),
+        ]);
+        let captured_requests = Arc::clone(&runner.requests);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(runner),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        );
+
+        let error = poll_ready(provider.submit(valid_request(), CancellationToken::new()))
+            .expect_err("missing deployment reviewer must fail closed");
+        assert!(matches!(
+            error,
+            RemoteBuildError::ProviderFailure { code, retryable: false, .. }
+                if code == "signing_environment_not_ready"
+        ));
+        assert_eq!(captured_requests.lock().expect("requests").len(), 5);
+        assert!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .published
+                .is_empty()
         );
     }
 
@@ -5113,7 +5522,11 @@ mod tests {
             config,
             signed_transport(FakeGhRunner::with([
                 Ok(Vec::new()),
+                Ok(public_source_repository_row()),
                 Ok(private_repository_row()),
+                Ok(signing_environment_row(false, true, true)),
+                Ok(exact_signing_policy_row()),
+                Ok(exact_signing_secret_rows()),
             ])),
             FakePublisher::default(),
             NoVerifiedArtifactStore,

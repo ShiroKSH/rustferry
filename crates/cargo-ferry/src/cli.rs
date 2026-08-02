@@ -270,12 +270,15 @@ pub struct RemoteSetupArgs {
     /// Project root or a child directory.
     #[arg(long, visible_alias = "project")]
     pub project_dir: Option<Utf8PathBuf>,
-    /// Exact GitHub owner/repository; defaults to the selected Git remote.
+    /// Exact GitHub execution owner/repository; defaults to the execution Git remote.
     #[arg(long)]
-    pub repository: Option<String>,
-    /// Git remote used for trusted-source checks and temporary refs.
+    pub execution_repository: Option<String>,
+    /// Git remote containing the public trusted source and installed workflow.
     #[arg(long, default_value = "origin")]
-    pub remote_name: String,
+    pub source_remote_name: String,
+    /// Git remote receiving isolated temporary workflow-dispatch refs.
+    #[arg(long, default_value = "origin")]
+    pub execution_remote_name: String,
     /// Full trusted ref; defaults to the current branch under refs/heads/.
     #[arg(long)]
     pub trusted_ref: Option<String>,
@@ -450,5 +453,34 @@ mod tests {
                 RemoteCommand::Setup(_) | RemoteCommand::Doctor(_) | RemoteCommand::Status(_)
             ));
         }
+    }
+
+    #[test]
+    fn github_setup_selects_distinct_source_and_execution_remotes() {
+        let parsed = Cli::try_parse_from([
+            "cargo-ferry",
+            "remote",
+            "setup",
+            "github",
+            "--source-remote-name",
+            "public",
+            "--execution-remote-name",
+            "signing",
+            "--execution-repository",
+            "owner/private-builds",
+        ])
+        .expect("split repository grammar");
+        let Command::Remote(remote) = parsed.command else {
+            panic!("expected remote command");
+        };
+        let RemoteCommand::Setup(arguments) = remote.command else {
+            panic!("expected setup command");
+        };
+        assert_eq!(arguments.source_remote_name, "public");
+        assert_eq!(arguments.execution_remote_name, "signing");
+        assert_eq!(
+            arguments.execution_repository.as_deref(),
+            Some("owner/private-builds")
+        );
     }
 }

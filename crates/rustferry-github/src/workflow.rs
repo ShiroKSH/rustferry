@@ -267,6 +267,41 @@ impl SigningSecretNames {
     }
 }
 
+/// Validated public GitHub repository containing the project source.
+///
+/// The constructor validates and normalizes repository identity. The caller
+/// must separately prove that GitHub reports the repository as public before
+/// using it with a private execution repository.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct PublicSourceRepository {
+    url: String,
+    slug: String,
+}
+
+impl PublicSourceRepository {
+    /// Normalize an `OWNER/REPOSITORY` slug or HTTPS GitHub repository URL.
+    ///
+    /// # Errors
+    ///
+    /// Rejects non-GitHub URLs, credentials, extra path components, expression
+    /// syntax, and values longer than 256 bytes.
+    pub fn new(value: impl Into<String>) -> Result<Self, WorkflowConfigError> {
+        let value = value.into();
+        let (url, slug) = normalize_github_repository("public source repository", &value)?;
+        Ok(Self { url, slug })
+    }
+
+    /// Normalized lowercase HTTPS repository URL.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Normalized lowercase `owner/repository` slug for `actions/checkout`.
+    pub fn slug(&self) -> &str {
+        &self.slug
+    }
+}
+
 /// Exact trusted branch or tag from which source revisions may be selected.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct TrustedSourceRef(String);
@@ -458,7 +493,8 @@ impl WorkerDistribution {
         let repository = repository.into();
         let revision = revision.into();
         let version = expected_version.into();
-        let (repository, repository_slug) = normalize_github_repository(&repository)?;
+        let (repository, repository_slug) =
+            normalize_github_repository("worker source repository", &repository)?;
         validate_commit_sha("worker source revision", &revision)?;
         validate_semver("worker version", &version)?;
         Ok(Self {
@@ -601,6 +637,7 @@ pub struct WorkflowConfig {
     protected_environment: ProtectedEnvironment,
     secret_names: SigningSecretNames,
     worker: WorkerDistribution,
+    public_source_repository: PublicSourceRepository,
     trusted_source_ref: TrustedSourceRef,
     temporary_branch_namespace: TemporaryBranchNamespace,
     developer_directory: DeveloperDirectory,
@@ -620,6 +657,7 @@ impl WorkflowConfig {
         protected_environment: ProtectedEnvironment,
         secret_names: SigningSecretNames,
         worker: WorkerDistribution,
+        public_source_repository: PublicSourceRepository,
         trusted_source_ref: TrustedSourceRef,
         temporary_branch_namespace: TemporaryBranchNamespace,
     ) -> Result<Self, WorkflowConfigError> {
@@ -637,6 +675,7 @@ impl WorkflowConfig {
             protected_environment,
             secret_names,
             worker,
+            public_source_repository,
             trusted_source_ref,
             temporary_branch_namespace,
             developer_directory: DeveloperDirectory::github_default(),
@@ -676,6 +715,11 @@ impl WorkflowConfig {
     /// Trusted worker provisioning policy.
     pub fn worker(&self) -> &WorkerDistribution {
         &self.worker
+    }
+
+    /// Public GitHub repository containing trusted and requested source.
+    pub fn public_source_repository(&self) -> &PublicSourceRepository {
+        &self.public_source_repository
     }
 
     /// Allowlisted source branch or tag.
@@ -738,9 +782,27 @@ pub fn generate_workflow(config: &WorkflowConfig) -> GeneratedWorkflow {
     }
     render_compile_job(&mut yaml, config);
     render_sign_job(&mut yaml, config);
-    // `hashFiles` requires a single-quoted expression literal. YAML escapes
-    // that quote by doubling it inside the surrounding single-quoted scalar.
+    // Source checkout repository insertion is limited to two unique validated
+    // paths. `hashFiles` needs doubled quotes inside its YAML scalar.
     let yaml = yaml
+        .replace(
+            "          path: .rustferry-trusted-source\n",
+            &format!(
+                "          path: .rustferry-trusted-source\n          repository: '{}'\n",
+                config.public_source_repository.slug()
+            ),
+        )
+        .replace(
+            "          path: source\n",
+            &format!(
+                "          path: source\n          repository: '{}'\n",
+                config.public_source_repository.slug()
+            ),
+        )
+        .replace(
+            "            --workflow-path \"",
+            "            --source-repository \"$RUSTFERRY_SOURCE_REPOSITORY\" \\\n            --workflow-path \"",
+        )
         .replace(
             "hashFiles('source/Cargo.lock')",
             "hashFiles(''source/Cargo.lock'')",
@@ -807,6 +869,13 @@ fn render_header(yaml: &mut String, config: &WorkflowConfig) {
     line(
         yaml,
         format_args!("  RUSTFERRY_WORKER_VERSION: '{}'", config.worker.version()),
+    );
+    line(
+        yaml,
+        format_args!(
+            "  RUSTFERRY_SOURCE_REPOSITORY: '{}'",
+            config.public_source_repository.url()
+        ),
     );
     line(
         yaml,
@@ -1335,13 +1404,15 @@ fn validate_worker_url(value: &str) -> Result<(), WorkflowConfigError> {
     Ok(())
 }
 
-fn normalize_github_repository(value: &str) -> Result<(String, String), WorkflowConfigError> {
-    const FIELD: &str = "worker source repository";
-    validate_nonempty_length(FIELD, value, 256)?;
+fn normalize_github_repository(
+    field: &'static str,
+    value: &str,
+) -> Result<(String, String), WorkflowConfigError> {
+    validate_nonempty_length(field, value, 256)?;
     let path = value.strip_prefix("https://github.com/").unwrap_or(value);
     let path = path.strip_suffix('/').unwrap_or(path);
     let path = path.strip_suffix(".git").unwrap_or(path);
-    validate_ascii_allowlist(FIELD, path, |byte| {
+    validate_ascii_allowlist(field, path, |byte| {
         byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-')
     })?;
     let mut segments = path.split('/');
@@ -1363,7 +1434,7 @@ fn normalize_github_repository(value: &str) -> Result<(String, String), Workflow
         || !repository.as_bytes()[0].is_ascii_alphanumeric()
         || matches!(repository, "." | "..")
     {
-        return Err(WorkflowConfigError::InvalidFormat { field: FIELD });
+        return Err(WorkflowConfigError::InvalidFormat { field });
     }
     let slug = format!(
         "{}/{}",
@@ -1424,6 +1495,10 @@ mod tests {
     const WORKER_REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
     const WORKER_SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+    fn fixture_public_source() -> PublicSourceRepository {
+        PublicSourceRepository::new("https://github.com/ShiroKSH/RustFerry.git/").unwrap()
+    }
+
     fn fixture_config() -> WorkflowConfig {
         WorkflowConfig::new(
             WorkflowFileName::new("rustferry-goal3-iphone.yml").unwrap(),
@@ -1435,6 +1510,7 @@ mod tests {
                 "0.1.0",
             )
             .unwrap(),
+            fixture_public_source(),
             TrustedSourceRef::new("refs/heads/goal3/macless-iphone-builds").unwrap(),
             TemporaryBranchNamespace::new("rustferry/goal3/builds").unwrap(),
         )
@@ -1452,10 +1528,18 @@ mod tests {
                 "0.1.0",
             )
             .unwrap(),
+            fixture_public_source(),
             TrustedSourceRef::new("refs/heads/goal3/macless-iphone-builds").unwrap(),
             TemporaryBranchNamespace::new("rustferry/goal3/builds").unwrap(),
         )
         .unwrap()
+    }
+
+    fn fixture_split_config() -> WorkflowConfig {
+        let mut config = fixture_source_config();
+        config.public_source_repository =
+            PublicSourceRepository::new("Public-Org/Public-App").unwrap();
+        config
     }
 
     #[test]
@@ -1465,8 +1549,8 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(first.path(), ".github/workflows/rustferry-goal3-iphone.yml");
-        assert_eq!(first.yaml().lines().count(), 272);
-        assert_eq!(fnv1a64(first.yaml().as_bytes()), 0xb4dd_3315_29fc_f46e);
+        assert_eq!(first.yaml().lines().count(), 276);
+        assert_eq!(fnv1a64(first.yaml().as_bytes()), 0x5bb3_46e9_17ce_aa34);
     }
 
     #[test]
@@ -1475,8 +1559,8 @@ mod tests {
         let second = generate_workflow(&fixture_source_config());
 
         assert_eq!(first, second);
-        assert_eq!(first.yaml().lines().count(), 361);
-        assert_eq!(fnv1a64(first.yaml().as_bytes()), 0xa771_6e14_4555_cc5a);
+        assert_eq!(first.yaml().lines().count(), 365);
+        assert_eq!(fnv1a64(first.yaml().as_bytes()), 0xab21_75f0_7c0a_bc44);
     }
 
     #[test]
@@ -1490,6 +1574,92 @@ mod tests {
         assert_eq!(worker.source_revision(), Some(WORKER_REVISION));
         assert_eq!(worker.version(), "0.1.0");
         assert!(worker.is_source_build());
+    }
+
+    #[test]
+    fn public_source_repository_normalizes_and_rejects_ambiguous_inputs() {
+        let repository =
+            PublicSourceRepository::new("https://github.com/Public-Org/Public-App.git/").unwrap();
+
+        assert_eq!(repository.url(), "https://github.com/public-org/public-app");
+        assert_eq!(repository.slug(), "public-org/public-app");
+
+        for rejected in [
+            "https://example.com/public-org/public-app",
+            "https://github.com/public-org/public-app/extra",
+            "https://github.com/public-org/public-app?private=true",
+            "git@github.com:public-org/public-app.git",
+            "${{ github.repository }}",
+        ] {
+            assert!(
+                PublicSourceRepository::new(rejected).is_err(),
+                "accepted {rejected}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_repository_workflow_keeps_execution_implicit_and_source_explicit() {
+        let workflow = generate_workflow(&fixture_split_config());
+        let yaml = workflow.yaml();
+        let dispatch = yaml
+            .split_once("      - name: Checkout immutable dispatch request\n")
+            .unwrap()
+            .1
+            .split_once("      - name: Checkout trusted source policy ref\n")
+            .unwrap()
+            .0;
+        let trusted = yaml
+            .split_once("      - name: Checkout trusted source policy ref\n")
+            .unwrap()
+            .1
+            .split_once("      - name: Validate dispatch request and workflow revision\n")
+            .unwrap()
+            .0;
+        let requested = yaml
+            .split_once("      - name: Checkout exact requested source revision\n")
+            .unwrap()
+            .1
+            .split_once("      - name: Restore source-revision-scoped Cargo cache\n")
+            .unwrap()
+            .0;
+
+        assert!(
+            yaml.contains(
+                "RUSTFERRY_SOURCE_REPOSITORY: 'https://github.com/public-org/public-app'"
+            )
+        );
+        assert!(yaml.contains("--source-repository \"$RUSTFERRY_SOURCE_REPOSITORY\""));
+        assert!(!yaml.contains("private-org/private-execution"));
+
+        assert!(dispatch.contains("ref: '${{ github.sha }}'"));
+        assert!(dispatch.contains("persist-credentials: false"));
+        assert!(!dispatch.contains("repository:"));
+
+        for source_checkout in [trusted, requested] {
+            assert!(source_checkout.contains("repository: 'public-org/public-app'"));
+            assert!(source_checkout.contains("persist-credentials: false"));
+        }
+        assert!(trusted.contains("ref: '${{ env.RUSTFERRY_TRUSTED_SOURCE_REF }}'"));
+        assert!(requested.contains("ref: '${{ steps.request.outputs.source_revision }}'"));
+    }
+
+    #[test]
+    fn same_repository_mode_keeps_dispatch_implicit_and_source_exact() {
+        let workflow = generate_workflow(&fixture_config());
+        let yaml = workflow.yaml();
+        let dispatch = yaml
+            .split_once("      - name: Checkout immutable dispatch request\n")
+            .unwrap()
+            .1
+            .split_once("      - name: Checkout trusted source policy ref\n")
+            .unwrap()
+            .0;
+
+        assert!(!dispatch.contains("repository:"));
+        assert_eq!(yaml.matches("repository: 'shiroksh/rustferry'").count(), 2);
+        assert!(yaml.contains("ref: '${{ env.RUSTFERRY_TRUSTED_SOURCE_REF }}'"));
+        assert!(yaml.contains("ref: '${{ steps.request.outputs.source_revision }}'"));
     }
 
     #[test]
@@ -1888,6 +2058,7 @@ mod tests {
                 "0.1.0",
             )
             .unwrap(),
+            fixture_public_source(),
             TrustedSourceRef::new("refs/heads/rustferry/goal3/builds/forbidden").unwrap(),
             TemporaryBranchNamespace::new("rustferry/goal3/builds").unwrap(),
         );
@@ -1903,6 +2074,7 @@ mod tests {
                 "0.1.0",
             )
             .unwrap(),
+            fixture_public_source(),
             TrustedSourceRef::new("refs/heads/rustferry/goal3/builds-next").unwrap(),
             TemporaryBranchNamespace::new("rustferry/goal3/builds").unwrap(),
         );

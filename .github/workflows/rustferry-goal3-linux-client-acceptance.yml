@@ -35,7 +35,6 @@ jobs:
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_TERM_COLOR: 'never'
-      GITHUB_TOKEN: '${{ github.token }}'
       RUST_BACKTRACE: '0'
       RUSTUP_TOOLCHAIN: '1.92.0'
       RUSTFERRY_WORKER_REVISION: '052f6ed18d3eb95a053264e32dd7417c131e0155'
@@ -93,6 +92,7 @@ jobs:
       - name: Run real GitHub provider and verify automatic download
         shell: bash
         env:
+          GITHUB_TOKEN: '${{ github.token }}'
           RUSTFERRY_ACCEPTANCE_SSH_PRIVATE_KEY: '${{ secrets.RUSTFERRY_GOAL3_ACCEPTANCE_SSH_PRIVATE_KEY }}'
         run: |
           set -euo pipefail
@@ -114,15 +114,16 @@ jobs:
 
           target/debug/cargo-ferry --json remote setup github \
             --project-dir examples/counter \
-            --repository ShiroKSH/rustferry \
-            --remote-name origin \
+            --execution-repository ShiroKSH/rustferry \
+            --source-remote-name origin \
+            --execution-remote-name origin \
             --trusted-ref refs/heads/goal3/macless-iphone-builds \
             --worker-repository https://github.com/ShiroKSH/rustferry \
             --worker-revision "$RUSTFERRY_WORKER_REVISION" \
             --worker-version 0.1.0 \
             | tee "$evidence/setup.json"
           jq -e \
-            '.data.repository == "ShiroKSH/rustferry" and .data.authenticated_as == "repository-scoped token" and .data.installed == true and .data.signing_mode == "unsigned-smoke-only"' \
+            '.data.source_repository == "https://github.com/shiroksh/rustferry" and .data.execution_repository == "shiroksh/rustferry" and .data.authenticated_as == "repository-scoped token" and .data.installed == true and .data.signing_mode == "unsigned-smoke-only"' \
             "$evidence/setup.json" >/dev/null
 
           target/debug/cargo-ferry --json remote doctor github \

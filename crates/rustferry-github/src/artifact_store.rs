@@ -500,12 +500,6 @@ fn validate_context(context: &GithubArtifactContext) -> Result<(), GithubArtifac
         || context.job_id != context.operation_id
         || context.request_sha256 != request_sha256
         || context.request.source_mode != SourceMode::Git
-        || context.source_repository
-            != format!(
-                "https://github.com/{}/{}",
-                context.repository.owner(),
-                context.repository.name()
-            )
         || context.request.source_repository.as_deref() != Some(context.source_repository.as_str())
         || context.request.source_revision.as_deref() != Some(context.source_revision.as_str())
         || context.run.handle().head_sha() != &context.dispatch_revision
@@ -1736,7 +1730,11 @@ const fn io_store_error(kind: io::ErrorKind) -> GithubArtifactStoreError {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, time::Duration};
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     use rustferry_remote::{
         BundleIdentifier, CURRENT_PROTOCOL_VERSION, CompileToolchainEvidence, DevelopmentTeam,
@@ -1767,18 +1765,21 @@ mod tests {
     #[derive(Default)]
     struct FakeRunner {
         responses: VecDeque<Result<Vec<u8>, GhExecutionError>>,
+        requests: Arc<Mutex<Vec<GhRequest>>>,
     }
 
     impl FakeRunner {
         fn with(responses: impl IntoIterator<Item = Result<Vec<u8>, GhExecutionError>>) -> Self {
             Self {
                 responses: responses.into_iter().collect(),
+                requests: Arc::default(),
             }
         }
     }
 
     impl GhRunner for FakeRunner {
-        fn execute(&mut self, _request: &GhRequest) -> Result<Vec<u8>, GhExecutionError> {
+        fn execute(&mut self, request: &GhRequest) -> Result<Vec<u8>, GhExecutionError> {
+            self.requests.lock().unwrap().push(request.clone());
             self.responses
                 .pop_front()
                 .unwrap_or(Err(GhExecutionError::ProcessIo))
@@ -1877,10 +1878,9 @@ mod tests {
         );
         let response =
             format!("73\t{}\t22\tfalse\t\n", base64(artifact_name.as_bytes())).into_bytes();
-        let transport = GithubTransport::new(
-            FakeRunner::with([Ok(response)]),
-            TransportLimits::secure_defaults(),
-        );
+        let runner = FakeRunner::with([Ok(response)]);
+        let requests = Arc::clone(&runner.requests);
+        let transport = GithubTransport::new(runner, TransportLimits::secure_defaults());
         let cache_root =
             Utf8PathBuf::from_path_buf(root.path().canonicalize().unwrap().join("private-cache"))
                 .unwrap();
@@ -1892,6 +1892,10 @@ mod tests {
             RemoteBuildError::ProviderFailure { ref code, .. }
                 if code == "artifact_api_digest_missing"
         ));
+        assert_eq!(
+            requests.lock().unwrap()[0].endpoint(),
+            "/repos/example/build-execution/actions/runs/41/artifacts"
+        );
         assert_eq!(fs::read_dir(cache_root).unwrap().count(), 0);
     }
 
@@ -2043,6 +2047,8 @@ mod tests {
     #[test]
     fn artifact_context_binds_source_and_dispatch_revisions_separately() {
         let context = test_context(test_request(SigningMode::UnsignedCompileOnly));
+        assert_eq!(context.repository.name(), "build-execution");
+        assert_eq!(context.source_repository, "https://github.com/example/app");
         assert_ne!(context.source_revision, context.dispatch_revision);
         assert_eq!(context.run.handle().head_sha(), &context.dispatch_revision);
         assert_eq!(
@@ -2050,6 +2056,13 @@ mod tests {
             Some(context.source_revision.as_str())
         );
         assert_eq!(validate_context(&context), Ok(()));
+
+        let mut wrong_source = context.clone();
+        wrong_source.source_repository = "https://github.com/example/other".to_owned();
+        assert_eq!(
+            validate_context(&wrong_source),
+            Err(GithubArtifactStoreError::InvalidContext)
+        );
 
         let mut wrong_dispatch = context;
         wrong_dispatch.dispatch_revision = wrong_dispatch.source_revision.clone();
@@ -2272,7 +2285,7 @@ mod tests {
     }
 
     fn test_context(request: IosDeviceBuildRequest) -> GithubArtifactContext {
-        let repository = crate::transport::Repository::new("example", "app").unwrap();
+        let repository = crate::transport::Repository::new("example", "build-execution").unwrap();
         let head = CommitSha::new(DISPATCH_REVISION).unwrap();
         let branch = BranchName::new(BRANCH).unwrap();
         let branch_base64 = base64(BRANCH.as_bytes());

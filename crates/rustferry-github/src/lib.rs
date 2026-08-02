@@ -21,7 +21,7 @@ mod strict_json;
 pub use artifact_store::{GithubArtifactStoreError, GithubVerifiedArtifactStore};
 
 pub use workflow::{
-    DeveloperDirectory, GeneratedWorkflow, ProtectedEnvironment, SecretName, SigningSecretNames,
-    TemporaryBranchNamespace, TrustedSourceRef, WorkerDistribution, WorkflowConfig,
-    WorkflowConfigError, WorkflowFileName, WorkflowLimits, generate_workflow,
+    DeveloperDirectory, GeneratedWorkflow, ProtectedEnvironment, PublicSourceRepository,
+    SecretName, SigningSecretNames, TemporaryBranchNamespace, TrustedSourceRef, WorkerDistribution,
+    WorkflowConfig, WorkflowConfigError, WorkflowFileName, WorkflowLimits, generate_workflow,
 };
