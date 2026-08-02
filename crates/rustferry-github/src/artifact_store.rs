@@ -2075,12 +2075,13 @@ mod tests {
     #[test]
     fn every_client_copy_rehashes_cache_and_never_clobbers() {
         let root = TempDir::new().unwrap();
-        let source = Utf8PathBuf::from_path_buf(root.path().join("cached.zip")).unwrap();
+        let root_path = canonical_temp_root(&root);
+        let source = root_path.join("cached.zip");
         fs::write(&source, b"tampered").unwrap();
-        let destination = root.path().join("download.zip");
+        let destination = root_path.join("download.zip");
         let destination_protocol = ProtocolPath::new(
             ProtocolPathSemantics::ClientAbsolute,
-            destination.to_string_lossy().into_owned(),
+            destination.as_str().to_owned(),
         )
         .unwrap();
         let record = ArtifactRecord {
@@ -2109,12 +2110,13 @@ mod tests {
     #[test]
     fn temporary_unlink_failure_rolls_back_exact_publication() {
         let root = TempDir::new().unwrap();
-        let source = Utf8PathBuf::from_path_buf(root.path().join("cached.zip")).unwrap();
+        let root_path = canonical_temp_root(&root);
+        let source = root_path.join("cached.zip");
         fs::write(&source, b"trusted").unwrap();
-        let destination = root.path().join("download.zip");
+        let destination = root_path.join("download.zip");
         let destination_protocol = ProtocolPath::new(
             ProtocolPathSemantics::ClientAbsolute,
-            destination.to_string_lossy().into_owned(),
+            destination.as_str().to_owned(),
         )
         .unwrap();
         let record = ArtifactRecord {
@@ -2136,7 +2138,7 @@ mod tests {
         );
         assert!(!destination.exists());
         assert!(source.is_file());
-        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(root_path).unwrap().count(), 1);
     }
 
     #[test]
@@ -2161,8 +2163,9 @@ mod tests {
     #[test]
     fn sanitized_log_download_is_verified_and_never_clobbers() {
         let root = TempDir::new().unwrap();
+        let root_path = canonical_temp_root(&root);
         let bytes = b"sanitized build output\n";
-        let source = Utf8PathBuf::from_path_buf(root.path().join("cached-log.txt")).unwrap();
+        let source = root_path.join("cached-log.txt");
         fs::write(&source, bytes).unwrap();
         let record = ArtifactRecord {
             artifact_id: SANITIZED_BUILD_LOG_ID.to_owned(),
@@ -2172,10 +2175,10 @@ mod tests {
             sha256: sha256_bytes(bytes),
             media_type: Some("text/plain; charset=utf-8".to_owned()),
         };
-        let destination = root.path().join(SANITIZED_BUILD_LOG_NAME);
+        let destination = root_path.join(SANITIZED_BUILD_LOG_NAME);
         let destination_protocol = ProtocolPath::new(
             ProtocolPathSemantics::ClientAbsolute,
-            destination.to_string_lossy().into_owned(),
+            destination.as_str().to_owned(),
         )
         .unwrap();
 
@@ -2263,10 +2266,13 @@ mod tests {
     }
 
     fn private_cache_root(root: &TempDir, name: &str) -> Utf8PathBuf {
-        let cache_root =
-            Utf8PathBuf::from_path_buf(root.path().canonicalize().unwrap().join(name)).unwrap();
+        let cache_root = canonical_temp_root(root).join(name);
         create_private_directory(&cache_root).unwrap();
         cache_root
+    }
+
+    fn canonical_temp_root(root: &TempDir) -> Utf8PathBuf {
+        Utf8PathBuf::from_path_buf(root.path().canonicalize().unwrap()).unwrap()
     }
 
     fn artifact_metadata_response(context: &GithubArtifactContext, bytes: &[u8]) -> Vec<u8> {
