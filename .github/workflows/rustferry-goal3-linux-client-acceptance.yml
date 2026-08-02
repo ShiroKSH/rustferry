@@ -143,7 +143,7 @@ jobs:
           unzip -t "$archive" > "$evidence/archive-zip-test.txt"
           zipinfo -1 "$archive" > "$evidence/archive-entries.txt"
           grep -qx 'Info.plist' "$evidence/archive-entries.txt"
-          grep -qx 'Products/Applications/Counter.app/Info.plist' \
+          grep -qx 'Products/Applications/counter.app/Info.plist' \
             "$evidence/archive-entries.txt"
 
           actual_sha256="$(sha256sum "$archive" | awk '{print $1}')"
