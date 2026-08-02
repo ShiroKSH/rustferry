@@ -29,6 +29,7 @@ REVIEWED_LICENSE_EXPRESSIONS = frozenset(
         "Apache-2.0 OR MIT",
         "Apache-2.0 WITH LLVM-exception",
         "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+        "BSD-3-Clause",
         "BSD-3-Clause OR MIT OR Apache-2.0",
         "MIT",
         "MIT OR Apache-2.0",
