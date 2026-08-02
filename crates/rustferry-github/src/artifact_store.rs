@@ -8,7 +8,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
     error::Error,
     fmt,
-    fs::{self, File, Metadata, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -29,6 +29,7 @@ use rustferry_remote::{
     ValidationLevel, canonical_request_bytes, canonical_request_sha256, inspect_unsigned_xcarchive,
     validate_source_manifest, verify_and_extract_source_bundle,
 };
+use same_file::Handle as FileIdentityHandle;
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 use zip::{CompressionMethod, ZipArchive, read::ZipFile};
@@ -1292,9 +1293,14 @@ fn remove_exact_cache_entry(
 }
 
 fn create_private_directory(path: &Utf8Path) -> Result<(), GithubArtifactStoreError> {
-    let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
-    builder.mode(0o700);
+    let builder = {
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = fs::DirBuilder::new();
     builder
         .create(path)
         .map_err(|error| io_store_error(error.kind()))?;
@@ -1517,15 +1523,11 @@ impl ExactPublicationGuard {
     }
 
     fn verify_destination(&self) -> Result<(), GithubArtifactStoreError> {
-        let linked_identity = self
-            .linked_file
-            .metadata()
-            .map_err(|error| io_store_error(error.kind()))?;
         let metadata = fs::symlink_metadata(&self.destination)
             .map_err(|error| io_store_error(error.kind()))?;
         if metadata.file_type().is_symlink()
             || !metadata.is_file()
-            || !same_file_identity(&linked_identity, &metadata)
+            || !path_matches_open_file(&self.destination, &self.linked_file)?
         {
             return Err(GithubArtifactStoreError::InvalidDestination);
         }
@@ -1555,9 +1557,6 @@ fn remove_exact_published_file(
     destination: &Utf8Path,
     linked_file: &File,
 ) -> Result<(), GithubArtifactStoreError> {
-    let linked_identity = linked_file
-        .metadata()
-        .map_err(|error| io_store_error(error.kind()))?;
     let path_metadata = match fs::symlink_metadata(destination) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -1565,7 +1564,7 @@ fn remove_exact_published_file(
     };
     if path_metadata.file_type().is_symlink()
         || !path_metadata.is_file()
-        || !same_file_identity(&linked_identity, &path_metadata)
+        || !path_matches_open_file(destination, linked_file)?
     {
         return Err(GithubArtifactStoreError::InvalidDestination);
     }
@@ -1573,29 +1572,22 @@ fn remove_exact_published_file(
         fs::symlink_metadata(destination).map_err(|error| io_store_error(error.kind()))?;
     if final_metadata.file_type().is_symlink()
         || !final_metadata.is_file()
-        || !same_file_identity(&linked_identity, &final_metadata)
+        || !path_matches_open_file(destination, linked_file)?
     {
         return Err(GithubArtifactStoreError::InvalidDestination);
     }
     fs::remove_file(destination).map_err(|error| io_store_error(error.kind()))
 }
 
-#[cfg(unix)]
-fn same_file_identity(left: &Metadata, right: &Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(windows)]
-fn same_file_identity(left: &Metadata, right: &Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt as _;
-    left.volume_serial_number() == right.volume_serial_number()
-        && left.file_index() == right.file_index()
-}
-
-#[cfg(not(any(unix, windows)))]
-fn same_file_identity(_left: &Metadata, _right: &Metadata) -> bool {
-    false
+fn path_matches_open_file(path: &Utf8Path, file: &File) -> Result<bool, GithubArtifactStoreError> {
+    let open_identity = FileIdentityHandle::from_file(
+        file.try_clone()
+            .map_err(|error| io_store_error(error.kind()))?,
+    )
+    .map_err(|error| io_store_error(error.kind()))?;
+    let path_identity =
+        FileIdentityHandle::from_path(path).map_err(|error| io_store_error(error.kind()))?;
+    Ok(open_identity == path_identity)
 }
 
 fn validated_destination(destination: &ProtocolPath) -> Result<PathBuf, GithubArtifactStoreError> {

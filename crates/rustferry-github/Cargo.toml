@@ -13,6 +13,7 @@ description = "Secure GitHub Actions workflow generation for RustFerry iPhone bu
 camino.workspace = true
 rustferry-core = { version = "0.1.0", path = "../rustferry-core" }
 rustferry-remote = { version = "0.1.0", path = "../rustferry-remote" }
+same-file.workspace = true
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
