@@ -37,7 +37,7 @@ jobs:
       CARGO_TERM_COLOR: 'never'
       RUST_BACKTRACE: '0'
       RUSTUP_TOOLCHAIN: '1.92.0'
-      RUSTFERRY_WORKER_REVISION: '9a62db39eacda0daf8f6f3951452bad7c3aad582'
+      RUSTFERRY_WORKER_REVISION: 'e28e08cddf31c1d703df987f92b2dfe1c19fffaf'
     steps:
       - name: Checkout exact acceptance source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
