@@ -2,12 +2,19 @@
 
 ## Integration update — 2026-08-08
 
-Goal 2 advanced to `1f4f9a06daaa90e0fe82adf4e5667a1a97d35b61` while Goal 3 advanced from the
-isolation base. Integration now preserves the Goal 2 package/release, IDE, deployment, assets, and
-local physical-signing surfaces while adding the Goal 3 remote protocol, GitHub provider, trusted
-worker, and unsigned/signed artifact contracts. The combined release surface is eight publishable
-crates plus the non-publishable macOS worker. A regenerated lockfile, fresh license inventory,
-workspace/package matrix, and exact integrated-revision remote acceptance are still required.
+Merge commit `797c1e3eeae9af167623ef8d4dd1d43cdb86ddaa` combines the Developer Experience
+parent `1f4f9a06daaa90e0fe82adf4e5667a1a97d35b61` with Goal 3. The final integrated head is
+`f55f5a94cc8cdfb050fb0fc17f6777ae625a19cc`.
+
+- **CLI and protocol:** kept the local iOS physical build, device selection, deployment, IDE, and asset commands while adding the remote GitHub provider, source/request contracts, worker events, signing setup, and artifact download path.
+- **Apple implementation:** retained schema 9 and the shared asset digest/resource/activity-model contract; reconciled extension-safe device APIs, Apple root certificate `.crt` inputs, and `SdkOnlyResources` physical-device packaging. The same request-product derivation now feeds local and remote planners.
+- **Release surface:** retained eight publishable crates plus the non-publishable macOS worker. Follow-up commit `4021e6e` converted crate license links into regular package files. The integrated Linux quality job passed license policy, release contract, archive guards, packaged CLI sources, and every workspace package archive.
+- **Security boundary:** retained immutable source/request binding, strict archive inspection, secret redaction, temporary signing-keychain isolation, protected signing Phase B, and cleanup checks. Local Apple execution now binds canonical developer tools, pins `/usr/bin/xcrun` and `/usr/bin/security`, supplies the validated `DEVELOPER_DIR`, and rejects relative, directory, and symlink substitutions instead of trusting `PATH` or ambient developer-directory overrides.
+- **Workflow pinning and portability:** follow-up commit `81510d3` pins the integrated worker; commit `c004b78` adds canonical Developer-directory regression coverage; commit `a39477c` fixes the first protocol-style fixture path; commit `c08e793` serializes native path components portably and closes Windows identity handles before cleanup; commits `1c06dc9` and `2849b50` reject raw lexical traversal and preserve it in the cross-platform fixture; commit `6658643` keeps directory fsync fail-closed on Unix/macOS while following the repository's non-Unix no-op policy. Final commit `f55f5a9` pins both acceptance and worker workflows to that hardened revision.
+
+[Integrated Linux acceptance run `31258657179`](https://github.com/ShiroKSH/rustferry/actions/runs/31258657179) completed successfully at the exact final head and dispatched [worker run `31258758075`](https://github.com/ShiroKSH/rustferry/actions/runs/31258758075). Worker Phase A compiled, sealed, uploaded, and cleaned up a real unsigned physical-iPhone archive; the Linux client automatically downloaded and verified it without a local Apple toolchain. Acceptance artifact `9022219517` has API digest `sha256:071a321305f361a3107128bf992322de77fa12114f6ef4b36a1972b2f3e7442c`, and the validated inner archive has SHA-256 `ebe4c99b0bab31f63b41fa043cf74a0ae3b2663faf0cef9bc0feeb2d5bc4aa28`. Protected Phase B was skipped: no real PKCS#12 archive, password, provisioning profile, or device was available, so no signed IPA, install, launch, or runtime result is claimed.
+
+Initial integrated CI run `31254848783` exposed two Windows `rustferry-remote` mixed-separator fixture failures. Replacement run `31255552203` exposed seven Windows worker path/handle cleanup cases. Run `31256564859` isolated the remaining normalized traversal fixture, and run `31258018324` exposed unsupported non-Unix directory fsync in two worker binary tests. The commits listed above resolve each issue without weakening the macOS execution boundary. [Final CI run `31258657173`](https://github.com/ShiroKSH/rustferry/actions/runs/31258657173) completed successfully at the exact final head: all five jobs are green, including Windows workspace tests and Windows starter generation/check.
 
 The remainder of this file is the historical isolation report that guided the merge.
 
