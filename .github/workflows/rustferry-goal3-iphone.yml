@@ -26,7 +26,6 @@ env:
 jobs:
   worker:
     name: Build trusted macOS worker from exact source revision
-    if: vars.RUSTFERRY_GOAL3_ACCEPTANCE_ENABLED == 'true'
     runs-on: macos-15
     timeout-minutes: 30
     permissions:
