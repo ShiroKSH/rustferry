@@ -7,7 +7,7 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
 use rustferry_apple::IosDeviceArchiveOutcome;
 use rustferry_remote::{
     ARTIFACT_MANIFEST_SCHEMA_VERSION, ArtifactKind, ArtifactManifest, ArtifactRecord,
@@ -78,7 +78,17 @@ impl WorkerRelativePath {
         let relative = absolute
             .strip_prefix(job_root)
             .map_err(|_| WorkerJobError::InvalidWorkerPath)?;
-        Self::new(relative.as_str())
+        let mut portable = String::new();
+        for component in relative.components() {
+            let Utf8Component::Normal(component) = component else {
+                return Err(WorkerJobError::InvalidWorkerPath);
+            };
+            if !portable.is_empty() {
+                portable.push('/');
+            }
+            portable.push_str(component);
+        }
+        Self::new(portable)
     }
 
     /// Return the normalized slash-separated value.
@@ -2554,7 +2564,10 @@ fn prepare_owned_directory(
         .strip_prefix(&root.path)
         .map_err(|_| WorkerJobError::InvalidWorkerDirectory)?;
     let mut current = root.path.clone();
-    for component in relative.as_str().split('/') {
+    for component in relative.components() {
+        let Utf8Component::Normal(component) = component else {
+            return Err(WorkerJobError::InvalidWorkerDirectory);
+        };
         current.push(component);
         match fs::symlink_metadata(&current) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
@@ -3304,6 +3317,38 @@ mod tests {
             WorkerRelativePath::new("logs").expect("path"),
         );
         assert_eq!(overlap, Err(WorkerJobError::OverlappingWorkerPaths));
+    }
+
+    #[test]
+    fn native_path_components_create_and_serialize_portably() {
+        let temporary = tempfile::tempdir().expect("temporary worker root");
+        let job_root =
+            Utf8PathBuf::from_path_buf(temporary.path().join("job")).expect("UTF-8 worker root");
+        fs::create_dir(&job_root).expect("worker root directory");
+        let root = JobRootBinding::open(&job_root).expect("bound worker root");
+
+        let logs_directory = root.path.join("output").join("logs");
+        prepare_owned_directory(&root, &logs_directory).expect("nested worker directory");
+        assert!(logs_directory.is_dir());
+
+        let artifact = root
+            .path
+            .join("workspace")
+            .join("source")
+            .join("target")
+            .join("Weather.xcarchive");
+        let relative = WorkerRelativePath::from_absolute_under(&root.path, &artifact)
+            .expect("portable relative artifact path");
+        assert_eq!(
+            relative.as_str(),
+            "workspace/source/target/Weather.xcarchive"
+        );
+
+        let traversal = root.path.join("workspace").join("..").join("outside");
+        assert_eq!(
+            WorkerRelativePath::from_absolute_under(&root.path, &traversal),
+            Err(WorkerJobError::InvalidWorkerPath)
+        );
     }
 
     #[test]

@@ -560,7 +560,7 @@ struct ValidationWorkspace {
     name: String,
     path: Utf8PathBuf,
     directory: Option<CapabilityDir>,
-    identity: FileIdentityHandle,
+    identity: Option<FileIdentityHandle>,
     active: bool,
 }
 
@@ -637,7 +637,7 @@ impl ValidationWorkspace {
                         name: name.clone(),
                         path: parent_path.join(name),
                         directory: Some(directory),
-                        identity,
+                        identity: Some(identity),
                         active: true,
                     };
                     if let Err(error) = workspace.verify_binding() {
@@ -677,6 +677,10 @@ impl ValidationWorkspace {
             return Err(SignedIpaValidationError::UnsafeIpaArchive);
         }
         let directory = self.directory()?;
+        let identity = self
+            .identity
+            .as_ref()
+            .ok_or(SignedIpaValidationError::CleanupIncomplete)?;
         let open_child = directory_identity(directory)
             .map_err(|source| io_error("reidentify validation extraction directory", source))?;
         let named_metadata = self
@@ -693,7 +697,7 @@ impl ValidationWorkspace {
                 .map_err(|source| io_error("reopen validation extraction directory", source))?,
         )
         .map_err(|source| io_error("reidentify validation extraction directory", source))?;
-        if open_child != self.identity || named_child != self.identity {
+        if &open_child != identity || &named_child != identity {
             return Err(SignedIpaValidationError::UnsafeIpaArchive);
         }
         Ok(())
@@ -704,11 +708,17 @@ impl ValidationWorkspace {
             return Ok(());
         }
         let binding_valid = self.verify_binding().is_ok();
-        let removal = self
+        let directory = self
             .directory
             .take()
-            .ok_or(SignedIpaValidationError::CleanupIncomplete)?
-            .remove_open_dir_all();
+            .ok_or(SignedIpaValidationError::CleanupIncomplete)?;
+        let Some(identity) = self.identity.take() else {
+            self.directory = Some(directory);
+            return Err(SignedIpaValidationError::CleanupIncomplete);
+        };
+        // Windows requires every identity handle to close before tree removal.
+        drop(identity);
+        let removal = directory.remove_open_dir_all();
         let absent = matches!(
             self.parent.symlink_metadata(&self.name),
             Err(error) if error.kind() == io::ErrorKind::NotFound
@@ -724,10 +734,11 @@ impl ValidationWorkspace {
 
 impl Drop for ValidationWorkspace {
     fn drop(&mut self) {
-        if self.active
-            && let Some(directory) = self.directory.take()
-        {
-            let _ = directory.remove_open_dir_all();
+        if self.active {
+            drop(self.identity.take());
+            if let Some(directory) = self.directory.take() {
+                let _ = directory.remove_open_dir_all();
+            }
         }
     }
 }
@@ -1428,11 +1439,8 @@ fn discover_nested_bundles(
             None
         };
         if let Some(kind) = kind {
-            let relative = path
-                .strip_prefix(app_root)
-                .map_err(|_| SignedIpaValidationError::BundleLayoutMismatch)?
-                .as_str()
-                .to_owned();
+            let relative = portable_relative_path(app_root, &path)
+                .map_err(|_| SignedIpaValidationError::BundleLayoutMismatch)?;
             bundles.push(read_bundle_identity(&path, kind, &relative)?);
             if kind == SigningTargetKind::Framework {
                 continue;
@@ -1618,11 +1626,28 @@ fn relative_evidence_path(
     extraction_root: &Utf8Path,
     path: &Utf8Path,
 ) -> Result<String, SignedIpaValidationError> {
+    portable_relative_path(extraction_root, path)
+}
+
+fn portable_relative_path(
+    root: &Utf8Path,
+    path: &Utf8Path,
+) -> Result<String, SignedIpaValidationError> {
     let relative = path
-        .strip_prefix(extraction_root)
+        .strip_prefix(root)
         .map_err(|_| SignedIpaValidationError::UnsafeIpaArchive)?;
-    validate_archive_relative_path(relative.as_str())?;
-    Ok(relative.as_str().to_owned())
+    let mut portable = String::new();
+    for component in relative.components() {
+        let Utf8Component::Normal(component) = component else {
+            return Err(SignedIpaValidationError::UnsafeIpaArchive);
+        };
+        if !portable.is_empty() {
+            portable.push('/');
+        }
+        portable.push_str(component);
+    }
+    validate_archive_relative_path(&portable)?;
+    Ok(portable)
 }
 
 fn read_sorted_directory(path: &Utf8Path) -> Result<Vec<Utf8PathBuf>, SignedIpaValidationError> {
@@ -2457,6 +2482,18 @@ mod tests {
         }
         assert!(validate_archive_relative_path("Payload/App.app/Info.plist").is_ok());
         assert!(validate_archive_relative_path("Payload/App.app/").is_ok());
+    }
+
+    #[test]
+    fn filesystem_relative_paths_use_archive_separators() {
+        let parent = tempfile::tempdir().expect("temporary parent");
+        let root = Utf8Path::from_path(parent.path()).expect("UTF-8 parent");
+        let nested = root.join("Payload/App.app/PlugIns/Share.appex");
+
+        assert_eq!(
+            portable_relative_path(root, &nested),
+            Ok("Payload/App.app/PlugIns/Share.appex".to_owned())
+        );
     }
 
     #[test]
