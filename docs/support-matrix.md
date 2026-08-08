@@ -12,6 +12,37 @@ This matrix deliberately separates validation levels. “Model tested” means h
 | Simulator/emulator validated | Behavior was observed in a simulator/emulator |
 | Device validated | Behavior was observed on physical hardware |
 
+## Goal 3 physical-iPhone scenarios
+
+These are the 18 scenarios named by the Goal 3 acceptance specification. A status applies only to
+the evidence in the last column; for example, the validated GitHub result is an unsigned
+XCArchive, not a signed IPA or a physical-device run.
+
+Status legend: ✅ artifact validated; 📱 physical-device validated; 🧪 implemented with hardware or
+signing validation pending; 🟡 partial; 🚫 unsupported; 📋 planned. No current Goal 3 scenario has
+physical-device validation.
+
+| Scenario | Status | Exact evidence / limitation |
+| --- | --- | --- |
+| iOS Simulator local macOS | ✅ artifact validated | arm64 `.app` and `.appex` bundles built and independently inspected; no Simulator runtime observation |
+| Physical iPhone local macOS | 🧪 implemented, hardware/signing validation pending | Official local Xcode development-signing/install/launch path exists; no real Team, profile, signed device artifact, or attached iPhone |
+| Physical iPhone from Windows via GitHub | 🟡 partial | Cross-platform client and Windows CI coverage exist; no live Windows-to-GitHub physical-iPhone build/download run |
+| Physical iPhone from Linux via GitHub | ✅ artifact validated | Linux acceptance `31261962599` triggered macOS worker `31262066567`, downloaded, hashed, and inspected an unsigned physical-device XCArchive |
+| Physical iPhone via SSH Mac | 🧪 implemented, hardware/signing validation pending | Named endpoint and unsigned snapshot session are locally tested; no live SSH Mac compile, SSH artifact, or signing support |
+| Unsigned device compile | ✅ artifact validated | Real `aarch64-apple-ios`/`iphoneos` XCArchive built by the GitHub macOS worker and independently revalidated on Linux |
+| Development signing | 🧪 implemented, hardware/signing validation pending | Signing engine and protected GitHub phase use synthetic fixtures only; no real Apple identity/profile run |
+| Manual development signing | 🧪 implemented, hardware/signing validation pending | Manual asset validation and protected secret setup exist for one application profile; no real assets were uploaded |
+| Personal Team | 🚫 unsupported | GitHub, SSH, and worker capability reports disable Personal Team; no headless Personal Team flow exists |
+| Widget device signing | 🚫 unsupported | The current one-profile remote setup rejects extension target graphs; Simulator Widget artifacts are separate evidence |
+| Live Activity device signing | 🚫 unsupported | The current one-profile remote setup rejects extension target graphs; Simulator Activity artifacts are separate evidence |
+| GitHub Actions provider | ✅ artifact validated | Exact-revision unsigned build, download, digest check, archive inspection, and cleanup accepted; signed phase remains unvalidated |
+| SSH provider | 🧪 implemented, hardware/signing validation pending | Handshake, doctor, source upload, events, cancel, XCArchive receipt, and cleanup pass deterministic tests; v1 is unsigned-only |
+| Windows client artifact download | 🧪 implemented, hardware/signing validation pending | Download/verification/publication code is cross-platform; no live Windows client acceptance run |
+| Linux client artifact download | ✅ artifact validated | Acceptance `31261962599` automatically downloaded and independently verified artifact `9023136948` |
+| Physical install | 🧪 implemented, hardware/signing validation pending | Typed devicectl install service exists; no signed downloaded IPA or attached-device install was exercised |
+| Physical launch | 🧪 implemented, hardware/signing validation pending | Typed devicectl launch service exists; no physical launch was exercised |
+| Physical logs | 🚫 unsupported | Standalone physical-iOS log streaming is not exposed; no device runtime logs were collected |
+
 ## Platform build paths
 
 | Path | Implemented | Compile | Artifact | Simulator/emulator | Device |
@@ -20,7 +51,9 @@ This matrix deliberately separates validation levels. “Model tested” means h
 | Android direct APK | Build plus typed devices/install/run/logs implemented | arm64 generated Rust app plus Java/DEX bridge | Public-CLI starter and Kitchen Sink APKs independently inspected | Deployment runtime not validated | Deployment runtime not validated |
 | iOS Simulator `.app` | Build plus typed devices/install/run/logs implemented | arm64 Slint executables | Public-CLI starter and Kitchen Sink `.app`/`.appex` bundles independently inspected | Deployment runtime not validated | N/A |
 | iOS physical-device app, local Mac | Official development-signing build/install/run implemented; explicit Team and provisioning controls | Deterministic arm64/Xcode plan tested; no local signing identity available | Signed app not validated | N/A | Not validated |
-| iOS physical-device archive, remote macOS | Exact-revision GitHub submission, trusted macOS compile, automatic download, and independent client validation implemented | Real `aarch64-apple-ios` archive compiled from a Linux client request | Unsigned `.xcarchive` validated; development-signed IPA pending real credentials/private execution setup | N/A | Not validated |
+| iOS physical-device archive, GitHub remote macOS | Exact-revision GitHub submission, trusted macOS compile, automatic download, and independent client validation implemented | Real `aarch64-apple-ios` archive compiled from a Linux client request | Unsigned `.xcarchive` validated; development-signed IPA pending real credentials/private execution setup | N/A | Not validated |
+| Deterministic snapshot transport | Inspect/create/verify CLI implemented with bounded source selection, no-clobber publication, and strict extraction | Host tests only | Source ZIP and descriptor round-trip validated in tests | N/A | N/A |
+| SSH Mac provider | Pinned endpoint, handshake/doctor, snapshot-v1 unsigned build, and private Unix/Windows config/operation staging implemented; deterministic local tests only | No live SSH Mac compile | No SSH-produced artifact; protocol returns unsigned XCArchive only | N/A | Not validated |
 
 ## Capability evidence
 

@@ -413,6 +413,7 @@ version = "4.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7281235d6e96d3544ca18bba9049be92f4190f8d923e3caef1b5f66cfa752608"
 dependencies = [
+ "camino",
  "cap-primitives",
  "io-extras",
  "io-lifetimes 3.0.1",
@@ -426,8 +427,10 @@ dependencies = [
  "assert_cmd",
  "base64",
  "camino",
+ "cap-std",
  "clap",
  "clap_complete",
+ "directories",
  "fs2",
  "keyring",
  "libc",
@@ -440,6 +443,7 @@ dependencies = [
  "rustferry-core",
  "rustferry-github",
  "rustferry-remote",
+ "rustferry-ssh",
  "same-file",
  "schemars",
  "semver",
@@ -2013,6 +2017,25 @@ dependencies = [
  "url",
  "uuid",
  "zip 6.0.0",
+]
+
+[[package]]
+name = "rustferry-ssh"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "camino",
+ "libc",
+ "rustferry-core",
+ "rustferry-remote",
+ "same-file",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.20",
+ "uuid",
 ]
 
 [[package]]

@@ -1,9 +1,10 @@
 # Publish Rust crates
 
-RustFerry contains eight publishable crates with one workspace version. They must be published in dependency order:
+RustFerry contains 10 workspace members: nine publishable crates with one workspace version plus the
+non-publishable macOS worker. Publishable crates must be published in dependency order:
 
 1. `rustferry-core`, `rustferry`, and `rustferry-remote`;
-2. `rustferry-codegen`;
+2. `rustferry-codegen` and `rustferry-ssh`;
 3. `rustferry-apple`, `rustferry-android`, and `rustferry-github`;
 4. `cargo-ferry`.
 

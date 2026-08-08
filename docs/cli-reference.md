@@ -23,10 +23,17 @@ Commands work as a Cargo subcommand (`cargo ferry ...`) or direct binary (`cargo
 | `build android` | Build-only Android request; platform readiness and validation level are in [STATUS](STATUS.md) |
 | `build ios --simulator` | Build-only Simulator request; no automatic boot/install/launch |
 | `build ios --device --team <id>` | Implemented official arm64/Xcode development-signing build; provisioning updates remain explicit; no identity, Team, profile, or signed artifact was available for artifact validation, and no device was available for device validation |
-| `build iphone --remote github --unsigned` | Submit an exact source revision to the configured GitHub macOS worker, then rehash, inspect, and atomically publish the downloaded unsigned physical-device archive |
-| `build iphone --remote github --team <id>` | Request protected remote Apple Development signing; implemented and synthetically tested, but no real signed IPA acceptance has run |
+| `build ios --device` | Uses GitHub automatically on Linux/Windows; remains local by default on macOS; an explicit `--remote` always wins |
+| `build iphone --unsigned` | Remote-only alias; defaults to GitHub when `--remote` is omitted, submits an exact source revision, then rehashes, inspects, and atomically publishes the downloaded unsigned physical-device archive |
+| `build iphone --team <id>` | Defaults to protected GitHub Apple Development signing when `--remote` is omitted; implemented and synthetically tested, but no real signed IPA acceptance has run |
 | `remote setup github` | Validate source/execution Git remote identities, generate the trusted workflow, and persist ignored provider metadata; signing requires a distinct private execution repository |
 | `remote doctor github` | Read-only provider, repository, workflow, and signed-readiness checks |
+| `remote add ssh-mac <name>` | Persist a create-only named endpoint after validating an exact dedicated `known_hosts` entry, pinned host-key fingerprint, and optional private-key path reference |
+| `remote doctor <name>` | Run the fixed-command SSH worker handshake and host doctor; readiness requires snapshot/unsigned/XCArchive/events/cancellation/download/cleanup and retention zero, but is not live-build evidence |
+| `build iphone --remote <name> --unsigned` | Create a deterministic snapshot, use fixed SSH session v1, stream ordered events, independently verify and create-only publish the unsigned XCArchive, acknowledge it, then require non-retaining cleanup |
+| `remote bundle inspect` | Print the deterministic snapshot manifest, path dependencies, rejected-symlink set, excluded sensitive roots, sizes, executable bits, and SHA-256 digests |
+| `remote bundle create` | Create a no-clobber deterministic source ZIP and separate versioned descriptor; global `--dry-run` writes neither |
+| `remote bundle verify` | Treat ZIP and descriptor as untrusted, perform bounded extraction, and require exact manifest/archive integrity |
 | `devices [--platform all\|android\|ios]` | Typed ADB/simctl/devicectl inventory; `--watch --json-stream` emits the initial snapshot followed by polling deltas until cancelled |
 | `install android\|ios` | Build, independently validate, select an exact compatible device, then install |
 | `run android\|ios` | Build → validate → install → launch; `--logs` adds one bounded filtered snapshot where standalone logging is supported |
@@ -56,6 +63,12 @@ Device watch mode requires `--json-stream`. It emits the current devices and war
 `logs` without `--json-stream` collects a finite snapshot using `--since-seconds`, `--max-entries`, `--max-bytes`, and `--level`. `--json-stream` selects continuous, application-filtered Android or iOS Simulator logging and emits protocol events incrementally. Standalone physical-iOS `logs` is currently unsupported; CoreDevice console attachment is not exposed as this command.
 
 `build` never discovers, boots, installs on, or launches a device. Those side effects exist only behind the explicit deployment commands. Android reinstall/downgrade/permission grant/data clear, Simulator boot, process termination, and Xcode provisioning updates are opt-in.
+
+SSH snapshot v1 is unsigned-only. A signed request or `--team` fails explicitly; it is never
+downgraded. Named SSH endpoints are always selected explicitly; omission never falls back from
+GitHub to a configured SSH endpoint. The returned XCArchive ZIP is not an IPA and is not installable
+on a stock iPhone. Unsigned remote archives are published at
+`target/ferry/ios/device/<debug|release>/<Product>-unsigned.xcarchive.zip`.
 
 ## JSON failures
 

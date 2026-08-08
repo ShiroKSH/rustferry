@@ -13,6 +13,7 @@ mod new;
 pub(crate) mod platform_build;
 mod remote;
 mod signing;
+mod ssh_remote;
 
 use crate::cli::Command;
 use crate::error::CliError;

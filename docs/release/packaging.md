@@ -1,7 +1,7 @@
 # Rust package readiness
 
-RustFerry has eight publishable crates. All versions come from
-`workspace.package`; a release must keep them identical.
+RustFerry has 10 workspace members: nine publishable crates and one non-publishable trusted worker.
+All publishable versions come from `workspace.package`; a release must keep them identical.
 
 | Order | Package | Role | Internal prerequisites |
 | --- | --- | --- | --- |
@@ -9,10 +9,11 @@ RustFerry has eight publishable crates. All versions come from
 | 1 | `rustferry` | Application runtime API | None |
 | 1 | `rustferry-remote` | Remote-build protocol, source, signing, and artifact contracts | None |
 | 2 | `rustferry-codegen` | Project, capability, and asset generation | `rustferry-core` |
+| 2 | `rustferry-ssh` | Pinned OpenSSH transport for macOS workers | `rustferry-core`, `rustferry-remote` |
 | 3 | `rustferry-apple` | Apple generation and artifact backend | `rustferry-core`, `rustferry-codegen`, `rustferry-remote` |
 | 3 | `rustferry-android` | Direct Android packaging backend | `rustferry-core`, `rustferry-codegen` |
 | 3 | `rustferry-github` | GitHub transport and workflow provider | `rustferry-core`, `rustferry-remote` |
-| 4 | `cargo-ferry` | Public CLI | Runtime, backend, core, codegen, remote, and GitHub crates |
+| 4 | `cargo-ferry` | Public CLI | Runtime, backend, core, codegen, remote, GitHub, and SSH crates |
 
 Wait for each prerequisite version to appear in the registry index before
 publishing the next group. The automated release workflow never publishes to
@@ -70,7 +71,7 @@ find target/package -maxdepth 1 -name '*.crate' -print | sort
 for archive in target/package/*.crate; do tar -tzf "$archive"; done
 ```
 
-The manual draft-release workflow copies all eight `.crate` files into one
+The manual draft-release workflow copies all nine `.crate` files into one
 release assembly, adds the schema, VSIX, license bundle, release notes, and
 SHA-256 checksums, then uploads that assembly as a workflow artifact.
 
@@ -78,8 +79,10 @@ For the pre-remote 2026-08-01 local candidate, archive/source/handshake
 validation passed for the then-current 6/6 publishable crates, the package
 Python suite passed 19/19, and the release contract confirmed 17/17 exact
 internal dependency edges. The largest archive was 152.9 KiB. Those results are
-historical; the expanded eight-crate release surface requires a fresh package,
-source, license, and publish dry-run before release. No crate was published.
+historical; the expanded nine-crate release surface requires a fresh package,
+source, license, and publish dry-run before release. Its current release-contract check covers all
+28 internal dependency edges, but that does not replace archive or registry dry-runs. No crate was
+published.
 
 ## Publish procedure
 

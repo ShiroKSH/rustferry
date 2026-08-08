@@ -18,6 +18,37 @@ versions match. Different major versions fail before source transfer. A protocol
 UTF-8 text only; every identifier, path, source manifest, signing plan, and event is validated again
 by the receiving boundary.
 
+## SSH snapshot session v1
+
+Handshake and doctor use strict JSON stdio envelopes. An unsigned SSH build then invokes only
+`ferry-worker-macos serve --stdio-session-v1` and switches to a full-duplex framed stream. Each
+24-byte big-endian header contains `RFDP`, schema `1`, a typed frame kind, a per-direction sequence,
+and the exact following payload length. Sequences start at zero and reject gaps, duplicates,
+replay, and exhaustion.
+
+The client sends `BuildRequest`, `SourceDescriptor`, and streamed `SourceArchive` frames. The worker
+returns `JobAccepted`, zero or more ordered `Event` frames, one `ArtifactDescriptor`, and the
+streamed `Artifact`. Only after the client has rehashed, safely extracted, independently inspected,
+durably published, and rebound the returned unsigned XCArchive does it send `ArtifactReceipt`.
+The worker then removes the exact capability-bound job root and returns `Complete` with
+non-retention cleanup proof. `Error` is terminal; `Cancel` is valid only at a clean client frame
+boundary. Disconnect, cancellation, timeout, malformed order, identity mismatch, or missing receipt
+cannot become success.
+
+JSON requests are limited to 1 MiB, snapshot descriptors to 8 MiB, control frames to 64 KiB,
+events to the protocol event-line bound, source ZIPs to 640 MiB, and sealed XCArchive ZIPs to 2 GiB.
+Large source and artifact payloads are copied with fixed memory. Bootstrap input has both total and
+inactivity deadlines; the complete OpenSSH build session also has a finite deadline and bounded
+process cleanup.
+
+Snapshot session v1 accepts only `snapshot` source mode, `unsigned-compile-only` signing, and exactly
+one XCArchive artifact. It carries no signing key, password, provisioning profile, IPA, device
+operation, or arbitrary command.
+
+These dedicated session capabilities are negotiated only by SSH handshake/doctor. The generic
+`BuildProvider` view does not advertise snapshot submit/events/cancel/download operations that its
+generic methods do not implement; those methods return typed unsupported errors.
+
 ## Build request
 
 An iPhone request fixes:

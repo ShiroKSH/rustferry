@@ -430,8 +430,11 @@ pub struct BuildArgs {
     #[arg(long, global = true)]
     pub release: bool,
     /// Remote provider for a physical-iPhone build.
-    #[arg(long, global = true, value_enum)]
-    pub remote: Option<RemoteProviderChoice>,
+    #[arg(long, global = true, value_name = "REMOTE")]
+    pub remote: Option<BuildRemoteTarget>,
+    /// Optional absolute `RustFerry` user-config root override for a named SSH remote.
+    #[arg(long, global = true, value_name = "ABSOLUTE_PATH")]
+    pub config_dir: Option<Utf8PathBuf>,
     /// Compile a physical-iPhone archive without signing or provisioning.
     #[arg(long, global = true)]
     pub unsigned: bool,
@@ -741,12 +744,118 @@ pub struct RemoteArgs {
 /// Supported remote-provider operations.
 #[derive(Debug, Subcommand)]
 pub enum RemoteCommand {
+    /// Add a named remote build endpoint without storing private-key bytes.
+    Add(RemoteAddArgs),
     /// Authenticate, verify, and create-only install the GitHub workflow and local provider config.
     Setup(RemoteSetupArgs),
     /// Run bounded authentication, repository, workflow, and artifact-store checks.
     Doctor(RemoteDoctorArgs),
     /// Show local provider configuration and workflow integrity without mutation.
     Status(RemoteStatusArgs),
+    /// Inspect, create, or independently verify a deterministic source snapshot.
+    Bundle(RemoteBundleArgs),
+}
+
+/// Named remote endpoint command wrapper.
+#[derive(Debug, Args)]
+pub struct RemoteAddArgs {
+    /// Remote endpoint kind.
+    #[command(subcommand)]
+    pub provider: RemoteAddProvider,
+}
+
+/// Remote endpoint kinds accepted by `remote add`.
+#[derive(Debug, Subcommand)]
+pub enum RemoteAddProvider {
+    /// Add a pinned OpenSSH endpoint running `ferry-worker-macos serve --stdio`.
+    #[command(name = "ssh-mac")]
+    SshMac(RemoteAddSshMacArgs),
+}
+
+/// Trusted SSH Mac endpoint arguments.
+#[derive(Debug, Args)]
+pub struct RemoteAddSshMacArgs {
+    /// Stable endpoint name used by later commands.
+    pub name: String,
+    /// Exact DNS name or IP address present in the dedicated known-hosts entry.
+    #[arg(long)]
+    pub host: String,
+    /// Remote login user.
+    #[arg(long)]
+    pub user: String,
+    /// Remote SSH port.
+    #[arg(long, default_value_t = 22)]
+    pub port: u16,
+    /// Absolute dedicated known-hosts file containing exactly this endpoint key.
+    #[arg(long)]
+    pub known_hosts: Utf8PathBuf,
+    /// Canonical pinned OpenSSH host-key fingerprint (`SHA256:` plus unpadded base64).
+    #[arg(long)]
+    pub host_key_sha256: String,
+    /// Optional absolute private-key path reference; key bytes are never stored.
+    #[arg(long)]
+    pub identity_file: Option<Utf8PathBuf>,
+    /// Optional absolute `RustFerry` user-config root override.
+    #[arg(long)]
+    pub config_dir: Option<Utf8PathBuf>,
+}
+
+/// Deterministic source-bundle command wrapper.
+#[derive(Debug, Args)]
+pub struct RemoteBundleArgs {
+    /// Source-bundle operation.
+    #[command(subcommand)]
+    pub command: RemoteBundleCommand,
+}
+
+/// Supported deterministic source-bundle operations.
+#[derive(Debug, Subcommand)]
+pub enum RemoteBundleCommand {
+    /// Show the exact allowlisted files, sizes, modes, and SHA-256 digests.
+    Inspect(RemoteBundleInspectArgs),
+    /// Create a deterministic ZIP plus its separately verified descriptor.
+    Create(RemoteBundleCreateArgs),
+    /// Verify an untrusted ZIP against its descriptor using bounded extraction.
+    Verify(RemoteBundleVerifyArgs),
+}
+
+/// Source selection shared by inspection and creation.
+#[derive(Debug, Args)]
+pub struct RemoteBundleInspectArgs {
+    /// Project root or a child directory.
+    #[arg(long, visible_alias = "project")]
+    pub project_dir: Option<Utf8PathBuf>,
+    /// Workspace-relative file whose executable bit must be preserved on hosts without Unix modes.
+    #[arg(long, value_name = "WORKSPACE_PATH")]
+    pub executable: Vec<Utf8PathBuf>,
+}
+
+/// Deterministic source-bundle creation arguments.
+#[derive(Debug, Args)]
+pub struct RemoteBundleCreateArgs {
+    /// New ZIP path outside the selected Cargo workspace; existing files are never overwritten.
+    #[arg(long)]
+    pub output: Utf8PathBuf,
+    /// New descriptor path outside the workspace; defaults to `<output>.manifest.json`.
+    #[arg(long)]
+    pub descriptor: Option<Utf8PathBuf>,
+    /// Project root or a child directory.
+    #[arg(long, visible_alias = "project")]
+    pub project_dir: Option<Utf8PathBuf>,
+    /// Workspace-relative file whose executable bit must be preserved on hosts without Unix modes.
+    #[arg(long, value_name = "WORKSPACE_PATH")]
+    pub executable: Vec<Utf8PathBuf>,
+}
+
+/// Deterministic source-bundle verification arguments.
+#[derive(Debug, Args)]
+pub struct RemoteBundleVerifyArgs {
+    /// Untrusted source ZIP to verify.
+    #[arg(long)]
+    pub archive: Utf8PathBuf,
+    /// JSON descriptor created alongside the ZIP.
+    #[arg(long)]
+    pub descriptor: Utf8PathBuf,
 }
 
 /// Remote providers implemented by this CLI surface.
@@ -754,6 +863,28 @@ pub enum RemoteCommand {
 pub enum RemoteProviderChoice {
     /// GitHub Actions on a GitHub-hosted macOS runner.
     Github,
+}
+
+/// Built-in or named remote selected only by physical-iPhone build commands.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BuildRemoteTarget {
+    /// GitHub Actions on a GitHub-hosted macOS runner.
+    Github,
+    /// A configured named OpenSSH Mac endpoint.
+    SshMac(rustferry_ssh::SshRemoteName),
+}
+
+impl std::str::FromStr for BuildRemoteTarget {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value == "github" {
+            return Ok(Self::Github);
+        }
+        rustferry_ssh::SshRemoteName::new(value)
+            .map(Self::SshMac)
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// Signing-setup mode wrapper.
@@ -838,15 +969,17 @@ pub struct RemoteSetupArgs {
     pub preview: bool,
 }
 
-/// GitHub provider doctor arguments.
+/// Remote provider or named-endpoint doctor arguments.
 #[derive(Debug, Args)]
 pub struct RemoteDoctorArgs {
-    /// Provider to inspect.
-    #[arg(value_enum)]
-    pub provider: RemoteProviderChoice,
+    /// Built-in provider (`github`) or configured endpoint name.
+    pub target: String,
     /// Project root or a child directory.
     #[arg(long, visible_alias = "project")]
     pub project_dir: Option<Utf8PathBuf>,
+    /// Optional absolute `RustFerry` user-config root override for named endpoints.
+    #[arg(long)]
+    pub config_dir: Option<Utf8PathBuf>,
 }
 
 /// GitHub provider status arguments.
@@ -938,8 +1071,8 @@ mod tests {
     use clap::Parser as _;
 
     use super::{
-        BuildPlatform, Cli, Command, RemoteCommand, RemoteProviderChoice, SigningCommand,
-        SigningSetupMode,
+        BuildPlatform, BuildRemoteTarget, Cli, Command, RemoteBundleCommand, RemoteCommand,
+        RemoteProviderChoice, SigningCommand, SigningSetupMode,
     };
 
     #[test]
@@ -957,7 +1090,7 @@ mod tests {
             panic!("expected build command");
         };
         assert!(matches!(iphone.platform, BuildPlatform::Iphone(_)));
-        assert_eq!(iphone.remote, Some(RemoteProviderChoice::Github));
+        assert_eq!(iphone.remote, Some(BuildRemoteTarget::Github));
         assert!(iphone.unsigned);
 
         let ios = Cli::try_parse_from([
@@ -973,7 +1106,43 @@ mod tests {
             panic!("expected build command");
         };
         assert!(matches!(ios.platform, BuildPlatform::Ios(_)));
-        assert_eq!(ios.remote, Some(RemoteProviderChoice::Github));
+        assert_eq!(ios.remote, Some(BuildRemoteTarget::Github));
+    }
+
+    #[test]
+    fn build_remote_accepts_validated_named_ssh_endpoints_and_config_roots() {
+        let parsed = Cli::try_parse_from([
+            "cargo-ferry",
+            "build",
+            "iphone",
+            "--remote",
+            "office-mac",
+            "--config-dir",
+            "/tmp/rustferry-config",
+        ])
+        .expect("named SSH build grammar");
+        let Command::Build(arguments) = parsed.command else {
+            panic!("expected build command");
+        };
+        let Some(BuildRemoteTarget::SshMac(name)) = arguments.remote else {
+            panic!("expected named SSH build target");
+        };
+        assert_eq!(name.as_str(), "office-mac");
+        assert_eq!(
+            arguments.config_dir,
+            Some(Utf8PathBuf::from("/tmp/rustferry-config"))
+        );
+
+        assert!(
+            Cli::try_parse_from([
+                "cargo-ferry",
+                "build",
+                "iphone",
+                "--remote",
+                "../office-mac",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -996,6 +1165,113 @@ mod tests {
                 RemoteCommand::Setup(_) | RemoteCommand::Doctor(_) | RemoteCommand::Status(_)
             ));
         }
+    }
+
+    #[test]
+    fn ssh_remote_add_and_named_doctor_grammars_are_explicit() {
+        let parsed = Cli::try_parse_from([
+            "cargo-ferry",
+            "remote",
+            "add",
+            "ssh-mac",
+            "office-mac",
+            "--host",
+            "builder.example",
+            "--user",
+            "builder",
+            "--known-hosts",
+            "/tmp/rustferry-known-hosts",
+            "--host-key-sha256",
+            "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "--identity-file",
+            "/tmp/rustferry-identity",
+            "--config-dir",
+            "/tmp/rustferry-config",
+        ])
+        .expect("SSH endpoint grammar");
+        let Command::Remote(remote) = parsed.command else {
+            panic!("expected remote command");
+        };
+        let RemoteCommand::Add(add) = remote.command else {
+            panic!("expected remote add command");
+        };
+        let super::RemoteAddProvider::SshMac(arguments) = add.provider;
+        assert_eq!(arguments.name, "office-mac");
+        assert_eq!(arguments.host, "builder.example");
+        assert_eq!(arguments.user, "builder");
+        assert_eq!(arguments.port, 22);
+
+        let parsed = Cli::try_parse_from([
+            "cargo-ferry",
+            "remote",
+            "doctor",
+            "office-mac",
+            "--config-dir",
+            "/tmp/rustferry-config",
+        ])
+        .expect("named SSH doctor grammar");
+        let Command::Remote(remote) = parsed.command else {
+            panic!("expected remote command");
+        };
+        let RemoteCommand::Doctor(arguments) = remote.command else {
+            panic!("expected remote doctor command");
+        };
+        assert_eq!(arguments.target, "office-mac");
+    }
+
+    #[test]
+    fn source_bundle_grammar_requires_explicit_create_and_verify_paths() {
+        let inspect = Cli::try_parse_from([
+            "cargo-ferry",
+            "remote",
+            "bundle",
+            "inspect",
+            "--project",
+            "weather",
+        ])
+        .expect("source bundle inspect grammar");
+        let Command::Remote(inspect) = inspect.command else {
+            panic!("expected remote command");
+        };
+        assert!(matches!(
+            inspect.command,
+            RemoteCommand::Bundle(super::RemoteBundleArgs {
+                command: RemoteBundleCommand::Inspect(_)
+            })
+        ));
+
+        Cli::try_parse_from([
+            "cargo-ferry",
+            "remote",
+            "bundle",
+            "create",
+            "--output",
+            "source.zip",
+        ])
+        .expect("source bundle create grammar");
+        Cli::try_parse_from([
+            "cargo-ferry",
+            "remote",
+            "bundle",
+            "verify",
+            "--archive",
+            "source.zip",
+            "--descriptor",
+            "source.zip.manifest.json",
+        ])
+        .expect("source bundle verify grammar");
+        assert!(Cli::try_parse_from(["cargo-ferry", "remote", "bundle", "create"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "cargo-ferry",
+                "remote",
+                "bundle",
+                "verify",
+                "--archive",
+                "source.zip",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
