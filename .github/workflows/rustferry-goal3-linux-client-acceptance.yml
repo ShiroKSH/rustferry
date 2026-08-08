@@ -3,7 +3,7 @@ name: RustFerry Goal 3 Linux client acceptance
 on:
   push:
     branches:
-      - 'goal3/macless-iphone-builds'
+      - 'goal3/integrate-goal2'
     paths:
       - '.github/workflows/rustferry-goal3-linux-client-acceptance.yml'
       - '.github/workflows/rustferry-goal3-iphone.yml'
@@ -37,7 +37,7 @@ jobs:
       CARGO_TERM_COLOR: 'never'
       RUST_BACKTRACE: '0'
       RUSTUP_TOOLCHAIN: '1.92.0'
-      RUSTFERRY_WORKER_REVISION: 'a6cc1ff867b03bc8fd66b8c6af7f1b0f7ca000c9'
+      RUSTFERRY_WORKER_REVISION: '797c1e3eeae9af167623ef8d4dd1d43cdb86ddaa'
     steps:
       - name: Checkout exact acceptance source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -117,7 +117,7 @@ jobs:
             --execution-repository ShiroKSH/rustferry \
             --source-remote-name origin \
             --execution-remote-name origin \
-            --trusted-ref refs/heads/goal3/macless-iphone-builds \
+            --trusted-ref refs/heads/goal3/integrate-goal2 \
             --worker-repository https://github.com/ShiroKSH/rustferry \
             --worker-revision "$RUSTFERRY_WORKER_REVISION" \
             --worker-version 0.1.0 \
