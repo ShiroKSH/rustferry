@@ -28,6 +28,9 @@ use crate::signing::{SigningMode, SigningStatus};
 
 /// Current artifact-manifest schema.
 pub const ARTIFACT_MANIFEST_SCHEMA_VERSION: u32 = 1;
+/// Exact secret-free success log emitted after protected signing cleanup.
+pub const PROTECTED_SIGNING_SANITIZED_LOG_V1: &[u8] =
+    b"RustFerry protected manual-development signing, IPA export, validation, and signing-material cleanup completed.\n";
 
 const MAX_IPA_ENTRIES: usize = 50_000;
 const MAX_IPA_ENTRY_NAME: usize = 4_096;

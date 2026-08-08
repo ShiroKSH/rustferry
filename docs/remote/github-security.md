@@ -167,8 +167,10 @@ workspace, and private workspace. A missing cleanup proof prevents success.
 GitHub's successful conclusion is insufficient. The client selects artifact names by exact run ID
 and attempt, verifies GitHub metadata size/digest before writing, validates the sealed phase-A
 handoff, and binds the final report to the submitted request and sealed archive digests. Final ZIP
-ingestion accepts only the IPA, artifact manifest, signing report, and validation report. It rejects
-links, traversal, collisions, expansion bombs, unexpected files, identity drift, and existing output.
+ingestion accepts only the IPA, artifact manifest, signing report, validation report, and sanitized
+protected-signing log. The log is manifest-bound and plain-text validated; compile-phase output is
+not substituted for it. Ingestion rejects links, traversal, collisions, expansion bombs, unexpected
+files, identity drift, and existing output.
 
 Verification uses a newly created operation directory beneath a private cache root. Any error removes
 that exact directory. A successful in-process cache retains only the verified downloadable files;

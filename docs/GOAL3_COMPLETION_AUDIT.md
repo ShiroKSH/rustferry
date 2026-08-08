@@ -40,7 +40,7 @@ historical full-workspace and cross-platform CI results below remain separate ev
 | 6 | Compile Rust for `aarch64-apple-ios` | Proven | Live unsigned worker run `31262066567`; toolchain and target checks in `crates/rustferry-worker-macos/src/host.rs`; build pipeline in `crates/rustferry-worker-macos/src/pipeline.rs`. |
 | 7 | Build a real `iphoneos` application bundle | Proven | Live unsigned `.xcarchive` path from runs `31261962599` / `31262066567`; validation recorded in `docs/GOAL3_STATUS.md`; pipeline in `crates/rustferry-worker-macos/src/pipeline.rs`. |
 | 8 | Produce a correctly signed `.app` | Implemented-unproven | Signing/keychain/provisioning pipeline exists in `crates/rustferry-worker-macos/src/keychain.rs`, `provisioning.rs`, and `pipeline.rs`; only synthetic evidence is recorded in `docs/GOAL3_STATUS.md`. |
-| 9 | Produce a correctly signed `.xcarchive` | Implemented-unproven | Archive/signing implementation in `crates/rustferry-worker-macos/src/pipeline.rs`; live accepted archive is unsigned. |
+| 9 | Produce a correctly signed `.xcarchive` | Missing | Phase B exports and validates an IPA from the unsigned handoff but does not publish a signed XCArchive; `--artifact all` is also absent. |
 | 10 | Export a signed `.ipa` | Implemented-unproven | Export implementation in `crates/rustferry-worker-macos/src/export.rs`; `docs/GOAL3_STATUS.md` states real IPA export remains unvalidated. |
 | 11 | Validate certificate identity and requested Apple Team ID | Implemented-unproven | Typed plans in `crates/rustferry-remote/src/signing.rs`; validation in worker signing/provisioning modules; no real certificate/account run. |
 | 12 | Validate provisioning profile against bundle, team, certificate, and device | Implemented-unproven | `crates/rustferry-worker-macos/src/provisioning.rs`; synthetic fixtures only. |
@@ -100,9 +100,9 @@ historical full-workspace and cross-platform CI results below remain separate ev
 | 12 | Every target embeds its matching provisioning profile | Implemented-unproven | Per-target loop in `crates/rustferry-worker-macos/src/pipeline.rs` and `provisioning.rs`; bounded named transport supplies the exact profile set in synthetic tests, but no real signed artifact exists. |
 | 13 | Frameworks and extensions are signed before the containing app | Implemented-unproven | Ordering in remote signing model and worker pipeline; synthetic proof only. |
 | 14 | Final signatures and entitlements are independently verified | Implemented-unproven | Worker signing/export validation code and artifact validation report; no real signed output. |
-| 15 | `.xcarchive` structure and metadata are valid | Implemented-unproven | Unsigned archive is live-proven; signed archive path exists in worker pipeline but lacks signed live proof. |
+| 15 | `.xcarchive` structure and metadata are valid | Missing | Unsigned archive structure is live-proven, but no signed XCArchive producer, transport, or live artifact exists. |
 | 16 | Export options are derived from validated manual-signing inputs | Implemented-unproven | `crates/rustferry-worker-macos/src/export.rs`; no real account/profile export. |
-| 17 | IPA, archive, manifest, validation report, and sanitized log are returned | Missing | The signed workflow and download set cover the IPA and reports, but omit the signed XCArchive and sanitized log required by this criterion; no live signed artifact set exists. |
+| 17 | IPA, archive, manifest, validation report, and sanitized log are returned | Missing | The default IPA, manifest, validation report, and protected-phase sanitized log now form a locally tested exact transport; signed XCArchive selection via `--artifact all`, dSYM selection, and live signed evidence remain absent. |
 | 18 | IPA installs, launches, and runs on the registered physical device | Missing | No real signed IPA artifact, device-install run, launch run, or runtime-log run; `docs/GOAL3_STATUS.md` and `docs/support-matrix.md`. |
 
 ## SSH Mac provider: 13 criteria

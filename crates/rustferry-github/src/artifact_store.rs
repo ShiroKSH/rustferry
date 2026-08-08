@@ -37,8 +37,8 @@ use zip::{CompressionMethod, ZipArchive, read::ZipFile};
 use crate::{
     artifact::{
         ARTIFACT_MANIFEST_NAME, DEVELOPMENT_IPA_NAME, GithubArtifactError,
-        GithubArtifactExpectation, GithubArtifactIngestion, SIGNING_REPORT_NAME,
-        VALIDATION_REPORT_NAME, ingest_github_actions_artifact,
+        GithubArtifactExpectation, GithubArtifactIngestion, SANITIZED_BUILD_LOG_NAME,
+        SIGNING_REPORT_NAME, VALIDATION_REPORT_NAME, ingest_github_actions_artifact,
     },
     provider::{GITHUB_PROVIDER_ID, GithubArtifactContext, VerifiedArtifactStore},
     strict_json,
@@ -62,7 +62,6 @@ const FINAL_ARTIFACT_PREFIX: &str = "rustferry-iphone";
 const UNSIGNED_ARTIFACT_ID: &str = "unsigned-xcarchive";
 const MANIFEST_ARTIFACT_ID: &str = "artifact-manifest";
 const SANITIZED_BUILD_LOG_ID: &str = "sanitized-build-log";
-const SANITIZED_BUILD_LOG_NAME: &str = "sanitized-build-log.txt";
 const UNSIGNED_ROOT_ENTRY_COUNT: usize = 4;
 const MAX_UNSIGNED_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_HANDOFF_JSON_BYTES: u64 = 4 * 1024 * 1024;
@@ -320,7 +319,7 @@ impl<R: GhRunner + Send> GithubVerifiedArtifactStore<R> {
                 expected: &expected,
                 ipa_expectation: &ipa_expectation,
             })?;
-            signed_verified_run(published, verified_unsigned.sanitized_log)
+            signed_verified_run(published)
         })();
         match verification {
             Ok(verified) => {
@@ -611,7 +610,9 @@ fn verify_unsigned_outer(
     if inspection != handoff.compile.archive_inspection {
         return Err(GithubArtifactStoreError::HandoffBindingMismatch);
     }
-    let sanitized_log_path = verified_directory.join(SANITIZED_BUILD_LOG_NAME);
+    // Keep phase-A evidence under its source name so phase B can publish its own
+    // no-clobber sanitized build log into the same verified directory.
+    let sanitized_log_path = compile_log_cache_path(verified_directory);
     write_private_file(&sanitized_log_path, &log_bytes)?;
     let sanitized_log = CachedArtifact {
         record: ArtifactRecord {
@@ -630,6 +631,10 @@ fn verify_unsigned_outer(
         archive_path: sealed_path,
         sanitized_log,
     })
+}
+
+fn compile_log_cache_path(verified_directory: &Utf8Path) -> Utf8PathBuf {
+    verified_directory.join(SANITIZED_COMPILE_LOG_NAME)
 }
 
 fn scan_unsigned_envelope(
@@ -1068,13 +1073,13 @@ fn unsigned_manifest(
 
 fn signed_verified_run(
     published: crate::artifact::PublishedGithubArtifact,
-    sanitized_log: CachedArtifact,
 ) -> Result<VerifiedRunContents, GithubArtifactStoreError> {
     let crate::artifact::PublishedGithubArtifact {
         ipa_path,
         manifest_path,
         signing_report_path,
         validation_report_path,
+        sanitized_log_path,
         mut manifest,
         manifest_sha256,
         manifest_size,
@@ -1084,6 +1089,7 @@ fn signed_verified_run(
         (DEVELOPMENT_IPA_NAME, ipa_path),
         (SIGNING_REPORT_NAME, signing_report_path),
         (VALIDATION_REPORT_NAME, validation_report_path),
+        (SANITIZED_BUILD_LOG_NAME, sanitized_log_path),
     ]);
     let mut artifacts = BTreeMap::new();
     for record in &manifest.artifacts {
@@ -1119,11 +1125,7 @@ fn signed_verified_run(
         },
         path: manifest_path,
     };
-    augment_store_catalog(
-        &mut manifest,
-        &mut artifacts,
-        [sanitized_log, received_manifest],
-    )?;
+    augment_store_catalog(&mut manifest, &mut artifacts, [received_manifest])?;
     Ok(VerifiedRunContents {
         manifest,
         artifacts,
@@ -1132,10 +1134,10 @@ fn signed_verified_run(
 
 /// Add client-transport records after validating the immutable worker manifest.
 /// The received manifest cannot include its own size and digest without recursion.
-fn augment_store_catalog(
+fn augment_store_catalog<const N: usize>(
     manifest: &mut ArtifactManifest,
     artifacts: &mut BTreeMap<String, CachedArtifact>,
-    additions: [CachedArtifact; 2],
+    additions: [CachedArtifact; N],
 ) -> Result<(), GithubArtifactStoreError> {
     for artifact in additions {
         insert_catalog_artifact(artifacts, artifact)?;
@@ -2181,6 +2183,16 @@ mod tests {
             Err(GithubArtifactStoreError::InvalidDestination)
         );
         assert_eq!(fs::read(destination).unwrap(), bytes);
+    }
+
+    #[test]
+    fn compile_log_cache_path_leaves_the_signed_log_name_available() {
+        let root = TempDir::new().unwrap();
+        let root_path = canonical_temp_root(&root);
+        let compile_log = compile_log_cache_path(&root_path);
+
+        assert_eq!(compile_log.file_name(), Some(SANITIZED_COMPILE_LOG_NAME));
+        assert_ne!(compile_log, root_path.join(SANITIZED_BUILD_LOG_NAME));
     }
 
     #[test]

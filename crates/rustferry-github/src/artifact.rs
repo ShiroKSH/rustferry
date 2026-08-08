@@ -1,7 +1,7 @@
 //! Bounded ingestion of the final GitHub Actions iPhone artifact.
 //!
 //! The GitHub artifact ZIP is untrusted input. This module accepts exactly the
-//! four public files emitted by the protected signing job, validates their
+//! five public files emitted by the protected signing job, validates their
 //! cross-file integrity, independently inspects the IPA, and publishes regular
 //! files without replacing an existing destination.
 
@@ -21,9 +21,9 @@ use rustferry_remote::{
     ARTIFACT_MANIFEST_SCHEMA_VERSION, ArtifactKind, ArtifactManifest, ArtifactRecord, BuildProfile,
     COMPILE_PHASE_EVIDENCE_SCHEMA_VERSION, CleanupStatus, CompilePhaseEvidence,
     IOS_DEVICE_RUST_TARGET, IOS_DEVICE_SDK, IosDeviceBuildRequest, IpaExpectation, IpaInspection,
-    SEALED_UNSIGNED_ARCHIVE_SCHEMA_VERSION, SigningMode, SigningStatus, SigningTargetKind,
-    SourceMode, UnsignedNestedBundleKind, ValidationLevel, canonical_request_sha256, inspect_ipa,
-    verify_downloaded_file,
+    PROTECTED_SIGNING_SANITIZED_LOG_V1, SEALED_UNSIGNED_ARCHIVE_SCHEMA_VERSION, SigningMode,
+    SigningStatus, SigningTargetKind, SourceMode, UnsignedNestedBundleKind, ValidationLevel,
+    canonical_request_sha256, inspect_ipa, verify_downloaded_file,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -40,13 +40,17 @@ pub const ARTIFACT_MANIFEST_NAME: &str = "artifact-manifest.json";
 pub const SIGNING_REPORT_NAME: &str = "signing-report.json";
 /// Exact independent-validation report filename published by the protected job.
 pub const VALIDATION_REPORT_NAME: &str = "validation-report.json";
+/// Exact sanitized signing-log filename published by the protected job.
+pub const SANITIZED_BUILD_LOG_NAME: &str = "sanitized-build-log.txt";
 
-const REQUIRED_ENTRY_COUNT: usize = 4;
+const REQUIRED_ENTRY_COUNT: usize = 5;
 const MAX_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024 + 32 * 1024 * 1024;
 const MAX_IPA_BYTES: u64 = 2 * 1024 * 1024 * 1024 + 16 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_REPORT_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_TOTAL_EXPANDED_BYTES: u64 = MAX_IPA_BYTES + MAX_MANIFEST_BYTES + 2 * MAX_REPORT_BYTES;
+const MAX_SANITIZED_LOG_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_TOTAL_EXPANDED_BYTES: u64 =
+    MAX_IPA_BYTES + MAX_MANIFEST_BYTES + 2 * MAX_REPORT_BYTES + MAX_SANITIZED_LOG_BYTES;
 const MAX_COMPRESSION_RATIO: u64 = 200;
 const MAX_PUBLIC_TEXT_BYTES: usize = 255;
 const MAX_SIGNED_BUNDLES: usize = 512;
@@ -193,7 +197,7 @@ pub struct GithubArtifactIngestion<'a> {
     pub archive_path: &'a Utf8Path,
     /// Existing, empty, caller-owned directory used only for this ingestion.
     pub temporary_directory: &'a Utf8Path,
-    /// Existing caller-owned directory receiving the four validated files.
+    /// Existing caller-owned directory receiving the five validated files.
     pub output_directory: &'a Utf8Path,
     /// Exact run identity and compile-handoff digests.
     pub expected: &'a GithubArtifactExpectation,
@@ -212,6 +216,8 @@ pub struct PublishedGithubArtifact {
     pub signing_report_path: Utf8PathBuf,
     /// Atomically published independent-validation report.
     pub validation_report_path: Utf8PathBuf,
+    /// Atomically published sanitized signing and export log.
+    pub sanitized_log_path: Utf8PathBuf,
     /// Strictly decoded worker manifest.
     pub manifest: ArtifactManifest,
     /// Cross-platform inspection of the exact published IPA bytes.
@@ -235,6 +241,8 @@ pub enum RequiredArtifactFile {
     SigningReport,
     /// Independent validation report.
     ValidationReport,
+    /// Sanitized protected-signing log.
+    SanitizedLog,
 }
 
 impl RequiredArtifactFile {
@@ -242,6 +250,7 @@ impl RequiredArtifactFile {
         Self::Manifest,
         Self::SigningReport,
         Self::ValidationReport,
+        Self::SanitizedLog,
         Self::Ipa,
     ];
 
@@ -251,6 +260,7 @@ impl RequiredArtifactFile {
             Self::Manifest => ARTIFACT_MANIFEST_NAME,
             Self::SigningReport => SIGNING_REPORT_NAME,
             Self::ValidationReport => VALIDATION_REPORT_NAME,
+            Self::SanitizedLog => SANITIZED_BUILD_LOG_NAME,
         }
     }
 
@@ -259,6 +269,7 @@ impl RequiredArtifactFile {
             Self::Ipa => MAX_IPA_BYTES,
             Self::Manifest => MAX_MANIFEST_BYTES,
             Self::SigningReport | Self::ValidationReport => MAX_REPORT_BYTES,
+            Self::SanitizedLog => MAX_SANITIZED_LOG_BYTES,
         }
     }
 
@@ -268,6 +279,7 @@ impl RequiredArtifactFile {
             ARTIFACT_MANIFEST_NAME => Some(Self::Manifest),
             SIGNING_REPORT_NAME => Some(Self::SigningReport),
             VALIDATION_REPORT_NAME => Some(Self::ValidationReport),
+            SANITIZED_BUILD_LOG_NAME => Some(Self::SanitizedLog),
             _ => None,
         }
     }
@@ -292,13 +304,13 @@ pub enum GithubArtifactError {
     ArchiveTooLarge,
     /// The downloaded bytes are not a valid supported ZIP.
     InvalidArchive,
-    /// The ZIP does not contain exactly four central-directory entries.
+    /// The ZIP does not contain exactly five central-directory entries.
     InvalidEntryCount,
     /// An entry name is non-UTF-8, absolute, traversing, or otherwise unsafe.
     UnsafeEntryName,
     /// An entry uses a nested directory or wrapper root.
     NestedArchiveRoot,
-    /// An entry is not one of the four exact public outputs.
+    /// An entry is not one of the five exact public outputs.
     UnexpectedEntry,
     /// An exact ZIP entry occurs more than once.
     DuplicateEntry,
@@ -549,6 +561,12 @@ pub fn ingest_github_actions_artifact(
         entries[&RequiredArtifactFile::ValidationReport],
         RequiredArtifactFile::ValidationReport,
     )?;
+    let sanitized_log_bytes = read_bounded_entry(
+        &mut archive,
+        entries[&RequiredArtifactFile::SanitizedLog],
+        RequiredArtifactFile::SanitizedLog,
+    )?;
+    validate_sanitized_log(&sanitized_log_bytes)?;
     let signing_report =
         parse_public_report(&signing_report_bytes, RequiredArtifactFile::SigningReport)?;
     let validation_report = parse_public_report(
@@ -581,6 +599,10 @@ pub fn ingest_github_actions_artifact(
         write_new_file(
             &staged_paths[&RequiredArtifactFile::ValidationReport],
             &validation_report_bytes,
+        )?;
+        write_new_file(
+            &staged_paths[&RequiredArtifactFile::SanitizedLog],
+            &sanitized_log_bytes,
         )?;
         extract_entry_to_new_file(
             &mut archive,
@@ -630,6 +652,7 @@ pub fn ingest_github_actions_artifact(
         manifest_path: published_paths[&RequiredArtifactFile::Manifest].clone(),
         signing_report_path: published_paths[&RequiredArtifactFile::SigningReport].clone(),
         validation_report_path: published_paths[&RequiredArtifactFile::ValidationReport].clone(),
+        sanitized_log_path: published_paths[&RequiredArtifactFile::SanitizedLog].clone(),
         manifest,
         ipa_inspection,
         manifest_sha256: sha256_bytes(&manifest_bytes),
@@ -831,6 +854,15 @@ fn read_bounded_entry(
     Ok(bytes)
 }
 
+fn validate_sanitized_log(bytes: &[u8]) -> Result<(), GithubArtifactError> {
+    if bytes != PROTECTED_SIGNING_SANITIZED_LOG_V1 {
+        return Err(GithubArtifactError::InvalidPublicReport(
+            RequiredArtifactFile::SanitizedLog,
+        ));
+    }
+    Ok(())
+}
+
 fn validate_manifest<'a>(
     manifest: &'a ArtifactManifest,
     expected: &GithubArtifactExpectation,
@@ -840,7 +872,7 @@ fn validate_manifest<'a>(
     if !manifest_identity_matches(manifest, expected)
         || !manifest_build_matches(manifest, expected, ipa_expectation)
         || !manifest_signing_matches(manifest, expected)
-        || manifest.artifacts.len() != 3
+        || manifest.artifacts.len() != 4
         || !validate_manifest_public_fields(manifest)
     {
         return Err(GithubArtifactError::InvalidManifest);
@@ -961,6 +993,11 @@ fn validate_manifest_records<'a>(
             RequiredArtifactFile::ValidationReport,
             ArtifactKind::ValidationReport,
             "application/json",
+        ),
+        (
+            RequiredArtifactFile::SanitizedLog,
+            ArtifactKind::SanitizedLog,
+            "text/plain; charset=utf-8",
         ),
     ];
     let mut records = BTreeMap::new();
@@ -1210,6 +1247,7 @@ fn validate_staged_files(
     for file in [
         RequiredArtifactFile::SigningReport,
         RequiredArtifactFile::ValidationReport,
+        RequiredArtifactFile::SanitizedLog,
         RequiredArtifactFile::Ipa,
     ] {
         verify_downloaded_file(&staged_paths[&file], records[&file])
@@ -1585,7 +1623,6 @@ mod tests {
     const PROFILE_UUID: &str = "12345678-1234-1234-1234-123456789ABC";
     const ENTITLEMENTS_SHA256: &str =
         "3333333333333333333333333333333333333333333333333333333333333333";
-
     #[test]
     fn entry_names_reject_escape_and_nested_roots() {
         for name in [
@@ -1612,6 +1649,24 @@ mod tests {
     }
 
     #[test]
+    fn sanitized_log_requires_the_exact_secret_free_protocol_payload() {
+        assert!(validate_sanitized_log(PROTECTED_SIGNING_SANITIZED_LOG_V1).is_ok());
+        for rejected in [
+            b"".as_slice(),
+            b"printable secret-like payload\n",
+            b"secret\0value",
+            &[0xff],
+        ] {
+            assert_eq!(
+                validate_sanitized_log(rejected),
+                Err(GithubArtifactError::InvalidPublicReport(
+                    RequiredArtifactFile::SanitizedLog
+                ))
+            );
+        }
+    }
+
+    #[test]
     fn valid_fixture_is_inspected_and_published_without_staging_residue() {
         let fixture = Fixture::new();
         let published = fixture.ingest().expect("ingest fixture");
@@ -1619,6 +1674,11 @@ mod tests {
         assert!(published.manifest_path.is_file());
         assert!(published.signing_report_path.is_file());
         assert!(published.validation_report_path.is_file());
+        assert!(published.sanitized_log_path.is_file());
+        assert_eq!(
+            fs::read(&published.sanitized_log_path).unwrap(),
+            PROTECTED_SIGNING_SANITIZED_LOG_V1
+        );
         assert_eq!(published.manifest.operation_id, OPERATION_ID);
         assert_eq!(
             published.manifest_size,
@@ -1683,6 +1743,7 @@ mod tests {
             DEVELOPMENT_IPA_NAME,
             ARTIFACT_MANIFEST_NAME,
             SIGNING_REPORT_NAME,
+            VALIDATION_REPORT_NAME,
             "secret.pem",
         ] {
             writer.start_file(name, options).unwrap();
@@ -1711,6 +1772,7 @@ mod tests {
             ARTIFACT_MANIFEST_NAME,
             SIGNING_REPORT_NAME,
             VALIDATION_REPORT_NAME,
+            SANITIZED_BUILD_LOG_NAME,
         ] {
             writer.start_file(name, options).unwrap();
             writer.write_all(b"x").unwrap();
@@ -1748,7 +1810,14 @@ mod tests {
             let ipa_sha256 = sha256_bytes(&ipa_bytes);
             let ipa_size = u64::try_from(ipa_bytes.len()).unwrap();
             let report_bytes = test_report(&compile.request_sha256, &ipa_sha256, ipa_size);
-            let manifest = test_manifest(&request, &compile, &ipa_sha256, ipa_size, &report_bytes);
+            let manifest = test_manifest(
+                &request,
+                &compile,
+                &ipa_sha256,
+                ipa_size,
+                &report_bytes,
+                PROTECTED_SIGNING_SANITIZED_LOG_V1,
+            );
             let manifest_bytes = serde_json::to_vec_pretty(&manifest).unwrap();
             write_artifact_zip(
                 &archive,
@@ -1756,6 +1825,7 @@ mod tests {
                 &manifest_bytes,
                 &report_bytes,
                 &report_bytes,
+                PROTECTED_SIGNING_SANITIZED_LOG_V1,
             );
             Self {
                 _root: root,
@@ -2071,6 +2141,7 @@ mod tests {
         ipa_sha256: &str,
         ipa_size: u64,
         report_bytes: &[u8],
+        sanitized_log: &[u8],
     ) -> ArtifactManifest {
         let report_sha256 = sha256_bytes(report_bytes);
         let report_size = u64::try_from(report_bytes.len()).unwrap();
@@ -2132,6 +2203,14 @@ mod tests {
                 sha256: report_sha256,
                 media_type: Some("application/json".to_owned()),
             },
+            ArtifactRecord {
+                artifact_id: "sanitized-build-log".to_owned(),
+                kind: ArtifactKind::SanitizedLog,
+                file_name: SANITIZED_BUILD_LOG_NAME.to_owned(),
+                size: u64::try_from(sanitized_log.len()).unwrap(),
+                sha256: sha256_bytes(sanitized_log),
+                media_type: Some("text/plain; charset=utf-8".to_owned()),
+            },
         ];
         manifest.validation_levels = BTreeSet::from([
             ValidationLevel::SourceValidated,
@@ -2159,6 +2238,7 @@ mod tests {
         manifest: &[u8],
         signing_report: &[u8],
         validation_report: &[u8],
+        sanitized_log: &[u8],
     ) {
         let file = File::create(path).unwrap();
         let mut writer = ZipWriter::new(file);
@@ -2170,6 +2250,7 @@ mod tests {
             (ARTIFACT_MANIFEST_NAME, manifest),
             (SIGNING_REPORT_NAME, signing_report),
             (VALIDATION_REPORT_NAME, validation_report),
+            (SANITIZED_BUILD_LOG_NAME, sanitized_log),
         ] {
             writer.start_file(name, options).unwrap();
             writer.write_all(bytes).unwrap();

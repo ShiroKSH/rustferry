@@ -20,10 +20,10 @@ use rustferry_apple::{AppleBuildProfile, IosDeviceArchiveRequest, with_command_c
 use rustferry_core::{FerryConfig, TargetPlatform};
 use rustferry_remote::{
     ArtifactKind, ArtifactRecord, CompileHandoff, IosArtifactType, IosDeviceBuildRequest,
-    SealedUnsignedArchive, SecretBytes, SecretReference, SecretReferenceKind, SigningMode,
-    SourceBundleRequest, SourceManifest, SourceMode, WorkerStdioCodecError,
-    WorkerStdioRequestEnvelope, canonical_signing_target_graph_sha256, decode_worker_stdio_request,
-    verify_source_manifest,
+    PROTECTED_SIGNING_SANITIZED_LOG_V1, SealedUnsignedArchive, SecretBytes, SecretReference,
+    SecretReferenceKind, SigningMode, SourceBundleRequest, SourceManifest, SourceMode,
+    WorkerStdioCodecError, WorkerStdioRequestEnvelope, canonical_signing_target_graph_sha256,
+    decode_worker_stdio_request, verify_source_manifest,
 };
 #[cfg(target_os = "macos")]
 use rustferry_worker_macos::keychain::{KeychainOptions, garbage_collect_stale_keychains};
@@ -80,6 +80,7 @@ const IPA_NAME: &str = "application-development.ipa";
 const ARTIFACT_MANIFEST_NAME: &str = "artifact-manifest.json";
 const SIGNING_REPORT_NAME: &str = "signing-report.json";
 const VALIDATION_REPORT_NAME: &str = "validation-report.json";
+const SANITIZED_BUILD_LOG_NAME: &str = "sanitized-build-log.txt";
 const GITHUB_DISPATCH_MANIFEST_SCHEMA_VERSION: u32 = 2;
 const GITHUB_DISPATCH_PROVIDER: &str = "github-actions";
 
@@ -1064,17 +1065,31 @@ fn run_sign(arguments: RunJobArgs) -> Result<(), CliFailure> {
         sha256: sha256_bytes(&validation_bytes),
         media_type: Some("application/json".to_owned()),
     };
-    if manifest
-        .artifacts
-        .iter()
-        .any(|record| record.artifact_id == validation_record.artifact_id)
-    {
-        return Err(CliFailure::execution(
-            "ambiguous_validation_report",
-            "validation report artifact is ambiguous",
-        ));
-    }
-    manifest.artifacts.push(validation_record.clone());
+    let sanitized_log_record = ArtifactRecord {
+        artifact_id: "sanitized-build-log".to_owned(),
+        kind: ArtifactKind::SanitizedLog,
+        file_name: SANITIZED_BUILD_LOG_NAME.to_owned(),
+        size: u64::try_from(PROTECTED_SIGNING_SANITIZED_LOG_V1.len()).map_err(|_| {
+            CliFailure::execution(
+                "sanitized_build_log_too_large",
+                "sanitized build log exceeded its bound",
+            )
+        })?,
+        sha256: sha256_bytes(PROTECTED_SIGNING_SANITIZED_LOG_V1),
+        media_type: Some("text/plain; charset=utf-8".to_owned()),
+    };
+    append_generated_artifact_record(
+        &mut manifest,
+        validation_record.clone(),
+        "ambiguous_validation_report",
+        "validation report artifact is ambiguous",
+    )?;
+    append_generated_artifact_record(
+        &mut manifest,
+        sanitized_log_record.clone(),
+        "ambiguous_sanitized_build_log",
+        "sanitized build log artifact is ambiguous",
+    )?;
     manifest
         .artifacts
         .sort_by(|left, right| left.artifact_id.cmp(&right.artifact_id));
@@ -1099,6 +1114,10 @@ fn run_sign(arguments: RunJobArgs) -> Result<(), CliFailure> {
         &validation_bytes,
     )?;
     atomic_write_new(
+        &output_directory.join(SANITIZED_BUILD_LOG_NAME),
+        PROTECTED_SIGNING_SANITIZED_LOG_V1,
+    )?;
+    atomic_write_new(
         &output_directory.join(ARTIFACT_MANIFEST_NAME),
         &manifest_bytes,
     )?;
@@ -1107,6 +1126,7 @@ fn run_sign(arguments: RunJobArgs) -> Result<(), CliFailure> {
         &ipa_record,
         &signing_record,
         &validation_record,
+        &sanitized_log_record,
         &manifest,
     )?;
     sync_directory(&output_directory)?;
@@ -1973,11 +1993,29 @@ fn verify_bytes_record(bytes: &[u8], record: &ArtifactRecord) -> Result<(), CliF
     Ok(())
 }
 
+fn append_generated_artifact_record(
+    manifest: &mut rustferry_remote::ArtifactManifest,
+    record: ArtifactRecord,
+    error_code: &'static str,
+    error_message: &'static str,
+) -> Result<(), CliFailure> {
+    if manifest.artifacts.iter().any(|existing| {
+        existing.artifact_id == record.artifact_id
+            || existing.kind == record.kind
+            || existing.file_name == record.file_name
+    }) {
+        return Err(CliFailure::execution(error_code, error_message));
+    }
+    manifest.artifacts.push(record);
+    Ok(())
+}
+
 fn verify_published_signing_output(
     directory: &Utf8Path,
     ipa: &ArtifactRecord,
     signing: &ArtifactRecord,
     validation: &ArtifactRecord,
+    sanitized_log: &ArtifactRecord,
     expected_manifest: &rustferry_remote::ArtifactManifest,
 ) -> Result<(), CliFailure> {
     let names = fs::read_dir(directory)
@@ -2001,6 +2039,7 @@ fn verify_published_signing_output(
         ARTIFACT_MANIFEST_NAME.to_owned(),
         SIGNING_REPORT_NAME.to_owned(),
         VALIDATION_REPORT_NAME.to_owned(),
+        SANITIZED_BUILD_LOG_NAME.to_owned(),
     ]);
     if names != expected {
         return Err(CliFailure::execution(
@@ -2008,7 +2047,7 @@ fn verify_published_signing_output(
             "signed artifact output set is incomplete",
         ));
     }
-    for record in [ipa, signing, validation] {
+    for record in [ipa, signing, validation, sanitized_log] {
         let path = resolve_regular_under(directory, Utf8Path::new(&record.file_name))?;
         if fs::metadata(&path).map(|metadata| metadata.len()).ok() != Some(record.size)
             || sha256_file(&path)? != record.sha256
@@ -4664,6 +4703,92 @@ unsafe_code = "deny"
             16,
             "invalid_signing_stdin",
         );
+    }
+
+    #[test]
+    fn published_signing_output_requires_and_hashes_the_sanitized_log() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let directory = canonical_temporary_root(&temporary).join("published");
+        create_private_directory(&directory).expect("published directory");
+        let record = |artifact_id: &str,
+                      kind: ArtifactKind,
+                      file_name: &str,
+                      bytes: &[u8],
+                      media_type: &str| ArtifactRecord {
+            artifact_id: artifact_id.to_owned(),
+            kind,
+            file_name: file_name.to_owned(),
+            size: u64::try_from(bytes.len()).expect("artifact size"),
+            sha256: sha256_bytes(bytes),
+            media_type: Some(media_type.to_owned()),
+        };
+        let ipa = record(
+            "iphone-ipa",
+            ArtifactKind::Ipa,
+            IPA_NAME,
+            b"ipa",
+            "application/octet-stream",
+        );
+        let signing = record(
+            "signing-report",
+            ArtifactKind::SigningReport,
+            SIGNING_REPORT_NAME,
+            b"signing",
+            "application/json",
+        );
+        let validation = record(
+            "validation-report",
+            ArtifactKind::ValidationReport,
+            VALIDATION_REPORT_NAME,
+            b"validation",
+            "application/json",
+        );
+        let sanitized_log = record(
+            "sanitized-build-log",
+            ArtifactKind::SanitizedLog,
+            SANITIZED_BUILD_LOG_NAME,
+            PROTECTED_SIGNING_SANITIZED_LOG_V1,
+            "text/plain; charset=utf-8",
+        );
+        let mut manifest = rustferry_remote::ArtifactManifest::new("operation-1", "job-1");
+        manifest.artifacts = vec![
+            ipa.clone(),
+            signing.clone(),
+            validation.clone(),
+            sanitized_log.clone(),
+        ];
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest).expect("artifact manifest");
+        for (name, bytes) in [
+            (IPA_NAME, b"ipa".as_slice()),
+            (SIGNING_REPORT_NAME, b"signing".as_slice()),
+            (VALIDATION_REPORT_NAME, b"validation".as_slice()),
+            (SANITIZED_BUILD_LOG_NAME, PROTECTED_SIGNING_SANITIZED_LOG_V1),
+            (ARTIFACT_MANIFEST_NAME, manifest_bytes.as_slice()),
+        ] {
+            fs::write(directory.join(name), bytes).expect("artifact output");
+        }
+
+        verify_published_signing_output(
+            &directory,
+            &ipa,
+            &signing,
+            &validation,
+            &sanitized_log,
+            &manifest,
+        )
+        .expect("complete signing output");
+
+        fs::write(directory.join(SANITIZED_BUILD_LOG_NAME), b"tampered\n").expect("tampered log");
+        let error = verify_published_signing_output(
+            &directory,
+            &ipa,
+            &signing,
+            &validation,
+            &sanitized_log,
+            &manifest,
+        )
+        .expect_err("tampered log must fail");
+        assert_eq!(error.code, "artifact_hash_mismatch");
     }
 
     #[test]

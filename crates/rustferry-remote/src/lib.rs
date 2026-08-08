@@ -40,10 +40,10 @@ pub use artifact::{
     ARTIFACT_MANIFEST_SCHEMA_VERSION, ApplePlatform, AppleToolchainEvidence, ArtifactError,
     ArtifactKind, ArtifactManifest, ArtifactRecord, ArtifactSigningEvidence, CleanupStatus,
     IosDeviceProductExpectation, IpaExpectation, IpaInspection, MachOSliceEvidence,
-    UnsignedAppInspection, UnsignedNestedBundleExpectation, UnsignedNestedBundleKind,
-    UnsignedXcarchiveExpectation, UnsignedXcarchiveInspection, ValidationLevel, inspect_ipa,
-    inspect_physical_iphone_macho, inspect_unsigned_app_bundle, inspect_unsigned_xcarchive,
-    verify_downloaded_file,
+    PROTECTED_SIGNING_SANITIZED_LOG_V1, UnsignedAppInspection, UnsignedNestedBundleExpectation,
+    UnsignedNestedBundleKind, UnsignedXcarchiveExpectation, UnsignedXcarchiveInspection,
+    ValidationLevel, inspect_ipa, inspect_physical_iphone_macho, inspect_unsigned_app_bundle,
+    inspect_unsigned_xcarchive, verify_downloaded_file,
 };
 pub use cancellation::CancellationToken;
 pub use data_plane::{

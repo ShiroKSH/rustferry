@@ -360,6 +360,7 @@ jobs:
             ${{ runner.temp }}/rustferry-signed/artifact-manifest.json
             ${{ runner.temp }}/rustferry-signed/signing-report.json
             ${{ runner.temp }}/rustferry-signed/validation-report.json
+            ${{ runner.temp }}/rustferry-signed/sanitized-build-log.txt
           if-no-files-found: error
           compression-level: 0
           retention-days: 3

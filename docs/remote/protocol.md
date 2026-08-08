@@ -176,6 +176,12 @@ SHA-256 before placement. IPA inspection additionally validates ZIP safety, `Pay
 plist identity, arm64 Mach-O slices, and `LC_BUILD_VERSION` platform metadata. An arm64 Simulator
 binary is rejected explicitly; arm64 alone is not device proof.
 
+The default protected GitHub result is an exact five-file transport set: development IPA, artifact
+manifest, signing report, validation report, and `sanitized-build-log.txt`. The fixed sanitized log
+is created only after protected signing, IPA export, validation, and signing-material cleanup are
+confirmed; its size and SHA-256 are part of the immutable worker manifest. Signed XCArchive and dSYM
+selection remain outside this implemented contract.
+
 A successful build and successful cleanup are distinct states. Cleanup proof records isolated
 workspace removal, signing-material/keychain removal, and intentional artifact retention. Cleanup
 failure remains visible even when compilation or export succeeded.
