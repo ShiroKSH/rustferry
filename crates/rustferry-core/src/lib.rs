@@ -7,6 +7,8 @@ mod naming;
 
 #[doc(hidden)]
 pub mod process_control;
+/// Atomic private-directory creation and handle validation on Windows.
+pub mod windows_private_directory;
 
 pub use artifact::{ArtifactDigest, ArtifactDigestError, ArtifactDigestKind, digest_artifact};
 pub use assets::{AssetError, PngMetadata, ProjectAssets};

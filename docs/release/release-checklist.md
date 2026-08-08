@@ -33,7 +33,7 @@ No step below implies that a release or registry publication has occurred.
 - [ ] `cargo package --workspace --exclude rustferry-worker-macos --locked`
 - [ ] `cargo publish --workspace --exclude rustferry-worker-macos --dry-run --locked --no-verify`
 - [ ] `python3 scripts/check-release-archives.py --check-sources --target-dir target/package-source-check target/package/*.crate`
-- [ ] Inspect all eight `.crate` archives and their normalized manifests; confirm
+- [ ] Inspect all nine `.crate` archives and their normalized manifests; confirm
       both canonical license files are regular root members.
 
 ## VS Code extension

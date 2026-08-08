@@ -9,6 +9,8 @@
 pub mod artifact;
 /// Runtime-neutral cooperative cancellation.
 pub mod cancellation;
+/// Length-framed binary transport for large worker source and artifact payloads.
+pub mod data_plane;
 /// Typed protocol and provider failures.
 pub mod error;
 /// Public compile-to-sign handoff evidence.
@@ -27,8 +29,12 @@ pub mod schema;
 pub mod secret;
 /// Apple signing plans and validation models.
 pub mod signing;
+/// Strict control messages for one framed SSH snapshot-build session.
+pub mod snapshot_session;
 /// Deterministic Git and snapshot source manifests.
 pub mod source;
+/// Strict, bounded envelopes for one-request worker stdio control planes.
+pub mod stdio;
 
 pub use artifact::{
     ARTIFACT_MANIFEST_SCHEMA_VERSION, ApplePlatform, AppleToolchainEvidence, ArtifactError,
@@ -40,6 +46,15 @@ pub use artifact::{
     verify_downloaded_file,
 };
 pub use cancellation::CancellationToken;
+pub use data_plane::{
+    MAX_WORKER_DATA_PLANE_ARTIFACT_BYTES, MAX_WORKER_DATA_PLANE_CONTROL_BYTES,
+    MAX_WORKER_DATA_PLANE_REQUEST_BYTES, MAX_WORKER_DATA_PLANE_RESULT_BYTES,
+    MAX_WORKER_DATA_PLANE_SOURCE_BYTES, WORKER_DATA_PLANE_HEADER_BYTES,
+    WORKER_DATA_PLANE_SCHEMA_VERSION, WorkerDataPlaneFrameError, WorkerDataPlaneFrameHeader,
+    WorkerDataPlaneFrameKind, WorkerDataPlaneSequence, copy_worker_data_plane_payload,
+    read_worker_data_plane_header, read_worker_data_plane_payload, write_worker_data_plane_frame,
+    write_worker_data_plane_header, write_worker_data_plane_stream,
+};
 pub use error::{RemoteBuildError, RemoteBuildResult};
 pub use handoff::{
     COMPILE_HANDOFF_SCHEMA_VERSION, COMPILE_PHASE_EVIDENCE_SCHEMA_VERSION, CompileHandoff,
@@ -80,10 +95,24 @@ pub use signing::{
     SigningTargetKind, SigningValidationError, SigningValidationErrors, SigningValidationReport,
     ValidationComponent, ValidationStatus,
 };
+pub use snapshot_session::{
+    MAX_SNAPSHOT_SESSION_DESCRIPTOR_BYTES, SNAPSHOT_SESSION_SCHEMA_VERSION,
+    SnapshotArtifactDescriptor, SnapshotArtifactReceipt, SnapshotBuildComplete,
+    SnapshotBuildParameters, SnapshotBuildStart, SnapshotJobAccepted, SnapshotSessionError,
+};
 pub use source::{
-    IgnoreRuleReason, PlannedSourceFile, PortablePathReason, SourceArchive, SourceArchiveLimits,
-    SourceBundlePlan, SourceBundleRequest, SourceError, SourceLimitKind, SourceLimits,
-    SourceManifest, SourceManifestEntry, SourceMode, create_source_bundle_archive,
+    IgnoreRuleReason, MAX_SOURCE_BUNDLE_DESCRIPTOR_BYTES, PlannedSourceFile, PortablePathReason,
+    SOURCE_BUNDLE_DESCRIPTOR_SCHEMA_VERSION, SourceArchive, SourceArchiveLimits,
+    SourceBundleDescriptor, SourceBundlePlan, SourceBundleRequest, SourceError, SourceLimitKind,
+    SourceLimits, SourceManifest, SourceManifestEntry, SourceMode, create_source_bundle_archive,
     plan_source_bundle, validate_source_manifest, verify_and_extract_source_bundle,
     verify_materialized_bundle, verify_source_bundle_plan, verify_source_manifest,
+    write_source_bundle_descriptor_file,
+};
+pub use stdio::{
+    MAX_WORKER_STDIO_REQUEST_BYTES, MAX_WORKER_STDIO_RESPONSE_BYTES, WORKER_STDIO_SCHEMA_VERSION,
+    WorkerStdioCodecError, WorkerStdioErrorResponse, WorkerStdioRequest,
+    WorkerStdioRequestEnvelope, WorkerStdioResponse, WorkerStdioResponseEnvelope,
+    decode_worker_stdio_request, decode_worker_stdio_response, encode_worker_stdio_request,
+    encode_worker_stdio_response,
 };

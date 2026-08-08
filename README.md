@@ -19,7 +19,7 @@
 RustFerry keeps application code and assets in an ordinary Rust project. When you build, it creates the required platform host below `target/ferry/`; that generated glue is disposable and stays out of your source tree.
 
 > [!IMPORTANT]
-> RustFerry is pre-release. Real signed/aligned arm64 Android APKs, arm64 iOS Simulator `.app`/`.appex` bundles, and an unsigned physical-iPhone `.xcarchive` built remotely from a Linux client have been independently inspected. Device discovery, install, run, logs, the VS Code extension, local physical-iOS development signing, and remote macOS compilation are implemented. A real development-signed remote IPA and runtime behavior on an emulator, Simulator, or physical device remain unvalidated. See the [support matrix](docs/support-matrix.md) and [evidence log](docs/STATUS.md).
+> RustFerry is pre-release. Real signed/aligned arm64 Android APKs, arm64 iOS Simulator `.app`/`.appex` bundles, and an unsigned physical-iPhone `.xcarchive` built through the GitHub provider from a Linux client have been independently inspected. Device discovery, install, run, logs, the VS Code extension, local physical-iOS development signing, and remote macOS compilation are implemented. SSH snapshot v1 has deterministic local coverage but no live SSH-produced artifact. A real development-signed remote IPA and runtime behavior on an emulator, Simulator, or physical device remain unvalidated. See the [support matrix](docs/support-matrix.md) and [evidence log](docs/STATUS.md).
 
 ## What it does
 
@@ -48,7 +48,7 @@ cargo ferry new weather \
   --runtime-path "$PWD/crates/rustferry"
 ```
 
-`--runtime-source workspace` supports monorepo development. `CARGO_FERRY_RUNTIME_PATH` remains an optional contributor-only development override when no explicit source is supplied; normal published installations do not require it. Rust 1.92 or newer is required. Mobile builds also need the relevant Android SDK/NDK or a full Xcode installation.
+`--runtime-source workspace` supports monorepo development. `CARGO_FERRY_RUNTIME_PATH` remains an optional contributor-only development override when no explicit source is supplied; normal published installations do not require it. Rust 1.92 or newer is required. Local Android builds need the Android SDK/NDK, and local Apple builds need full Xcode. A Linux or Windows client using a configured remote physical-iPhone provider needs neither local Xcode nor an Apple SDK.
 
 After the coordinated crates are published, the normal installation will be `cargo install cargo-ferry`.
 
@@ -112,9 +112,30 @@ cargo ferry remote setup github \
 cargo ferry build iphone --remote github --unsigned
 ```
 
+On Linux and Windows, omitting `--remote` from a physical-iPhone build selects GitHub. Named SSH
+endpoints are never selected implicitly; pass their configured name explicitly. On macOS,
+`cargo ferry build ios --device` remains a local build unless a remote is requested (or unsigned
+remote mode is selected).
+
 Development signing additionally requires the protected private-repository setup and Apple assets
 described in [GitHub provider security](docs/remote/github-security.md). The unsigned remote path has
 live compile/download evidence; remote signed IPA export has not yet been accepted.
+
+For a dedicated Mac, add a pinned SSH endpoint and request the locally tested unsigned snapshot
+path:
+
+```console
+cargo ferry remote add ssh-mac production-mac \
+  --host build.example.com \
+  --user ferry \
+  --known-hosts /absolute/path/rustferry.known_hosts \
+  --host-key-sha256 SHA256:BASE64_WITHOUT_PADDING
+cargo ferry remote doctor production-mac
+cargo ferry build iphone --remote production-mac --unsigned
+```
+
+SSH snapshot v1 returns an independently verified unsigned XCArchive ZIP. No live SSH Mac build has
+been recorded, and this path does not sign, export an IPA, install, launch, or prove device runtime.
 
 Build never touches a device. Deployment is explicit:
 
@@ -177,6 +198,8 @@ Configuration lives in `ferry.toml`. Generated platform files remain under `targ
 - [VS Code extension](docs/editors/vscode.md)
 - [Devices, install, run, and logs](docs/deployment/install-run-logs.md)
 - [Remote physical-iPhone builds](docs/remote/github-security.md)
+- [Deterministic remote source bundles](docs/remote/source-bundles.md)
+- [SSH Mac control plane](docs/remote/ssh-mac.md)
 - [Support matrix](docs/support-matrix.md)
 - [Implementation evidence](docs/STATUS.md)
 - [Threat model](docs/THREAT_MODEL.md)

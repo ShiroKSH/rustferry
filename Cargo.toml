@@ -8,6 +8,7 @@ members = [
     "crates/rustferry-core",
     "crates/rustferry-github",
     "crates/rustferry-remote",
+    "crates/rustferry-ssh",
     "crates/rustferry-worker-macos",
 ]
 resolver = "2"
@@ -57,8 +58,10 @@ uuid = { version = "1.17.0", features = ["serde", "v4"] }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_JobObjects",
+    "Win32_System_SystemServices",
     "Win32_System_Threading",
 ] }
 zip = { version = "6.0.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }

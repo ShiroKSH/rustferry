@@ -1,8 +1,8 @@
 # Create a GitHub Release
 
-The manual **Draft release** workflow verifies one explicit version on the default branch, runs Rust and extension gates, packages all eight publishable crates while excluding the trusted macOS worker, and assembles:
+The manual **Draft release** workflow verifies one explicit version on the default branch, runs Rust and extension gates, packages all nine publishable crates while excluding the trusted macOS worker, and assembles:
 
-- eight `.crate` archives;
+- nine `.crate` archives;
 - the versioned VSIX;
 - IDE protocol JSON Schema;
 - canonical and third-party license bundle;

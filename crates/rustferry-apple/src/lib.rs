@@ -24,7 +24,9 @@ pub use build::{
     AppleBuildProfile, ExtensionKind, IosBuildOutcome, IosBuildPlan, IosSimulatorBuildRequest,
     PlannedCopy, build_ios_simulator, plan_ios_simulator,
 };
-pub use command::{CommandOutput, CommandSpec, DEFAULT_COMMAND_TIMEOUT, run_command};
+pub use command::{
+    CommandOutput, CommandSpec, DEFAULT_COMMAND_TIMEOUT, run_command, with_command_cancellation,
+};
 pub use device::{
     IosDeviceArchiveOutcome, IosDeviceArchivePlan, IosDeviceArchiveRequest,
     IosDeviceArtifactDisposition, IosDeviceMachOValidation, IosDeviceMachOValidationPlan,

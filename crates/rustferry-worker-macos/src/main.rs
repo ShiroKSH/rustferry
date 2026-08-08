@@ -16,12 +16,13 @@ use std::{
 
 use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
 use clap::{Args, Parser, Subcommand, ValueEnum, error::ErrorKind};
-use rustferry_apple::{AppleBuildProfile, IosDeviceArchiveRequest};
+use rustferry_apple::{AppleBuildProfile, IosDeviceArchiveRequest, with_command_cancellation};
 use rustferry_core::{FerryConfig, TargetPlatform};
 use rustferry_remote::{
     ArtifactKind, ArtifactRecord, CompileHandoff, IosArtifactType, IosDeviceBuildRequest,
     SealedUnsignedArchive, SecretBytes, SecretReference, SecretReferenceKind, SigningMode,
-    SourceBundleRequest, SourceManifest, SourceMode, verify_source_manifest,
+    SourceBundleRequest, SourceManifest, SourceMode, WorkerStdioCodecError,
+    WorkerStdioRequestEnvelope, decode_worker_stdio_request, verify_source_manifest,
 };
 #[cfg(target_os = "macos")]
 use rustferry_worker_macos::keychain::{KeychainOptions, garbage_collect_stale_keychains};
@@ -31,6 +32,16 @@ use rustferry_worker_macos::{
     pipeline::{
         CompilePhaseRequest, PipelineError, PipelinePublicMetadata, PipelineToolchainSelection,
         ProtectedSignPhaseRequest, compile_unsigned_phase, sign_protected_phase,
+    },
+    session_output::{
+        BoundedSessionOutput, SNAPSHOT_OUTPUT_INACTIVITY_DEADLINE, SNAPSHOT_OUTPUT_TOTAL_DEADLINE,
+    },
+    snapshot_session::{
+        SnapshotCompileContext, SnapshotCompileFailure, SnapshotCompileOutput, SnapshotCompiler,
+        serve_snapshot_session,
+    },
+    stdio::{
+        WORKER_STDIO_REQUEST_DEADLINE, serve_one_stdio_request, write_request_timeout_response,
     },
 };
 use same_file::Handle;
@@ -89,8 +100,8 @@ enum WorkerCommand {
     RunJob(RunJobArgs),
     /// Remove one marker-bound worker job root.
     Cleanup(CleanupArgs),
-    /// Start the persistent worker protocol server (not enabled in this release).
-    Serve,
+    /// Handle one read-only worker control-plane request over stdin/stdout.
+    Serve(ServeArgs),
 }
 
 #[derive(Debug, Args)]
@@ -105,6 +116,65 @@ struct HostArgs {
     /// Worker-owned root to inspect; it is never created by this command.
     #[arg(long)]
     worker_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct ServeArgs {
+    /// Read one strict JSON request from stdin and write one strict JSON response.
+    #[arg(
+        long,
+        action = clap::ArgAction::SetTrue,
+        conflicts_with = "stdio_session_v1",
+        required_unless_present = "stdio_session_v1"
+    )]
+    stdio: bool,
+    /// Run one framed snapshot-build session over stdin/stdout.
+    #[arg(long, action = clap::ArgAction::SetTrue, conflicts_with = "stdio")]
+    stdio_session_v1: bool,
+    /// Worker-owned root to inspect for a provider-doctor request.
+    #[arg(long)]
+    worker_root: Option<PathBuf>,
+}
+
+type DecodedStdioRequest = Result<WorkerStdioRequestEnvelope, WorkerStdioCodecError>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StdioRequestWaitError {
+    DeadlineExceeded,
+    ReaderStopped,
+}
+
+struct StdioRequestTask {
+    receiver: mpsc::Receiver<DecodedStdioRequest>,
+    worker: thread::JoinHandle<()>,
+}
+
+impl StdioRequestTask {
+    fn spawn(
+        read_request: impl FnOnce() -> DecodedStdioRequest + Send + 'static,
+    ) -> io::Result<Self> {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("rustferry-stdio-request".to_owned())
+            .spawn(move || {
+                let _ = sender.send(read_request());
+            })?;
+        Ok(Self { receiver, worker })
+    }
+
+    fn wait(&self, deadline: Duration) -> Result<DecodedStdioRequest, StdioRequestWaitError> {
+        match self.receiver.recv_timeout(deadline) {
+            Ok(request) => Ok(request),
+            Err(RecvTimeoutError::Timeout) => Err(StdioRequestWaitError::DeadlineExceeded),
+            Err(RecvTimeoutError::Disconnected) => Err(StdioRequestWaitError::ReaderStopped),
+        }
+    }
+
+    fn join(self) -> Result<(), StdioRequestWaitError> {
+        self.worker
+            .join()
+            .map_err(|_| StdioRequestWaitError::ReaderStopped)
+    }
 }
 
 #[derive(Debug, Args)]
@@ -307,10 +377,7 @@ fn dispatch(command: WorkerCommand) -> Result<(), CliFailure> {
             JobPhase::Sign => run_sign(arguments),
         },
         WorkerCommand::Cleanup(arguments) => run_cleanup(arguments),
-        WorkerCommand::Serve => Err(CliFailure::execution(
-            "unsupported_capability",
-            "persistent worker serving is not enabled in this release",
-        )),
+        WorkerCommand::Serve(arguments) => run_stdio(arguments),
     }
 }
 
@@ -334,16 +401,7 @@ fn run_version(arguments: &VersionArgs) -> Result<(), CliFailure> {
 }
 
 fn run_doctor(arguments: HostArgs, capabilities_only: bool) -> Result<(), CliFailure> {
-    let worker_root = match arguments.worker_root {
-        Some(path) => path_to_utf8(path)?,
-        None => path_to_utf8(env::temp_dir().join("rustferry-worker"))?,
-    };
-    if !worker_root.is_absolute() {
-        return Err(CliFailure::input(
-            "invalid_worker_root",
-            "worker root must be absolute",
-        ));
-    }
+    let worker_root = command_worker_root(arguments.worker_root)?;
     let options = WorkerHostOptions::from_environment(worker_root);
     let report = doctor_worker_host(&options);
     let capabilities = worker_host_capabilities(&report);
@@ -365,6 +423,120 @@ fn run_doctor(arguments: HostArgs, capabilities_only: bool) -> Result<(), CliFai
             "report": report,
         }))
     }
+}
+
+fn run_stdio(arguments: ServeArgs) -> Result<(), CliFailure> {
+    if arguments.stdio_session_v1 {
+        if arguments.worker_root.is_some() {
+            return Err(CliFailure::input(
+                "invalid_worker_root_source",
+                "snapshot sessions require the configured trusted worker root",
+            ));
+        }
+        return run_snapshot_stdio();
+    }
+    if !arguments.stdio {
+        return Err(CliFailure::input(
+            "invalid_transport",
+            "worker serve transport must be stdio",
+        ));
+    }
+    let worker_root = command_worker_root(arguments.worker_root)?;
+    let options = WorkerHostOptions::from_environment(worker_root);
+    let Ok(request_task) =
+        StdioRequestTask::spawn(|| decode_worker_stdio_request(&mut io::stdin().lock()))
+    else {
+        return serve_one_stdio_request(
+            Err(WorkerStdioCodecError::Io),
+            &mut io::stdout().lock(),
+            &options,
+        )
+        .map_err(map_stdio_failure);
+    };
+    let request = match request_task.wait(WORKER_STDIO_REQUEST_DEADLINE) {
+        Ok(request) => {
+            if request_task.join().is_ok() {
+                request
+            } else {
+                Err(WorkerStdioCodecError::Io)
+            }
+        }
+        Err(StdioRequestWaitError::DeadlineExceeded) => terminate_after_stdio_request_deadline(),
+        Err(StdioRequestWaitError::ReaderStopped) => {
+            let _ = request_task.join();
+            Err(WorkerStdioCodecError::Io)
+        }
+    };
+    serve_one_stdio_request(request, &mut io::stdout().lock(), &options).map_err(map_stdio_failure)
+}
+
+struct ProductionSnapshotCompiler;
+
+impl SnapshotCompiler for ProductionSnapshotCompiler {
+    fn compile(
+        &mut self,
+        context: SnapshotCompileContext<'_>,
+    ) -> Result<SnapshotCompileOutput, SnapshotCompileFailure> {
+        let result = with_command_cancellation(context.cancellation(), || {
+            compile_materialized_source(
+                context.request().clone(),
+                context.source_root(),
+                context.output_directory(),
+                context.job_id(),
+                rustferry_worker_macos::stdio::SSH_STDIO_PROVIDER_ID,
+                env!("CARGO_PKG_VERSION"),
+            )
+        });
+        let handoff = result.map_err(|_| {
+            SnapshotCompileFailure::new(
+                "snapshot_compile_failed",
+                "unsigned physical-iPhone compilation failed",
+                false,
+            )
+        })?;
+        Ok(SnapshotCompileOutput {
+            handoff,
+            artifact_path: context.output_directory().join(SEALED_ARCHIVE_NAME),
+        })
+    }
+}
+
+fn run_snapshot_stdio() -> Result<(), CliFailure> {
+    let worker_root = trusted_worker_root()?;
+    let mut compiler = ProductionSnapshotCompiler;
+    let mut output = BoundedSessionOutput::spawn(
+        io::stdout(),
+        SNAPSHOT_OUTPUT_TOTAL_DEADLINE,
+        SNAPSHOT_OUTPUT_INACTIVITY_DEADLINE,
+    )
+    .map_err(|_| {
+        CliFailure::execution(
+            "snapshot_output_failed",
+            "snapshot session output could not be initialized",
+        )
+    })?;
+    serve_snapshot_session(io::stdin(), &mut output, &worker_root, &mut compiler).map_err(|_| {
+        CliFailure::execution(
+            "snapshot_session_failed",
+            "snapshot session response could not be completed",
+        )
+    })
+}
+
+fn terminate_after_stdio_request_deadline() -> ! {
+    if write_request_timeout_response(&mut io::stdout().lock()).is_ok() {
+        std::process::exit(0);
+    }
+    let failure = map_stdio_failure(WorkerStdioCodecError::Io);
+    write_error(&failure);
+    std::process::exit(i32::from(failure.exit_code));
+}
+
+const fn map_stdio_failure(_error: WorkerStdioCodecError) -> CliFailure {
+    CliFailure::execution(
+        "stdio_failed",
+        "worker stdio response could not be completed",
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -607,9 +779,35 @@ fn run_compile(arguments: RunJobArgs) -> Result<(), CliFailure> {
     let materialized_root = job_root.join("source");
     create_private_directory(&materialized_root)?;
     materialize_manifest(&source_root, &materialized_root, &request.source)?;
-    let materialized_selection = source_selection(&materialized_root, &request.source)?;
+    let metadata_job_id = request.operation_id.clone();
+    let handoff = compile_materialized_source(
+        request,
+        &materialized_root,
+        &output_directory,
+        &metadata_job_id,
+        "github-actions",
+        env!("CARGO_PKG_VERSION"),
+    )?;
+    output_guard.keep();
+    write_json_stdout(&serde_json::json!({
+        "schema_version": CLI_SCHEMA_VERSION,
+        "status": "succeeded",
+        "phase": "compile",
+        "request_sha256": handoff.compile.request_sha256,
+        "sealed_sha256": handoff.compile.sealed_archive.transport.sha256,
+    }))
+}
 
-    let project_root = project_root_for(&materialized_root, &request.source.project_path)?;
+fn compile_materialized_source(
+    request: IosDeviceBuildRequest,
+    materialized_root: &Utf8Path,
+    output_directory: &Utf8Path,
+    metadata_job_id: &str,
+    provider: &str,
+    rustferry_version: &str,
+) -> Result<CompileHandoff, CliFailure> {
+    let materialized_selection = source_selection(materialized_root, &request.source)?;
+    let project_root = project_root_for(materialized_root, &request.source.project_path)?;
     let config = FerryConfig::load(&project_root.join("ferry.toml"))
         .map_err(|_| CliFailure::input("invalid_ferry_config", "ferry configuration is invalid"))?;
     if !config.platforms.contains(&TargetPlatform::Ios) {
@@ -626,12 +824,8 @@ fn run_compile(arguments: RunJobArgs) -> Result<(), CliFailure> {
         rustferry_remote::BuildProfile::Release => AppleBuildProfile::Release,
     };
     let toolchain = toolchain_selection()?;
-    let metadata = PipelinePublicMetadata::new(
-        request.operation_id.clone(),
-        "github-actions",
-        env!("CARGO_PKG_VERSION"),
-    )
-    .map_err(map_pipeline_error)?;
+    let metadata = PipelinePublicMetadata::new(metadata_job_id, provider, rustferry_version)
+        .map_err(map_pipeline_error)?;
     let sealed_archive_path = output_directory.join(SEALED_ARCHIVE_NAME);
     let phase = CompilePhaseRequest {
         request: &request,
@@ -667,15 +861,8 @@ fn run_compile(arguments: RunJobArgs) -> Result<(), CliFailure> {
         &output_directory.join("sanitized-compile-log.txt"),
         b"RustFerry unsigned physical-iPhone compilation and sealing completed.\n",
     )?;
-    sync_directory(&output_directory)?;
-    output_guard.keep();
-    write_json_stdout(&serde_json::json!({
-        "schema_version": CLI_SCHEMA_VERSION,
-        "status": "succeeded",
-        "phase": "compile",
-        "request_sha256": handoff.compile.request_sha256,
-        "sealed_sha256": handoff.compile.sealed_archive.transport.sha256,
-    }))
+    sync_directory(output_directory)?;
+    Ok(handoff)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2417,6 +2604,32 @@ fn trusted_worker_root() -> Result<Utf8PathBuf, CliFailure> {
     )
 }
 
+fn command_worker_root(explicit: Option<PathBuf>) -> Result<Utf8PathBuf, CliFailure> {
+    let explicit = explicit.map(path_to_utf8).transpose()?;
+    select_command_worker_root(
+        explicit,
+        exact_environment_path("RUNNER_TEMP")?,
+        exact_environment_path("RUSTFERRY_WORKER_ROOT")?,
+    )
+}
+
+fn select_command_worker_root(
+    explicit: Option<Utf8PathBuf>,
+    runner_temp: Option<Utf8PathBuf>,
+    persistent_root: Option<Utf8PathBuf>,
+) -> Result<Utf8PathBuf, CliFailure> {
+    if let Some(root) = explicit {
+        if !root.is_absolute() {
+            return Err(CliFailure::input(
+                "invalid_worker_root",
+                "worker root must be absolute",
+            ));
+        }
+        return Ok(root);
+    }
+    select_trusted_worker_root(runner_temp, persistent_root)
+}
+
 fn select_trusted_worker_root(
     runner_temp: Option<Utf8PathBuf>,
     persistent_root: Option<Utf8PathBuf>,
@@ -3393,6 +3606,84 @@ mod tests {
     }
 
     #[test]
+    fn serve_requires_the_explicit_stdio_transport() {
+        assert!(Cli::try_parse_from(["ferry-worker-macos", "serve"]).is_err());
+        let cli = Cli::try_parse_from(["ferry-worker-macos", "serve", "--stdio"])
+            .expect("explicit stdio transport");
+        assert!(matches!(
+            cli.command,
+            WorkerCommand::Serve(ServeArgs { stdio: true, .. })
+        ));
+        let cli = Cli::try_parse_from(["ferry-worker-macos", "serve", "--stdio-session-v1"])
+            .expect("explicit snapshot session transport");
+        assert!(matches!(
+            cli.command,
+            WorkerCommand::Serve(ServeArgs {
+                stdio_session_v1: true,
+                ..
+            })
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "ferry-worker-macos",
+                "serve",
+                "--stdio",
+                "--stdio-session-v1",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn partial_open_stdio_request_hits_injected_deadline_and_reader_can_finish() {
+        struct PartialOpenReader {
+            prefix: io::Cursor<Vec<u8>>,
+            release: mpsc::Receiver<()>,
+            released: bool,
+        }
+
+        impl Read for PartialOpenReader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let read = self.prefix.read(buffer)?;
+                if read > 0 {
+                    return Ok(read);
+                }
+                if !self.released {
+                    self.release.recv().map_err(|_| {
+                        io::Error::new(io::ErrorKind::BrokenPipe, "test reader release closed")
+                    })?;
+                    self.released = true;
+                }
+                Ok(0)
+            }
+        }
+
+        let (release, wait_for_release) = mpsc::sync_channel(1);
+        let request_task = StdioRequestTask::spawn(move || {
+            let mut reader = PartialOpenReader {
+                prefix: io::Cursor::new(br#"{"schema_version":1,"request":{"#.to_vec()),
+                release: wait_for_release,
+                released: false,
+            };
+            decode_worker_stdio_request(&mut reader)
+        })
+        .expect("stdio reader task");
+
+        assert_eq!(
+            request_task.wait(Duration::ZERO),
+            Err(StdioRequestWaitError::DeadlineExceeded)
+        );
+        release.send(()).expect("release partial reader");
+        assert_eq!(
+            request_task
+                .wait(Duration::from_secs(1))
+                .expect("reader result after release"),
+            Err(WorkerStdioCodecError::TruncatedJson)
+        );
+        request_task.join().expect("reader task joined");
+    }
+
+    #[test]
     fn cargo_document_parser_accepts_package_and_binary_tables() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let root = Utf8PathBuf::from_path_buf(temporary.path().to_path_buf())
@@ -3796,6 +4087,25 @@ unsafe_code = "deny"
             select_trusted_worker_root(Some(root.clone()), None).expect("runner root"),
             root
         );
+    }
+
+    #[test]
+    fn stdio_control_and_snapshot_sessions_select_the_same_trusted_root() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let root = canonical_temporary_root(&temporary).join("worker");
+        create_private_directory(&root).expect("private worker root");
+
+        let snapshot =
+            select_trusted_worker_root(None, Some(root.clone())).expect("snapshot worker root");
+        let control = select_command_worker_root(None, None, Some(root.clone()))
+            .expect("control worker root");
+        assert_eq!(control, snapshot);
+
+        let missing = select_command_worker_root(None, None, None).expect_err("missing root");
+        assert_eq!(missing.code, "missing_worker_root");
+        let ambiguous = select_command_worker_root(None, Some(root.clone()), Some(root.clone()))
+            .expect_err("ambiguous root");
+        assert_eq!(ambiguous.code, "ambiguous_worker_root");
     }
 
     #[test]

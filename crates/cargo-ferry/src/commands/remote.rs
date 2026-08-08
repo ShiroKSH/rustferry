@@ -27,11 +27,14 @@ use rustferry_remote::{
     ArtifactDownloadRequest, ArtifactKind, ArtifactListRequest, BuildProfile, BuildProvider,
     BundleIdentifier, CURRENT_PROTOCOL_VERSION, CancellationRequest, CancellationToken,
     CleanupConfirmation, CleanupRequest, DiagnosticSeverity, EventRequest, HandshakeRequest,
-    IosArtifactType, IosDeviceBuildRequest, JobState, ProtocolPath, ProtocolPathSemantics,
-    ProviderDoctorRequest, ProviderFeature, ProviderFuture, RemoteBuildEvent, RemoteBuildEventKind,
-    SecretBytes, SigningMode, SigningPlan, SigningTarget, SigningTargetKind, SourceBundleRequest,
-    SourceLimits, SourceManifest, SourceManifestEntry, SourceMode, UnsignedNestedBundleKind,
-    ValidationLevel, plan_source_bundle, validate_source_manifest,
+    IosArtifactType, IosDeviceBuildRequest, JobState, MAX_SOURCE_BUNDLE_DESCRIPTOR_BYTES,
+    ProtocolPath, ProtocolPathSemantics, ProviderDoctorRequest, ProviderFeature, ProviderFuture,
+    RemoteBuildEvent, RemoteBuildEventKind, SecretBytes, SigningMode, SigningPlan, SigningTarget,
+    SigningTargetKind, SourceArchive, SourceArchiveLimits, SourceBundleDescriptor,
+    SourceBundlePlan, SourceBundleRequest, SourceLimits, SourceManifest, SourceManifestEntry,
+    SourceMode, UnsignedNestedBundleKind, ValidationLevel, create_source_bundle_archive,
+    plan_source_bundle, validate_source_manifest, verify_and_extract_source_bundle,
+    write_source_bundle_descriptor_file,
 };
 use same_file::Handle as FileIdentityHandle;
 use semver::Version;
@@ -40,8 +43,9 @@ use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use crate::cli::{
-    RemoteArgs, RemoteCommand, RemoteDoctorArgs, RemoteProviderChoice, RemoteSetupArgs,
-    RemoteStatusArgs,
+    RemoteArgs, RemoteBundleArgs, RemoteBundleCommand, RemoteBundleCreateArgs,
+    RemoteBundleInspectArgs, RemoteBundleVerifyArgs, RemoteCommand, RemoteDoctorArgs,
+    RemoteProviderChoice, RemoteSetupArgs, RemoteStatusArgs,
 };
 use crate::error::CliError;
 use crate::output::Reporter;
@@ -140,12 +144,27 @@ struct GitRemoteContext {
 #[derive(Debug, Deserialize)]
 struct CargoMetadata {
     packages: Vec<CargoMetadataPackage>,
+    resolve: Option<CargoMetadataResolve>,
+    workspace_members: Vec<String>,
+    workspace_root: Utf8PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
 struct CargoMetadataPackage {
+    id: String,
     manifest_path: Utf8PathBuf,
     source: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoMetadataResolve {
+    nodes: Vec<CargoMetadataNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoMetadataNode {
+    id: String,
+    dependencies: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -181,6 +200,49 @@ struct DoctorOutput {
     ready: bool,
     checks: Vec<rustferry_remote::ProviderCheck>,
     signing_mode: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct SourceBundleInspectOutput {
+    project: String,
+    workspace: String,
+    path_dependencies: Vec<String>,
+    symlinks: Vec<String>,
+    excluded_sensitive_paths: Vec<String>,
+    manifest: SourceManifest,
+}
+
+#[derive(Debug, Serialize)]
+struct SourceBundleCreateOutput {
+    project: String,
+    workspace: String,
+    archive_path: String,
+    descriptor_path: String,
+    archive: Option<SourceArchive>,
+    path_dependencies: Vec<String>,
+    symlinks: Vec<String>,
+    excluded_sensitive_paths: Vec<String>,
+    manifest: SourceManifest,
+    created: bool,
+    dry_run: bool,
+}
+
+#[derive(Debug)]
+struct SourceBundleOutputPaths {
+    archive: Utf8PathBuf,
+    descriptor: Utf8PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+struct SourceBundleVerifyOutput {
+    archive_path: String,
+    descriptor_path: String,
+    archive: SourceArchive,
+    project_path: String,
+    source_sha256: String,
+    source_files: usize,
+    source_bytes: u64,
+    verified: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -532,13 +594,13 @@ struct CreatedArtifact {
 }
 
 #[derive(Default)]
-struct ArtifactDownloadRollback {
+pub(super) struct ArtifactDownloadRollback {
     created: Vec<CreatedArtifact>,
     committed: bool,
 }
 
 impl ArtifactDownloadRollback {
-    fn record(&mut self, path: &Utf8Path) -> std::io::Result<()> {
+    pub(super) fn record(&mut self, path: &Utf8Path) -> std::io::Result<()> {
         self.created.push(CreatedArtifact {
             path: path.to_owned(),
             identity: ArtifactFileIdentity::capture(path)?,
@@ -546,8 +608,52 @@ impl ArtifactDownloadRollback {
         Ok(())
     }
 
-    fn commit(&mut self) {
+    pub(super) fn record_hard_link_from_file(
+        &mut self,
+        source: &File,
+        path: &Utf8Path,
+    ) -> std::io::Result<()> {
+        let identity = ArtifactFileIdentity::from_file(source)?;
+        self.created.push(CreatedArtifact {
+            path: path.to_owned(),
+            identity,
+        });
+        let published = ArtifactFileIdentity::capture(path)?;
+        if self
+            .created
+            .last()
+            .is_none_or(|created| created.identity != published)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "hard-link publication changed filesystem identity",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn commit(&mut self) {
         self.committed = true;
+    }
+
+    pub(super) fn abort(&mut self) -> std::io::Result<()> {
+        if self.committed {
+            return Ok(());
+        }
+        let mut failed = false;
+        while let Some(artifact) = self.created.pop() {
+            if rollback_created_artifact(artifact).is_err() {
+                failed = true;
+            }
+        }
+        if failed {
+            Err(std::io::Error::other(
+                "one or more created artifact paths could not be rolled back safely",
+            ))
+        } else {
+            self.committed = true;
+            Ok(())
+        }
     }
 }
 
@@ -555,35 +661,42 @@ impl Drop for ArtifactDownloadRollback {
     fn drop(&mut self) {
         if !self.committed {
             while let Some(artifact) = self.created.pop() {
-                rollback_created_artifact(artifact);
+                let _ = rollback_created_artifact(artifact);
             }
         }
     }
 }
 
-fn rollback_created_artifact(artifact: CreatedArtifact) {
-    rollback_created_artifact_with(artifact, |_| {});
+fn rollback_created_artifact(artifact: CreatedArtifact) -> std::io::Result<()> {
+    rollback_created_artifact_with(artifact, |_| {})
 }
 
 fn rollback_created_artifact_with(
     artifact: CreatedArtifact,
     after_quarantine: impl FnOnce(&Utf8Path),
-) {
+) -> std::io::Result<()> {
     let Some(parent) = artifact.path.parent() else {
-        return;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "artifact path has no parent",
+        ));
     };
-    let Ok(quarantine) = tempfile::Builder::new()
+    let quarantine = tempfile::Builder::new()
         .prefix(".rustferry-rollback-")
-        .tempdir_in(parent)
-    else {
-        return;
-    };
-    let Ok(quarantine_root) = Utf8PathBuf::from_path_buf(quarantine.path().to_path_buf()) else {
-        return;
-    };
+        .tempdir_in(parent)?;
+    let quarantine_root =
+        Utf8PathBuf::from_path_buf(quarantine.path().to_path_buf()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "rollback path is not UTF-8",
+            )
+        })?;
     let quarantined = quarantine_root.join("artifact");
-    if fs::rename(&artifact.path, &quarantined).is_err() {
-        return;
+    if let Err(error) = fs::rename(&artifact.path, &quarantined) {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        return Err(error);
     }
     after_quarantine(&quarantined);
 
@@ -595,32 +708,880 @@ fn rollback_created_artifact_with(
     drop(artifact.identity);
     let Ok(temporary_path) = tempfile::TempPath::try_from_path(quarantined.to_path_buf()) else {
         let _ = quarantine.keep();
-        return;
+        return Err(std::io::Error::other(
+            "quarantined artifact path could not be guarded",
+        ));
     };
     if unchanged {
-        let _ = temporary_path.close();
-        let _ = quarantine.close();
-        return;
+        temporary_path.close()?;
+        quarantine.close()?;
+        return Ok(());
     }
 
     match temporary_path.persist_noclobber(&artifact.path) {
         Ok(()) => {
             let _ = quarantine.close();
+            Err(std::io::Error::other(
+                "artifact path changed identity during rollback",
+            ))
         }
         Err(mut error) => {
             error.path.disable_cleanup(true);
             drop(error);
             let _ = quarantine.keep();
+            Err(std::io::Error::other(
+                "artifact replacement could not be restored after rollback",
+            ))
         }
     }
 }
 
 pub fn run(arguments: RemoteArgs, dry_run: bool, reporter: &Reporter) -> Result<(), CliError> {
     match arguments.command {
+        RemoteCommand::Add(arguments) => match arguments.provider {
+            crate::cli::RemoteAddProvider::SshMac(arguments) => {
+                super::ssh_remote::add(&arguments, dry_run, reporter)
+            }
+        },
         RemoteCommand::Setup(arguments) => setup(arguments, dry_run, reporter),
-        RemoteCommand::Doctor(arguments) => doctor(&arguments, reporter),
+        RemoteCommand::Doctor(arguments) => {
+            if arguments.target == "github" {
+                doctor(&arguments, reporter)
+            } else {
+                super::ssh_remote::doctor(&arguments, reporter)
+            }
+        }
         RemoteCommand::Status(arguments) => status(&arguments, reporter),
+        RemoteCommand::Bundle(arguments) => bundle(arguments, dry_run, reporter),
     }
+}
+
+fn bundle(arguments: RemoteBundleArgs, dry_run: bool, reporter: &Reporter) -> Result<(), CliError> {
+    match arguments.command {
+        RemoteBundleCommand::Inspect(arguments) => inspect_source_bundle(&arguments, reporter),
+        RemoteBundleCommand::Create(arguments) => {
+            create_source_bundle(&arguments, dry_run, reporter)
+        }
+        RemoteBundleCommand::Verify(arguments) => verify_source_bundle(&arguments, reporter),
+    }
+}
+
+fn inspect_source_bundle(
+    arguments: &RemoteBundleInspectArgs,
+    reporter: &Reporter,
+) -> Result<(), CliError> {
+    let project = find_project_root(arguments.project_dir.as_deref())?;
+    let (workspace, plan, path_dependencies) =
+        snapshot_source_bundle_plan(&project, &arguments.executable, reporter)?;
+    let output = SourceBundleInspectOutput {
+        project: project.to_string(),
+        workspace: workspace.to_string(),
+        path_dependencies,
+        symlinks: Vec::new(),
+        excluded_sensitive_paths: plan.excluded_sensitive_paths().to_vec(),
+        manifest: plan.manifest().clone(),
+    };
+    reporter.success(
+        "remote-bundle-inspect",
+        &output,
+        || {
+            format!(
+                "Source bundle\n\nProject:\n  {}\n\nWorkspace:\n  {}\n\nPath dependencies:\n{}\n\nSymlinks:\n  none (rejected during planning)\n\nExcluded sensitive paths:\n{}\n\nFiles:\n{}\n\nTotal:\n  {} files, {} bytes\n\nManifest SHA-256:\n  {}",
+                output.project,
+                output.workspace,
+                source_bundle_audit_list(&output.path_dependencies),
+                source_bundle_audit_list(&output.excluded_sensitive_paths),
+                source_bundle_file_list(&output.manifest),
+                output.manifest.entries.len(),
+                output.manifest.total_size,
+                output.manifest.sha256,
+            )
+        },
+        &[],
+    );
+    Ok(())
+}
+
+fn create_source_bundle(
+    arguments: &RemoteBundleCreateArgs,
+    dry_run: bool,
+    reporter: &Reporter,
+) -> Result<(), CliError> {
+    let project = find_project_root(arguments.project_dir.as_deref())?;
+    let (workspace, plan, path_dependencies) =
+        snapshot_source_bundle_plan(&project, &arguments.executable, reporter)?;
+    let paths = source_bundle_output_paths(arguments, &workspace)?;
+
+    if dry_run {
+        report_source_bundle_create_plan(
+            &project,
+            &workspace,
+            &paths,
+            &plan,
+            &path_dependencies,
+            reporter,
+        );
+        return Ok(());
+    }
+
+    let limits = SourceArchiveLimits::default();
+    let archive = create_source_bundle_archive(&plan, &paths.archive, limits)
+        .map_err(|error| source_bundle_error("source_bundle_create_failed", &error))?;
+
+    let descriptor = SourceBundleDescriptor::new(archive.clone(), plan.manifest().clone());
+    write_source_bundle_descriptor_file(&descriptor, &paths.descriptor, limits).map_err(
+        |error| {
+            remote_error_with_details(
+                "source_bundle_descriptor_create_failed",
+                "the source archive was created, but its descriptor could not be published safely",
+                "Keep the reported archive for inspection, then retry with two new output paths; RustFerry will not delete or overwrite a path after losing its filesystem identity.",
+                vec![
+                    format!("archive_path={}", paths.archive),
+                    format!("descriptor_path={}", paths.descriptor),
+                    error.to_string(),
+                ],
+            )
+        },
+    )?;
+
+    report_created_source_bundle(
+        &project,
+        &workspace,
+        &paths,
+        &plan,
+        path_dependencies,
+        archive,
+        reporter,
+    );
+    Ok(())
+}
+
+fn report_source_bundle_create_plan(
+    project: &Utf8Path,
+    workspace: &Utf8Path,
+    paths: &SourceBundleOutputPaths,
+    plan: &SourceBundlePlan,
+    path_dependencies: &[String],
+    reporter: &Reporter,
+) {
+    let output = SourceBundleCreateOutput {
+        project: project.to_string(),
+        workspace: workspace.to_string(),
+        archive_path: paths.archive.to_string(),
+        descriptor_path: paths.descriptor.to_string(),
+        archive: None,
+        path_dependencies: path_dependencies.to_vec(),
+        symlinks: Vec::new(),
+        excluded_sensitive_paths: plan.excluded_sensitive_paths().to_vec(),
+        manifest: plan.manifest().clone(),
+        created: false,
+        dry_run: true,
+    };
+    reporter.success(
+        "remote-bundle-create",
+        &output,
+        || {
+            format!(
+                "Source bundle creation plan\n\nArchive:\n  {}\n\nDescriptor:\n  {}\n\nPath dependencies:\n{}\n\nSymlinks:\n  none (rejected during planning)\n\nExcluded sensitive paths:\n{}\n\nFiles:\n{}\n\nTotal:\n  {} files, {} bytes\n\nManifest SHA-256:\n  {}",
+                output.archive_path,
+                output.descriptor_path,
+                source_bundle_audit_list(&output.path_dependencies),
+                source_bundle_audit_list(&output.excluded_sensitive_paths),
+                source_bundle_file_list(&output.manifest),
+                output.manifest.entries.len(),
+                output.manifest.total_size,
+                output.manifest.sha256,
+            )
+        },
+        &[],
+    );
+}
+
+fn report_created_source_bundle(
+    project: &Utf8Path,
+    workspace: &Utf8Path,
+    paths: &SourceBundleOutputPaths,
+    plan: &SourceBundlePlan,
+    path_dependencies: Vec<String>,
+    archive: SourceArchive,
+    reporter: &Reporter,
+) {
+    let output = SourceBundleCreateOutput {
+        project: project.to_string(),
+        workspace: workspace.to_string(),
+        archive_path: paths.archive.to_string(),
+        descriptor_path: paths.descriptor.to_string(),
+        archive: Some(archive),
+        path_dependencies,
+        symlinks: Vec::new(),
+        excluded_sensitive_paths: plan.excluded_sensitive_paths().to_vec(),
+        manifest: plan.manifest().clone(),
+        created: true,
+        dry_run: false,
+    };
+    reporter.success(
+        "remote-bundle-create",
+        &output,
+        || {
+            let archive = output.archive.as_ref().expect("created archive descriptor");
+            format!(
+                "✓ Created deterministic source bundle\n\nArchive:\n  {}\n  {} bytes\n  SHA-256: {}\n\nDescriptor:\n  {}\n\nSource:\n  {} files, {} bytes\n  SHA-256: {}",
+                output.archive_path,
+                archive.size,
+                archive.sha256,
+                output.descriptor_path,
+                output.manifest.entries.len(),
+                output.manifest.total_size,
+                output.manifest.sha256,
+            )
+        },
+        &[],
+    );
+}
+
+fn source_bundle_output_paths(
+    arguments: &RemoteBundleCreateArgs,
+    workspace: &Utf8Path,
+) -> Result<SourceBundleOutputPaths, CliError> {
+    let archive = new_source_bundle_output(&arguments.output, "source archive")?;
+    let descriptor_argument = arguments.descriptor.clone().unwrap_or_else(|| {
+        Utf8PathBuf::from(format!("{}.manifest.json", arguments.output.as_str()))
+    });
+    let descriptor = new_source_bundle_output(&descriptor_argument, "source descriptor")?;
+    if archive == descriptor {
+        return Err(remote_error(
+            "source_bundle_output_collision",
+            "the source archive and descriptor resolve to the same path",
+            "Choose two distinct new output paths.",
+        ));
+    }
+    for (role, path) in [
+        ("source archive", &archive),
+        ("source descriptor", &descriptor),
+    ] {
+        if path.starts_with(workspace) {
+            return Err(remote_error_with_details(
+                "source_bundle_output_inside_workspace",
+                format!("the {role} output is inside the selected Cargo workspace"),
+                "Choose two new output paths outside the workspace so bundle creation cannot change its own source snapshot.",
+                vec![format!("workspace={workspace}"), format!("path={path}")],
+            ));
+        }
+    }
+    Ok(SourceBundleOutputPaths {
+        archive,
+        descriptor,
+    })
+}
+
+fn verify_source_bundle(
+    arguments: &RemoteBundleVerifyArgs,
+    reporter: &Reporter,
+) -> Result<(), CliError> {
+    let descriptor_bytes = read_stable_source_bundle_file(
+        &arguments.descriptor,
+        MAX_SOURCE_BUNDLE_DESCRIPTOR_BYTES,
+        "source bundle descriptor",
+    )?;
+    let descriptor =
+        serde_json::from_slice::<SourceBundleDescriptor>(&descriptor_bytes).map_err(|_| {
+            remote_error(
+                "invalid_source_bundle_descriptor",
+                "the source bundle descriptor is malformed or contains unknown fields",
+                "Use the exact descriptor created with `cargo ferry remote bundle create`.",
+            )
+        })?;
+    descriptor
+        .validate(SourceArchiveLimits::default())
+        .map_err(|error| source_bundle_error("invalid_source_bundle_descriptor", &error))?;
+
+    let temporary = tempfile::Builder::new()
+        .prefix("rustferry-source-verify-")
+        .tempdir()
+        .map_err(|source| CliError::Io {
+            action: "create source verification directory",
+            path: Utf8PathBuf::from("temporary directory"),
+            source,
+        })?;
+    let temporary_root = Utf8PathBuf::from_path_buf(temporary.path().to_path_buf())
+        .map_err(CliError::NonUtf8Path)?;
+    let destination = temporary_root.join("extracted");
+    let actual = verify_and_extract_source_bundle(
+        &arguments.archive,
+        &descriptor.archive,
+        &descriptor.manifest,
+        &destination,
+        SourceArchiveLimits::default(),
+    )
+    .map_err(|error| source_bundle_error("source_bundle_verification_failed", &error))?;
+    if actual != descriptor.archive {
+        return Err(remote_error(
+            "source_bundle_verification_failed",
+            "the verified source archive descriptor changed unexpectedly",
+            "Discard the archive and transfer it again from the trusted sender.",
+        ));
+    }
+
+    let output = SourceBundleVerifyOutput {
+        archive_path: arguments.archive.to_string(),
+        descriptor_path: arguments.descriptor.to_string(),
+        archive: actual,
+        project_path: descriptor.manifest.project_path,
+        source_sha256: descriptor.manifest.sha256,
+        source_files: descriptor.manifest.entries.len(),
+        source_bytes: descriptor.manifest.total_size,
+        verified: true,
+    };
+    reporter.success(
+        "remote-bundle-verify",
+        &output,
+        || {
+            format!(
+                "✓ Source bundle verified\n\nArchive:\n  {}\n  {} bytes\n  SHA-256: {}\n\nSource:\n  {} files, {} bytes\n  SHA-256: {}",
+                output.archive_path,
+                output.archive.size,
+                output.archive.sha256,
+                output.source_files,
+                output.source_bytes,
+                output.source_sha256,
+            )
+        },
+        &[],
+    );
+    Ok(())
+}
+
+pub(super) fn snapshot_source_bundle_plan(
+    project: &Utf8Path,
+    explicit_executables: &[Utf8PathBuf],
+    reporter: &Reporter,
+) -> Result<(Utf8PathBuf, SourceBundlePlan, Vec<String>), CliError> {
+    let metadata = source_bundle_cargo_metadata(project, reporter)?;
+    let workspace = source_bundle_workspace(&metadata, project)?;
+    let selected_package = source_bundle_selected_package(&metadata, project)?;
+    let reachable = source_bundle_reachable_packages(&metadata, &selected_package)?;
+    let (mut request, path_dependencies) =
+        source_bundle_request(&metadata, &workspace, project, &reachable)?;
+    let baseline = plan_source_bundle(&request)
+        .map_err(|error| source_bundle_error("source_bundle_plan_failed", &error))?;
+    let executable_modes = explicit_executables
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    #[cfg(not(unix))]
+    let mut executable_modes = executable_modes;
+    #[cfg(not(unix))]
+    {
+        let selected = baseline
+            .manifest()
+            .entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<HashSet<_>>();
+        executable_modes.extend(
+            git_index_executable_paths(&workspace, reporter)?
+                .into_iter()
+                .filter(|path| selected.contains(path.as_str())),
+        );
+    }
+    if executable_modes.is_empty() {
+        return Ok((workspace, baseline, path_dependencies));
+    }
+    for path in executable_modes {
+        request = request.with_executable_mode(path, true);
+    }
+    let plan = plan_source_bundle(&request)
+        .map_err(|error| source_bundle_error("source_bundle_plan_failed", &error))?;
+    Ok((workspace, plan, path_dependencies))
+}
+
+fn source_bundle_cargo_metadata(
+    project: &Utf8Path,
+    reporter: &Reporter,
+) -> Result<CargoMetadata, CliError> {
+    let cargo = executable("cargo")?;
+    let output = checked_output(
+        &cargo,
+        &[
+            OsString::from("metadata"),
+            OsString::from("--format-version"),
+            OsString::from("1"),
+            OsString::from("--locked"),
+        ],
+        project,
+        "read Cargo metadata for source bundle",
+        reporter,
+    )?;
+    serde_json::from_slice(&output).map_err(|_| {
+        remote_error(
+            "invalid_cargo_metadata",
+            "Cargo returned malformed or unsupported project metadata",
+            "Run `cargo metadata --format-version 1 --locked` and correct the manifest error.",
+        )
+    })
+}
+
+fn source_bundle_workspace(
+    metadata: &CargoMetadata,
+    project: &Utf8Path,
+) -> Result<Utf8PathBuf, CliError> {
+    let workspace = metadata
+        .workspace_root
+        .canonicalize_utf8()
+        .map_err(|source| CliError::Io {
+            action: "resolve Cargo workspace root",
+            path: metadata.workspace_root.clone(),
+            source,
+        })?;
+    if project.starts_with(&workspace) {
+        Ok(workspace)
+    } else {
+        Err(remote_error(
+            "project_outside_workspace",
+            "the RustFerry project is outside the Cargo workspace selected by metadata",
+            "Run the command from the workspace that contains the project.",
+        ))
+    }
+}
+
+fn source_bundle_selected_package(
+    metadata: &CargoMetadata,
+    project: &Utf8Path,
+) -> Result<String, CliError> {
+    for package in metadata
+        .packages
+        .iter()
+        .filter(|package| package.source.is_none())
+    {
+        if source_bundle_package_root(package)? == project {
+            return Ok(package.id.clone());
+        }
+    }
+    Err(remote_error(
+        "project_package_not_found",
+        "Cargo metadata did not identify the selected RustFerry project package",
+        "Run the command from a package directory containing both Cargo.toml and ferry.toml.",
+    ))
+}
+
+fn source_bundle_reachable_packages(
+    metadata: &CargoMetadata,
+    selected_package: &str,
+) -> Result<HashSet<String>, CliError> {
+    let resolve = metadata.resolve.as_ref().ok_or_else(|| {
+        remote_error(
+            "cargo_dependency_graph_unavailable",
+            "Cargo metadata did not return a resolved dependency graph",
+            "Run `cargo metadata --format-version 1 --locked` and correct the workspace resolution error.",
+        )
+    })?;
+    let dependencies = resolve
+        .nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node.dependencies.as_slice()))
+        .collect::<BTreeMap<_, _>>();
+    if !dependencies.contains_key(selected_package) {
+        return Err(remote_error(
+            "project_dependency_graph_missing",
+            "Cargo's resolved dependency graph does not contain the selected project package",
+            "Regenerate Cargo.lock and rerun `cargo metadata --format-version 1 --locked`.",
+        ));
+    }
+    let mut reachable = HashSet::new();
+    let mut pending = vec![selected_package.to_owned()];
+    while let Some(package) = pending.pop() {
+        if !reachable.insert(package.clone()) {
+            continue;
+        }
+        if let Some(package_dependencies) = dependencies.get(package.as_str()) {
+            pending.extend(
+                package_dependencies
+                    .iter()
+                    .map(|dependency| (*dependency).clone()),
+            );
+        }
+    }
+    Ok(reachable)
+}
+
+fn source_bundle_request(
+    metadata: &CargoMetadata,
+    workspace: &Utf8Path,
+    project: &Utf8Path,
+    reachable: &HashSet<String>,
+) -> Result<(SourceBundleRequest, Vec<String>), CliError> {
+    let workspace_members = metadata
+        .workspace_members
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut included = BTreeSet::new();
+    let mut excluded = BTreeSet::new();
+    for package in metadata.packages.iter().filter(|package| {
+        package.source.is_none()
+            && (reachable.contains(&package.id) || workspace_members.contains(package.id.as_str()))
+    }) {
+        let canonical = source_bundle_package_root(package)?;
+        let relative = canonical.strip_prefix(workspace).map_err(|_| {
+            remote_error(
+                "local_dependency_outside_workspace",
+                "a local Cargo path dependency is outside the selected workspace",
+                "Move the dependency into the workspace or publish it before creating a portable snapshot.",
+            )
+        })?;
+        if canonical == project {
+            continue;
+        }
+        if relative.as_str().is_empty() || relative == Utf8Path::new(".") {
+            if reachable.contains(&package.id) {
+                return Err(remote_error(
+                    "workspace_root_dependency_unsupported",
+                    "a nested RustFerry project depends on a package rooted at the workspace root",
+                    "Move the shared package into a named workspace subdirectory or create the bundle from a root RustFerry project.",
+                ));
+            }
+            continue;
+        }
+        if reachable.contains(&package.id) {
+            included.insert(relative.to_owned());
+        } else if project == workspace && workspace_members.contains(package.id.as_str()) {
+            excluded.insert(relative.to_owned());
+        }
+    }
+    reject_overlapping_package_roots(&included, &excluded)?;
+
+    let path_dependencies = included.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let mut request = SourceBundleRequest::new(workspace, project);
+    for path in included {
+        request = request.include_workspace_path(path);
+    }
+    for path in excluded {
+        request = request.exclude_workspace_path(path);
+    }
+    Ok((request, path_dependencies))
+}
+
+fn source_bundle_package_root(package: &CargoMetadataPackage) -> Result<Utf8PathBuf, CliError> {
+    let parent = package.manifest_path.parent().ok_or_else(|| {
+        remote_error(
+            "invalid_local_dependency",
+            "a local Cargo package manifest has no parent directory",
+            "Correct the local package manifest path.",
+        )
+    })?;
+    parent.canonicalize_utf8().map_err(|source| CliError::Io {
+        action: "resolve local Cargo package",
+        path: parent.to_owned(),
+        source,
+    })
+}
+
+fn reject_overlapping_package_roots(
+    included: &BTreeSet<Utf8PathBuf>,
+    excluded: &BTreeSet<Utf8PathBuf>,
+) -> Result<(), CliError> {
+    if let Some((dependency, unrelated)) = included.iter().find_map(|dependency| {
+        excluded
+            .iter()
+            .find(|unrelated| dependency.starts_with(unrelated))
+            .map(|unrelated| (dependency, unrelated))
+    }) {
+        return Err(remote_error_with_details(
+            "overlapping_workspace_package_roots",
+            "an unrelated workspace package contains a required local dependency",
+            "Move the nested package to a distinct workspace path before creating a portable snapshot.",
+            vec![
+                format!("required={dependency}"),
+                format!("unrelated={unrelated}"),
+            ],
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn git_index_executable_paths(
+    workspace: &Utf8Path,
+    reporter: &Reporter,
+) -> Result<BTreeSet<Utf8PathBuf>, CliError> {
+    let Some(found) = find_in_path("git") else {
+        reporter.verbose(
+            "Git is unavailable; pass --executable for source files that need a Unix executable bit",
+        );
+        return Ok(BTreeSet::new());
+    };
+    let git = executable_entrypoint(&found, "git")?;
+    let output = run_captured_bounded(
+        &git,
+        &[
+            OsString::from("ls-files"),
+            OsString::from("--stage"),
+            OsString::from("-z"),
+            OsString::from("--"),
+        ],
+        workspace,
+        "read portable executable modes from the Git index",
+        reporter,
+        MAX_TOOL_OUTPUT_BYTES,
+    )?;
+    if !output.status.success() {
+        reporter.verbose(
+            "No Git index is available; pass --executable for source files that need a Unix executable bit",
+        );
+        return Ok(BTreeSet::new());
+    }
+    parse_git_index_executable_paths(&output.stdout)
+}
+
+#[cfg(any(test, not(unix)))]
+fn parse_git_index_executable_paths(bytes: &[u8]) -> Result<BTreeSet<Utf8PathBuf>, CliError> {
+    let mut executable = BTreeSet::new();
+    for record in bytes
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        let separator = record
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or_else(|| {
+                remote_error(
+                    "invalid_git_executable_metadata",
+                    "Git returned a malformed index entry while reading executable modes",
+                    "Resolve the Git index and retry, or pass explicit --executable paths.",
+                )
+            })?;
+        let header = std::str::from_utf8(&record[..separator]).map_err(|_| {
+            remote_error(
+                "invalid_git_executable_metadata",
+                "Git returned non-UTF-8 executable metadata",
+                "Use UTF-8 repository paths or pass explicit --executable paths.",
+            )
+        })?;
+        let mut fields = header.split_ascii_whitespace();
+        let mode = fields.next();
+        let object = fields.next();
+        let stage = fields.next();
+        if mode.is_none()
+            || object.is_none()
+            || stage.is_none()
+            || fields.next().is_some()
+            || stage != Some("0")
+        {
+            return Err(remote_error(
+                "invalid_git_executable_metadata",
+                "Git returned an unresolved or malformed index entry",
+                "Resolve index conflicts and retry, or pass explicit --executable paths.",
+            ));
+        }
+        if mode != Some("100755") {
+            continue;
+        }
+        let path = std::str::from_utf8(&record[separator + 1..]).map_err(|_| {
+            remote_error(
+                "invalid_git_executable_metadata",
+                "Git returned a non-UTF-8 executable path",
+                "Use UTF-8 repository paths or pass an explicit --executable path.",
+            )
+        })?;
+        executable.insert(Utf8PathBuf::from(path));
+    }
+    Ok(executable)
+}
+
+fn source_bundle_file_list(manifest: &SourceManifest) -> String {
+    manifest
+        .entries
+        .iter()
+        .map(|entry| {
+            let mode = if entry.executable {
+                "executable"
+            } else {
+                "file"
+            };
+            format!(
+                "  {}  {:>10}  {mode}  {}",
+                entry.sha256, entry.size, entry.path
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn source_bundle_audit_list(paths: &[String]) -> String {
+    if paths.is_empty() {
+        "  none".to_owned()
+    } else {
+        paths
+            .iter()
+            .map(|path| format!("  {path}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+fn new_source_bundle_output(path: &Utf8Path, role: &'static str) -> Result<Utf8PathBuf, CliError> {
+    let file_name = path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            remote_error(
+                "invalid_source_bundle_destination",
+                format!("the {role} path has no file name"),
+                "Choose a new regular-file path in an existing directory.",
+            )
+        })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_str().is_empty())
+        .unwrap_or_else(|| Utf8Path::new("."));
+    let parent = parent.canonicalize_utf8().map_err(|source| CliError::Io {
+        action: "resolve source bundle output directory",
+        path: parent.to_owned(),
+        source,
+    })?;
+    let resolved = parent.join(file_name);
+    match fs::symlink_metadata(&resolved) {
+        Ok(_) => Err(remote_error_with_details(
+            "source_bundle_output_exists",
+            format!("the {role} output already exists or is linked"),
+            "Choose a new path; RustFerry never overwrites source bundle output.",
+            vec![format!("path={resolved}")],
+        )),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(resolved),
+        Err(source) => Err(CliError::Io {
+            action: "inspect source bundle output",
+            path: resolved,
+            source,
+        }),
+    }
+}
+
+fn read_stable_source_bundle_file(
+    path: &Utf8Path,
+    maximum: u64,
+    role: &'static str,
+) -> Result<Vec<u8>, CliError> {
+    let initial_metadata = fs::symlink_metadata(path).map_err(|source| CliError::Io {
+        action: "inspect source bundle input",
+        path: path.to_owned(),
+        source,
+    })?;
+    validate_source_bundle_input_metadata(&initial_metadata, maximum, role)?;
+    let initial_length = initial_metadata.len();
+    let initial_modified = initial_metadata.modified().ok();
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path).map_err(|source| CliError::Io {
+        action: "open source bundle input",
+        path: path.to_owned(),
+        source,
+    })?;
+    let opened_metadata = file.metadata().map_err(|source| CliError::Io {
+        action: "inspect open source bundle input",
+        path: path.to_owned(),
+        source,
+    })?;
+    validate_source_bundle_input_metadata(&opened_metadata, maximum, role)?;
+    let opened_identity =
+        ArtifactFileIdentity::from_file(&file).map_err(|source| CliError::Io {
+            action: "identify open source bundle input",
+            path: path.to_owned(),
+            source,
+        })?;
+    let linked_identity = ArtifactFileIdentity::capture(path).map_err(|source| CliError::Io {
+        action: "identify source bundle input path",
+        path: path.to_owned(),
+        source,
+    })?;
+    if linked_identity != opened_identity
+        || opened_metadata.len() != initial_length
+        || opened_metadata.modified().ok() != initial_modified
+    {
+        return Err(source_bundle_input_changed(role));
+    }
+
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(initial_length.min(1024 * 1024)).unwrap_or(1024 * 1024));
+    (&file)
+        .take(maximum.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|source| CliError::Io {
+            action: "read source bundle input",
+            path: path.to_owned(),
+            source,
+        })?;
+    let final_metadata = file.metadata().map_err(|source| CliError::Io {
+        action: "reinspect open source bundle input",
+        path: path.to_owned(),
+        source,
+    })?;
+    let final_identity = ArtifactFileIdentity::from_file(&file).map_err(|source| CliError::Io {
+        action: "reidentify open source bundle input",
+        path: path.to_owned(),
+        source,
+    })?;
+    let final_linked = ArtifactFileIdentity::capture(path).map_err(|source| CliError::Io {
+        action: "reidentify source bundle input path",
+        path: path.to_owned(),
+        source,
+    })?;
+    if bytes.len() as u64 != initial_length
+        || final_metadata.len() != initial_length
+        || final_metadata.modified().ok() != initial_modified
+        || final_identity != opened_identity
+        || final_linked != opened_identity
+    {
+        return Err(source_bundle_input_changed(role));
+    }
+    Ok(bytes)
+}
+
+fn validate_source_bundle_input_metadata(
+    metadata: &fs::Metadata,
+    maximum: u64,
+    role: &'static str,
+) -> Result<(), CliError> {
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > maximum {
+        return Err(remote_error(
+            "invalid_source_bundle_input",
+            format!("the {role} is not a bounded regular file"),
+            "Use a regular no-link file created by the source bundle command.",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.nlink() != 1 {
+            return Err(remote_error(
+                "invalid_source_bundle_input",
+                format!("the {role} has multiple filesystem links"),
+                "Copy it to a new regular file and retry verification.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn source_bundle_input_changed(role: &'static str) -> CliError {
+    remote_error(
+        "source_bundle_input_changed",
+        format!("the {role} changed while it was being read"),
+        "Stop concurrent writes and retry with a stable copy.",
+    )
+}
+
+fn source_bundle_error(code: &'static str, error: &rustferry_remote::SourceError) -> CliError {
+    remote_error_with_details(
+        code,
+        "the deterministic source bundle operation failed safely",
+        "Inspect the selected paths and retry from a stable, portable source tree.",
+        vec![error.to_string()],
+    )
 }
 
 pub(super) fn prepare_manual_github_signing(
@@ -1692,7 +2653,6 @@ fn setup(arguments: RemoteSetupArgs, dry_run: bool, reporter: &Reporter) -> Resu
 }
 
 fn doctor(arguments: &RemoteDoctorArgs, reporter: &Reporter) -> Result<(), CliError> {
-    let RemoteProviderChoice::Github = arguments.provider;
     let root = find_project_root(arguments.project_dir.as_deref())?;
     let stored = load_config(&root)?;
     let git = git_context(&root, &stored.source_remote_name, reporter)?;
@@ -3079,7 +4039,7 @@ fn record_events(events: &[RemoteBuildEvent], reporter: &Reporter, diagnostics: 
     }
 }
 
-fn event_detail(event: &RemoteBuildEvent) -> String {
+pub(super) fn event_detail(event: &RemoteBuildEvent) -> String {
     let detail = match &event.kind {
         RemoteBuildEventKind::Progress { message, .. }
         | RemoteBuildEventKind::Warning { message, .. }
@@ -4275,7 +5235,7 @@ fn ensure_provider_directories(root: &Utf8Path, paths: &GithubPaths) -> Result<(
     Ok(())
 }
 
-fn ensure_directory_chain(
+pub(super) fn ensure_directory_chain(
     root: &Utf8Path,
     relative: &Utf8Path,
     private_final: bool,
@@ -4331,7 +5291,10 @@ fn ensure_directory_chain(
     Ok(current)
 }
 
-fn prepare_artifact_destination(root: &Utf8Path, artifact: &Utf8Path) -> Result<(), CliError> {
+pub(super) fn prepare_artifact_destination(
+    root: &Utf8Path,
+    artifact: &Utf8Path,
+) -> Result<(), CliError> {
     let parent = artifact.parent().ok_or_else(|| {
         remote_error(
             "artifact_destination_invalid",
@@ -4505,7 +5468,7 @@ fn expected_artifact_downloads(
     Ok(downloads)
 }
 
-fn validate_artifact_product_name(product_name: &str) -> Result<(), CliError> {
+pub(super) fn validate_artifact_product_name(product_name: &str) -> Result<(), CliError> {
     let filename = format!("{product_name}-development.ipa");
     let basename = product_name
         .split('.')
@@ -4724,6 +5687,8 @@ fn safe_public_text(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(test, not(unix)))]
+    use super::parse_git_index_executable_paths;
     use super::{
         ArtifactDownloadRollback, CONFIG_SCHEMA_VERSION, CanonicalBase64SigningBlob,
         ConfigCommitError, ExistingFile, GithubPaths, ImmediateProviderResult,
@@ -5581,6 +6546,25 @@ mod tests {
     }
 
     #[test]
+    fn git_index_executable_parser_is_nul_safe_and_rejects_unmerged_entries() {
+        let parsed = parse_git_index_executable_paths(
+            b"100755 0123456789012345678901234567890123456789 0\tscripts/build tool\0\
+              100644 0123456789012345678901234567890123456789 0\tsrc/main.rs\0",
+        )
+        .expect("Git executable modes");
+        assert_eq!(
+            parsed,
+            BTreeSet::from([camino::Utf8PathBuf::from("scripts/build tool")])
+        );
+
+        let error = parse_git_index_executable_paths(
+            b"100755 0123456789012345678901234567890123456789 2\tscripts/conflicted\0",
+        )
+        .expect_err("unmerged index entry must fail");
+        assert_eq!(error.code(), "invalid_git_executable_metadata");
+    }
+
+    #[test]
     fn unsigned_plan_contains_the_complete_generated_product_graph() {
         let mut config = rustferry_core::FerryConfig::starter("Weather", "com.example.weather");
         config.extensions.widget.enabled = true;
@@ -5785,6 +6769,28 @@ mod tests {
     }
 
     #[test]
+    fn hard_link_rollback_binds_the_open_source_file_before_publication_cleanup() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let root = camino::Utf8Path::from_path(temporary.path()).expect("UTF-8 temp path");
+        let source = root.join("staged-events.jsonl");
+        let published = root.join("events.jsonl");
+        std::fs::write(&source, b"event\n").expect("staged event log");
+        let source_file = std::fs::File::open(&source).expect("open staged event log");
+        std::fs::hard_link(&source, &published).expect("publish event log");
+        let mut rollback = ArtifactDownloadRollback::default();
+        rollback
+            .record_hard_link_from_file(&source_file, &published)
+            .expect("bind publication to open file");
+        rollback.abort().expect("explicit rollback");
+        rollback.abort().expect("idempotent rollback");
+        assert_eq!(
+            std::fs::read(&source).expect("preserved staged event log"),
+            b"event\n"
+        );
+        assert!(!published.exists());
+    }
+
+    #[test]
     fn partial_download_rollback_preserves_a_replaced_file() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let root = camino::Utf8Path::from_path(temporary.path()).expect("UTF-8 temp path");
@@ -5827,7 +6833,8 @@ mod tests {
         super::rollback_created_artifact_with(artifact, |_| {
             std::fs::write(&primary, b"concurrent replacement")
                 .expect("install concurrent replacement");
-        });
+        })
+        .expect("owned artifact removed while replacement preserved");
 
         assert_eq!(
             std::fs::read(&primary).expect("preserved concurrent replacement"),

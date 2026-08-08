@@ -28,8 +28,10 @@ path = "src/main.rs"
 [dependencies]
 base64.workspace = true
 camino.workspace = true
+cap-std = { workspace = true, features = ["fs_utf8"] }
 clap.workspace = true
 clap_complete = "4.5.55"
+directories.workspace = true
 fs2.workspace = true
 keyring.workspace = true
 libc.workspace = true
@@ -39,6 +41,7 @@ rustferry-codegen = { version = "=0.1.0", path = "../rustferry-codegen" }
 rustferry-core = { version = "=0.1.0", path = "../rustferry-core" }
 rustferry-github = { version = "=0.1.0", path = "../rustferry-github" }
 rustferry-remote = { version = "=0.1.0", path = "../rustferry-remote" }
+rustferry-ssh = { version = "=0.1.0", path = "../rustferry-ssh" }
 rustferry-runtime-contract = { package = "rustferry", version = "=0.1.0", path = "../rustferry", default-features = false }
 rpassword.workspace = true
 same-file.workspace = true

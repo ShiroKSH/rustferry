@@ -38,6 +38,8 @@
 # Remote physical-iPhone builds
 
 - [Protocol](remote/protocol.md)
+- [Source bundles](remote/source-bundles.md)
+- [SSH Mac control plane](remote/ssh-mac.md)
 - [GitHub macOS provider security](remote/github-security.md)
 
 # Release
@@ -101,6 +103,8 @@
 
 # Project records
 
+- [Goal 3 evidence and remaining gates](GOAL3_STATUS.md)
+- [Developer Experience status](NEXT_PHASE_STATUS.md)
 - [ADR-001: UI backend](ADR-001-ui-backend.md)
 - [ADR-002: Android packaging](ADR-002-android-build.md)
 - [ADR-003: Platform bridge](ADR-003-platform-bridge.md)

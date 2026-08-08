@@ -4,7 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
-- Harden remote build file-identity checks across Windows and macOS, make provider-config replacement no-clobber, and bound GitHub CLI process cleanup.
+- Add pinned SSH Mac endpoints and strict snapshot-session v1 with bounded source upload, ordered progress and cancellation, independently verified unsigned XCArchive transfer, receipt-gated publication, and zero-retention cleanup.
+- Keep SSH snapshot builds explicitly unsigned-only; signing, IPA export, installation, and physical-device runtime remain unsupported and unvalidated.
+- Add deterministic snapshot inspect/create/verify commands and make physical-device builds select the GitHub remote automatically on Linux and Windows when `--remote` is omitted.
+- Harden remote build file-identity checks across Windows and macOS, create and verify Windows SSH config/operation objects with protected owner-bound ACLs, make provider-config replacement no-clobber, and bound GitHub CLI process cleanup.
 - Add manual GitHub remote-signing setup with local Apple Development asset validation, secure bounded secret upload after confirmation, and signing-plan persistence only after remote verification.
 - Add versioned remote-build contracts and a GitHub-hosted macOS physical-iPhone pipeline with exact-ref publication, unsigned archive validation, protected development signing, verified artifact download, cancellation, and cleanup.
 - Establish the RustFerry workspace, strict configuration, atomic project templates, host-testable runtime, platform build foundations, documentation, and cross-platform CI.

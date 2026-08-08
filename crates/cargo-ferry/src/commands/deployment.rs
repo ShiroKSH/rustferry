@@ -667,6 +667,7 @@ fn build_arguments(root: &Utf8Path, spec: &DeploymentSpec, release: bool) -> Bui
         platform,
         release,
         remote: None,
+        config_dir: None,
         unsigned: false,
         project_dir: Some(root.to_owned()),
     }

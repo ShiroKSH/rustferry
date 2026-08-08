@@ -7,11 +7,15 @@ use std::{
 
 use camino::{Utf8Path, Utf8PathBuf};
 use rustferry_remote::source::{
-    IgnoreRuleReason, PortablePathReason, SourceArchive, SourceArchiveLimits, SourceBundleRequest,
-    SourceError, SourceLimitKind, SourceLimits, SourceManifest, SourceManifestEntry, SourceMode,
-    create_source_bundle_archive, plan_source_bundle, validate_source_manifest,
-    verify_and_extract_source_bundle, verify_materialized_bundle, verify_source_bundle_plan,
-    verify_source_manifest,
+    IgnoreRuleReason, MAX_SOURCE_TRAVERSAL_ENTRIES, PortablePathReason, SourceArchive,
+    SourceArchiveLimits, SourceBundleRequest, SourceError, SourceLimitKind, SourceLimits,
+    SourceManifest, SourceManifestEntry, SourceMode, create_source_bundle_archive,
+    plan_source_bundle, validate_source_manifest, verify_and_extract_source_bundle,
+    verify_materialized_bundle, verify_source_bundle_plan, verify_source_manifest,
+};
+use rustferry_remote::{
+    MAX_SOURCE_BUNDLE_DESCRIPTOR_BYTES, SOURCE_BUNDLE_DESCRIPTOR_SCHEMA_VERSION,
+    SourceBundleDescriptor, write_source_bundle_descriptor_file,
 };
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -68,6 +72,185 @@ fn source_mode_has_canonical_wire_values() {
         "\"snapshot\""
     );
     assert!(SourceMode::Git < SourceMode::Snapshot);
+}
+
+#[test]
+fn source_bundle_descriptor_binds_and_validates_archive_and_manifest() {
+    let fixture = Fixture::new();
+    write(&fixture.project.join("src/main.rs"), b"fn main() {}\n");
+    let plan = plan_source_bundle(&fixture.request()).unwrap();
+    let archive_path = fixture.workspace.join("source.zip");
+    let archive =
+        create_source_bundle_archive(&plan, &archive_path, SourceArchiveLimits::default()).unwrap();
+    let descriptor = SourceBundleDescriptor::new(archive.clone(), plan.manifest().clone());
+
+    assert_eq!(
+        descriptor.schema_version,
+        SOURCE_BUNDLE_DESCRIPTOR_SCHEMA_VERSION
+    );
+    assert_eq!(descriptor.archive, archive);
+    assert_eq!(&descriptor.manifest, plan.manifest());
+    descriptor.validate(SourceArchiveLimits::default()).unwrap();
+}
+
+#[test]
+fn source_bundle_descriptor_strictly_rejects_invalid_envelope_fields() {
+    let fixture = Fixture::new();
+    let plan = plan_source_bundle(&fixture.request()).unwrap();
+    let valid = SourceBundleDescriptor::new(
+        SourceArchive {
+            size: 1,
+            sha256: "a".repeat(64),
+        },
+        plan.manifest().clone(),
+    );
+
+    let mut unsupported = valid.clone();
+    unsupported.schema_version += 1;
+    assert!(matches!(
+        unsupported.validate(SourceArchiveLimits::default()),
+        Err(SourceError::InvalidArchive { .. })
+    ));
+
+    let mut empty = valid.clone();
+    empty.archive.size = 0;
+    assert!(matches!(
+        empty.validate(SourceArchiveLimits::default()),
+        Err(SourceError::InvalidArchive { .. })
+    ));
+
+    let mut malformed_digest = valid.clone();
+    malformed_digest.archive.sha256 = "A".repeat(64);
+    assert!(matches!(
+        malformed_digest.validate(SourceArchiveLimits::default()),
+        Err(SourceError::InvalidArchive { .. })
+    ));
+
+    let limits = SourceArchiveLimits {
+        max_archive_size: 0,
+        ..SourceArchiveLimits::default()
+    };
+    assert!(matches!(
+        valid.validate(limits),
+        Err(SourceError::LimitExceeded {
+            kind: SourceLimitKind::ArchiveSize,
+            maximum: 0,
+            actual: 1,
+            ..
+        })
+    ));
+
+    let mut invalid_manifest = valid;
+    invalid_manifest.manifest.total_size += 1;
+    assert!(matches!(
+        invalid_manifest.validate(SourceArchiveLimits::default()),
+        Err(SourceError::InvalidManifest { .. })
+    ));
+}
+
+#[test]
+fn source_bundle_descriptor_json_is_strict_and_round_trips() {
+    let fixture = Fixture::new();
+    let plan = plan_source_bundle(&fixture.request()).unwrap();
+    let descriptor = SourceBundleDescriptor::new(
+        SourceArchive {
+            size: 1,
+            sha256: "a".repeat(64),
+        },
+        plan.manifest().clone(),
+    );
+    let encoded = serde_json::to_value(&descriptor).unwrap();
+    assert_eq!(
+        serde_json::from_value::<SourceBundleDescriptor>(encoded.clone()).unwrap(),
+        descriptor
+    );
+
+    let mut unknown_top_level = encoded.clone();
+    unknown_top_level
+        .as_object_mut()
+        .unwrap()
+        .insert("unexpected".to_owned(), serde_json::Value::Bool(true));
+    assert!(serde_json::from_value::<SourceBundleDescriptor>(unknown_top_level).is_err());
+
+    let mut unknown_archive_field = encoded;
+    unknown_archive_field["archive"]
+        .as_object_mut()
+        .unwrap()
+        .insert("unexpected".to_owned(), serde_json::Value::Bool(true));
+    assert!(serde_json::from_value::<SourceBundleDescriptor>(unknown_archive_field).is_err());
+}
+
+#[test]
+fn source_bundle_descriptor_file_is_deterministic_and_create_only() {
+    let fixture = Fixture::new();
+    let plan = plan_source_bundle(&fixture.request()).unwrap();
+    let descriptor = SourceBundleDescriptor::new(
+        SourceArchive {
+            size: 1,
+            sha256: "a".repeat(64),
+        },
+        plan.manifest().clone(),
+    );
+    let root = fixture.workspace.parent().unwrap();
+    let first = root.join("first.manifest.json");
+    let second = root.join("second.manifest.json");
+    let limits = SourceArchiveLimits::default();
+
+    write_source_bundle_descriptor_file(&descriptor, &first, limits).unwrap();
+    write_source_bundle_descriptor_file(&descriptor, &second, limits).unwrap();
+    let first_bytes = fs::read(&first).unwrap();
+    assert_eq!(first_bytes, fs::read(&second).unwrap());
+    assert_eq!(first_bytes.last(), Some(&b'\n'));
+    assert!(first_bytes.len() as u64 <= MAX_SOURCE_BUNDLE_DESCRIPTOR_BYTES);
+    let mut expected = serde_json::to_vec_pretty(&descriptor).unwrap();
+    expected.push(b'\n');
+    assert_eq!(first_bytes, expected);
+
+    assert!(matches!(
+        write_source_bundle_descriptor_file(&descriptor, &first, limits),
+        Err(SourceError::OutputExists { .. })
+    ));
+    assert_eq!(fs::read(&first).unwrap(), expected);
+    assert!(fs::read_dir(root).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".rustferry-partial-")
+    }));
+}
+
+#[cfg(unix)]
+#[test]
+fn source_bundle_descriptor_file_does_not_replace_a_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new();
+    let plan = plan_source_bundle(&fixture.request()).unwrap();
+    let descriptor = SourceBundleDescriptor::new(
+        SourceArchive {
+            size: 1,
+            sha256: "a".repeat(64),
+        },
+        plan.manifest().clone(),
+    );
+    let root = fixture.workspace.parent().unwrap();
+    let target = root.join("sentinel.json");
+    let output = root.join("linked.manifest.json");
+    write(&target, b"unchanged");
+    symlink(&target, &output).unwrap();
+
+    assert!(matches!(
+        write_source_bundle_descriptor_file(&descriptor, &output, SourceArchiveLimits::default()),
+        Err(SourceError::OutputExists { .. })
+    ));
+    assert_eq!(fs::read(&target).unwrap(), b"unchanged");
+    assert!(
+        fs::symlink_metadata(&output)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
 }
 
 #[test]
@@ -129,12 +312,88 @@ fn project_and_explicit_workspace_inputs_are_the_only_source_roots() {
 }
 
 #[test]
+fn workspace_exclusions_are_portable_and_override_selected_roots() {
+    let fixture = Fixture::new();
+    write(&fixture.project.join("src/main.rs"), b"fn main() {}");
+    write(&fixture.workspace.join("shared/kept.txt"), b"kept");
+    write(
+        &fixture.workspace.join("shared/unreachable/private.txt"),
+        b"not selected",
+    );
+
+    let request = fixture
+        .request()
+        .include_workspace_path("shared")
+        .include_workspace_path("missing-but-excluded")
+        .exclude_workspace_path("shared/unreachable/deeper")
+        .exclude_workspace_path("shared/unreachable")
+        .exclude_workspace_path("missing-but-excluded");
+    assert_eq!(
+        request.workspace_exclusions(),
+        &[
+            Utf8PathBuf::from("shared/unreachable/deeper"),
+            Utf8PathBuf::from("shared/unreachable"),
+            Utf8PathBuf::from("missing-but-excluded"),
+        ]
+    );
+
+    let plan = plan_source_bundle(&request).unwrap();
+    let selected = paths(plan.manifest());
+    assert!(selected.contains(&"shared/kept.txt"));
+    assert!(!selected.contains(&"shared/unreachable/private.txt"));
+}
+
+#[test]
+fn workspace_exclusions_reject_the_root_and_non_portable_paths() {
+    let cases = [
+        (".", PortablePathReason::DotComponent),
+        ("/absolute", PortablePathReason::Absolute),
+        ("../outside", PortablePathReason::DotComponent),
+        ("safe\\outside", PortablePathReason::Backslash),
+    ];
+
+    for (path, expected_reason) in cases {
+        let fixture = Fixture::new();
+        let error =
+            plan_source_bundle(&fixture.request().exclude_workspace_path(path)).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SourceError::NonPortablePath { reason, .. } if reason == expected_reason
+            ),
+            "{path:?}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn workspace_exclusions_precede_excluded_ignore_policy_files() {
+    let fixture = Fixture::new();
+    write(&fixture.workspace.join(".ferryignore"), b"*.pem\n");
+    write(&fixture.project.join(".ferryignore"), b"!keep.rs\n");
+    write(&fixture.project.join("src/lib.rs"), b"safe");
+
+    let plan = plan_source_bundle(
+        &fixture
+            .request()
+            .exclude_workspace_path(".ferryignore")
+            .exclude_workspace_path("app/.ferryignore"),
+    )
+    .unwrap();
+    assert!(paths(plan.manifest()).contains(&"app/src/lib.rs"));
+    assert!(!paths(plan.manifest()).contains(&".ferryignore"));
+    assert!(!paths(plan.manifest()).contains(&"app/.ferryignore"));
+}
+
+#[test]
 fn sensitive_exclusions_are_case_insensitive_and_non_overridable() {
     let fixture = Fixture::new();
     write(&fixture.project.join(".env"), b"TOKEN=secret");
     write(&fixture.project.join("TARGET/cache.bin"), b"cache");
     write(&fixture.project.join("Signing/key.P12"), b"secret");
     write(&fixture.project.join(".cargo/credentials.toml"), b"token");
+    write(&fixture.project.join(".ssh/deploy"), b"private key");
+    write(&fixture.project.join("credentials/token.txt"), b"token");
     write(&fixture.project.join("src/lib.rs"), b"safe");
 
     let plan = plan_source_bundle(&fixture.request()).unwrap();
@@ -144,6 +403,7 @@ fn sensitive_exclusions_are_case_insensitive_and_non_overridable() {
             && !path.to_lowercase().contains("target")
             && !path.to_lowercase().contains("signing")
             && !path.to_lowercase().contains("credentials")
+            && !path.to_lowercase().contains(".ssh")
             && !path
                 .split('/')
                 .next_back()
@@ -153,6 +413,50 @@ fn sensitive_exclusions_are_case_insensitive_and_non_overridable() {
     write(&fixture.workspace.join(".env"), b"TOKEN=secret");
     let error = plan_source_bundle(&fixture.request().include_workspace_path(".env")).unwrap_err();
     assert!(matches!(error, SourceError::SensitivePath { .. }));
+}
+
+#[test]
+fn sensitive_exclusion_audit_is_sorted_exact_and_does_not_traverse_roots() {
+    let fixture = Fixture::new();
+    write(&fixture.project.join(".env"), b"TOKEN=secret");
+    write(&fixture.project.join(".git-credentials"), b"secret");
+    write(
+        &fixture.project.join("application_default_credentials.json"),
+        b"secret",
+    );
+    write(&fixture.project.join("credentials.json"), b"secret");
+    write(&fixture.project.join("credentials.yaml"), b"secret");
+    write(&fixture.project.join("credentials.yml"), b"secret");
+    write(
+        &fixture.project.join("credentials/nested/private.txt"),
+        b"secret",
+    );
+    write(
+        &fixture.project.join("config/credentials.txt"),
+        b"ordinary project data",
+    );
+    write(&fixture.project.join("src/lib.rs"), b"safe");
+
+    let plan = plan_source_bundle(&fixture.request()).unwrap();
+    let excluded = plan
+        .excluded_sensitive_paths()
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        excluded,
+        vec![
+            "app/.env",
+            "app/.git-credentials",
+            "app/application_default_credentials.json",
+            "app/credentials",
+            "app/credentials.json",
+            "app/credentials.yaml",
+            "app/credentials.yml",
+        ]
+    );
+    assert!(paths(plan.manifest()).contains(&"app/config/credentials.txt"));
+    assert!(!excluded.iter().any(|path| path.contains("nested")));
 }
 
 #[test]
@@ -392,6 +696,112 @@ fn file_count_size_total_and_depth_limits_are_enforced() {
 }
 
 #[test]
+fn traversal_entry_limit_bounds_empty_directory_breadth() {
+    let fixture = Fixture::new();
+    for index in 0..8 {
+        fs::create_dir(fixture.project.join(format!("empty-{index}"))).unwrap();
+    }
+
+    let error = plan_source_bundle(&fixture.request().with_max_traversal_entries(4)).unwrap_err();
+    assert!(matches!(
+        error,
+        SourceError::LimitExceeded {
+            kind: SourceLimitKind::TraversalEntryCount,
+            maximum: 4,
+            actual: 5,
+            ..
+        }
+    ));
+
+    let error = plan_source_bundle(
+        &fixture
+            .request()
+            .with_max_traversal_entries(MAX_SOURCE_TRAVERSAL_ENTRIES + 1),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        SourceError::UnsupportedTraversalLimit {
+            requested,
+            maximum,
+        } if requested == MAX_SOURCE_TRAVERSAL_ENTRIES + 1
+            && maximum == MAX_SOURCE_TRAVERSAL_ENTRIES
+    ));
+}
+
+#[test]
+fn traversal_entry_limit_combines_enumeration_and_final_manifest_path_nodes() {
+    let fixture = Fixture::new();
+
+    let error = plan_source_bundle(&fixture.request().with_max_traversal_entries(5)).unwrap_err();
+    assert!(matches!(
+        error,
+        SourceError::LimitExceeded {
+            kind: SourceLimitKind::TraversalEntryCount,
+            maximum: 5,
+            actual: 6,
+            ..
+        }
+    ));
+
+    let plan = plan_source_bundle(&fixture.request().with_max_traversal_entries(6)).unwrap();
+    validate_source_manifest(plan.manifest(), SourceLimits::default()).unwrap();
+
+    let error = plan_source_bundle(
+        &fixture
+            .request()
+            .exclude_workspace_path("missing")
+            .exclude_workspace_path("missing")
+            .exclude_workspace_path("missing")
+            .with_max_traversal_entries(2),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        SourceError::LimitExceeded {
+            kind: SourceLimitKind::TraversalEntryCount,
+            maximum: 2,
+            actual: 3,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn manifest_path_node_traversal_is_bounded() {
+    let prefix = (0..63)
+        .map(|index| format!("d{index}"))
+        .collect::<Vec<_>>()
+        .join("/");
+    let entry_count = MAX_SOURCE_TRAVERSAL_ENTRIES / 64 + 1;
+    let mut entries = (0..entry_count)
+        .map(|index| SourceManifestEntry {
+            path: format!("{prefix}/f{index:05}"),
+            size: 0,
+            sha256: "0".repeat(64),
+            executable: false,
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    let manifest = SourceManifest {
+        schema_version: 1,
+        project_path: ".".to_owned(),
+        entries,
+        total_size: 0,
+        sha256: "0".repeat(64),
+    };
+
+    assert!(matches!(
+        validate_source_manifest(&manifest, SourceLimits::default()),
+        Err(SourceError::LimitExceeded {
+            kind: SourceLimitKind::TraversalEntryCount,
+            maximum,
+            ..
+        }) if maximum == MAX_SOURCE_TRAVERSAL_ENTRIES as u64
+    ));
+}
+
+#[test]
 fn exact_verification_detects_add_change_and_delete() {
     let fixture = Fixture::new();
     let source = fixture.project.join("src/lib.rs");
@@ -430,7 +840,10 @@ fn executable_bit_is_manifested_and_verified() {
     let mut permissions = fs::metadata(&script).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&script, permissions).unwrap();
-    let plan = plan_source_bundle(&fixture.request()).unwrap();
+    let request = fixture
+        .request()
+        .with_executable_mode("app/build.sh", false);
+    let plan = plan_source_bundle(&request).unwrap();
     let entry = plan
         .manifest()
         .entries
@@ -445,6 +858,97 @@ fn executable_bit_is_manifested_and_verified() {
     assert!(matches!(
         verify_source_bundle_plan(&plan),
         Err(SourceError::ManifestMismatch)
+    ));
+}
+
+#[test]
+fn portable_executable_metadata_is_strict_and_survives_archive_roundtrip() {
+    let fixture = Fixture::new();
+    let script = fixture.project.join("build.sh");
+    write(&script, b"#!/bin/sh\n");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&script, permissions).unwrap();
+    }
+
+    let request = fixture.request().with_executable_mode("app/build.sh", true);
+    let plan = plan_source_bundle(&request).unwrap();
+    let entry = plan
+        .manifest()
+        .entries
+        .iter()
+        .find(|entry| entry.path == "app/build.sh")
+        .unwrap();
+    assert!(entry.executable);
+    verify_source_bundle_plan(&plan).unwrap();
+
+    let archive = fixture
+        .workspace
+        .parent()
+        .unwrap()
+        .join("portable-mode.zip");
+    let destination = fixture.workspace.parent().unwrap().join("portable-mode");
+    let limits = SourceArchiveLimits::default();
+    let archive_descriptor = create_source_bundle_archive(&plan, &archive, limits).unwrap();
+    verify_and_extract_source_bundle(
+        &archive,
+        &archive_descriptor,
+        plan.manifest(),
+        &destination,
+        limits,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert_ne!(
+            fs::metadata(destination.join("app/build.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+    }
+
+    write(&fixture.workspace.join("unselected.sh"), b"#!/bin/sh\n");
+    let error = plan_source_bundle(
+        &fixture
+            .request()
+            .with_executable_mode("unselected.sh", true),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        SourceError::ExecutableModePathNotSelected { ref path }
+            if path == "unselected.sh"
+    ));
+
+    let error = plan_source_bundle(
+        &fixture
+            .request()
+            .with_executable_mode("app/build.sh", true)
+            .with_executable_mode("app/build.sh", true),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        SourceError::DuplicateExecutableMode { ref path } if path == "app/build.sh"
+    ));
+
+    let error = plan_source_bundle(&fixture.request().with_executable_mode("C:/build.sh", true))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        SourceError::NonPortablePath {
+            reason: PortablePathReason::DrivePrefix,
+            ..
+        }
     ));
 }
 

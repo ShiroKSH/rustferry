@@ -93,6 +93,7 @@ jobs:
             rustferry-core \
             rustferry \
             rustferry-remote \
+            rustferry-ssh \
             rustferry-codegen \
             rustferry-apple \
             rustferry-android \
@@ -123,7 +124,7 @@ jobs:
           set -euo pipefail
           mkdir -p dist license-bundle/LICENSES
           cp "$PACKAGE_DIRECTORY"/*.crate dist/
-          test "$(find dist -maxdepth 1 -name '*.crate' | wc -l | tr -d ' ')" -eq 8
+          test "$(find dist -maxdepth 1 -name '*.crate' | wc -l | tr -d ' ')" -eq 9
           cp editors/vscode/dist/rustferry-vscode.vsix \
             "dist/rustferry-vscode-$RELEASE_VERSION.vsix"
           jq -e 'type == "object" and .["$schema"] != null' \

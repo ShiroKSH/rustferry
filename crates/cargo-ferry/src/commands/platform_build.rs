@@ -19,12 +19,15 @@ use cargo_ferry::deployment::{
     plan_physical_build,
 };
 
-use crate::cli::{AndroidBuildArgs, BuildArgs, BuildPlatform, IosBuildArgs, RemoteProviderChoice};
+use crate::cli::{
+    AndroidBuildArgs, BuildArgs, BuildPlatform, BuildRemoteTarget, IosBuildArgs,
+    RemoteProviderChoice,
+};
 use crate::error::CliError;
 use crate::output::Reporter;
 use crate::project::find_project_root;
 
-use super::remote;
+use super::{remote, ssh_remote};
 
 #[derive(Debug, Serialize)]
 pub(crate) struct BuildOutput {
@@ -73,11 +76,34 @@ enum BuildRoute {
     Remote,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClientHost {
+    MacOs,
+    NonMacOs,
+}
+
+impl ClientHost {
+    const fn current() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::MacOs
+        } else {
+            Self::NonMacOs
+        }
+    }
+}
+
 fn build_route(arguments: &BuildArgs) -> BuildRoute {
+    build_route_for_host(arguments, ClientHost::current())
+}
+
+fn build_route_for_host(arguments: &BuildArgs, host: ClientHost) -> BuildRoute {
     match &arguments.platform {
         BuildPlatform::Iphone(_) => BuildRoute::Remote,
         BuildPlatform::Ios(ios)
-            if ios.device && (arguments.remote.is_some() || arguments.unsigned) =>
+            if ios.device
+                && (arguments.remote.is_some()
+                    || arguments.unsigned
+                    || host == ClientHost::NonMacOs) =>
         {
             BuildRoute::Remote
         }
@@ -86,45 +112,67 @@ fn build_route(arguments: &BuildArgs) -> BuildRoute {
 }
 
 fn run_remote(arguments: BuildArgs, dry_run: bool, reporter: &Reporter) -> Result<(), CliError> {
+    let remote_target = arguments
+        .remote
+        .clone()
+        .unwrap_or(BuildRemoteTarget::Github);
+    if remote_target == BuildRemoteTarget::Github && arguments.config_dir.is_some() {
+        return Err(CliError::Unsupported {
+            message: "`--config-dir` applies only to named SSH build remotes".to_owned(),
+            help: "Remove `--config-dir` for GitHub, or pass `--remote REMOTE_NAME`.".to_owned(),
+        });
+    }
     let root = find_project_root(arguments.project_dir.as_deref())?;
     let config = rustferry_core::FerryConfig::load(&root.join("ferry.toml"))?;
     let targets = read_cargo_targets(&root)?;
     require_platform(&config, TargetPlatform::Ios, "ios")?;
 
-    let (team, provider) = match arguments.platform {
-        BuildPlatform::Iphone(iphone) => (
-            iphone.team,
-            arguments.remote.unwrap_or(RemoteProviderChoice::Github),
-        ),
+    let team = match arguments.platform {
+        BuildPlatform::Iphone(iphone) => iphone.team,
         BuildPlatform::Ios(ios) => {
             if ios.allow_provisioning_updates || ios.provisioning_profile.is_some() {
                 return Err(CliError::Unsupported {
                     message: "local Xcode provisioning options cannot be used for a remote iPhone build"
                         .to_owned(),
-                    help: "Remove `--allow-provisioning-updates` and `--provisioning-profile`, or omit `--remote` and `--unsigned` to build locally."
+                    help: "Remove `--allow-provisioning-updates` and `--provisioning-profile`; local physical-iPhone builds are available only on macOS."
                         .to_owned(),
                 });
             }
-            (
-                ios.team,
-                arguments.remote.unwrap_or(RemoteProviderChoice::Github),
-            )
+            ios.team
         }
         BuildPlatform::Android(_) => unreachable!("only iPhone builds use the remote route"),
     };
 
-    remote::build_iphone(
-        &root,
-        &config,
-        &targets.package,
-        &targets.binary,
-        provider,
-        team.as_deref(),
-        arguments.release,
-        arguments.unsigned,
-        dry_run,
-        reporter,
-    )
+    match remote_target {
+        BuildRemoteTarget::Github => remote::build_iphone(
+            &root,
+            &config,
+            &targets.package,
+            &targets.binary,
+            RemoteProviderChoice::Github,
+            team.as_deref(),
+            arguments.release,
+            arguments.unsigned,
+            dry_run,
+            reporter,
+        ),
+        BuildRemoteTarget::SshMac(name) => {
+            ssh_remote::validate_snapshot_build_mode(team.as_deref(), arguments.unsigned)?;
+            let endpoint = ssh_remote::load_endpoint(&name, arguments.config_dir.as_deref())?;
+            ssh_remote::build_iphone(
+                &root,
+                &config,
+                &targets.package,
+                &targets.binary,
+                &endpoint,
+                team.as_deref(),
+                arguments.release,
+                arguments.unsigned,
+                dry_run,
+                reporter,
+            )
+        }
+    }
 }
 
 pub(crate) fn execute(
@@ -137,11 +185,11 @@ pub(crate) fn execute(
     let targets = read_cargo_targets(&root)?;
     match arguments.platform {
         BuildPlatform::Android(android) => {
-            if arguments.remote.is_some() || arguments.unsigned {
+            if arguments.remote.is_some() || arguments.config_dir.is_some() || arguments.unsigned {
                 return Err(CliError::Unsupported {
-                    message: "remote and unsigned options apply only to physical-iPhone builds"
+                    message: "remote, config-directory, and unsigned options apply only to physical-iPhone builds"
                         .to_owned(),
-                    help: "Remove `--remote` and `--unsigned` from the Android build command."
+                    help: "Remove `--remote`, `--config-dir`, and `--unsigned` from the Android build command."
                         .to_owned(),
                 });
             }
@@ -160,11 +208,11 @@ pub(crate) fn execute(
             help: "Run this build through the top-level `cargo ferry build` command.".to_owned(),
         }),
         BuildPlatform::Ios(ios) => {
-            if arguments.remote.is_some() || arguments.unsigned {
+            if arguments.remote.is_some() || arguments.config_dir.is_some() || arguments.unsigned {
                 return Err(CliError::Unsupported {
-                    message: "remote and unsigned options apply only to physical-iPhone builds"
+                    message: "remote, config-directory, and unsigned options apply only to physical-iPhone builds"
                         .to_owned(),
-                    help: "Use `cargo ferry build ios --simulator` without `--remote` or `--unsigned`, or select `--device`."
+                    help: "Use `cargo ferry build ios --simulator` without `--remote`, `--config-dir`, or `--unsigned`, or select `--device`."
                         .to_owned(),
                 });
             }
@@ -711,20 +759,14 @@ const fn profile_name(release: bool) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use crate::cli::{
-        BuildArgs, BuildPlatform, IosBuildArgs, IphoneBuildArgs, RemoteProviderChoice,
-    };
+    use crate::cli::{BuildArgs, BuildPlatform, BuildRemoteTarget, IosBuildArgs, IphoneBuildArgs};
 
     use super::{
-        BuildRoute, build_route, canonical_developer_dir_override, intended_developer_dir,
-        intended_xcrun_path,
+        BuildRoute, ClientHost, build_route_for_host, canonical_developer_dir_override,
+        intended_developer_dir, intended_xcrun_path,
     };
 
-    fn ios_arguments(
-        device: bool,
-        remote: Option<RemoteProviderChoice>,
-        unsigned: bool,
-    ) -> BuildArgs {
+    fn ios_arguments(device: bool, remote: Option<BuildRemoteTarget>, unsigned: bool) -> BuildArgs {
         BuildArgs {
             platform: BuildPlatform::Ios(IosBuildArgs {
                 simulator: !device,
@@ -735,16 +777,21 @@ mod tests {
             }),
             release: false,
             remote,
+            config_dir: None,
             unsigned,
             project_dir: None,
         }
     }
 
     #[test]
-    fn signed_ios_device_build_without_remote_flags_stays_local() {
+    fn ios_device_auto_selects_remote_only_away_from_macos() {
         assert_eq!(
-            build_route(&ios_arguments(true, None, false)),
+            build_route_for_host(&ios_arguments(true, None, false), ClientHost::MacOs),
             BuildRoute::Local
+        );
+        assert_eq!(
+            build_route_for_host(&ios_arguments(true, None, false), ClientHost::NonMacOs),
+            BuildRoute::Remote
         );
     }
 
@@ -774,30 +821,46 @@ mod tests {
 
     #[test]
     fn remote_or_unsigned_ios_device_build_uses_remote_route() {
-        assert_eq!(
-            build_route(&ios_arguments(
-                true,
-                Some(RemoteProviderChoice::Github),
-                false,
-            )),
-            BuildRoute::Remote
-        );
-        assert_eq!(
-            build_route(&ios_arguments(true, None, true)),
-            BuildRoute::Remote
-        );
+        for host in [ClientHost::MacOs, ClientHost::NonMacOs] {
+            assert_eq!(
+                build_route_for_host(
+                    &ios_arguments(true, Some(BuildRemoteTarget::Github), false),
+                    host,
+                ),
+                BuildRoute::Remote
+            );
+            assert_eq!(
+                build_route_for_host(&ios_arguments(true, None, true), host),
+                BuildRoute::Remote
+            );
+        }
+    }
+
+    #[test]
+    fn named_ssh_ios_device_build_uses_remote_route_on_every_host() {
+        let name = rustferry_ssh::SshRemoteName::new("office-mac").expect("remote name");
+        for host in [ClientHost::MacOs, ClientHost::NonMacOs] {
+            assert_eq!(
+                build_route_for_host(
+                    &ios_arguments(true, Some(BuildRemoteTarget::SshMac(name.clone())), false,),
+                    host,
+                ),
+                BuildRoute::Remote
+            );
+        }
     }
 
     #[test]
     fn simulator_options_never_select_the_remote_route() {
-        assert_eq!(
-            build_route(&ios_arguments(
-                false,
-                Some(RemoteProviderChoice::Github),
-                false,
-            )),
-            BuildRoute::Local
-        );
+        for host in [ClientHost::MacOs, ClientHost::NonMacOs] {
+            assert_eq!(
+                build_route_for_host(
+                    &ios_arguments(false, Some(BuildRemoteTarget::Github), false),
+                    host,
+                ),
+                BuildRoute::Local
+            );
+        }
     }
 
     #[test]
@@ -806,9 +869,12 @@ mod tests {
             platform: BuildPlatform::Iphone(IphoneBuildArgs { team: None }),
             release: false,
             remote: None,
+            config_dir: None,
             unsigned: false,
             project_dir: None,
         };
-        assert_eq!(build_route(&arguments), BuildRoute::Remote);
+        for host in [ClientHost::MacOs, ClientHost::NonMacOs] {
+            assert_eq!(build_route_for_host(&arguments, host), BuildRoute::Remote);
+        }
     }
 }

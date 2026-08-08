@@ -95,7 +95,7 @@ pub enum AppleError {
         /// Diagnostic log containing only the retained prefixes.
         log: Option<Utf8PathBuf>,
     },
-    /// Ctrl+C interrupted an external build tool.
+    /// Cancellation interrupted an external build tool.
     #[error("`{program}` was interrupted during {stage}")]
     CommandInterrupted {
         /// Build or validation stage.
