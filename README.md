@@ -118,8 +118,26 @@ endpoints are never selected implicitly; pass their configured name explicitly. 
 remote mode is selected).
 
 Development signing additionally requires the protected private-repository setup and Apple assets
-described in [GitHub provider security](docs/remote/github-security.md). The unsigned remote path has
-live compile/download evidence; remote signed IPA export has not yet been accepted.
+described in [GitHub provider security](docs/remote/github-security.md). An app with Widget and Live
+Activity targets supplies one exact profile per generated target:
+
+```console
+cargo ferry signing setup manual \
+  --certificate /private/signing/development.p12 \
+  --profile weather=/private/signing/application.mobileprovision \
+  --profile FerryWidgetExtension=/private/signing/widget.mobileprovision \
+  --profile FerryLiveActivityExtension=/private/signing/live-activity.mobileprovision \
+  --remote github \
+  --device-sha256 <lowercase-sha256> \
+  --dry-run
+```
+
+The exact target names come from the generated signing plan. At most three profiles are accepted and
+they must share the selected device. The legacy unkeyed profile path remains available for a
+single-application project. The generated workflow and worker bind the complete application,
+extension, framework, and dynamic-library target graph through a canonical SHA-256. Multi-profile
+setup and transport pass the affected-package integration suite locally. The unsigned remote path
+has live compile/download evidence; protected secret upload and real signed IPA export have not run.
 
 For a dedicated Mac, add a pinned SSH endpoint and request the locally tested unsigned snapshot
 path:

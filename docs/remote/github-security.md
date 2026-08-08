@@ -80,27 +80,33 @@ expected public certificate, Team ID, profile, entitlement, and SHA-256 device e
 secret references. Values are never request arguments, repository files, public reports, or
 diagnostics.
 
-Manual setup currently accepts one application and one iOS development profile. It rejects Widget
-and Live Activity extensions before reading assets because each extension needs its own profile. The
-PKCS#12 and profile paths must resolve to stable regular files outside every Git repository; on Unix,
-each file must also have one hard link. The client verifies the PKCS#12 private-key match,
-Apple Development certificate chain, Team ID and validity, then verifies the profile CMS signature,
-type, certificate, team, bundle identifier, selected device, entitlements, and validity.
+Manual setup accepts at most three signable targets: the application, Widget extension, and Live
+Activity extension. Extension-bearing projects require one repeatable, exact
+`--profile TARGET=PATH` argument for every generated application and extension target. An unkeyed
+`--profile PATH` remains compatible only with a single application target; keyed and unkeyed forms
+cannot be mixed. All profiles must authorize the same selected device and match the certificate,
+Team, target bundle identifier, required entitlements, and validity window. The PKCS#12 and profile
+paths must resolve to stable regular files outside every Git repository; on Unix, each file must
+also have one hard link. The client verifies the PKCS#12 private-key match, Apple Development
+certificate chain, Team ID and validity, then verifies every profile's CMS signature and bindings.
 
 Use a dry run first:
 
 ```console
 cargo ferry signing setup manual \
   --certificate /private/signing/development.p12 \
-  --profile /private/signing/application.mobileprovision \
+  --profile weather=/private/signing/application.mobileprovision \
+  --profile FerryWidgetExtension=/private/signing/widget.mobileprovision \
+  --profile FerryLiveActivityExtension=/private/signing/live-activity.mobileprovision \
   --remote github \
   --device-sha256 <lowercase-sha256> \
   --dry-run
 ```
 
-`--device-sha256` is optional only when the profile contains one registered device. The example
-uses the interactive no-echo prompt. Password input is mutually exclusive: omit all selectors for
-that prompt, or use
+Target names are exact and case-sensitive; use the generated signing preview rather than guessing
+them. `--device-sha256` is optional only when all supplied profiles contain the same single
+registered device. The example uses the interactive no-echo prompt. Password input is mutually
+exclusive: omit all selectors for that prompt, or use
 `--password-stdin`, `--password-env <NAME>`, or `--password-credential <ENTRY>`. Credential entries
 use operating-system secure storage under service `org.rustferry.cargo-ferry.signing`.
 `GH_TOKEN` and `GITHUB_TOKEN` cannot be used as password-variable names. Passwords are bounded to
@@ -115,20 +121,41 @@ Initial setup requires a public source repository, a distinct active private exe
 and an empty protected Environment. The Environment must require a deployment reviewer, enable
 custom branch policies, and contain exactly `rustferry/goal3/builds/*`. After rechecking local and
 remote state, the client cryptographically revalidates the retained bytes and sends canonical padded
-base64 PKCS#12 and profile values plus the raw password to these exact Environment secret names:
+base64 PKCS#12 and profile values plus the raw password. The certificate, password, and application
+profile retain these fixed names:
 
 - `RUSTFERRY_GOAL3_IOS_CERTIFICATE_P12`
 - `RUSTFERRY_GOAL3_IOS_CERTIFICATE_PASSWORD`
 - `RUSTFERRY_GOAL3_IOS_PROVISIONING_PROFILE`
 
+Each extension profile uses a canonical static name
+`RUSTFERRY_GOAL3_IOS_PROFILE_<32_HEX>`, where the uppercase suffix is derived from the SHA-256 of the
+exact target name, a NUL separator, and its bundle identifier. The preview shows the complete mapping
+before mutation. The protected Environment and generated workflow must contain exactly two
+certificate/password secrets plus one profile secret per signable target: three to five names.
+
 Each final value is limited to 48 KiB. The upload process sends secret bytes to `gh` only through
 standard input, not its arguments, environment, output, or repository files. Existing secrets are
 never replaced implicitly. A project-local exclusive lock and stable no-follow file snapshots
-serialize config writers. The client requires the exact three-name set after upload, rechecks the
+serialize config writers. The client requires the exact planned name set after upload, rechecks the
 workflow and private provider config, and persists the signing plan last. Partial or indeterminate
 remote writes leave the config unsigned and list both uploaded and possibly-uploaded cleanup roles.
 A failure after atomic config replacement reports the config as possibly signed and requires
 inspection instead of claiming rollback.
+
+The generated protected signing job binds every reviewed secret name statically. Multi-profile jobs
+send the exact reference/value set through the bounded `RFSIGNV2` stdin frame; the worker rejects
+missing, duplicate, unknown, oversized, or trailing records and resolves each secret once. The
+legacy three-field one-profile frame remains accepted only for a single application profile. Neither
+format places secret values in arguments, workflow files, or logs.
+
+Modern setup also stores the exact public target graph: target name, bundle identifier, and kind for
+the application, extensions, frameworks, and dynamic libraries. The workflow embeds a
+domain-separated canonical SHA-256 of that complete graph. The provider requires an exact
+order-independent match, and the worker rederives the digest before checkout of the requested
+project revision or compilation. Schema-v2 configuration remains readable only for the legacy
+target-free workflow; adding targets requires recreating the provider workflow instead of silently
+weakening the binding.
 
 The worker uses a per-job private keychain and provisioning home. Changes to the user-global
 keychain search list are serialized by one worker-user-wide lock. Cleanup restores the prior search
@@ -157,7 +184,8 @@ and complete signing cleanup.
 
 - Protected Environment limited to the signing job, with custom policies enabled and the single
   `rustferry/goal3/builds/*` deployment branch policy.
-- Empty protected Environment before initial setup; exact three signing-secret names afterward.
+- Empty protected Environment before initial setup; exact planned three-to-five signing-secret set
+  afterward.
 - Private signing repository with restricted membership and controlled visibility changes.
 - Required deployment reviewer while signing workflow bytes come from the temporary push branch.
 - Minimal repository/Actions permissions; no fork or `pull_request_target` signing path.

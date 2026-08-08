@@ -45,6 +45,8 @@ commits, and integration artifacts belong to
 - Real Apple Development certificate/profile/device assets and a distinct private signing
   repository are external inputs, not repository-owned fixtures.
 - Live SSH Mac operation, native Windows/OpenSSH interoperability, performance measurements,
-  Personal Team, per-extension device profiles, and a reference managed-cloud provider remain
-  unvalidated or unsupported as recorded in [Goal 3 status](GOAL3_STATUS.md) and the
-  [support matrix](support-matrix.md).
+  Personal Team, signed app/Widget/Live Activity acceptance, and a reference managed-cloud provider
+  remain unvalidated or unsupported as recorded in [Goal 3 status](GOAL3_STATUS.md) and the
+  [support matrix](support-matrix.md). Bounded per-extension profile transport is repository-owned
+  and locally integration-tested; Apple assets, protected-environment execution, and device evidence
+  remain external.

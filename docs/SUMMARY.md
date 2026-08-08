@@ -104,6 +104,7 @@
 # Project records
 
 - [Goal 3 evidence and remaining gates](GOAL3_STATUS.md)
+- [Goal 3 completion audit](GOAL3_COMPLETION_AUDIT.md)
 - [Developer Experience status](NEXT_PHASE_STATUS.md)
 - [ADR-001: UI backend](ADR-001-ui-backend.md)
 - [ADR-002: Android packaging](ADR-002-android-build.md)

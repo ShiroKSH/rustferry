@@ -138,6 +138,23 @@ subset; it cannot re-include built-in sensitive paths.
 overwrite on drop is defense in depth, not guaranteed erasure. `SecretReference` serializes only a
 validated environment, credential-store, GitHub Actions, or worker-owned handle.
 
+Protected GitHub signing supports at most three application/extension provisioning profiles. A
+multi-profile worker invocation receives only the bounded `RFSIGNV2` stdin frame: eight-byte magic,
+big-endian record count, then records containing a 16-bit reference-name length, 32-bit value length,
+and the exact reference/value bytes. The immutable signing plan defines the expected two
+certificate/password references plus one profile reference per target. Missing, duplicate, unknown,
+oversized, non-canonical, truncated, or trailing records fail before signing; values are resolved
+once and input storage is wiped on every exit. The legacy three-field NUL-delimited input remains
+available only for a single application profile. Secret values never enter the remote JSON protocol,
+arguments, events, reports, or workflow source.
+
+The modern GitHub signing workflow also binds the complete public signing-target graph, including
+application, extension, framework, and dynamic-library names, bundle identifiers, and target kinds.
+Shared canonical encoding produces a domain-separated lowercase SHA-256. The provider checks exact
+graph equality without depending on order, and the worker recomputes the digest before checkout of
+the requested project revision or compilation. The digest is public policy metadata; it contains no
+secret values.
+
 Each signed request binds the expected certificate common name, Team ID, SHA-256 fingerprint, and
 expiry to an opaque private-key reference. The protected worker derives the imported identity again
 and rejects any mismatch before profiles or application code are signed.

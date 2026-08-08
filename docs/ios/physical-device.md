@@ -60,18 +60,21 @@ the result, rehashes and independently inspects it, then atomically writes
 a real unsigned physical-iPhone archive and validated the automatic download end to end. This is
 compile and unsigned-artifact evidence, not installability or device-runtime evidence.
 
-Manual Apple Development signing setup supports one application profile. Configure it as described
-in [iOS signing](signing.md), then request a signed build:
+Manual Apple Development signing setup accepts one exact profile for the application and each
+enabled Widget or Live Activity extension, up to three profiles. Extension-bearing projects use
+repeatable `--profile TARGET=PATH`; the legacy unkeyed path remains available only for a
+single-application project. Configure the assets as described in [iOS signing](signing.md), then
+request a signed build:
 
 ```console
 cargo ferry build iphone --remote github --team <TEAMID>
 ```
 
 The signed path is designed to return a development IPA, artifact manifest, validation report, and
-sanitized log below `target/ferry/ios/device/<profile>/`. Real certificate/profile upload, signed IPA
-export, and independent signed-artifact acceptance have not run because the required Apple assets
-and distinct private execution repository are not configured. Widget and Live Activity projects
-remain unsupported by this setup flow until separate extension profiles exist.
+sanitized log below `target/ferry/ios/device/<profile>/`. App/Widget/Live Activity profile mapping
+and protected secret transport pass local integration tests. Real certificate/profile upload,
+signed IPA export, and independent signed-artifact acceptance have not run because the required
+Apple assets and distinct private execution repository are not configured.
 
 ## Named SSH Mac
 

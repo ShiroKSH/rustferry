@@ -39,7 +39,7 @@ Commands work as a Cargo subcommand (`cargo ferry ...`) or direct binary (`cargo
 | `run android\|ios` | Build → validate → install → launch; `--logs` adds one bounded filtered snapshot where standalone logging is supported |
 | `logs android\|ios` | Finite application-filtered history by default; `--json-stream` runs the live protocol stream until cancellation or platform-tool exit |
 | `signing teams` | Read-only Apple Development identity/Team inventory |
-| `signing setup manual` | Validate one PKCS#12/application-profile pair outside Git, check protected GitHub Environment policy, and upload secrets only after dry-run review and confirmation |
+| `signing setup manual` | Validate one PKCS#12 plus one profile per application/extension target outside Git, check protected GitHub Environment policy, and upload secrets only after dry-run review and confirmation |
 | `assets check\|generate` | Validate release sources; generate fingerprinted Android densities and an iOS asset catalog |
 | `clean [android\|ios\|generated]` | Remove only selected generated output below `target/ferry/` |
 | `clean --all` | Remove cargo-ferry output below `target/ferry/`, not application source/signing inputs |
@@ -53,6 +53,13 @@ Commands work as a Cargo subcommand (`cargo ferry ...`) or direct binary (`cargo
 | `completions <shell>` | Generate shell completion definitions |
 
 Capabilities accepted by `add`/`remove`: `network`, `notifications`, `storage`, `haptics`, `clipboard`, `deep-links`, `share`, `widget`, and `live-activity`.
+
+Manual GitHub signing accepts at most three profiles. An extension-free project may retain the
+legacy `--profile PATH` form. A project with Widget or Live Activity targets must pass repeatable,
+exact `--profile TARGET=PATH` arguments for the application and every extension; keyed and unkeyed
+forms cannot be mixed. The profiles must share the selected registered device and match their target
+bundle identifiers, Team, certificate, validity, and required entitlements. Multi-profile secret
+input uses `RFSIGNV2`; the legacy worker frame remains single-application-only.
 
 Templates accepted by `new`: `starter`, `minimal`, `counter`, `network`, `notifications`, `widget`, `live-activity`, and `kitchen-sink`. They share a template engine and feature fragments rather than copied project trees.
 

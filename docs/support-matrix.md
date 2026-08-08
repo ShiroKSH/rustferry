@@ -31,10 +31,10 @@ physical-device validation.
 | Physical iPhone via SSH Mac | 🧪 implemented, hardware/signing validation pending | Named endpoint and unsigned snapshot session are locally tested; no live SSH Mac compile, SSH artifact, or signing support |
 | Unsigned device compile | ✅ artifact validated | Real `aarch64-apple-ios`/`iphoneos` XCArchive built by the GitHub macOS worker and independently revalidated on Linux |
 | Development signing | 🧪 implemented, hardware/signing validation pending | Signing engine and protected GitHub phase use synthetic fixtures only; no real Apple identity/profile run |
-| Manual development signing | 🧪 implemented, hardware/signing validation pending | Manual asset validation and protected secret setup exist for one application profile; no real assets were uploaded |
+| Manual development signing | 🧪 implemented, hardware/signing validation pending | Bounded app/Widget/Live Activity profile mapping, exact target-graph binding, and protected secret transport pass local integration tests; real asset upload remains pending |
 | Personal Team | 🚫 unsupported | GitHub, SSH, and worker capability reports disable Personal Team; no headless Personal Team flow exists |
-| Widget device signing | 🚫 unsupported | The current one-profile remote setup rejects extension target graphs; Simulator Widget artifacts are separate evidence |
-| Live Activity device signing | 🚫 unsupported | The current one-profile remote setup rejects extension target graphs; Simulator Activity artifacts are separate evidence |
+| Widget device signing | 🧪 implemented, hardware/signing validation pending | Remote manual setup accepts an exact Widget profile and static protected secret; no real development-signed Widget artifact or device run exists |
+| Live Activity device signing | 🧪 implemented, hardware/signing validation pending | Remote manual setup accepts an exact Live Activity profile and static protected secret; no real development-signed Activity artifact or device run exists |
 | GitHub Actions provider | ✅ artifact validated | Exact-revision unsigned build, download, digest check, archive inspection, and cleanup accepted; signed phase remains unvalidated |
 | SSH provider | 🧪 implemented, hardware/signing validation pending | Handshake, doctor, source upload, events, cancel, XCArchive receipt, and cleanup pass deterministic tests; v1 is unsigned-only |
 | Windows client artifact download | 🧪 implemented, hardware/signing validation pending | Download/verification/publication code is cross-platform; no live Windows client acceptance run |

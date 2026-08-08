@@ -1,6 +1,6 @@
 # Implementation status
 
-Last updated: 2026-08-08
+Last updated: 2026-08-09
 
 Source and documentation now use RustFerry. [Platform artifacts run 30719811812](https://github.com/ShiroKSH/rustferry/actions/runs/30719811812) at commit `8ed0192` produced and inspected current RustFerry-named Android and iOS artifacts. Exact pre-rename `cargo-pocket`/`Pocket*` paths, identifiers, symbols, and hashes remain below as historical evidence.
 
@@ -47,7 +47,7 @@ Status terms:
 | Widget | Provider/backend implemented and artifact-inspected; runtime unobserved | State publisher, WidgetKit `.appex`, and framework artifact-inspected | Snapshot model/example pass | Android probe plus combined iOS extension app |
 | Live Activity | Ongoing-notification fallback enabled in an inspected APK; runtime unobserved | ActivityKit lifecycle bridge and `.appex` artifact-inspected | State model/example pass | Public-CLI Kitchen Sink plus Live Score |
 | Devices/install/run/logs | Typed ADB services and IDE protocol implemented; runtime unobserved | Typed `simctl` services and IDE protocol implemented; no Simulator runtime/device | Service, parser, protocol, schema, fixture, and CLI tests pass | Official-tool argument arrays, explicit device IDs, validated artifacts, bounded application logs; no runtime claim |
-| Physical iOS development — GitHub | N/A | Local official signing/build/install/launch plus exact-revision GitHub macOS compilation and automatic client download implemented | Signing, deployment, protocol, provider, worker, and cross-platform artifact tests pass | Real GitHub remote unsigned archive validated; development-signed IPA, install, launch, and device runtime not validated |
+| Physical iOS development — GitHub | N/A | Local official signing/build/install/launch plus exact-revision GitHub macOS compilation, bounded app/extension manual profiles, and automatic client download implemented | Signing, deployment, protocol, provider, worker, and cross-platform artifact tests pass, including the final affected-package multi-profile suite | Real GitHub remote unsigned archive validated; development-signed IPA, extension behavior, install, launch, and device runtime not validated |
 | Physical iOS development — SSH | N/A | Pinned endpoint, handshake/doctor, snapshot upload, unsigned compile session, events/cancel, verified XCArchive return, receipt, and cleanup implemented | Deterministic local protocol/process/worker tests pass | No live SSH compile or SSH-produced artifact; signing, IPA, install, launch, and device runtime not validated |
 | IDE and VS Code | Same CLI build/deploy service | Same CLI build/deploy service | Protocol v1 tests; extension TypeScript/lint; 42 base tests pass and 4 real-CLI tests skip when no CLI is supplied; all 46 pass with the final CLI | Installable VSIX and real Extension Host smoke-tested; no mobile runtime claim |
 | Assets | Five-density launcher icons and splash integrated into an inspected signed/aligned arm64 APK | `CompiledCatalog` implemented/tested; runtime-free `SdkOnlyResources` integrated into an inspected signed arm64 `.app` | Source validation, SHA-256 cache integrity, concurrent publication, tamper rejection, packaging, and artifact tests pass | Full `Assets.car` artifact validation still needs an installed iOS Simulator runtime |
@@ -61,7 +61,7 @@ Real arm64 Android APK, iOS Simulator `.app`, and `.appex` artifacts have been p
 - Physical iOS uses `aarch64-apple-ios`, hidden Xcode generation, Apple Development signing, explicit Team selection, opt-in provisioning updates, and post-build recursive verification. `cargo ferry build ios --device --team ABCDE12345 --dry-run` produces the same side-effect-free official-tool plan without requiring Xcode, including in Ubuntu integration tests; no signed artifact was produced.
 - Generated projects default to the exact registry version with no checkout path. Explicit registry, workspace, and canonical local-path modes plus independent `--display-name` are covered by generator and black-box CLI tests. Publication has not occurred, so the 0.1.0 protocol handshake deliberately reports the registry runtime dependency as unusable instead of promising an unavailable crate.
 - The VS Code extension passed TypeScript, ESLint, all 46 tests across 12 files with the final CLI supplied, `npm audit` with zero findings, VSIX packaging/content checks, an isolated VS Code CLI install/list smoke, and a real Extension Host smoke. Without a supplied CLI, the same suite passes 42 base tests and skips 4 live-CLI tests. The host proved ordinary Rust workspaces stay inactive and Ferry workspaces auto-activate, discover, validate, and diagnose an unsaved manifest without changing the saved file. The integrated VSIX has 18 entries, is 44,435 bytes, and has SHA-256 `d7dc5fc4abc60ac8b1068ec89439274d2067585cc76b3c967c9224ccccfafada`.
-- The pre-Goal3 Developer Experience candidate passed formatting, workspace all-target/all-feature check, strict Clippy, 258 Rust tests with 0 failures and 7 deliberate platform/hardware ignores (including 24 doctests), Rustdoc with warnings denied, Rust 1.92 checks, cookbook pages, license inventories, workflow lint, and archive guards. Its then-current six publishable crates and 17 internal edges passed package/source/handshake and release-contract gates. On the final integrated eight-crate head, CI passed license policy, release contract, archive guards, formatting, Clippy, packaged CLI sources, every workspace package archive, examples, Rustdoc/doctests, cookbook, links, mdBook, Rust 1.92, and Ubuntu, macOS, and Windows tests/templates. The continuation has 10 workspace members—nine publishable crates plus the worker—and its release contract covers 28 internal edges. Current focused results are 115 `rustferry-remote` tests, 69 worker library plus 22 worker binary tests, and 54 `rustferry-ssh` tests with 2 live-process tests ignored. The current full workspace test run passes, including the 94.56-second generated-project template check after the Goal 3 cache cleanup; a final exact-commit continuation CI/package matrix remains pending.
+- The pre-Goal3 Developer Experience candidate passed formatting, workspace all-target/all-feature check, strict Clippy, 258 Rust tests with 0 failures and 7 deliberate platform/hardware ignores (including 24 doctests), Rustdoc with warnings denied, Rust 1.92 checks, cookbook pages, license inventories, workflow lint, and archive guards. Its then-current six publishable crates and 17 internal edges passed package/source/handshake and release-contract gates. On the final integrated eight-crate head, CI passed license policy, release contract, archive guards, formatting, Clippy, packaged CLI sources, every workspace package archive, examples, Rustdoc/doctests, cookbook, links, mdBook, Rust 1.92, and Ubuntu, macOS, and Windows tests/templates. The continuation has 10 workspace members—nine publishable crates plus the worker—and its release contract covers 28 internal edges. The final affected-package run at code revision `a339fff` passes `cargo-ferry` (42 library, 106 binary, 52 CLI tests plus integration coverage), `rustferry-apple` (47 passed, 1 Xcode-dependent ignored plus integration coverage), `rustferry-github` (131), `rustferry-remote` (41 plus integration coverage), and `rustferry-worker-macos` (70 library and 26 binary). Strict Clippy with warnings denied and formatting pass for the same package slice. The earlier full workspace run, including the 94.56-second generated-project template check, remains historical evidence; a current-revision CI/full package matrix remains pending.
 
 Asset integration has two separately reported Apple modes. An available iOS runtime selects `CompiledCatalog`, which emits `Assets.xcassets` and requires `Assets.car`; generation, project wiring, cache consumption, plist selection, and rejection tests pass, but this host could not produce that artifact because no runtime is installed. With zero runtimes, `SdkOnlyResources` produced a real Xcode-built arm64 `.app`; inspection verified exact source PNG bytes, plist references, Cargo Mach-O identity, resources, and strict/deep ad-hoc signing without claiming a compiled catalog. The Android integration test produced and inspected all five launcher densities plus the splash in a v2/v3-signed, 16 KiB-aligned arm64 APK.
 
@@ -95,14 +95,20 @@ Apple-tool entry points, propagates the validated Developer directory to each Ap
 has regression coverage for relative paths, directories, and symlink substitution. Cross-platform
 dry-run planning remains available without an Apple toolchain.
 
-Manual GitHub signing setup is implemented for one application profile. It locally validates an
-Apple Development PKCS#12 archive and development profile, accepts bounded secure password
-sources, verifies the exact protected-Environment policy and empty initial secret set, uploads only
-after confirmation, and persists local signing configuration last. Cryptographic and policy tests
-use synthetic assets. A real development-signed IPA acceptance remains pending the external Apple
-certificate/profile/device assets and a distinct private execution repository. Widget and Live
-Activity extensions remain unsupported by this setup flow. Local physical install/launch services
-exist, but accepting a downloaded remote artifact and physical-device runtime remain unvalidated.
+Manual GitHub signing setup now accepts at most three application/extension profiles. An
+extension-free app retains legacy `--profile PATH`; app/Widget/Live Activity projects require an
+exact repeatable `--profile TARGET=PATH` for every generated target, with one common selected device.
+The client locally validates the Apple Development PKCS#12 archive and each development profile,
+accepts bounded secure password sources, verifies the exact protected-Environment policy and empty
+initial secret set, uploads only after confirmation, and persists local signing configuration last.
+The application keeps the legacy profile secret name, extensions use canonical static target-derived
+names, and multi-profile jobs use bounded `RFSIGNV2` input while legacy input remains single-app-only.
+The modern workflow and worker also bind the complete public target graph through a canonical
+SHA-256. The affected-package integration suite for this continuation passes locally. A real
+development-signed IPA acceptance still requires external Apple certificate/profile/device assets
+and a distinct private execution repository. Local physical install/launch services exist, but
+signed extension artifacts, acceptance of a downloaded remote artifact, and physical-device runtime
+remain unvalidated.
 
 Local physical-device compilation is unavailable because this host lacks the `aarch64-apple-ios`
 Rust target and installed iPhoneOS platform component. The validated remote path does not depend on
