@@ -74,7 +74,8 @@ jobs:
         run: |
           cmp schemas/ferry.schema.json crates/rustferry-core/tests/fixtures/ferry.schema.json
           cmp schemas/ide-protocol-v1.schema.json crates/cargo-ferry/tests/fixtures/ide-protocol-v1/schema.json
-          cargo package --workspace --locked --no-verify
+          cargo package --workspace --exclude rustferry-worker-macos --locked --no-verify
+          test "$(find target/package -maxdepth 1 -name '*.crate' | wc -l | tr -d ' ')" -eq 8
           python3 scripts/check-release-archives.py --check-sources target/package/*.crate
       - name: Standalone example checks and tests
         shell: bash

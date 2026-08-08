@@ -1,0 +1,26 @@
+From d39ba324aecaba85a69ca0bd749edc74bc4cc621 Mon Sep 17 00:00:00 2001
+From: ShiroKSH <kushidashiro@gmail.com>
+Date: Sat, 8 Aug 2026 12:36:22 +0300
+Subject: [PATCH 33/33] test: normalize CLI help whitespace
+
+---
+ crates/cargo-ferry/tests/cli.rs | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/crates/cargo-ferry/tests/cli.rs b/crates/cargo-ferry/tests/cli.rs
+index 144ea64..21b9f99 100644
+--- a/crates/cargo-ferry/tests/cli.rs
++++ b/crates/cargo-ferry/tests/cli.rs
+@@ -122,7 +122,8 @@ fn manual_signing_setup_help_has_exact_inputs_and_no_password_value_option() {
+     assert!(output.status.success());
+     assert!(output.stderr.is_empty());
+     let help = String::from_utf8(output.stdout).expect("UTF-8 help");
+-    assert!(help.contains(
++    let normalized_help = help.split_whitespace().collect::<Vec<_>>().join(" ");
++    assert!(normalized_help.contains(
+         "Usage: cargo-ferry signing setup manual [OPTIONS] --certificate <CERTIFICATE> --profile <PROFILE> --remote <REMOTE>"
+     ));
+     assert!(help.contains("--certificate <CERTIFICATE>"));
+-- 
+2.55.0
+

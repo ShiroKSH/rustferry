@@ -29,11 +29,11 @@ No step below implies that a release or registry publication has occurred.
 - [ ] `cargo test --locked --workspace --all-features`
 - [ ] `RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --all-features --no-deps`
 - [ ] `python3 scripts/check-release-contract.py` reports every internal edge exact.
-- [ ] `cargo package --workspace --locked --list`
-- [ ] `cargo package --workspace --locked`
-- [ ] `cargo publish --workspace --dry-run --locked --no-verify`
+- [ ] `cargo package --workspace --exclude rustferry-worker-macos --locked --list`
+- [ ] `cargo package --workspace --exclude rustferry-worker-macos --locked`
+- [ ] `cargo publish --workspace --exclude rustferry-worker-macos --dry-run --locked --no-verify`
 - [ ] `python3 scripts/check-release-archives.py --check-sources --target-dir target/package-source-check target/package/*.crate`
-- [ ] Inspect all six `.crate` archives and their normalized manifests; confirm
+- [ ] Inspect all eight `.crate` archives and their normalized manifests; confirm
       both canonical license files are regular root members.
 
 ## VS Code extension

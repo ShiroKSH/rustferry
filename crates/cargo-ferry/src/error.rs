@@ -142,6 +142,18 @@ pub enum CliError {
         /// Concrete recovery step.
         help: String,
     },
+    /// Remote-provider configuration, orchestration, or verification failed safely.
+    #[error("{message}")]
+    Remote {
+        /// Stable machine-readable failure code.
+        code: &'static str,
+        /// Secret-safe failure summary.
+        message: String,
+        /// Concrete recovery step.
+        help: String,
+        /// Additional public provider/job context.
+        details: Vec<String>,
+    },
     /// Operation is deliberately unavailable rather than falsely succeeding.
     #[error("{message}")]
     Unsupported {
@@ -194,6 +206,7 @@ impl CliError {
             Self::CommandInterrupted { .. } => "external_command_interrupted",
             Self::InterruptHandler { .. } => "interrupt_handler_failed",
             Self::ToolMissing { .. } => "tool_missing",
+            Self::Remote { code, .. } => code,
             Self::Unsupported { .. } => "unsupported",
             Self::UnsafeCleanPath { .. } => "unsafe_clean_path",
             Self::EditConfig { .. } => "configuration_edit_failed",
@@ -237,6 +250,7 @@ impl CliError {
             | Self::CommandInterrupted { .. }
             | Self::Android(_)
             | Self::Apple(_)
+            | Self::Remote { .. }
             | Self::Deployment(_) => 4,
         }
     }
@@ -267,6 +281,7 @@ impl CliError {
                 .map(|issue| format!("{}: {}", issue.field, issue.help)),
             Self::CommandFailed { help, .. }
             | Self::ToolMissing { help, .. }
+            | Self::Remote { help, .. }
             | Self::Unsupported { help, .. } => Some(help.clone()),
             Self::UnsafeCleanPath { .. } => Some(
                 "Only paths below the project's `target/ferry` directory can be cleaned."
@@ -326,6 +341,7 @@ impl CliError {
                 details
             }
             Self::ToolMissing { searched, .. } => searched.clone(),
+            Self::Remote { details, .. } => details.clone(),
             Self::Deployment(
                 cargo_ferry::deployment::DeploymentError::DeviceSelectionRequired { device_ids },
             ) => device_ids

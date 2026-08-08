@@ -1,8 +1,9 @@
 use std::ffi::OsString;
 #[cfg(unix)]
 use std::fs;
-use std::io::Write as _;
-use std::process::{Child, Command, Output, Stdio};
+use std::io::{self, Write as _};
+use std::process::{Child, ChildStdin, Command, Output, Stdio};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -61,9 +62,58 @@ pub fn run_captured(
         stage,
         reporter,
         COMMAND_TIMEOUT,
+        None,
+        None,
+        false,
     )
 }
 
+/// Run an external command while bounding each captured output stream.
+pub fn run_captured_bounded(
+    program: &Utf8Path,
+    arguments: &[OsString],
+    current_directory: &Utf8Path,
+    stage: &'static str,
+    reporter: &Reporter,
+    output_limit: usize,
+) -> Result<Output, CliError> {
+    run_captured_with_timeout(
+        program,
+        arguments,
+        current_directory,
+        stage,
+        reporter,
+        COMMAND_TIMEOUT,
+        Some(output_limit),
+        None,
+        false,
+    )
+}
+
+/// Run a bounded command with a minimal environment and optional fixed stdin bytes.
+pub fn run_captured_bounded_isolated(
+    program: &Utf8Path,
+    arguments: &[OsString],
+    current_directory: &Utf8Path,
+    stage: &'static str,
+    reporter: &Reporter,
+    output_limit: usize,
+    input: Option<&[u8]>,
+) -> Result<Output, CliError> {
+    run_captured_with_timeout(
+        program,
+        arguments,
+        current_directory,
+        stage,
+        reporter,
+        COMMAND_TIMEOUT,
+        Some(output_limit),
+        input,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn run_captured_with_timeout(
     program: &Utf8Path,
     arguments: &[OsString],
@@ -71,6 +121,9 @@ fn run_captured_with_timeout(
     stage: &'static str,
     reporter: &Reporter,
     timeout: Duration,
+    output_limit: Option<usize>,
+    input: Option<&[u8]>,
+    isolated_environment: bool,
 ) -> Result<Output, CliError> {
     run_captured_with_limits(
         program,
@@ -79,11 +132,13 @@ fn run_captured_with_timeout(
         stage,
         reporter,
         timeout,
-        DEFAULT_PROCESS_OUTPUT_LIMIT,
+        output_limit.unwrap_or(DEFAULT_PROCESS_OUTPUT_LIMIT),
+        input,
+        isolated_environment,
     )
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn run_captured_with_limits(
     program: &Utf8Path,
     arguments: &[OsString],
@@ -92,14 +147,22 @@ fn run_captured_with_limits(
     reporter: &Reporter,
     timeout: Duration,
     output_limit: usize,
+    input: Option<&[u8]>,
+    isolated_environment: bool,
 ) -> Result<Output, CliError> {
     reporter.verbose(format_command(program, arguments));
     let mut command = Command::new(program);
+    command.args(arguments).current_dir(current_directory);
+    if isolated_environment {
+        apply_minimal_environment(&mut command);
+    }
     command
-        .args(arguments)
-        .current_dir(current_directory)
         .env("CARGO_TERM_COLOR", "never")
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_process_group(&mut command);
@@ -110,6 +173,7 @@ fn run_captured_with_limits(
     })?;
     let process_group = child.id();
     let _process_group_guard = track_child(&mut child, program)?;
+    let started = Instant::now();
     let mut capture = match capture_output(&mut child, program, output_limit) {
         Ok(capture) => capture,
         Err(error) => {
@@ -117,7 +181,32 @@ fn run_captured_with_limits(
             return Err(error);
         }
     };
-    let started = Instant::now();
+    let stdin_writer = if let Some(input) = input {
+        let Some(stdin) = child.stdin.take() else {
+            terminate_process_tree(&mut child, process_group);
+            drain_after_termination(&mut capture);
+            return Err(CliError::Io {
+                action: "open external command stdin",
+                path: program.to_owned(),
+                source: io::Error::other("spawned process did not expose stdin"),
+            });
+        };
+        match spawn_stdin_writer(stdin, input.to_vec()) {
+            Ok(writer) => Some(writer),
+            Err(source) => {
+                terminate_process_tree(&mut child, process_group);
+                drain_after_termination(&mut capture);
+                return Err(CliError::Io {
+                    action: "start external command stdin writer",
+                    path: program.to_owned(),
+                    source,
+                });
+            }
+        }
+    } else {
+        None
+    };
+    let mut stdin_complete = stdin_writer.is_none();
     let mut status = None;
     loop {
         if rustferry_core::process_control::interrupt_requested() {
@@ -127,6 +216,24 @@ fn run_captured_with_limits(
                 tool: program.to_string(),
                 stage,
             });
+        }
+        if !stdin_complete {
+            let writer = stdin_writer
+                .as_ref()
+                .expect("incomplete stdin requires a writer");
+            match poll_stdin_writer(writer) {
+                Ok(true) => stdin_complete = true,
+                Ok(false) => {}
+                Err(source) => {
+                    terminate_process_tree(&mut child, process_group);
+                    drain_after_termination(&mut capture);
+                    return Err(CliError::Io {
+                        action: "write external command stdin",
+                        path: program.to_owned(),
+                        source,
+                    });
+                }
+            }
         }
         let capture_status = match capture.poll() {
             Ok(capture_status) => capture_status,
@@ -159,7 +266,7 @@ fn run_captured_with_limits(
                 }
             }
         }
-        if status.is_some() && capture.is_complete() {
+        if status.is_some() && capture.is_complete() && stdin_complete {
             break;
         }
         let remaining = timeout.saturating_sub(started.elapsed());
@@ -229,6 +336,49 @@ fn capture_output(
         path: program.to_owned(),
         source,
     })
+}
+
+fn spawn_stdin_writer(
+    mut stdin: ChildStdin,
+    input: Vec<u8>,
+) -> io::Result<Receiver<io::Result<()>>> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("rustferry-stdin-writer".to_owned())
+        .spawn(move || {
+            let result = stdin.write_all(&input);
+            let _ = sender.send(result);
+        })
+        .map(|_| receiver)
+}
+
+fn poll_stdin_writer(writer: &Receiver<io::Result<()>>) -> io::Result<bool> {
+    match writer.try_recv() {
+        Ok(result) => result.map(|()| true),
+        Err(TryRecvError::Empty) => Ok(false),
+        Err(TryRecvError::Disconnected) => Err(io::Error::other(
+            "external command stdin writer disconnected",
+        )),
+    }
+}
+
+fn apply_minimal_environment(command: &mut Command) {
+    command.env_clear();
+    for name in [
+        "PATH",
+        "PATHEXT",
+        "SystemRoot",
+        "WINDIR",
+        "COMSPEC",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+    ] {
+        if let Some(value) = std::env::var_os(name).filter(|value| !value.is_empty()) {
+            command.env(name, value);
+        }
+    }
+    command.env("LC_ALL", "C").env("LANG", "C");
 }
 
 fn track_child(
@@ -411,10 +561,37 @@ mod tests {
             "descendant timeout",
             &reporter,
             Duration::from_millis(200),
+            None,
+            None,
+            false,
         )
         .unwrap_err();
         assert!(matches!(error, CliError::CommandTimedOut { .. }));
         assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    #[test]
+    fn bounded_capture_drains_but_rejects_oversized_output() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temporary.path().to_owned()).unwrap();
+        let reporter = Reporter::new(false, true, false);
+        let error = run_captured_bounded(
+            Utf8Path::new("/bin/sh"),
+            &[OsString::from("-c"), OsString::from("printf 123456789")],
+            &root,
+            "bounded output",
+            &reporter,
+            4,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CliError::ProcessOutputTooLarge {
+                ref stream,
+                limit_bytes: 4,
+                ..
+            } if stream == "stdout"
+        ));
     }
 
     #[test]
@@ -438,6 +615,8 @@ mod tests {
             &reporter,
             Duration::from_secs(5),
             TEST_OUTPUT_LIMIT,
+            None,
+            false,
         )
         .unwrap_err();
         assert!(matches!(
@@ -467,5 +646,24 @@ mod tests {
             .stderr(Stdio::null())
             .status()
             .is_ok_and(|status| status.success())
+    }
+
+    #[test]
+    fn isolated_capture_writes_fixed_stdin() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temporary.path().to_owned()).unwrap();
+        let reporter = Reporter::new(false, true, false);
+        let output = run_captured_bounded_isolated(
+            Utf8Path::new("/bin/sh"),
+            &[OsString::from("-c"), OsString::from("cat")],
+            &root,
+            "isolated stdin",
+            &reporter,
+            32,
+            Some(b"fixed-input"),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"fixed-input");
     }
 }

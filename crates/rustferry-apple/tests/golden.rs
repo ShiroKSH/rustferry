@@ -63,6 +63,10 @@ fn project_structure_snapshot(project: &str) -> String {
             "com.apple.product-type.app-extension",
         ),
         (
+            "com.apple.product-type.framework",
+            "com.apple.product-type.framework",
+        ),
+        (
             "FerryWidgetExtension.appex in Embed App Extensions",
             "FerryWidgetExtension.appex in Embed App Extensions",
         ),
@@ -74,6 +78,26 @@ fn project_structure_snapshot(project: &str) -> String {
         (
             "LiveActivity.swift in Sources",
             "LiveActivity.swift in Sources",
+        ),
+        (
+            "FerryActivityAttributes.swift in Sources",
+            "FerryActivityAttributes.swift in Sources",
+        ),
+        (
+            "FerryActivityModel.framework in Embed Frameworks",
+            "FerryActivityModel.framework in Embed Frameworks",
+        ),
+        (
+            "FerryActivityModel.framework in RuntimeBridge Frameworks",
+            "FerryActivityModel.framework in RuntimeBridge Frameworks",
+        ),
+        (
+            "FerryActivityModel.framework in Live Activity Frameworks",
+            "FerryActivityModel.framework in Live Activity Frameworks",
+        ),
+        (
+            "unsafe RuntimeBridge framework links",
+            "FerryRuntimeBridge.framework in Frameworks",
         ),
         ("PBXTargetDependency", "PBXTargetDependency"),
         ("Install Rust Executable", "Install Rust Executable"),
@@ -87,6 +111,14 @@ fn project_structure_snapshot(project: &str) -> String {
         (
             "SUPPORTED_PLATFORMS = iphonesimulator",
             "SUPPORTED_PLATFORMS = iphonesimulator",
+        ),
+        (
+            "APPLICATION_EXTENSION_API_ONLY = YES",
+            "APPLICATION_EXTENSION_API_ONLY = YES",
+        ),
+        (
+            "APPLICATION_EXTENSION_API_ONLY = NO",
+            "APPLICATION_EXTENSION_API_ONLY = NO",
         ),
     ] {
         writeln!(output, "{label}: {}", project.matches(needle).count()).unwrap();

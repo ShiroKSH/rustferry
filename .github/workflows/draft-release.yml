@@ -92,16 +92,19 @@ jobs:
           for crate in \
             rustferry-core \
             rustferry \
+            rustferry-remote \
             rustferry-codegen \
             rustferry-apple \
             rustferry-android \
+            rustferry-github \
             cargo-ferry
           do
             cargo package --locked -p "$crate" --list \
               > "$RUNNER_TEMP/$crate-package-files.txt"
           done
-          cargo package --workspace --locked
-          cargo publish --workspace --dry-run --locked --no-verify
+          cargo package --workspace --exclude rustferry-worker-macos --locked
+          cargo publish --workspace --exclude rustferry-worker-macos \
+            --dry-run --locked --no-verify
           python3 scripts/check-release-archives.py "$CARGO_TARGET_DIR"/package/*.crate
       - name: Build real CLI protocol fixture
         run: cargo build --locked -p cargo-ferry
@@ -120,7 +123,7 @@ jobs:
           set -euo pipefail
           mkdir -p dist license-bundle/LICENSES
           cp "$PACKAGE_DIRECTORY"/*.crate dist/
-          test "$(find dist -maxdepth 1 -name '*.crate' | wc -l | tr -d ' ')" -eq 6
+          test "$(find dist -maxdepth 1 -name '*.crate' | wc -l | tr -d ' ')" -eq 8
           cp editors/vscode/dist/rustferry-vscode.vsix \
             "dist/rustferry-vscode-$RELEASE_VERSION.vsix"
           jq -e 'type == "object" and .["$schema"] != null' \

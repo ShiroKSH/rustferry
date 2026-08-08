@@ -268,6 +268,10 @@ fn builds_real_widgetkit_and_activitykit_targets() {
         )
         .expect("validate generated extension product");
         assert_eq!(validation.kind, expected.kind);
+        assert_eq!(
+            validation.activity_model_linked,
+            expected.kind == ExtensionKind::ActivityKit
+        );
         assert!(validation.code_signature.strict_verified);
         assert_eq!(
             validation.code_signature.app_groups,
@@ -298,6 +302,12 @@ fn builds_app_with_embedded_widgetkit_and_activitykit_extensions() {
     let outcome = build_ios_simulator(&request).expect("build extension app");
     let validation = outcome.validation().expect("artifact validation");
     assert_eq!(validation.extensions.len(), 2);
+    assert!(
+        validation
+            .embedded_frameworks
+            .iter()
+            .any(|path| path.file_name() == Some("FerryActivityModel.framework"))
+    );
     assert_eq!(
         validation.code_signature.app_groups,
         ["group.com.example.ferryextensionapp"]
@@ -316,6 +326,10 @@ fn builds_app_with_embedded_widgetkit_and_activitykit_extensions() {
             .any(|extension| extension.kind == ExtensionKind::ActivityKit)
     );
     for extension in &validation.extensions {
+        assert_eq!(
+            extension.activity_model_linked,
+            extension.kind == ExtensionKind::ActivityKit
+        );
         assert_eq!(extension.architectures, ["arm64"]);
         assert_eq!(
             extension.extension_point_identifier,

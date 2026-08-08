@@ -5,7 +5,10 @@ use rustferry_android::{
     AndroidBuildOutcome, AndroidBuildProfile, AndroidBuildRequest, AndroidSigningConfig,
     SigningPasswordSource,
 };
-use rustferry_apple::{AppleBuildProfile, IosSimulatorBuildRequest};
+use rustferry_apple::{
+    AppleBuildProfile, AppleDiscoveryOptions, IosDeviceToolchain, IosSimulatorBuildRequest,
+    discover_apple,
+};
 use rustferry_core::TargetPlatform;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -13,12 +16,15 @@ use toml_edit::DocumentMut;
 
 use cargo_ferry::deployment::{
     PhysicalBuildRequest, SigningService, SystemExecutor, ToolCommand, ValidatedArtifact,
+    plan_physical_build,
 };
 
-use crate::cli::{AndroidBuildArgs, BuildArgs, BuildPlatform, IosBuildArgs};
+use crate::cli::{AndroidBuildArgs, BuildArgs, BuildPlatform, IosBuildArgs, RemoteProviderChoice};
 use crate::error::CliError;
 use crate::output::Reporter;
 use crate::project::find_project_root;
+
+use super::remote;
 
 #[derive(Debug, Serialize)]
 pub(crate) struct BuildOutput {
@@ -46,10 +52,79 @@ pub(crate) struct CargoTargets {
     pub(crate) binary: String,
 }
 
+impl CargoTargets {
+    pub(super) fn binary(&self) -> &str {
+        &self.binary
+    }
+}
+
 pub fn run(arguments: BuildArgs, dry_run: bool, reporter: &Reporter) -> Result<(), CliError> {
+    if build_route(&arguments) == BuildRoute::Remote {
+        return run_remote(arguments, dry_run, reporter);
+    }
     let output = execute(arguments, dry_run, reporter)?;
     report_build(&output, reporter);
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BuildRoute {
+    Local,
+    Remote,
+}
+
+fn build_route(arguments: &BuildArgs) -> BuildRoute {
+    match &arguments.platform {
+        BuildPlatform::Iphone(_) => BuildRoute::Remote,
+        BuildPlatform::Ios(ios)
+            if ios.device && (arguments.remote.is_some() || arguments.unsigned) =>
+        {
+            BuildRoute::Remote
+        }
+        BuildPlatform::Android(_) | BuildPlatform::Ios(_) => BuildRoute::Local,
+    }
+}
+
+fn run_remote(arguments: BuildArgs, dry_run: bool, reporter: &Reporter) -> Result<(), CliError> {
+    let root = find_project_root(arguments.project_dir.as_deref())?;
+    let config = rustferry_core::FerryConfig::load(&root.join("ferry.toml"))?;
+    let targets = read_cargo_targets(&root)?;
+    require_platform(&config, TargetPlatform::Ios, "ios")?;
+
+    let (team, provider) = match arguments.platform {
+        BuildPlatform::Iphone(iphone) => (
+            iphone.team,
+            arguments.remote.unwrap_or(RemoteProviderChoice::Github),
+        ),
+        BuildPlatform::Ios(ios) => {
+            if ios.allow_provisioning_updates || ios.provisioning_profile.is_some() {
+                return Err(CliError::Unsupported {
+                    message: "local Xcode provisioning options cannot be used for a remote iPhone build"
+                        .to_owned(),
+                    help: "Remove `--allow-provisioning-updates` and `--provisioning-profile`, or omit `--remote` and `--unsigned` to build locally."
+                        .to_owned(),
+                });
+            }
+            (
+                ios.team,
+                arguments.remote.unwrap_or(RemoteProviderChoice::Github),
+            )
+        }
+        BuildPlatform::Android(_) => unreachable!("only iPhone builds use the remote route"),
+    };
+
+    remote::build_iphone(
+        &root,
+        &config,
+        &targets.package,
+        &targets.binary,
+        provider,
+        team.as_deref(),
+        arguments.release,
+        arguments.unsigned,
+        dry_run,
+        reporter,
+    )
 }
 
 pub(crate) fn execute(
@@ -61,24 +136,48 @@ pub(crate) fn execute(
     let config = rustferry_core::FerryConfig::load(&root.join("ferry.toml"))?;
     let targets = read_cargo_targets(&root)?;
     match arguments.platform {
-        BuildPlatform::Android(android) => build_android(
-            &root,
-            config,
-            &targets,
-            android,
-            arguments.release,
-            dry_run,
-            reporter,
-        ),
-        BuildPlatform::Ios(ios) => build_ios(
-            &root,
-            config,
-            &targets,
-            &ios,
-            arguments.release,
-            dry_run,
-            reporter,
-        ),
+        BuildPlatform::Android(android) => {
+            if arguments.remote.is_some() || arguments.unsigned {
+                return Err(CliError::Unsupported {
+                    message: "remote and unsigned options apply only to physical-iPhone builds"
+                        .to_owned(),
+                    help: "Remove `--remote` and `--unsigned` from the Android build command."
+                        .to_owned(),
+                });
+            }
+            build_android(
+                &root,
+                config,
+                &targets,
+                android,
+                arguments.release,
+                dry_run,
+                reporter,
+            )
+        }
+        BuildPlatform::Iphone(_) => Err(CliError::Unsupported {
+            message: "physical-iPhone builds use the remote build route".to_owned(),
+            help: "Run this build through the top-level `cargo ferry build` command.".to_owned(),
+        }),
+        BuildPlatform::Ios(ios) => {
+            if arguments.remote.is_some() || arguments.unsigned {
+                return Err(CliError::Unsupported {
+                    message: "remote and unsigned options apply only to physical-iPhone builds"
+                        .to_owned(),
+                    help: "Use `cargo ferry build ios --simulator` without `--remote` or `--unsigned`, or select `--device`."
+                        .to_owned(),
+                });
+            }
+            build_ios(
+                &root,
+                config,
+                &targets,
+                &ios,
+                arguments.release,
+                dry_run,
+                reporter,
+            )
+        }
     }
 }
 
@@ -202,6 +301,7 @@ fn ios_request(
     request
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn build_ios(
     root: &Utf8Path,
     config: rustferry_core::FerryConfig,
@@ -218,7 +318,8 @@ fn build_ios(
     if !arguments.simulator {
         return Err(CliError::Unsupported {
             message: "an iOS build mode was not selected".to_owned(),
-            help: "Pass `--simulator`, or use `--device --team TEAM` for an officially signed physical-device build.".to_owned(),
+            help: "Pass `--simulator`; use `--device --team TEAM` for a local signed build, or `--device --remote github` for a remote build."
+                .to_owned(),
         });
     }
 
@@ -331,25 +432,25 @@ fn build_ios_device(
         .provisioning_profile
         .clone_from(&arguments.provisioning_profile);
 
-    let service = SigningService::new(SystemExecutor);
-    let plan = service.plan(&request)?;
-    reporter.verbose(format!(
-        "physical-ios-rust: {}",
-        display_tool_command(&plan.cargo_command).join(" ")
-    ));
-    reporter.verbose(format!(
-        "physical-ios-xcode: {}",
-        display_tool_command(&plan.xcodebuild_command).join(" ")
-    ));
-    let expected_artifact = plan.artifact_path.to_string();
     if dry_run {
+        let xcrun = intended_xcrun_path();
+        let developer_dir = intended_developer_dir();
+        let plan = plan_physical_build(&request, &intended_cargo_path(), &xcrun, &developer_dir)?;
+        reporter.verbose(format!(
+            "physical-ios-rust: {}",
+            display_tool_command(&plan.cargo_command).join(" ")
+        ));
+        reporter.verbose(format!(
+            "physical-ios-xcode: {}",
+            display_tool_command(&plan.xcodebuild_command).join(" ")
+        ));
         return Ok(BuildOutput {
             project: root.to_string(),
             platform: "ios-device",
             profile: profile_name(release),
             artifact: None,
             deployment_artifact: None,
-            expected_artifact,
+            expected_artifact: plan.artifact_path.to_string(),
             validated: false,
             validation: None,
             plan: Some(json!({
@@ -371,6 +472,18 @@ fn build_ios_device(
         });
     }
 
+    let toolchain = discover_physical_toolchain(root)?;
+    let service = SigningService::for_physical_build(SystemExecutor, &toolchain)?;
+    let plan = service.plan(&request)?;
+    reporter.verbose(format!(
+        "physical-ios-rust: {}",
+        display_tool_command(&plan.cargo_command).join(" ")
+    ));
+    reporter.verbose(format!(
+        "physical-ios-xcode: {}",
+        display_tool_command(&plan.xcodebuild_command).join(" ")
+    ));
+    let expected_artifact = plan.artifact_path.to_string();
     let built = service.build(&request)?;
     let artifact_path = built.artifact.path().to_string();
     let validation = serde_json::to_value(&built.validation).unwrap_or(Value::Null);
@@ -390,6 +503,102 @@ fn build_ios_device(
         device_required: false,
         dry_run: false,
     })
+}
+
+fn discover_physical_toolchain(root: &Utf8Path) -> Result<IosDeviceToolchain, CliError> {
+    let mut search_paths = vec![
+        camino::Utf8PathBuf::from("/usr/bin"),
+        camino::Utf8PathBuf::from("/bin"),
+    ];
+    let executable_directory = std::env::current_exe()
+        .ok()
+        .and_then(|executable| executable.parent().map(std::path::Path::to_owned))
+        .and_then(|parent| camino::Utf8PathBuf::from_path_buf(parent).ok());
+    for path in [
+        "/opt/homebrew/opt/rustup/bin",
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+    ] {
+        let path = camino::Utf8PathBuf::from(path);
+        if !search_paths.contains(&path) {
+            search_paths.push(path);
+        }
+    }
+    if let Some(parent) = executable_directory
+        && !search_paths.contains(&parent)
+    {
+        search_paths.push(parent);
+    }
+    let discovery = discover_apple(&AppleDiscoveryOptions {
+        developer_dir: developer_dir_override()?,
+        executable_search_paths: search_paths,
+        current_dir: root.to_owned(),
+        host_os: std::env::consts::OS.to_owned(),
+        host_arch: std::env::consts::ARCH.to_owned(),
+    })?;
+    discovery.select_device_toolchain().map_err(Into::into)
+}
+
+fn developer_dir_override() -> Result<Option<camino::Utf8PathBuf>, CliError> {
+    canonical_developer_dir_override(
+        std::env::var_os("DEVELOPER_DIR").map(std::path::PathBuf::from),
+    )
+}
+
+fn canonical_developer_dir_override(
+    path: Option<std::path::PathBuf>,
+) -> Result<Option<camino::Utf8PathBuf>, CliError> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let developer_dir = camino::Utf8PathBuf::from_path_buf(path).map_err(CliError::NonUtf8Path)?;
+    let canonical = developer_dir
+        .canonicalize_utf8()
+        .map_err(|source| CliError::Io {
+            action: "resolve DEVELOPER_DIR",
+            path: developer_dir,
+            source,
+        })?;
+    if !canonical.is_dir() {
+        return Err(rustferry_apple::AppleError::InvalidRequest(
+            "DEVELOPER_DIR must identify an existing directory".to_owned(),
+        )
+        .into());
+    }
+    Ok(Some(canonical))
+}
+
+fn intended_cargo_path() -> camino::Utf8PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(std::path::Path::to_owned))
+        .and_then(|parent| camino::Utf8PathBuf::from_path_buf(parent).ok())
+        .map_or_else(
+            || {
+                if cfg!(windows) {
+                    camino::Utf8PathBuf::from("C:/Program Files/Rust/bin/cargo.exe")
+                } else {
+                    camino::Utf8PathBuf::from("/usr/local/bin/cargo")
+                }
+            },
+            |parent| parent.join(if cfg!(windows) { "cargo.exe" } else { "cargo" }),
+        )
+}
+
+fn intended_xcrun_path() -> camino::Utf8PathBuf {
+    if cfg!(windows) {
+        camino::Utf8PathBuf::from("C:/usr/bin/xcrun.exe")
+    } else {
+        camino::Utf8PathBuf::from("/usr/bin/xcrun")
+    }
+}
+
+fn intended_developer_dir() -> camino::Utf8PathBuf {
+    if cfg!(windows) {
+        camino::Utf8PathBuf::from("C:/Applications/Xcode.app/Contents/Developer")
+    } else {
+        camino::Utf8PathBuf::from("/Applications/Xcode.app/Contents/Developer")
+    }
 }
 
 fn display_tool_command(command: &ToolCommand) -> Vec<String> {
@@ -498,4 +707,108 @@ fn require_platform(
 
 const fn profile_name(release: bool) -> &'static str {
     if release { "release" } else { "debug" }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::cli::{
+        BuildArgs, BuildPlatform, IosBuildArgs, IphoneBuildArgs, RemoteProviderChoice,
+    };
+
+    use super::{
+        BuildRoute, build_route, canonical_developer_dir_override, intended_developer_dir,
+        intended_xcrun_path,
+    };
+
+    fn ios_arguments(
+        device: bool,
+        remote: Option<RemoteProviderChoice>,
+        unsigned: bool,
+    ) -> BuildArgs {
+        BuildArgs {
+            platform: BuildPlatform::Ios(IosBuildArgs {
+                simulator: !device,
+                device,
+                team: device.then(|| "TEAM123456".to_owned()),
+                allow_provisioning_updates: false,
+                provisioning_profile: None,
+            }),
+            release: false,
+            remote,
+            unsigned,
+            project_dir: None,
+        }
+    }
+
+    #[test]
+    fn signed_ios_device_build_without_remote_flags_stays_local() {
+        assert_eq!(
+            build_route(&ios_arguments(true, None, false)),
+            BuildRoute::Local
+        );
+    }
+
+    #[test]
+    fn physical_dry_run_tool_paths_are_absolute_on_the_target_host() {
+        assert!(intended_xcrun_path().is_absolute());
+        assert!(intended_developer_dir().is_absolute());
+    }
+
+    #[test]
+    fn explicit_developer_directory_is_canonicalized_before_discovery() {
+        let directory = tempfile::tempdir().expect("developer directory");
+        let expected = camino::Utf8PathBuf::from_path_buf(
+            directory
+                .path()
+                .canonicalize()
+                .expect("canonical directory"),
+        )
+        .expect("UTF-8 directory");
+
+        let selected = canonical_developer_dir_override(Some(directory.path().to_owned()))
+            .expect("valid override")
+            .expect("present override");
+
+        assert_eq!(selected, expected);
+    }
+
+    #[test]
+    fn remote_or_unsigned_ios_device_build_uses_remote_route() {
+        assert_eq!(
+            build_route(&ios_arguments(
+                true,
+                Some(RemoteProviderChoice::Github),
+                false,
+            )),
+            BuildRoute::Remote
+        );
+        assert_eq!(
+            build_route(&ios_arguments(true, None, true)),
+            BuildRoute::Remote
+        );
+    }
+
+    #[test]
+    fn simulator_options_never_select_the_remote_route() {
+        assert_eq!(
+            build_route(&ios_arguments(
+                false,
+                Some(RemoteProviderChoice::Github),
+                false,
+            )),
+            BuildRoute::Local
+        );
+    }
+
+    #[test]
+    fn iphone_alias_always_selects_the_remote_route() {
+        let arguments = BuildArgs {
+            platform: BuildPlatform::Iphone(IphoneBuildArgs { team: None }),
+            release: false,
+            remote: None,
+            unsigned: false,
+            project_dir: None,
+        };
+        assert_eq!(build_route(&arguments), BuildRoute::Remote);
+    }
 }

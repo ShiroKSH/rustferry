@@ -18,7 +18,20 @@ SEMVER = re.compile(
     r"(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
 )
 DEPENDENCY_TABLES = ("dependencies", "dev-dependencies", "build-dependencies")
-IGNORED_PARTS = {".git", "node_modules", "target"}
+IGNORED_PARTS = {".git", ".goal3", "node_modules", "target"}
+EXPECTED_PUBLISHABLE_PACKAGES = frozenset(
+    {
+        "cargo-ferry",
+        "rustferry",
+        "rustferry-android",
+        "rustferry-apple",
+        "rustferry-codegen",
+        "rustferry-core",
+        "rustferry-github",
+        "rustferry-remote",
+    }
+)
+EXPECTED_NON_PUBLISHABLE_PACKAGES = frozenset({"rustferry-worker-macos"})
 
 
 def read_toml(path: Path) -> dict[str, Any]:
@@ -75,6 +88,8 @@ def validate(root: Path, expected_version: str) -> tuple[list[str], int]:
         )
 
     internal_packages: set[str] = set()
+    publishable_packages: set[str] = set()
+    non_publishable_packages: set[str] = set()
     member_manifests: list[Path] = []
     for member in workspace.get("members", []):
         manifest = root / member / "Cargo.toml"
@@ -85,11 +100,28 @@ def validate(root: Path, expected_version: str) -> tuple[list[str], int]:
             failures.append(f"{manifest.relative_to(root)} has no package name")
             continue
         internal_packages.add(name)
+        if package.get("publish") is False:
+            non_publishable_packages.add(name)
+        else:
+            publishable_packages.add(name)
         version = package.get("version")
         if version != {"workspace": True}:
             failures.append(
                 f"{manifest.relative_to(root)} must inherit package.version from the workspace"
             )
+
+    if publishable_packages != EXPECTED_PUBLISHABLE_PACKAGES:
+        failures.append(
+            "publishable workspace packages are "
+            f"{sorted(publishable_packages)!r}; expected "
+            f"{sorted(EXPECTED_PUBLISHABLE_PACKAGES)!r}"
+        )
+    if non_publishable_packages != EXPECTED_NON_PUBLISHABLE_PACKAGES:
+        failures.append(
+            "non-publishable workspace packages are "
+            f"{sorted(non_publishable_packages)!r}; expected "
+            f"{sorted(EXPECTED_NON_PUBLISHABLE_PACKAGES)!r}"
+        )
 
     expected_requirement = f"={expected_version}"
     workspace_dependencies = workspace.get("dependencies", {})

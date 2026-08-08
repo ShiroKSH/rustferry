@@ -19,13 +19,14 @@
 RustFerry keeps application code and assets in an ordinary Rust project. When you build, it creates the required platform host below `target/ferry/`; that generated glue is disposable and stays out of your source tree.
 
 > [!IMPORTANT]
-> RustFerry is pre-release. Real signed/aligned arm64 Android APKs and arm64 iOS Simulator `.app`/`.appex` bundles have been built and independently inspected. Device discovery, install, run, logs, the VS Code extension, and the official physical-iOS development pipeline are implemented, but runtime behavior has not yet been observed on an emulator, Simulator, or physical device. See the [support matrix](docs/support-matrix.md) and [evidence log](docs/STATUS.md).
+> RustFerry is pre-release. Real signed/aligned arm64 Android APKs, arm64 iOS Simulator `.app`/`.appex` bundles, and an unsigned physical-iPhone `.xcarchive` built remotely from a Linux client have been independently inspected. Device discovery, install, run, logs, the VS Code extension, local physical-iOS development signing, and remote macOS compilation are implemented. A real development-signed remote IPA and runtime behavior on an emulator, Simulator, or physical device remain unvalidated. See the [support matrix](docs/support-matrix.md) and [evidence log](docs/STATUS.md).
 
 ## What it does
 
 - Generates Rust application projects from small, capability-aware templates.
 - Builds Android APKs directly with Cargo, the NDK, `aapt2`, `d8`, `zipalign`, and `apksigner`; no Gradle project to maintain.
 - Generates an Apple host under `target/ferry/` and invokes Xcode tooling for iOS Simulator builds; no Xcode project in application source.
+- Sends an exact physical-iPhone build request from Linux or Windows to a trusted GitHub-hosted macOS worker, then independently validates the downloaded artifact.
 - Discovers devices and composes artifact-validated builds with typed install and launch operations through ADB, simctl, and devicectl, with bounded application-filtered logs.
 - Provides a native, trust-aware Visual Studio Code extension driven by a stable versioned JSON/NDJSON protocol.
 - Generates deterministic Android density assets plus tested iOS compiled-catalog and SDK-only resources from validated opaque PNG sources.
@@ -36,14 +37,7 @@ Capability availability and validation depth differ by platform. An API or gener
 
 ## Install from source
 
-RustFerry is not published to crates.io yet. The release path is registry-first:
-
-```console
-cargo install cargo-ferry
-cargo ferry new weather
-```
-
-That path becomes usable when the coordinated crates are published. For a contributor checkout, select the local runtime explicitly:
+RustFerry is not published to crates.io yet. Install the CLI from a checkout and select the local runtime explicitly:
 
 ```console
 git clone https://github.com/ShiroKSH/rustferry.git
@@ -55,6 +49,8 @@ cargo ferry new weather \
 ```
 
 `--runtime-source workspace` supports monorepo development. `CARGO_FERRY_RUNTIME_PATH` remains an optional contributor-only development override when no explicit source is supplied; normal published installations do not require it. Rust 1.92 or newer is required. Mobile builds also need the relevant Android SDK/NDK or a full Xcode installation.
+
+After the coordinated crates are published, the normal installation will be `cargo install cargo-ferry`.
 
 ## Create a project
 
@@ -104,6 +100,22 @@ cargo ferry signing teams
 cargo ferry build ios --device --team ABCDE12345
 ```
 
+From Linux or Windows, configure the GitHub provider and request an unsigned physical-iPhone
+archive without installing Xcode locally:
+
+```console
+cargo ferry remote setup github \
+  --source-remote-name public \
+  --execution-remote-name signing \
+  --execution-repository OWNER/private-signing \
+  --worker-revision <exact-commit>
+cargo ferry build iphone --remote github --unsigned
+```
+
+Development signing additionally requires the protected private-repository setup and Apple assets
+described in [GitHub provider security](docs/remote/github-security.md). The unsigned remote path has
+live compile/download evidence; remote signed IPA export has not yet been accepted.
+
 Build never touches a device. Deployment is explicit:
 
 ```console
@@ -113,7 +125,7 @@ cargo ferry run ios --simulator SIMULATOR_UDID
 cargo ferry logs android --device SERIAL
 ```
 
-The current environment had no emulator, Simulator runtime, signing identity, or physical device, so these deployment backends are implemented and deterministically tested but not runtime-validated.
+Deployment backends are implemented and deterministically tested, but emulator, Simulator, and physical-device runtime validation remains pending.
 
 ## Visual Studio Code
 
@@ -164,6 +176,7 @@ Configuration lives in `ferry.toml`. Generated platform files remain under `targ
 - [iOS Simulator setup](docs/ios/simulator.md)
 - [VS Code extension](docs/editors/vscode.md)
 - [Devices, install, run, and logs](docs/deployment/install-run-logs.md)
+- [Remote physical-iPhone builds](docs/remote/github-security.md)
 - [Support matrix](docs/support-matrix.md)
 - [Implementation evidence](docs/STATUS.md)
 - [Threat model](docs/THREAT_MODEL.md)

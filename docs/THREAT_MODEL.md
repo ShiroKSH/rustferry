@@ -8,6 +8,7 @@
 - Developer workstation SDKs and executable search paths.
 - Editor workspace trust, diagnostics, quick fixes, tasks, and extension settings.
 - Device identifiers, application logs, pairing state, and development-team metadata.
+- Remote request identity, trusted worker provenance, sealed unsigned handoff, and downloaded artifact integrity.
 
 ## Trust boundaries and entry points
 
@@ -26,6 +27,10 @@
   and deployment.
 - Application logs may contain user data. Log collection is explicit, application-filtered,
   bounded, and never clears the platform log buffer.
+- Remote iPhone builds cross public source-repository, private execution-repository, GitHub API,
+  Actions runner, artifact-store, and local publication boundaries. The source project and its
+  build scripts are untrusted; the worker revision, workflow bytes, request envelope, temporary
+  ref, run identity, and every downloaded byte require independent binding.
 
 ## Required controls
 
@@ -56,6 +61,14 @@
 - Physical iOS builds use the official Cargo/Xcode/codesign/provisioning path. Require an explicit
   Development Team; keep provisioning updates opt-in; reject ad-hoc signatures, team/profile/
   entitlement mismatches, expired profiles, missing extensions, and non-arm64 device binaries.
+- Split remote physical-iOS compilation from signing. Phase A may execute untrusted Cargo code but
+  receives no signing secrets. Phase B receives only a digest-bound sealed archive, runs behind a
+  reviewed protected Environment in a distinct private repository, and must prove temporary
+  keychain, decoded-secret, workspace, and operation-ref cleanup before success.
+- Bind remote submission to exact repository identities, source and worker commits, trusted ref,
+  generated workflow digest, request digest, operation ref, run/attempt, artifact metadata, and
+  final file hashes. Reject replacement, traversal, links, collisions, expansion bombs, stale runs,
+  moved refs, visibility drift, or ambiguous cleanup. See [GitHub macOS provider security](remote/github-security.md).
 - Validate PNG type, dimensions, opacity, byte bounds, canonical containment, and cache manifests
   before generating platform assets. Generate below `target/ferry`, reject symlink boundaries, and
   commit a complete fingerprint directory atomically.

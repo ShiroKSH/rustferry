@@ -35,6 +35,11 @@
   - [iOS logs](deployment/ios-logs.md)
   - [Physical iPhone](deployment/physical-iphone.md)
 
+# Remote physical-iPhone builds
+
+- [Protocol](remote/protocol.md)
+- [GitHub macOS provider security](remote/github-security.md)
+
 # Release
 
 - [Packaging](release/packaging.md)

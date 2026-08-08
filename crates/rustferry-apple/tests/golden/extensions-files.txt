@@ -1,3 +1,5 @@
+ActivityModel/FerryActivityAttributes.swift
+ActivityModel/Info.plist
 App.entitlements
 FerryHost.xcodeproj/project.pbxproj
 FerryHost.xcodeproj/xcshareddata/xcschemes/FerryApp.xcscheme

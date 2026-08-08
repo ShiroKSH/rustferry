@@ -1,0 +1,167 @@
+name: RustFerry Goal 3 Linux client acceptance
+
+on:
+  push:
+    branches:
+      - 'goal3/integrate-goal2'
+    paths:
+      - '.github/workflows/rustferry-goal3-linux-client-acceptance.yml'
+      - '.github/workflows/rustferry-goal3-iphone.yml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'rust-toolchain.toml'
+      - 'crates/cargo-ferry/**'
+      - 'crates/rustferry-apple/**'
+      - 'crates/rustferry-github/**'
+      - 'crates/rustferry-remote/**'
+      - 'crates/rustferry-worker-macos/**'
+      - 'examples/counter/**'
+
+permissions: {}
+
+concurrency:
+  group: 'rustferry-goal3-linux-client-${{ github.repository_id }}'
+  cancel-in-progress: false
+
+jobs:
+  linux-client:
+    name: Linux client to remote unsigned iPhone archive
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      actions: write
+      contents: read
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: 'never'
+      RUST_BACKTRACE: '0'
+      RUSTUP_TOOLCHAIN: '1.92.0'
+      RUSTFERRY_WORKER_REVISION: '6658643e9646c97efa7977923ba770e002f7b8a4'
+    steps:
+      - name: Checkout exact acceptance source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prove Linux has no local Apple toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/rustferry-goal3-linux-evidence"
+          install -d -m 0700 "$evidence"
+          uname -a > "$evidence/uname.txt"
+          test "$RUNNER_OS" = 'Linux'
+          test ! -d /Applications/Xcode.app
+          for tool in xcodebuild xcrun codesign; do
+            if command -v "$tool" >/dev/null 2>&1; then
+              echo "Unexpected Apple tool on Linux client: $tool" >&2
+              exit 1
+            fi
+          done
+          printf '%s\n' \
+            'client_os=Linux' \
+            'xcode=absent' \
+            'xcodebuild=absent' \
+            'codesign=absent' \
+            'iphoneos_sdk=absent' \
+            > "$evidence/client-toolchain.txt"
+          git rev-parse --verify 'HEAD^{commit}' > "$evidence/source-revision.txt"
+          git status --porcelain=v1 --untracked-files=all > "$evidence/prebuild-status.txt"
+          test ! -s "$evidence/prebuild-status.txt"
+
+      - name: Install exact Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
+          actual="$(rustup run "$RUSTUP_TOOLCHAIN" rustc --version)"
+          [[ "$actual" == 'rustc 1.92.0 '* ]]
+          printf '%s\n' "$actual" \
+            > "$RUNNER_TEMP/rustferry-goal3-linux-evidence/rustc-version.txt"
+
+      - name: Build Linux cargo-ferry client
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --package cargo-ferry
+          target/debug/cargo-ferry --version \
+            > "$RUNNER_TEMP/rustferry-goal3-linux-evidence/cargo-ferry-version.txt"
+
+      - name: Run real GitHub provider and verify automatic download
+        shell: bash
+        env:
+          GITHUB_TOKEN: '${{ github.token }}'
+          RUSTFERRY_ACCEPTANCE_SSH_PRIVATE_KEY: '${{ secrets.RUSTFERRY_GOAL3_ACCEPTANCE_SSH_PRIVATE_KEY }}'
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/rustferry-goal3-linux-evidence"
+          test -n "$RUSTFERRY_ACCEPTANCE_SSH_PRIVATE_KEY"
+
+          install -d -m 0700 "$HOME/.ssh"
+          gh api meta --jq '.ssh_keys[]' \
+            | awk '{ print "github.com " $0 }' \
+            > "$HOME/.ssh/known_hosts"
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 0600 "$HOME/.ssh/known_hosts"
+          eval "$(ssh-agent -s)" >/dev/null
+          trap 'ssh-agent -k >/dev/null 2>&1 || true' EXIT
+          printf '%s\n' "$RUSTFERRY_ACCEPTANCE_SSH_PRIVATE_KEY" \
+            | ssh-add - >/dev/null
+          unset RUSTFERRY_ACCEPTANCE_SSH_PRIVATE_KEY
+          git remote set-url --push origin 'git@github.com:ShiroKSH/rustferry.git'
+
+          target/debug/cargo-ferry --json remote setup github \
+            --project-dir examples/counter \
+            --execution-repository ShiroKSH/rustferry \
+            --source-remote-name origin \
+            --execution-remote-name origin \
+            --trusted-ref refs/heads/goal3/integrate-goal2 \
+            --worker-repository https://github.com/ShiroKSH/rustferry \
+            --worker-revision "$RUSTFERRY_WORKER_REVISION" \
+            --worker-version 0.1.0 \
+            | tee "$evidence/setup.json"
+          jq -e \
+            '.data.source_repository == "https://github.com/shiroksh/rustferry" and .data.execution_repository == "shiroksh/rustferry" and .data.authenticated_as == "repository-scoped token" and .data.installed == true and .data.signing_mode == "unsigned-smoke-only"' \
+            "$evidence/setup.json" >/dev/null
+
+          target/debug/cargo-ferry --json remote doctor github \
+            --project-dir examples/counter \
+            | tee "$evidence/doctor.json"
+          jq -e '.data.ready == true' "$evidence/doctor.json" >/dev/null
+
+          target/debug/cargo-ferry --json build iphone \
+            --project-dir examples/counter \
+            --remote github \
+            --unsigned \
+            | tee "$evidence/build.json"
+
+          archive="$GITHUB_WORKSPACE/examples/counter/target/ferry/ios/device/debug/Counter-unsigned.xcarchive.zip"
+          sanitized_log="$GITHUB_WORKSPACE/examples/counter/target/ferry/ios/device/debug/sanitized-build-log.txt"
+          test -s "$archive"
+          test -s "$sanitized_log"
+          unzip -t "$archive" > "$evidence/archive-zip-test.txt"
+          zipinfo -1 "$archive" > "$evidence/archive-entries.txt"
+          grep -qx 'Info.plist' "$evidence/archive-entries.txt"
+          grep -qx 'Products/Applications/counter.app/Info.plist' \
+            "$evidence/archive-entries.txt"
+
+          actual_sha256="$(sha256sum "$archive" | awk '{print $1}')"
+          reported_sha256="$(jq -er '.data.artifact_sha256' "$evidence/build.json")"
+          test "$actual_sha256" = "$reported_sha256"
+          printf '%s  %s\n' "$actual_sha256" 'Counter-unsigned.xcarchive.zip' \
+            > "$evidence/SHA256SUMS"
+          stat --printf='%s\n' "$archive" > "$evidence/archive-size-bytes.txt"
+          cp --reflink=auto "$archive" "$evidence/Counter-unsigned.xcarchive.zip"
+          cp --reflink=auto "$sanitized_log" "$evidence/sanitized-build-log.txt"
+
+      - name: Upload Linux-client acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: 'rustferry-goal3-linux-client-${{ github.run_id }}-${{ github.run_attempt }}'
+          path: '${{ runner.temp }}/rustferry-goal3-linux-evidence'
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3

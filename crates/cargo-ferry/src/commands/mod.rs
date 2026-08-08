@@ -11,6 +11,7 @@ pub(crate) mod ide;
 mod info;
 mod new;
 pub(crate) mod platform_build;
+mod remote;
 mod signing;
 
 use crate::cli::Command;
@@ -29,12 +30,13 @@ pub fn run(
         Command::Remove(arguments) => capability::run(&arguments, false, dry_run, reporter),
         Command::Check(arguments) => check::run(&arguments, dry_run, reporter),
         Command::Doctor(arguments) => doctor::run(&arguments, dry_run, reporter),
+        Command::Remote(arguments) => remote::run(arguments, dry_run, reporter),
+        Command::Signing(arguments) => signing::run(arguments, dry_run, reporter),
         Command::Build(arguments) => platform_build::run(arguments, dry_run, reporter),
         Command::Devices(arguments) => devices::run(arguments, dry_run, json_stream, reporter),
         Command::Install(arguments) => deployment::install(arguments, dry_run, reporter),
         Command::Run(arguments) => deployment::run(arguments, dry_run, reporter),
         Command::Logs(arguments) => deployment::logs(arguments, dry_run, json_stream, reporter),
-        Command::Signing(arguments) => signing::run(arguments, reporter),
         Command::Assets(arguments) => assets::run(arguments, dry_run, reporter),
         Command::Clean(arguments) => clean::run(&arguments, dry_run, reporter),
         Command::Config(arguments) => config::run(arguments, dry_run, reporter),

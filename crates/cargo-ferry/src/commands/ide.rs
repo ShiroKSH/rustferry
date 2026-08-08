@@ -602,6 +602,8 @@ fn build(arguments: IdeBuildArgs, dry_run: bool, reporter: &Reporter) -> Result<
         BuildArgs {
             platform: build_platform,
             release: matches!(arguments.profile, IdeProfile::Release),
+            remote: None,
+            unsigned: false,
             project_dir: Some(root.clone()),
         },
         dry_run,
@@ -1162,6 +1164,8 @@ fn build_deployment_artifact(
         BuildArgs {
             platform: build_platform,
             release: false,
+            remote: None,
+            unsigned: false,
             project_dir: Some(root.to_owned()),
         },
         false,

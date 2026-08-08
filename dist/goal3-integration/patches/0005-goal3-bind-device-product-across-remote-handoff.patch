@@ -1,0 +1,2299 @@
+From 1034835208010459bdc1048c462b66dc554759e6 Mon Sep 17 00:00:00 2001
+From: ShiroKSH <kushidashiro@gmail.com>
+Date: Sat, 1 Aug 2026 23:28:06 +0300
+Subject: [PATCH 05/33] goal3: bind device product across remote handoff
+
+---
+ crates/rustferry-apple/src/device.rs          | 101 ++-
+ crates/rustferry-apple/src/lib.rs             |   2 +-
+ crates/rustferry-apple/tests/device.rs        |  30 +-
+ crates/rustferry-remote/src/artifact.rs       | 174 ++++-
+ crates/rustferry-remote/src/handoff.rs        | 102 +++
+ crates/rustferry-remote/src/lib.rs            |  18 +-
+ crates/rustferry-remote/src/protocol.rs       | 223 +++++-
+ crates/rustferry-remote/src/schema.rs         |  14 +-
+ crates/rustferry-remote/src/signing.rs        | 118 +++-
+ .../tests/product_contract.rs                 | 177 +++++
+ crates/rustferry-remote/tests/security.rs     |  75 +-
+ crates/rustferry-remote/tests/source.rs       |   5 +-
+ docs/remote/protocol.md                       |  37 +-
+ schemas/ferry-remote-protocol-v1.schema.json  | 641 +++++++++++++++++-
+ 14 files changed, 1623 insertions(+), 94 deletions(-)
+ create mode 100644 crates/rustferry-remote/src/handoff.rs
+ create mode 100644 crates/rustferry-remote/tests/product_contract.rs
+
+diff --git a/crates/rustferry-apple/src/device.rs b/crates/rustferry-apple/src/device.rs
+index f38ebaa..4af2c26 100644
+--- a/crates/rustferry-apple/src/device.rs
++++ b/crates/rustferry-apple/src/device.rs
+@@ -3,8 +3,8 @@ use std::fs;
+ use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
+ use rustferry_core::{FerryConfig, ProjectAssets, brand};
+ use rustferry_remote::{
+-    UnsignedNestedBundleExpectation, UnsignedNestedBundleKind, UnsignedXcarchiveExpectation,
+-    UnsignedXcarchiveInspection, inspect_unsigned_xcarchive,
++    IosDeviceProductExpectation, UnsignedNestedBundleExpectation, UnsignedNestedBundleKind,
++    UnsignedXcarchiveExpectation, UnsignedXcarchiveInspection, inspect_unsigned_xcarchive,
+ };
+ use serde::{Deserialize, Serialize};
+ use sha2::{Digest, Sha256};
+@@ -165,6 +165,62 @@ pub fn plan_ios_device_unsigned(
+     plan_with_assets(request, toolchain, &assets)
+ }
+ 
++/// Derive the complete client-owned product identity for a physical-iPhone request.
++///
++/// This helper is host-independent and does not inspect Xcode. The remote worker later compares
++/// the generated archive with these pre-submission values.
++///
++/// # Errors
++///
++/// Returns [`AppleError`] when the binary name, configuration, or extension graph is invalid.
++pub fn derive_ios_device_product_expectation(
++    config: &FerryConfig,
++    binary_name: &str,
++) -> Result<IosDeviceProductExpectation, AppleError> {
++    validate_binary_name(binary_name)?;
++    let _ = generate_ios_project_for_platform(
++        &IosProjectSpec::new(config.clone(), binary_name.to_owned()),
++        IosProjectPlatform::DeviceUnsigned,
++    )?;
++    let mut nested_bundles = vec![UnsignedNestedBundleExpectation {
++        relative_path: "Frameworks/FerryRuntimeBridge.framework".to_owned(),
++        bundle_identifier: "org.rustferry.runtime-bridge".to_owned(),
++        executable: "FerryRuntimeBridge".to_owned(),
++        kind: UnsignedNestedBundleKind::Framework,
++    }];
++    if config.extensions.live_activity.enabled {
++        nested_bundles.push(UnsignedNestedBundleExpectation {
++            relative_path: "Frameworks/FerryActivityModel.framework".to_owned(),
++            bundle_identifier: "org.rustferry.activity-model".to_owned(),
++            executable: "FerryActivityModel".to_owned(),
++            kind: UnsignedNestedBundleKind::Framework,
++        });
++        nested_bundles.push(UnsignedNestedBundleExpectation {
++            relative_path: "PlugIns/FerryLiveActivityExtension.appex".to_owned(),
++            bundle_identifier: format!("{}.liveactivity", config.app.identifier),
++            executable: "FerryLiveActivityExtension".to_owned(),
++            kind: UnsignedNestedBundleKind::AppExtension,
++        });
++    }
++    if config.extensions.widget.enabled {
++        nested_bundles.push(UnsignedNestedBundleExpectation {
++            relative_path: "PlugIns/FerryWidgetExtension.appex".to_owned(),
++            bundle_identifier: format!("{}.widget", config.app.identifier),
++            executable: "FerryWidgetExtension".to_owned(),
++            kind: UnsignedNestedBundleKind::AppExtension,
++        });
++    }
++    nested_bundles.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
++    let version = &config.app.version;
++    Ok(IosDeviceProductExpectation {
++        app_directory_name: format!("{binary_name}.app"),
++        executable: binary_name.to_owned(),
++        app_version: config.app.display_version.clone(),
++        build_number: format!("{}.{}.{}", version.major, version.minor, version.patch),
++        nested_bundles,
++    })
++}
++
+ fn plan_with_assets(
+     request: &IosDeviceArchiveRequest,
+     toolchain: &IosDeviceToolchain,
+@@ -253,35 +309,7 @@ fn archive_expectation(
+     toolchain: &IosDeviceToolchain,
+     generated: &crate::GeneratedAppleProject,
+ ) -> Result<UnsignedXcarchiveExpectation, AppleError> {
+-    let mut nested_bundles = vec![UnsignedNestedBundleExpectation {
+-        relative_path: "Frameworks/FerryRuntimeBridge.framework".to_owned(),
+-        bundle_identifier: "org.rustferry.runtime-bridge".to_owned(),
+-        executable: "FerryRuntimeBridge".to_owned(),
+-        kind: UnsignedNestedBundleKind::Framework,
+-    }];
+-    if request.config.extensions.live_activity.enabled {
+-        nested_bundles.push(UnsignedNestedBundleExpectation {
+-            relative_path: "Frameworks/FerryActivityModel.framework".to_owned(),
+-            bundle_identifier: "org.rustferry.activity-model".to_owned(),
+-            executable: "FerryActivityModel".to_owned(),
+-            kind: UnsignedNestedBundleKind::Framework,
+-        });
+-        nested_bundles.push(UnsignedNestedBundleExpectation {
+-            relative_path: "PlugIns/FerryLiveActivityExtension.appex".to_owned(),
+-            bundle_identifier: format!("{}.liveactivity", request.config.app.identifier),
+-            executable: "FerryLiveActivityExtension".to_owned(),
+-            kind: UnsignedNestedBundleKind::AppExtension,
+-        });
+-    }
+-    if request.config.extensions.widget.enabled {
+-        nested_bundles.push(UnsignedNestedBundleExpectation {
+-            relative_path: "PlugIns/FerryWidgetExtension.appex".to_owned(),
+-            bundle_identifier: format!("{}.widget", request.config.app.identifier),
+-            executable: "FerryWidgetExtension".to_owned(),
+-            kind: UnsignedNestedBundleKind::AppExtension,
+-        });
+-    }
+-    nested_bundles.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
++    let product = derive_ios_device_product_expectation(&request.config, &request.binary_name)?;
+ 
+     let mut required_resources = std::collections::BTreeMap::new();
+     for relative in ["FerryResources.json", "FerryIcon.png", "FerrySplash.png"] {
+@@ -295,17 +323,16 @@ fn archive_expectation(
+             })?;
+         required_resources.insert(relative.to_owned(), format!("{:x}", Sha256::digest(bytes)));
+     }
+-    let version = &request.config.app.version;
+     Ok(UnsignedXcarchiveExpectation {
+-        app_directory_name: format!("{}.app", request.binary_name),
++        app_directory_name: product.app_directory_name,
+         bundle_identifier: request.config.app.identifier.clone(),
+-        executable: request.binary_name.clone(),
+-        app_version: request.config.app.display_version.clone(),
+-        build_number: format!("{}.{}.{}", version.major, version.minor, version.patch),
++        executable: product.executable,
++        app_version: product.app_version,
++        build_number: product.build_number,
+         minimum_os: request.config.ios.min_version.clone(),
+         sdk_version: toolchain.device_sdk.version.clone(),
+         sdk_build_version: toolchain.device_sdk.build_version.clone(),
+-        nested_bundles,
++        nested_bundles: product.nested_bundles,
+         required_resources,
+     })
+ }
+diff --git a/crates/rustferry-apple/src/lib.rs b/crates/rustferry-apple/src/lib.rs
+index 3404bc1..2bd6c5b 100644
+--- a/crates/rustferry-apple/src/lib.rs
++++ b/crates/rustferry-apple/src/lib.rs
+@@ -26,7 +26,7 @@ pub use command::{CommandOutput, CommandSpec, DEFAULT_COMMAND_TIMEOUT, run_comma
+ pub use device::{
+     IosDeviceArchiveOutcome, IosDeviceArchivePlan, IosDeviceArchiveRequest,
+     IosDeviceArtifactDisposition, IosDeviceMachOValidation, IosDeviceMachOValidationPlan,
+-    build_ios_device_unsigned, plan_ios_device_unsigned,
++    build_ios_device_unsigned, derive_ios_device_product_expectation, plan_ios_device_unsigned,
+ };
+ pub use discovery::{
+     AppleDiscovery, AppleDiscoveryOptions, AppleHostTools, AppleToolchain, IosDeviceSdk,
+diff --git a/crates/rustferry-apple/tests/device.rs b/crates/rustferry-apple/tests/device.rs
+index 6ae6f51..1f008ab 100644
+--- a/crates/rustferry-apple/tests/device.rs
++++ b/crates/rustferry-apple/tests/device.rs
+@@ -11,8 +11,8 @@ use rustferry_apple::{
+ };
+ use rustferry_apple::{
+     IOS_DEVICE_TARGET, IosDeviceArchiveRequest, IosDeviceArtifactDisposition, IosDeviceSdk,
+-    IosDeviceToolchain, IosProjectPlatform, IosProjectSpec, generate_ios_project,
+-    generate_ios_project_for_platform, plan_ios_device_unsigned,
++    IosDeviceToolchain, IosProjectPlatform, IosProjectSpec, derive_ios_device_product_expectation,
++    generate_ios_project, generate_ios_project_for_platform, plan_ios_device_unsigned,
+ };
+ use rustferry_core::FerryConfig;
+ #[cfg(target_os = "macos")]
+@@ -123,6 +123,32 @@ fn device_plan_uses_physical_target_sdk_destination_and_unsigned_archive() {
+     }));
+ }
+ 
++#[test]
++fn client_product_expectation_matches_the_worker_archive_plan() {
++    let temporary = tempfile::tempdir().unwrap();
++    let root = Utf8Path::from_path(temporary.path()).unwrap();
++    let request = request(root);
++    let product =
++        derive_ios_device_product_expectation(&request.config, &request.binary_name).unwrap();
++    let plan = plan_ios_device_unsigned(&request, &fake_toolchain(root)).unwrap();
++
++    assert_eq!(product.app_directory_name, "weather.app");
++    assert_eq!(product.executable, "weather");
++    assert_eq!(product.app_version, request.config.app.display_version);
++    assert_eq!(product.nested_bundles.len(), 1);
++    assert_eq!(
++        plan.archive_expectation.app_directory_name,
++        product.app_directory_name
++    );
++    assert_eq!(plan.archive_expectation.executable, product.executable);
++    assert_eq!(plan.archive_expectation.app_version, product.app_version);
++    assert_eq!(plan.archive_expectation.build_number, product.build_number);
++    assert_eq!(
++        plan.archive_expectation.nested_bundles,
++        product.nested_bundles
++    );
++}
++
+ #[test]
+ fn validation_hook_requires_arm64_and_physical_ios_platform() {
+     let temporary = tempfile::tempdir().unwrap();
+diff --git a/crates/rustferry-remote/src/artifact.rs b/crates/rustferry-remote/src/artifact.rs
+index d3b29bb..0df2ad0 100644
+--- a/crates/rustferry-remote/src/artifact.rs
++++ b/crates/rustferry-remote/src/artifact.rs
+@@ -342,8 +342,11 @@ pub struct MachOSliceEvidence {
+ }
+ 
+ /// Expected metadata for client-side IPA inspection.
+-#[derive(Clone, Debug, Eq, PartialEq)]
++#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
++#[serde(deny_unknown_fields)]
+ pub struct IpaExpectation {
++    /// Exact main application directory name, including `.app`.
++    pub app_directory_name: String,
+     /// Main bundle identifier.
+     pub bundle_identifier: String,
+     /// `CFBundleExecutable`.
+@@ -352,6 +355,10 @@ pub struct IpaExpectation {
+     pub app_version: Option<String>,
+     /// Optional expected build number.
+     pub build_number: Option<String>,
++    /// Configured minimum iOS version.
++    pub minimum_os: String,
++    /// Exact generated extension and framework set.
++    pub nested_bundles: Vec<UnsignedNestedBundleExpectation>,
+     /// Whether a development provisioning profile must be embedded.
+     pub provisioning_required: bool,
+ }
+@@ -422,6 +429,26 @@ pub struct UnsignedNestedBundleExpectation {
+     pub kind: UnsignedNestedBundleKind,
+ }
+ 
++/// Client-owned product identity used to validate both unsigned and signed outputs.
++///
++/// Unlike [`UnsignedXcarchiveExpectation`], this contains no worker-selected SDK fields. Every
++/// value is derived before provider submission and is therefore safe to use as an independent
++/// artifact expectation.
++#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
++#[serde(deny_unknown_fields)]
++pub struct IosDeviceProductExpectation {
++    /// Exact main application directory name, including `.app`.
++    pub app_directory_name: String,
++    /// Exact main `CFBundleExecutable` and executable filename.
++    pub executable: String,
++    /// Exact `CFBundleShortVersionString`.
++    pub app_version: String,
++    /// Exact `CFBundleVersion`.
++    pub build_number: String,
++    /// Exact generated extension and framework set.
++    pub nested_bundles: Vec<UnsignedNestedBundleExpectation>,
++}
++
+ /// Exact generated-product invariants for an unsigned physical-iPhone archive.
+ #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+ #[serde(deny_unknown_fields)]
+@@ -840,6 +867,13 @@ pub fn inspect_ipa(
+     }
+     let info_path = app_info_plists.pop().unwrap_or_default();
+     let app_path = info_path.trim_end_matches("/Info.plist").to_owned();
++    let expected_app_path = format!("Payload/{}", expectation.app_directory_name);
++    if app_path != expected_app_path {
++        return invalid_ipa(
++            path,
++            format!("application path is `{app_path}`, expected `{expected_app_path}`"),
++        );
++    }
+     let info = read_zip_plist(&mut archive, path, &info_path)?;
+     let bundle_identifier = plist_string(path, &info, "CFBundleIdentifier")?;
+     let executable = plist_string(path, &info, "CFBundleExecutable")?;
+@@ -879,10 +913,18 @@ pub fn inspect_ipa(
+             );
+         }
+     }
++    let minimum_os = plist_string(path, &info, "MinimumOSVersion")?;
++    validate_ipa_minimum_os(path, "application", &minimum_os, &expectation.minimum_os)?;
+ 
+     let executable_path = format!("{app_path}/{executable}");
+     let main_bytes = read_zip_entry(&mut archive, path, &executable_path)?;
+     let main_executable = inspect_physical_iphone_macho(&main_bytes)?;
++    validate_ipa_macho_minimum_os(
++        path,
++        &executable_path,
++        &main_executable,
++        &expectation.minimum_os,
++    )?;
+     let profile_path = format!("{app_path}/embedded.mobileprovision");
+     let provisioning_profile_present = exact.contains(&profile_path);
+     if expectation.provisioning_required && !provisioning_profile_present {
+@@ -891,6 +933,22 @@ pub fn inspect_ipa(
+ 
+     let mut extensions = Vec::new();
+     let mut nested_executables = BTreeMap::new();
++    let mut expected_nested = BTreeMap::new();
++    for expected in &expectation.nested_bundles {
++        if expected_nested
++            .insert(expected.relative_path.as_str(), expected)
++            .is_some()
++        {
++            return invalid_ipa(
++                path,
++                format!(
++                    "duplicate nested bundle expectation `{}`",
++                    expected.relative_path
++                ),
++            );
++        }
++    }
++    let mut actual_nested = BTreeSet::new();
+     let nested_plists = entries
+         .iter()
+         .filter(|name| {
+@@ -903,14 +961,85 @@ pub fn inspect_ipa(
+         let nested_info = read_zip_plist(&mut archive, path, &nested_info_path)?;
+         let nested_executable = plist_string(path, &nested_info, "CFBundleExecutable")?;
+         let nested_root = nested_info_path.trim_end_matches("/Info.plist");
++        let relative_root = nested_root
++            .strip_prefix(&format!("{app_path}/"))
++            .ok_or_else(|| ArtifactError::InvalidIpa {
++                path: path.to_owned(),
++                reason: format!("nested bundle `{nested_root}` escaped the main application"),
++            })?;
++        let expected =
++            expected_nested
++                .get(relative_root)
++                .ok_or_else(|| ArtifactError::InvalidIpa {
++                    path: path.to_owned(),
++                    reason: format!("unexpected nested bundle `{relative_root}`"),
++                })?;
++        let actual_kind = if nested_info_path.ends_with(".appex/Info.plist") {
++            UnsignedNestedBundleKind::AppExtension
++        } else {
++            UnsignedNestedBundleKind::Framework
++        };
++        let nested_bundle_identifier = plist_string(path, &nested_info, "CFBundleIdentifier")?;
++        if expected.kind != actual_kind
++            || expected.executable != nested_executable
++            || expected.bundle_identifier != nested_bundle_identifier
++        {
++            return invalid_ipa(
++                path,
++                format!("nested bundle `{relative_root}` differs from its request expectation"),
++            );
++        }
++        if let Some(expected_version) = &expectation.app_version {
++            let actual_version = plist_string(path, &nested_info, "CFBundleShortVersionString")?;
++            if actual_version != *expected_version {
++                return invalid_ipa(
++                    path,
++                    format!("nested bundle `{relative_root}` has an unexpected app version"),
++                );
++            }
++        }
++        if let Some(expected_build) = &expectation.build_number {
++            let actual_build = plist_string(path, &nested_info, "CFBundleVersion")?;
++            if actual_build != *expected_build {
++                return invalid_ipa(
++                    path,
++                    format!("nested bundle `{relative_root}` has an unexpected build number"),
++                );
++            }
++        }
++        let nested_minimum_os = plist_string(path, &nested_info, "MinimumOSVersion")?;
++        validate_ipa_minimum_os(
++            path,
++            relative_root,
++            &nested_minimum_os,
++            &expectation.minimum_os,
++        )?;
+         let nested_path = format!("{nested_root}/{nested_executable}");
+         let nested_bytes = read_zip_entry(&mut archive, path, &nested_path)?;
+         let nested_evidence = inspect_physical_iphone_macho(&nested_bytes)?;
+-        if nested_info_path.ends_with(".appex/Info.plist") {
+-            extensions.push(plist_string(path, &nested_info, "CFBundleIdentifier")?);
++        validate_ipa_macho_minimum_os(
++            path,
++            &nested_path,
++            &nested_evidence,
++            &expectation.minimum_os,
++        )?;
++        if actual_kind == UnsignedNestedBundleKind::AppExtension {
++            extensions.push(nested_bundle_identifier);
+         }
++        actual_nested.insert(relative_root.to_owned());
+         nested_executables.insert(nested_path, nested_evidence);
+     }
++    if actual_nested
++        != expected_nested
++            .keys()
++            .map(|path| (*path).to_owned())
++            .collect()
++    {
++        return invalid_ipa(
++            path,
++            "nested bundle set differs from the request".to_owned(),
++        );
++    }
+     for name in entries.iter().filter(|name| {
+         name.starts_with(&format!("{app_path}/Frameworks/")) && has_ascii_extension(name, "dylib")
+     }) {
+@@ -933,6 +1062,45 @@ pub fn inspect_ipa(
+     })
+ }
+ 
++fn validate_ipa_minimum_os(
++    path: &Utf8Path,
++    context: &str,
++    actual: &str,
++    expected: &str,
++) -> Result<(), ArtifactError> {
++    let actual = parse_apple_version(actual);
++    let expected = parse_apple_version(expected);
++    if actual.is_none() || actual != expected {
++        return invalid_ipa(
++            path,
++            format!("{context} minimum iOS version does not match the request"),
++        );
++    }
++    Ok(())
++}
++
++fn validate_ipa_macho_minimum_os(
++    path: &Utf8Path,
++    relative: &str,
++    evidence: &[MachOSliceEvidence],
++    expected: &str,
++) -> Result<(), ArtifactError> {
++    let expected = parse_apple_version(expected).ok_or_else(|| ArtifactError::InvalidIpa {
++        path: path.to_owned(),
++        reason: "request minimum iOS version is invalid".to_owned(),
++    })?;
++    if evidence
++        .iter()
++        .any(|slice| slice.minimum_os.as_deref().and_then(parse_apple_version) != Some(expected))
++    {
++        return invalid_ipa(
++            path,
++            format!("Mach-O `{relative}` minimum iOS version does not match the request"),
++        );
++    }
++    Ok(())
++}
++
+ /// Inspect an unsigned physical-iPhone `.xcarchive` without trusting Xcode's exit status.
+ ///
+ /// The archive must contain exactly one generated application below `Products/Applications`.
+diff --git a/crates/rustferry-remote/src/handoff.rs b/crates/rustferry-remote/src/handoff.rs
+new file mode 100644
+index 0000000..8aa5181
+--- /dev/null
++++ b/crates/rustferry-remote/src/handoff.rs
+@@ -0,0 +1,102 @@
++//! Public compile-to-sign handoff documents.
++//!
++//! These types contain only serializable evidence. Archive sealing, extraction, inspection, and
++//! worker policy remain implementation details of the macOS worker and provider clients.
++
++use schemars::JsonSchema;
++use serde::{Deserialize, Serialize};
++
++use crate::{
++    artifact::{UnsignedXcarchiveExpectation, UnsignedXcarchiveInspection},
++    protocol::IosDeviceBuildRequest,
++    source::{SourceArchive, SourceManifest},
++};
++
++/// Current sealed unsigned-archive descriptor schema.
++pub const SEALED_UNSIGNED_ARCHIVE_SCHEMA_VERSION: u32 = 1;
++/// Current compile-phase evidence schema.
++pub const COMPILE_PHASE_EVIDENCE_SCHEMA_VERSION: u32 = 1;
++/// Current complete compile-handoff envelope schema.
++pub const COMPILE_HANDOFF_SCHEMA_VERSION: u32 = 1;
++
++/// Public descriptor for one exact unsigned `.xcarchive` ZIP.
++#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct SealedUnsignedArchive {
++    /// Sealed-handoff schema version.
++    pub schema_version: u32,
++    /// Exact deterministic ZIP size and SHA-256.
++    pub transport: SourceArchive,
++    /// Exact file paths, modes, sizes, and hashes inside the archive.
++    pub contents: SourceManifest,
++    /// Structural and physical-device invariants recomputed after extraction.
++    pub expectation: UnsignedXcarchiveExpectation,
++}
++
++/// Public Apple and Rust toolchain evidence selected by the compile phase.
++#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct CompileToolchainEvidence {
++    /// Worker operating-system family and version.
++    pub worker_os: String,
++    /// Worker architecture.
++    pub worker_architecture: String,
++    /// Normalized Xcode version evidence.
++    pub xcode_version: String,
++    /// Selected iPhoneOS SDK version.
++    pub iphoneos_sdk_version: String,
++    /// Selected iPhoneOS SDK build version.
++    pub iphoneos_sdk_build_version: String,
++    /// SHA-256 of the canonical selected Xcode developer-directory string.
++    pub developer_directory_sha256: String,
++    /// Rust compiler version used by the selected installation.
++    pub rust_version: String,
++    /// Exact physical-iPhone Rust target.
++    pub rust_target: String,
++}
++
++/// Public evidence emitted by the credential-free compile phase.
++#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct CompilePhaseEvidence {
++    /// Compile-evidence schema version.
++    pub schema_version: u32,
++    /// Provider job identifier.
++    pub job_id: String,
++    /// Provider implementation name.
++    pub provider: String,
++    /// Canonical SHA-256 of the complete submitted request.
++    pub request_sha256: String,
++    /// Exact verified source-manifest SHA-256.
++    pub source_sha256: String,
++    /// Exact `Cargo.lock` content SHA-256 from the source manifest.
++    pub cargo_lock_sha256: String,
++    /// Exact `ferry.toml` content SHA-256 from the source manifest.
++    pub config_sha256: String,
++    /// Client version copied from trusted provider metadata.
++    pub rustferry_version: String,
++    /// Worker crate version.
++    pub worker_version: String,
++    /// Selected toolchain evidence.
++    pub toolchain: CompileToolchainEvidence,
++    /// Deterministic sealed unsigned archive descriptor.
++    pub sealed_archive: SealedUnsignedArchive,
++    /// Independently inspected unsigned archive and Mach-O graph.
++    pub archive_inspection: UnsignedXcarchiveInspection,
++    /// Compile start time in Unix seconds.
++    pub started_at_unix_seconds: u64,
++    /// Compile completion time in Unix seconds.
++    pub finished_at_unix_seconds: u64,
++}
++
++/// Complete public handoff downloaded by a protected signer or independent client verifier.
++#[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct CompileHandoff {
++    /// Handoff-envelope schema version.
++    pub schema_version: u32,
++    /// Exact declarative request submitted by the client.
++    pub request: IosDeviceBuildRequest,
++    /// Credential-free compile evidence bound to the request.
++    pub compile: CompilePhaseEvidence,
++}
+diff --git a/crates/rustferry-remote/src/lib.rs b/crates/rustferry-remote/src/lib.rs
+index 5f2e78d..4ac2f33 100644
+--- a/crates/rustferry-remote/src/lib.rs
++++ b/crates/rustferry-remote/src/lib.rs
+@@ -11,6 +11,8 @@ pub mod artifact;
+ pub mod cancellation;
+ /// Typed protocol and provider failures.
+ pub mod error;
++/// Public compile-to-sign handoff evidence.
++pub mod handoff;
+ /// Ferry Remote Build Protocol v1 data and NDJSON events.
+ pub mod protocol;
+ /// Runtime-neutral asynchronous build-provider boundary.
+@@ -29,19 +31,25 @@ pub mod source;
+ pub use artifact::{
+     ARTIFACT_MANIFEST_SCHEMA_VERSION, ApplePlatform, AppleToolchainEvidence, ArtifactError,
+     ArtifactKind, ArtifactManifest, ArtifactRecord, ArtifactSigningEvidence, CleanupStatus,
+-    IpaExpectation, IpaInspection, MachOSliceEvidence, UnsignedAppInspection,
+-    UnsignedNestedBundleExpectation, UnsignedNestedBundleKind, UnsignedXcarchiveExpectation,
+-    UnsignedXcarchiveInspection, ValidationLevel, inspect_ipa, inspect_physical_iphone_macho,
+-    inspect_unsigned_app_bundle, inspect_unsigned_xcarchive, verify_downloaded_file,
++    IosDeviceProductExpectation, IpaExpectation, IpaInspection, MachOSliceEvidence,
++    UnsignedAppInspection, UnsignedNestedBundleExpectation, UnsignedNestedBundleKind,
++    UnsignedXcarchiveExpectation, UnsignedXcarchiveInspection, ValidationLevel, inspect_ipa,
++    inspect_physical_iphone_macho, inspect_unsigned_app_bundle, inspect_unsigned_xcarchive,
++    verify_downloaded_file,
+ };
+ pub use cancellation::CancellationToken;
+ pub use error::{RemoteBuildError, RemoteBuildResult};
++pub use handoff::{
++    COMPILE_HANDOFF_SCHEMA_VERSION, COMPILE_PHASE_EVIDENCE_SCHEMA_VERSION, CompileHandoff,
++    CompilePhaseEvidence, CompileToolchainEvidence, SEALED_UNSIGNED_ARCHIVE_SCHEMA_VERSION,
++    SealedUnsignedArchive,
++};
+ pub use protocol::{
+     BuildProfile, CURRENT_PROTOCOL_VERSION, CleanupConfirmation, DiagnosticSeverity,
+     IOS_DEVICE_RUST_TARGET, IOS_DEVICE_SDK, IosArtifactType, IosDeviceBuildRequest,
+     IosDeviceBuildResult, JobState, ProtocolPath, ProtocolPathSemantics, ProtocolVersion,
+     REMOTE_BUILD_EVENT_TYPES, RemoteBuildEvent, RemoteBuildEventKind, RemoteDiagnostic,
+-    RemoteErrorInfo,
++    RemoteErrorInfo, canonical_request_bytes, canonical_request_sha256,
+ };
+ pub use provider::{
+     ArtifactDownloadRequest, ArtifactDownloadResult, ArtifactListRequest, BuildProvider,
+diff --git a/crates/rustferry-remote/src/protocol.rs b/crates/rustferry-remote/src/protocol.rs
+index 7a02c6e..6df6c02 100644
+--- a/crates/rustferry-remote/src/protocol.rs
++++ b/crates/rustferry-remote/src/protocol.rs
+@@ -3,11 +3,15 @@ use std::{collections::BTreeSet, fmt};
+ use schemars::JsonSchema;
+ use serde::{Deserialize, Serialize};
+ use serde_json::Value;
++use sha2::{Digest, Sha256};
++use unicode_normalization::UnicodeNormalization;
+ 
+ use crate::{
+-    artifact::ArtifactManifest,
++    artifact::{
++        ArtifactManifest, IosDeviceProductExpectation, IpaExpectation, UnsignedNestedBundleKind,
++    },
+     error::{RemoteBuildError, RemoteBuildResult},
+-    signing::{SigningMode, SigningPlan},
++    signing::{SigningMode, SigningPlan, SigningTargetKind},
+     source::{SourceLimits, SourceManifest, SourceMode, validate_source_manifest},
+ };
+ 
+@@ -332,6 +336,8 @@ pub struct IosDeviceBuildRequest {
+     pub bundle_identifier: String,
+     /// Minimum supported iOS version.
+     pub minimum_ios_version: String,
++    /// Client-derived product identity used for independent output validation.
++    pub product: IosDeviceProductExpectation,
+     /// Rust/Xcode optimization profile.
+     pub profile: BuildProfile,
+     /// How the provider obtains the source.
+@@ -363,6 +369,7 @@ impl IosDeviceBuildRequest {
+         validate_safe_text("product_name", &self.product_name, 255)?;
+         validate_bundle_identifier(&self.bundle_identifier)?;
+         validate_ios_version(&self.minimum_ios_version)?;
++        validate_product_expectation(&self.product, &self.bundle_identifier, &self.signing)?;
+         validate_source_manifest(&self.source, SourceLimits::default()).map_err(|error| {
+             RemoteBuildError::InvalidSourceManifest {
+                 message: error.to_string(),
+@@ -428,6 +435,52 @@ impl IosDeviceBuildRequest {
+         }
+         Ok(())
+     }
++
++    /// Derive a complete client-side IPA expectation without worker-provided metadata.
++    ///
++    /// # Errors
++    ///
++    /// Returns a typed request-validation error when any product or signing field is invalid.
++    pub fn ipa_expectation(&self) -> RemoteBuildResult<IpaExpectation> {
++        self.validate()?;
++        Ok(IpaExpectation {
++            app_directory_name: self.product.app_directory_name.clone(),
++            bundle_identifier: self.bundle_identifier.clone(),
++            executable: self.product.executable.clone(),
++            app_version: Some(self.product.app_version.clone()),
++            build_number: Some(self.product.build_number.clone()),
++            minimum_os: self.minimum_ios_version.clone(),
++            nested_bundles: self.product.nested_bundles.clone(),
++            provisioning_required: self.signing.mode.is_signed(),
++        })
++    }
++}
++
++/// Serialize one validated iPhone build request using the protocol's deterministic field order.
++///
++/// Maps and sets nested in the request use ordered representations. Keeping this function in the
++/// protocol crate prevents providers and workers from hashing subtly different request encodings.
++///
++/// # Errors
++///
++/// Returns a typed validation or serialization failure.
++pub fn canonical_request_bytes(request: &IosDeviceBuildRequest) -> RemoteBuildResult<Vec<u8>> {
++    request.validate()?;
++    serde_json::to_vec(request).map_err(|error| RemoteBuildError::Serialization {
++        message: error.to_string(),
++    })
++}
++
++/// Return lowercase SHA-256 of [`canonical_request_bytes`].
++///
++/// # Errors
++///
++/// Returns the same validation or serialization failure as [`canonical_request_bytes`].
++pub fn canonical_request_sha256(request: &IosDeviceBuildRequest) -> RemoteBuildResult<String> {
++    Ok(format!(
++        "{:x}",
++        Sha256::digest(canonical_request_bytes(request)?)
++    ))
+ }
+ 
+ /// Provider result after a physical-iPhone build reaches a build-terminal state.
+@@ -1033,6 +1086,172 @@ fn validate_ios_version(value: &str) -> RemoteBuildResult<()> {
+     Ok(())
+ }
+ 
++fn validate_product_expectation(
++    product: &IosDeviceProductExpectation,
++    main_bundle_identifier: &str,
++    signing: &SigningPlan,
++) -> RemoteBuildResult<()> {
++    validate_portable_component("app_directory_name", &product.app_directory_name)?;
++    if !has_exact_extension(&product.app_directory_name, "app") {
++        return Err(RemoteBuildError::InvalidIdentifier {
++            field: "app_directory_name",
++            reason: "value must end with .app",
++        });
++    }
++    validate_portable_component("executable", &product.executable)?;
++    validate_bundle_version("app_version", &product.app_version)?;
++    validate_bundle_version("build_number", &product.build_number)?;
++    if product.nested_bundles.len() > 512 {
++        return Err(RemoteBuildError::InvalidEventPayload {
++            event: "ios_device_build_request",
++            reason: "product contains too many nested bundles",
++        });
++    }
++
++    let mut paths = BTreeSet::new();
++    let mut portable_paths = BTreeSet::new();
++    let mut bundle_identifiers = BTreeSet::from([main_bundle_identifier.to_owned()]);
++    let mut product_targets = BTreeSet::new();
++    let mut previous_path: Option<&str> = None;
++    for nested in &product.nested_bundles {
++        if previous_path.is_some_and(|previous| previous >= nested.relative_path.as_str()) {
++            return Err(RemoteBuildError::InvalidEventPayload {
++                event: "ios_device_build_request",
++                reason: "nested product bundles must be strictly sorted by path",
++            });
++        }
++        previous_path = Some(&nested.relative_path);
++        validate_nested_bundle_path(&nested.relative_path, nested.kind)?;
++        validate_portable_component("nested_executable", &nested.executable)?;
++        validate_bundle_identifier(&nested.bundle_identifier)?;
++        if !paths.insert(nested.relative_path.as_str())
++            || !portable_paths.insert(portable_name_key(&nested.relative_path))
++            || !bundle_identifiers.insert(nested.bundle_identifier.clone())
++        {
++            return Err(RemoteBuildError::InvalidEventPayload {
++                event: "ios_device_build_request",
++                reason: "nested product bundles contain duplicate or portable-colliding identities",
++            });
++        }
++        let signing_kind = match nested.kind {
++            UnsignedNestedBundleKind::AppExtension => SigningTargetKind::Extension,
++            UnsignedNestedBundleKind::Framework => SigningTargetKind::Framework,
++        };
++        product_targets.insert((nested.bundle_identifier.as_str(), signing_kind));
++    }
++
++    let signing_targets = signing
++        .targets
++        .iter()
++        .filter(|target| {
++            matches!(
++                target.kind,
++                SigningTargetKind::Extension | SigningTargetKind::Framework
++            )
++        })
++        .map(|target| (target.bundle_identifier.as_str(), target.kind))
++        .collect::<BTreeSet<_>>();
++    if product_targets != signing_targets {
++        return Err(RemoteBuildError::InvalidEventPayload {
++            event: "ios_device_build_request",
++            reason: "product nested bundle graph does not match signing targets",
++        });
++    }
++    Ok(())
++}
++
++fn validate_portable_component(field: &'static str, value: &str) -> RemoteBuildResult<()> {
++    validate_safe_text(field, value, 255)?;
++    if matches!(value, "." | "..")
++        || value.contains(['/', '\\', '\0', ':', '*', '?', '"', '<', '>', '|'])
++        || value.ends_with(['.', ' '])
++    {
++        return Err(RemoteBuildError::InvalidIdentifier {
++            field,
++            reason: "value is not a portable filename component",
++        });
++    }
++    let basename = value
++        .split('.')
++        .next()
++        .unwrap_or_default()
++        .to_ascii_uppercase();
++    let reserved = matches!(basename.as_str(), "CON" | "PRN" | "AUX" | "NUL")
++        || basename
++            .strip_prefix("COM")
++            .or_else(|| basename.strip_prefix("LPT"))
++            .is_some_and(|suffix| {
++                matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
++            });
++    if reserved {
++        return Err(RemoteBuildError::InvalidIdentifier {
++            field,
++            reason: "value is reserved on a supported client filesystem",
++        });
++    }
++    Ok(())
++}
++
++fn validate_nested_bundle_path(
++    path: &str,
++    kind: UnsignedNestedBundleKind,
++) -> RemoteBuildResult<()> {
++    validate_safe_text("nested_bundle_path", path, 1024)?;
++    let components = path.split('/').collect::<Vec<_>>();
++    if components.len() != 2 {
++        return Err(RemoteBuildError::InvalidIdentifier {
++            field: "nested_bundle_path",
++            reason: "value must be directly below PlugIns or Frameworks",
++        });
++    }
++    validate_portable_component("nested_bundle_directory", components[1])?;
++    let valid = match kind {
++        UnsignedNestedBundleKind::AppExtension => {
++            components[0] == "PlugIns" && has_exact_extension(components[1], "appex")
++        }
++        UnsignedNestedBundleKind::Framework => {
++            components[0] == "Frameworks" && has_exact_extension(components[1], "framework")
++        }
++    };
++    if !valid {
++        return Err(RemoteBuildError::InvalidIdentifier {
++            field: "nested_bundle_path",
++            reason: "value does not match its nested bundle kind",
++        });
++    }
++    Ok(())
++}
++
++fn validate_bundle_version(field: &'static str, value: &str) -> RemoteBuildResult<()> {
++    validate_safe_text(field, value, 64)?;
++    let components = value.split('.').collect::<Vec<_>>();
++    if components.is_empty()
++        || components.len() > 3
++        || components.iter().any(|component| {
++            component.is_empty()
++                || (component.len() > 1 && component.starts_with('0'))
++                || !component.bytes().all(|byte| byte.is_ascii_digit())
++                || component.parse::<u32>().is_err()
++        })
++    {
++        return Err(RemoteBuildError::InvalidIdentifier {
++            field,
++            reason: "value must contain one to three canonical numeric components",
++        });
++    }
++    Ok(())
++}
++
++fn portable_name_key(value: &str) -> String {
++    value.nfkc().flat_map(char::to_lowercase).collect()
++}
++
++fn has_exact_extension(value: &str, expected: &str) -> bool {
++    value
++        .rsplit_once('.')
++        .is_some_and(|(_, extension)| extension == expected)
++}
++
+ fn validate_github_repository(value: &str) -> RemoteBuildResult<()> {
+     validate_safe_text("source_repository", value, 2048)?;
+     let repository = url::Url::parse(value).map_err(|_| RemoteBuildError::InvalidIdentifier {
+diff --git a/crates/rustferry-remote/src/schema.rs b/crates/rustferry-remote/src/schema.rs
+index 0c28397..2be7fb5 100644
+--- a/crates/rustferry-remote/src/schema.rs
++++ b/crates/rustferry-remote/src/schema.rs
+@@ -4,9 +4,10 @@ use schemars::{JsonSchema, schema_for};
+ 
+ use crate::{
+     ArtifactDownloadRequest, ArtifactDownloadResult, ArtifactListRequest, ArtifactManifest,
+-    CancellationAck, CancellationRequest, CleanupConfirmation, CleanupRequest, EventPage,
+-    EventRequest, HandshakeRequest, HandshakeResponse, IosDeviceBuildRequest, IosDeviceBuildResult,
+-    JobHandle, ProviderDoctorReport, ProviderDoctorRequest, RemoteBuildEvent,
++    CancellationAck, CancellationRequest, CleanupConfirmation, CleanupRequest, CompileHandoff,
++    CompilePhaseEvidence, EventPage, EventRequest, HandshakeRequest, HandshakeResponse,
++    IosDeviceBuildRequest, IosDeviceBuildResult, JobHandle, ProviderDoctorReport,
++    ProviderDoctorRequest, RemoteBuildEvent, SealedUnsignedArchive,
+ };
+ 
+ /// Every standalone document exchanged or persisted by protocol v1.
+@@ -15,6 +16,7 @@ use crate::{
+ /// which concrete document is valid at each boundary.
+ #[derive(JsonSchema)]
+ #[schemars(title = "Ferry Remote Build Protocol v1", untagged)]
++#[allow(clippy::large_enum_variant)]
+ pub enum RemoteProtocolV1Document {
+     /// Client-to-provider compatibility request.
+     HandshakeRequest(HandshakeRequest),
+@@ -26,6 +28,12 @@ pub enum RemoteProtocolV1Document {
+     ProviderDoctorReport(ProviderDoctorReport),
+     /// Declarative physical-iPhone build request.
+     IosDeviceBuildRequest(IosDeviceBuildRequest),
++    /// Complete public compile-to-sign handoff.
++    CompileHandoff(CompileHandoff),
++    /// Public credential-free compile evidence.
++    CompilePhaseEvidence(CompilePhaseEvidence),
++    /// Sealed unsigned archive descriptor.
++    SealedUnsignedArchive(SealedUnsignedArchive),
+     /// Accepted provider job handle.
+     JobHandle(JobHandle),
+     /// One NDJSON event envelope.
+diff --git a/crates/rustferry-remote/src/signing.rs b/crates/rustferry-remote/src/signing.rs
+index 50f9c3f..8429dcd 100644
+--- a/crates/rustferry-remote/src/signing.rs
++++ b/crates/rustferry-remote/src/signing.rs
+@@ -7,6 +7,7 @@ use std::{
+ use schemars::JsonSchema;
+ use serde::{Deserialize, Deserializer, Serialize};
+ use serde_json::Value;
++use sha2::{Digest, Sha256};
+ 
+ use crate::secret::SecretReference;
+ 
+@@ -110,14 +111,13 @@ impl SigningStatus {
+     }
+ }
+ 
+-/// Serializable signing inputs containing references only, never secret bytes.
+-#[derive(
+-    Clone, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+-)]
++/// Serializable signing inputs containing public identity metadata and opaque
++/// references only, never secret bytes.
++#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+ #[serde(deny_unknown_fields)]
+ pub struct SigningReference {
+-    /// Opaque reference to an encrypted identity bundle or configured identity.
+-    pub identity: SecretReference,
++    /// Expected public certificate paired with the opaque private-key reference.
++    pub identity: SigningIdentity,
+     /// Opaque reference to its password or passphrase, when required.
+     pub password: Option<SecretReference>,
+ }
+@@ -234,12 +234,12 @@ impl<'de> Deserialize<'de> for DevelopmentTeam {
+ /// Registered physical iPhone selected for a development artifact.
+ #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+ pub struct DevicePlan {
+-    udid: String,
++    udid_sha256: String,
+     display_name: Option<String>,
+ }
+ 
+ impl DevicePlan {
+-    /// Construct a validated opaque Apple device identifier.
++    /// Validate and hash an Apple device identifier without retaining it.
+     ///
+     /// # Errors
+     ///
+@@ -250,25 +250,48 @@ impl DevicePlan {
+         display_name: Option<String>,
+     ) -> Result<Self, SigningValidationError> {
+         let udid = udid.into();
+-        let valid_udid = (20..=64).contains(&udid.len())
+-            && udid
+-                .bytes()
+-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+-            && !udid.starts_with('-')
+-            && !udid.ends_with('-');
+-        if !valid_udid
++        validate_raw_udid(&udid)?;
++        Self::from_sha256(sha256_lowercase(udid.as_bytes()), display_name)
++    }
++
++    /// Construct a device plan from an existing lowercase SHA-256 digest.
++    ///
++    /// # Errors
++    ///
++    /// Returns [`SigningValidationError::InvalidDeviceIdentifier`] for a
++    /// malformed digest or unsafe display name.
++    pub fn from_sha256(
++        udid_sha256: impl Into<String>,
++        display_name: Option<String>,
++    ) -> Result<Self, SigningValidationError> {
++        let udid_sha256 = udid_sha256.into();
++        if !is_lowercase_sha256(&udid_sha256)
+             || display_name
+                 .as_deref()
+                 .is_some_and(|name| !is_safe_label(name))
+         {
+             return Err(SigningValidationError::InvalidDeviceIdentifier);
+         }
+-        Ok(Self { udid, display_name })
++        Ok(Self {
++            udid_sha256,
++            display_name,
++        })
+     }
+ 
+-    /// Return the validated device identifier.
+-    pub fn udid(&self) -> &str {
+-        &self.udid
++    /// Return the lowercase SHA-256 of the selected device identifier.
++    pub fn udid_sha256(&self) -> &str {
++        &self.udid_sha256
++    }
++
++    /// Validate and compare a raw device identifier without retaining it.
++    ///
++    /// # Errors
++    ///
++    /// Returns [`SigningValidationError::InvalidDeviceIdentifier`] when the
++    /// candidate is malformed.
++    pub fn matches_udid(&self, udid: &str) -> Result<bool, SigningValidationError> {
++        validate_raw_udid(udid)?;
++        Ok(self.udid_sha256 == sha256_lowercase(udid.as_bytes()))
+     }
+ 
+     /// Return the optional public device name.
+@@ -280,7 +303,7 @@ impl DevicePlan {
+ #[derive(Deserialize)]
+ #[serde(deny_unknown_fields)]
+ struct UncheckedDevicePlan {
+-    udid: String,
++    udid_sha256: String,
+     display_name: Option<String>,
+ }
+ 
+@@ -290,7 +313,8 @@ impl<'de> Deserialize<'de> for DevicePlan {
+         D: Deserializer<'de>,
+     {
+         let unchecked = UncheckedDevicePlan::deserialize(deserializer)?;
+-        Self::new(unchecked.udid, unchecked.display_name).map_err(serde::de::Error::custom)
++        Self::from_sha256(unchecked.udid_sha256, unchecked.display_name)
++            .map_err(serde::de::Error::custom)
+     }
+ }
+ 
+@@ -447,8 +471,9 @@ pub struct ProvisioningProfile {
+     pub created_at_unix_seconds: u64,
+     /// Expiration time as a Unix timestamp.
+     pub expires_at_unix_seconds: u64,
+-    /// Registered device identifiers, empty for App Store profiles.
+-    pub device_udids: Vec<String>,
++    /// Lowercase SHA-256 digests of registered device identifiers, empty for
++    /// App Store profiles.
++    pub device_udid_sha256s: Vec<String>,
+     /// Profile entitlements.
+     pub entitlements: EntitlementSet,
+     /// Profile platform allowlist.
+@@ -502,19 +527,19 @@ impl ProvisioningProfile {
+             validate_fingerprint(fingerprint)?;
+         }
+         let mut devices = BTreeSet::new();
+-        for udid in &self.device_udids {
+-            DevicePlan::new(udid.clone(), None)?;
+-            if !devices.insert(udid) {
++        for udid_sha256 in &self.device_udid_sha256s {
++            DevicePlan::from_sha256(udid_sha256.clone(), None)?;
++            if !devices.insert(udid_sha256) {
+                 return Err(SigningValidationError::InvalidDeviceIdentifier);
+             }
+         }
+         match self.profile_type {
+             ProvisioningProfileType::Development | ProvisioningProfileType::AdHoc
+-                if self.device_udids.is_empty() =>
++                if self.device_udid_sha256s.is_empty() =>
+             {
+                 return Err(SigningValidationError::DeviceNotProvisioned);
+             }
+-            ProvisioningProfileType::AppStore if !self.device_udids.is_empty() => {
++            ProvisioningProfileType::AppStore if !self.device_udid_sha256s.is_empty() => {
+                 return Err(SigningValidationError::ProfileTypeMismatch);
+             }
+             ProvisioningProfileType::Development
+@@ -543,6 +568,31 @@ impl ProvisioningProfile {
+     }
+ }
+ 
++fn validate_raw_udid(udid: &str) -> Result<(), SigningValidationError> {
++    let valid = (20..=64).contains(&udid.len())
++        && udid
++            .bytes()
++            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
++        && !udid.starts_with('-')
++        && !udid.ends_with('-');
++    if valid {
++        Ok(())
++    } else {
++        Err(SigningValidationError::InvalidDeviceIdentifier)
++    }
++}
++
++fn is_lowercase_sha256(value: &str) -> bool {
++    value.len() == 64
++        && value
++            .bytes()
++            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
++}
++
++fn sha256_lowercase(bytes: &[u8]) -> String {
++    format!("{:x}", Sha256::digest(bytes))
++}
++
+ /// Kind of code object in the required inside-out signing order.
+ #[derive(
+     Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+@@ -599,7 +649,7 @@ pub struct EntitlementPlan {
+ pub struct SigningPlan {
+     /// Requested signing mode.
+     pub mode: SigningMode,
+-    /// Opaque identity/password references for modes that import an identity.
++    /// Public identity metadata plus opaque key/password references.
+     pub signing: Option<SigningReference>,
+     /// Expected team for all code and profiles.
+     pub team: Option<DevelopmentTeamPlan>,
+@@ -635,6 +685,16 @@ impl SigningPlan {
+             if self.mode.requires_identity_reference() && self.signing.is_none() {
+                 errors.push(SigningValidationError::MissingSigningReference);
+             }
++            if let Some(signing) = &self.signing {
++                if let Err(error) = signing.identity.certificate.validate() {
++                    errors.push(error);
++                }
++                if self.team.as_ref().is_some_and(|team| {
++                    team.expected.id() != signing.identity.certificate.team.id()
++                }) {
++                    errors.push(SigningValidationError::CertificateTeamMismatch);
++                }
++            }
+             if self.mode == SigningMode::ManualDevelopment
+                 && self
+                     .signing
+diff --git a/crates/rustferry-remote/tests/product_contract.rs b/crates/rustferry-remote/tests/product_contract.rs
+new file mode 100644
+index 0000000..c5d37df
+--- /dev/null
++++ b/crates/rustferry-remote/tests/product_contract.rs
+@@ -0,0 +1,177 @@
++//! Client-owned physical-iPhone product expectation tests.
++
++use std::collections::BTreeSet;
++
++use rustferry_remote::{
++    BuildProfile, BundleIdentifier, CURRENT_PROTOCOL_VERSION, IosArtifactType,
++    IosDeviceBuildRequest, IosDeviceProductExpectation, SigningMode, SigningPlan, SigningTarget,
++    SigningTargetKind, SourceManifest, SourceMode, UnsignedNestedBundleExpectation,
++    UnsignedNestedBundleKind, canonical_request_bytes, canonical_request_sha256,
++};
++use sha2::{Digest, Sha256};
++
++const SOURCE_REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
++
++#[test]
++fn request_derives_the_complete_ipa_expectation_and_canonical_hash() {
++    let request = valid_request();
++    request.validate().expect("valid product request");
++
++    let expectation = request.ipa_expectation().expect("IPA expectation");
++    assert_eq!(expectation.app_directory_name, "Weather.app");
++    assert_eq!(expectation.bundle_identifier, "com.example.weather");
++    assert_eq!(expectation.executable, "weather");
++    assert_eq!(expectation.app_version.as_deref(), Some("1.2.3"));
++    assert_eq!(expectation.build_number.as_deref(), Some("42"));
++    assert_eq!(expectation.minimum_os, "16.0");
++    assert_eq!(expectation.nested_bundles, request.product.nested_bundles);
++    assert!(!expectation.provisioning_required);
++
++    let first_bytes = canonical_request_bytes(&request).expect("canonical request");
++    let second_bytes = canonical_request_bytes(&request).expect("canonical request");
++    let first_hash = canonical_request_sha256(&request).expect("request SHA-256");
++    let second_hash = canonical_request_sha256(&request).expect("request SHA-256");
++    assert_eq!(first_bytes, second_bytes);
++    assert_eq!(first_hash, second_hash);
++    assert_eq!(first_hash.len(), 64);
++    assert!(
++        first_hash
++            .bytes()
++            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
++    );
++
++    let mut changed = request;
++    changed.product.executable = "weather-next".to_owned();
++    assert_ne!(
++        first_hash,
++        canonical_request_sha256(&changed).expect("changed request SHA-256")
++    );
++}
++
++#[test]
++fn unsafe_or_ambiguous_product_identity_is_rejected() {
++    let mut request = valid_request();
++    request.product.app_directory_name = "../Weather.app".to_owned();
++    assert!(request.validate().is_err());
++
++    let mut request = valid_request();
++    request.product.app_version = "1.02.3".to_owned();
++    assert!(request.validate().is_err());
++
++    let mut request = valid_request();
++    request.product.nested_bundles.swap(0, 1);
++    assert!(request.validate().is_err());
++
++    let mut request = valid_request();
++    request
++        .product
++        .nested_bundles
++        .push(UnsignedNestedBundleExpectation {
++            relative_path: "PlugIns/widget.appex".to_owned(),
++            bundle_identifier: "com.example.weather.second-widget".to_owned(),
++            executable: "SecondWidget".to_owned(),
++            kind: UnsignedNestedBundleKind::AppExtension,
++        });
++    request.signing.targets.push(SigningTarget {
++        name: "SecondWidget".to_owned(),
++        bundle_identifier: BundleIdentifier::new("com.example.weather.second-widget")
++            .expect("bundle identifier"),
++        kind: SigningTargetKind::Extension,
++    });
++    assert!(request.validate().is_err());
++}
++
++#[test]
++fn product_bundle_graph_must_match_the_signing_graph() {
++    let mut request = valid_request();
++    request.product.nested_bundles.pop();
++    assert!(request.validate().is_err());
++
++    let mut request = valid_request();
++    request.product.nested_bundles[1].bundle_identifier =
++        "com.example.weather.other-widget".to_owned();
++    assert!(request.validate().is_err());
++}
++
++fn valid_request() -> IosDeviceBuildRequest {
++    let product = IosDeviceProductExpectation {
++        app_directory_name: "Weather.app".to_owned(),
++        executable: "weather".to_owned(),
++        app_version: "1.2.3".to_owned(),
++        build_number: "42".to_owned(),
++        nested_bundles: vec![
++            UnsignedNestedBundleExpectation {
++                relative_path: "Frameworks/FerryRuntimeBridge.framework".to_owned(),
++                bundle_identifier: "org.rustferry.runtime-bridge".to_owned(),
++                executable: "FerryRuntimeBridge".to_owned(),
++                kind: UnsignedNestedBundleKind::Framework,
++            },
++            UnsignedNestedBundleExpectation {
++                relative_path: "PlugIns/Widget.appex".to_owned(),
++                bundle_identifier: "com.example.weather.widget".to_owned(),
++                executable: "Widget".to_owned(),
++                kind: UnsignedNestedBundleKind::AppExtension,
++            },
++        ],
++    };
++    let signing = SigningPlan {
++        mode: SigningMode::UnsignedCompileOnly,
++        signing: None,
++        team: None,
++        device: None,
++        targets: vec![
++            SigningTarget {
++                name: "Weather".to_owned(),
++                bundle_identifier: BundleIdentifier::new("com.example.weather")
++                    .expect("bundle identifier"),
++                kind: SigningTargetKind::Application,
++            },
++            SigningTarget {
++                name: "RuntimeBridge".to_owned(),
++                bundle_identifier: BundleIdentifier::new("org.rustferry.runtime-bridge")
++                    .expect("bundle identifier"),
++                kind: SigningTargetKind::Framework,
++            },
++            SigningTarget {
++                name: "Widget".to_owned(),
++                bundle_identifier: BundleIdentifier::new("com.example.weather.widget")
++                    .expect("bundle identifier"),
++                kind: SigningTargetKind::Extension,
++            },
++        ],
++        provisioning: Vec::new(),
++        entitlements: Vec::new(),
++        allow_provisioning_updates: false,
++    };
++    IosDeviceBuildRequest {
++        protocol_version: CURRENT_PROTOCOL_VERSION,
++        operation_id: "operation-1".to_owned(),
++        product_name: "Weather".to_owned(),
++        bundle_identifier: "com.example.weather".to_owned(),
++        minimum_ios_version: "16.0".to_owned(),
++        product,
++        profile: BuildProfile::Release,
++        source_mode: SourceMode::Git,
++        source_repository: Some("https://github.com/example/weather".to_owned()),
++        source_revision: Some(SOURCE_REVISION.to_owned()),
++        source: empty_source_manifest(),
++        signing,
++        requested_artifacts: BTreeSet::from([IosArtifactType::Xcarchive]),
++    }
++}
++
++fn empty_source_manifest() -> SourceManifest {
++    let mut digest = Sha256::new();
++    digest.update(b"rustferry-source-manifest-v1\0");
++    digest.update(1_u64.to_be_bytes());
++    digest.update(b".");
++    digest.update(0_u64.to_be_bytes());
++    digest.update(0_u64.to_be_bytes());
++    SourceManifest {
++        schema_version: 1,
++        project_path: ".".to_owned(),
++        entries: Vec::new(),
++        total_size: 0,
++        sha256: format!("{:x}", digest.finalize()),
++    }
++}
+diff --git a/crates/rustferry-remote/tests/security.rs b/crates/rustferry-remote/tests/security.rs
+index 22383c1..756bf92 100644
+--- a/crates/rustferry-remote/tests/security.rs
++++ b/crates/rustferry-remote/tests/security.rs
+@@ -8,7 +8,8 @@ use rustferry_remote::{
+     signing::{
+         BundleIdentifier, DevelopmentTeam, DevelopmentTeamPlan, DevicePlan, EntitlementPlan,
+         EntitlementSet, ProvisioningPlan, ProvisioningPlatform, ProvisioningProfile,
+-        ProvisioningProfileType, SigningPlan, SigningStatus, SigningTarget, SigningTargetKind,
++        ProvisioningProfileType, SigningCertificate, SigningIdentity, SigningPlan,
++        SigningPrivateKeyReference, SigningStatus, SigningTarget, SigningTargetKind,
+         SigningValidationError, SigningValidationReport, ValidationComponent, ValidationStatus,
+     },
+ };
+@@ -19,6 +20,18 @@ fn github_secret(name: &str) -> SecretReference {
+         .expect("test secret name is valid")
+ }
+ 
++fn signing_identity(reference: SecretReference, team: DevelopmentTeam) -> SigningIdentity {
++    SigningIdentity {
++        certificate: SigningCertificate {
++            common_name: "Apple Development: Example (ABC123XYZ9)".to_owned(),
++            sha256_fingerprint: "A".repeat(64),
++            team,
++            expires_at_unix_seconds: u64::MAX,
++        },
++        private_key: SigningPrivateKeyReference { reference },
++    }
++}
++
+ #[test]
+ fn secret_wrappers_clear_their_owned_bytes() {
+     let mut password = Secret::new("correct horse battery staple");
+@@ -44,7 +57,10 @@ fn secret_references_round_trip_only_validated_identifiers() {
+     assert_eq!(decoded, reference);
+ 
+     let signing = SigningReference {
+-        identity: reference,
++        identity: signing_identity(
++            reference,
++            DevelopmentTeam::new("ABC123XYZ9", None).expect("valid team"),
++        ),
+         password: Some(github_secret("IOS_SIGNING_PASSWORD")),
+     };
+     let encoded = serde_json::to_string(&signing).expect("signing references serialize");
+@@ -55,6 +71,52 @@ fn secret_references_round_trip_only_validated_identifiers() {
+     );
+ }
+ 
++#[test]
++fn device_plan_wire_form_contains_only_a_lowercase_sha256() {
++    const RAW_UDID: &str = "00008110-001234567890801E";
++    const OTHER_UDID: &str = "00008110-00AAAAAAAAAAAAAA";
++    const UDID_SHA256: &str = "4a5f50907ec074080957ea89dd35b48051f861d4e0db99a4ab391acd90fefc6d";
++
++    let device = DevicePlan::new(RAW_UDID, Some("Acceptance iPhone".to_owned()))
++        .expect("raw device identifier should validate");
++    assert_eq!(device.udid_sha256(), UDID_SHA256);
++    assert!(device.matches_udid(RAW_UDID).expect("raw UDID is valid"));
++    assert!(
++        !device
++            .matches_udid(OTHER_UDID)
++            .expect("other raw UDID is valid")
++    );
++    assert!(device.matches_udid("invalid").is_err());
++
++    let encoded = serde_json::to_string(&device).expect("device plan should serialize");
++    assert!(!encoded.contains(RAW_UDID));
++    assert_eq!(
++        serde_json::from_str::<serde_json::Value>(&encoded).expect("wire form should be JSON"),
++        json!({
++            "udid_sha256": UDID_SHA256,
++            "display_name": "Acceptance iPhone"
++        })
++    );
++    assert_eq!(
++        serde_json::from_str::<DevicePlan>(&encoded).expect("hash-only wire form should decode"),
++        device
++    );
++    assert!(!format!("{device:?}").contains(RAW_UDID));
++
++    let raw_wire_error = serde_json::from_value::<DevicePlan>(json!({
++        "udid": RAW_UDID,
++        "display_name": null
++    }))
++    .expect_err("raw device identifier must not decode from the wire");
++    assert!(!raw_wire_error.to_string().contains(RAW_UDID));
++    assert!(DevicePlan::from_sha256(UDID_SHA256.to_ascii_uppercase(), None).is_err());
++
++    let signing_plan =
++        serde_json::to_string(&valid_manual_signing_plan()).expect("signing plan should serialize");
++    assert!(!signing_plan.contains(RAW_UDID));
++    assert!(signing_plan.contains(UDID_SHA256));
++}
++
+ #[test]
+ fn unsafe_secret_references_are_rejected_without_echoing_values() {
+     let unsafe_names = [
+@@ -377,7 +439,12 @@ fn provisioning_metadata_and_entitlements_are_bounded_and_typed() {
+         wildcard: false,
+         created_at_unix_seconds: 1,
+         expires_at_unix_seconds: 2,
+-        device_udids: vec!["00008110-001234567890801E".to_owned()],
++        device_udid_sha256s: vec![
++            DevicePlan::new("00008110-001234567890801E", None)
++                .expect("valid device")
++                .udid_sha256()
++                .to_owned(),
++        ],
+         entitlements: EntitlementSet::default(),
+         platforms: BTreeSet::from([ProvisioningPlatform::Ios]),
+         profile_type: ProvisioningProfileType::Development,
+@@ -453,7 +520,7 @@ fn valid_manual_signing_plan() -> SigningPlan {
+     SigningPlan {
+         mode: SigningMode::ManualDevelopment,
+         signing: Some(SigningReference {
+-            identity: github_secret("IOS_SIGNING_P12"),
++            identity: signing_identity(github_secret("IOS_SIGNING_P12"), team.clone()),
+             password: Some(github_secret("IOS_SIGNING_PASSWORD")),
+         }),
+         team: Some(DevelopmentTeamPlan { expected: team }),
+diff --git a/crates/rustferry-remote/tests/source.rs b/crates/rustferry-remote/tests/source.rs
+index 62e6617..5a440c4 100644
+--- a/crates/rustferry-remote/tests/source.rs
++++ b/crates/rustferry-remote/tests/source.rs
+@@ -881,7 +881,7 @@ fn extraction_ancestor_swap_never_writes_through_attacker_symlink() {
+ #[cfg(unix)]
+ #[test]
+ fn archive_parent_swap_never_publishes_into_replacement_directory() {
+-    use std::{thread, time::Instant};
++    use std::{sync::mpsc, thread, time::Instant};
+ 
+     let fixture = Fixture::new();
+     write(
+@@ -898,7 +898,9 @@ fn archive_parent_swap_never_publishes_into_replacement_directory() {
+     let watched_parent = output_parent.clone();
+     let replacement_parent = output_parent.clone();
+     let moved_parent_for_attacker = moved_parent.clone();
++    let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
+     let attacker = thread::spawn(move || {
++        ready_sender.send(()).unwrap();
+         let deadline = Instant::now() + std::time::Duration::from_secs(10);
+         loop {
+             let partial_exists = fs::read_dir(&watched_parent).unwrap().any(|entry| {
+@@ -922,6 +924,7 @@ fn archive_parent_swap_never_publishes_into_replacement_directory() {
+         write(&replacement_parent.join("sentinel"), b"unchanged");
+     });
+ 
++    ready_receiver.recv().unwrap();
+     let result = create_source_bundle_archive(&plan, &output, SourceArchiveLimits::default());
+     attacker.join().unwrap();
+ 
+diff --git a/docs/remote/protocol.md b/docs/remote/protocol.md
+index 4aa5014..7444913 100644
+--- a/docs/remote/protocol.md
++++ b/docs/remote/protocol.md
+@@ -23,10 +23,13 @@ by the receiving boundary.
+ An iPhone request fixes:
+ 
+ - operation ID, bundle ID, product name, build profile, and minimum iOS version;
++- a client-derived product expectation: exact `.app` directory, executable, app version, build
++  number, and sorted extension/framework path, bundle-ID, executable, and kind graph;
+ - source mode and deterministic source manifest;
+ - exact credential-free GitHub HTTPS repository plus lowercase 40-hex commit in `git` mode;
+ - no repository or revision fields in explicit `snapshot` mode;
+-- a complete signing plan containing opaque secret references, never secret values;
++- a complete signing plan containing expected public certificate metadata and opaque secret
++  references, never secret values;
+ - requested artifact kinds.
+ 
+ Unsigned compile-only mode cannot request an installable IPA. Signed plans identify the expected
+@@ -34,6 +37,34 @@ team, device, application and extension targets, profile references, and entitle
+ Providers reject unsupported signing/source/artifact capabilities with a typed error; they do not
+ substitute a weaker build or return fake success.
+ 
++Device plans carry only a strict lowercase SHA-256 digest in `udid_sha256`. A raw UDID is validated
++and hashed at the local constructor boundary; protected workers likewise hash decoded profile UDIDs
++before comparison or creation of public metadata. Raw UDIDs are excluded from requests, reports,
++debug output, and serialization.
++
++The product expectation is computed before submission. The worker must compare its regenerated
++plan and unsigned archive with it; a client derives final IPA expectations only from this submitted
++request, never from a worker report. Product paths are portable, version/build strings use canonical
++numeric components, nested paths are unique after Unicode normalization and case folding, and the
++nested bundle graph must equal the corresponding framework and extension signing targets.
++
++Canonical compact request bytes and their lowercase SHA-256 are produced by the shared
++`canonical_request_bytes` and `canonical_request_sha256` functions. Providers and workers must not
++implement their own request encoding.
++
++## Compile handoff
++
++The public `CompileHandoff` envelope contains the exact submitted request and credential-free
++`CompilePhaseEvidence`. Its `SealedUnsignedArchive` descriptor binds the deterministic unsigned
++`.xcarchive` ZIP size and SHA-256, its complete source-style content manifest, and the worker's
++toolchain-specific unsigned archive expectation. These wire structs live in `rustferry-remote` so a
++Windows or Linux client can decode them without depending on the macOS worker implementation.
++
++Receiving boundaries still hash the sealed ZIP bytes, safely extract and inspect the archive, bind
++the embedded request to the independently retained submitted request, and compare client-owned
++product fields before trusting the handoff. A digest copied only from a signing report is not
++independent evidence.
++
+ ## Events
+ 
+ Each progress record is one compact JSON object followed by `\n`. It carries protocol version,
+@@ -76,6 +107,10 @@ subset; it cannot re-include built-in sensitive paths.
+ overwrite on drop is defense in depth, not guaranteed erasure. `SecretReference` serializes only a
+ validated environment, credential-store, GitHub Actions, or worker-owned handle.
+ 
++Each signed request binds the expected certificate common name, Team ID, SHA-256 fingerprint, and
++expiry to an opaque private-key reference. The protected worker derives the imported identity again
++and rejects any mismatch before profiles or application code are signed.
++
+ All process and provider output passes through the same redaction policy before logs, diagnostics,
+ or events are emitted. Redaction holds possible secret prefixes across stdout/stderr chunks and also
+ handles nested JSON, command arguments, environment values, authorization fields, private-key
+diff --git a/schemas/ferry-remote-protocol-v1.schema.json b/schemas/ferry-remote-protocol-v1.schema.json
+index e59d99c..055083b 100644
+--- a/schemas/ferry-remote-protocol-v1.schema.json
++++ b/schemas/ferry-remote-protocol-v1.schema.json
+@@ -23,6 +23,18 @@
+       "description": "Declarative physical-iPhone build request.",
+       "$ref": "#/$defs/IosDeviceBuildRequest"
+     },
++    {
++      "description": "Complete public compile-to-sign handoff.",
++      "$ref": "#/$defs/CompileHandoff"
++    },
++    {
++      "description": "Public credential-free compile evidence.",
++      "$ref": "#/$defs/CompilePhaseEvidence"
++    },
++    {
++      "description": "Sealed unsigned archive descriptor.",
++      "$ref": "#/$defs/SealedUnsignedArchive"
++    },
+     {
+       "description": "Accepted provider job handle.",
+       "$ref": "#/$defs/JobHandle"
+@@ -77,6 +89,61 @@
+     }
+   ],
+   "$defs": {
++    "ApplePlatform": {
++      "description": "Apple platform encoded in `LC_BUILD_VERSION`.",
++      "oneOf": [
++        {
++          "description": "Physical iOS device.",
++          "type": "string",
++          "const": "ios"
++        },
++        {
++          "description": "iOS Simulator.",
++          "type": "string",
++          "const": "ios_simulator"
++        },
++        {
++          "description": "macOS.",
++          "type": "string",
++          "const": "macos"
++        },
++        {
++          "description": "Mac Catalyst.",
++          "type": "string",
++          "const": "mac_catalyst"
++        },
++        {
++          "description": "visionOS device.",
++          "type": "string",
++          "const": "vision_os"
++        },
++        {
++          "description": "visionOS Simulator.",
++          "type": "string",
++          "const": "vision_os_simulator"
++        },
++        {
++          "description": "Another known Apple platform represented by its numeric value.",
++          "type": "object",
++          "properties": {
++            "other": {
++              "type": "integer",
++              "format": "uint32",
++              "minimum": 0
++            }
++          },
++          "additionalProperties": false,
++          "required": [
++            "other"
++          ]
++        },
++        {
++          "description": "Only legacy `LC_VERSION_MIN_IPHONEOS` was present; device status is not proven.",
++          "type": "string",
++          "const": "legacy_iphone_os"
++        }
++      ]
++    },
+     "AppleToolchainEvidence": {
+       "description": "Worker and Apple toolchain evidence.",
+       "type": "object",
+@@ -610,6 +677,166 @@
+         }
+       ]
+     },
++    "CompileHandoff": {
++      "description": "Complete public handoff downloaded by a protected signer or independent client verifier.",
++      "type": "object",
++      "properties": {
++        "compile": {
++          "description": "Credential-free compile evidence bound to the request.",
++          "$ref": "#/$defs/CompilePhaseEvidence"
++        },
++        "request": {
++          "description": "Exact declarative request submitted by the client.",
++          "$ref": "#/$defs/IosDeviceBuildRequest"
++        },
++        "schema_version": {
++          "description": "Handoff-envelope schema version.",
++          "type": "integer",
++          "format": "uint32",
++          "minimum": 0
++        }
++      },
++      "additionalProperties": false,
++      "required": [
++        "schema_version",
++        "request",
++        "compile"
++      ]
++    },
++    "CompilePhaseEvidence": {
++      "description": "Public evidence emitted by the credential-free compile phase.",
++      "type": "object",
++      "properties": {
++        "archive_inspection": {
++          "description": "Independently inspected unsigned archive and Mach-O graph.",
++          "$ref": "#/$defs/UnsignedXcarchiveInspection"
++        },
++        "cargo_lock_sha256": {
++          "description": "Exact `Cargo.lock` content SHA-256 from the source manifest.",
++          "type": "string"
++        },
++        "config_sha256": {
++          "description": "Exact `ferry.toml` content SHA-256 from the source manifest.",
++          "type": "string"
++        },
++        "finished_at_unix_seconds": {
++          "description": "Compile completion time in Unix seconds.",
++          "type": "integer",
++          "format": "uint64",
++          "minimum": 0
++        },
++        "job_id": {
++          "description": "Provider job identifier.",
++          "type": "string"
++        },
++        "provider": {
++          "description": "Provider implementation name.",
++          "type": "string"
++        },
++        "request_sha256": {
++          "description": "Canonical SHA-256 of the complete submitted request.",
++          "type": "string"
++        },
++        "rustferry_version": {
++          "description": "Client version copied from trusted provider metadata.",
++          "type": "string"
++        },
++        "schema_version": {
++          "description": "Compile-evidence schema version.",
++          "type": "integer",
++          "format": "uint32",
++          "minimum": 0
++        },
++        "sealed_archive": {
++          "description": "Deterministic sealed unsigned archive descriptor.",
++          "$ref": "#/$defs/SealedUnsignedArchive"
++        },
++        "source_sha256": {
++          "description": "Exact verified source-manifest SHA-256.",
++          "type": "string"
++        },
++        "started_at_unix_seconds": {
++          "description": "Compile start time in Unix seconds.",
++          "type": "integer",
++          "format": "uint64",
++          "minimum": 0
++        },
++        "toolchain": {
++          "description": "Selected toolchain evidence.",
++          "$ref": "#/$defs/CompileToolchainEvidence"
++        },
++        "worker_version": {
++          "description": "Worker crate version.",
++          "type": "string"
++        }
++      },
++      "additionalProperties": false,
++      "required": [
++        "schema_version",
++        "job_id",
++        "provider",
++        "request_sha256",
++        "source_sha256",
++        "cargo_lock_sha256",
++        "config_sha256",
++        "rustferry_version",
++        "worker_version",
++        "toolchain",
++        "sealed_archive",
++        "archive_inspection",
++        "started_at_unix_seconds",
++        "finished_at_unix_seconds"
++      ]
++    },
++    "CompileToolchainEvidence": {
++      "description": "Public Apple and Rust toolchain evidence selected by the compile phase.",
++      "type": "object",
++      "properties": {
++        "developer_directory_sha256": {
++          "description": "SHA-256 of the canonical selected Xcode developer-directory string.",
++          "type": "string"
++        },
++        "iphoneos_sdk_build_version": {
++          "description": "Selected iPhoneOS SDK build version.",
++          "type": "string"
++        },
++        "iphoneos_sdk_version": {
++          "description": "Selected iPhoneOS SDK version.",
++          "type": "string"
++        },
++        "rust_target": {
++          "description": "Exact physical-iPhone Rust target.",
++          "type": "string"
++        },
++        "rust_version": {
++          "description": "Rust compiler version used by the selected installation.",
++          "type": "string"
++        },
++        "worker_architecture": {
++          "description": "Worker architecture.",
++          "type": "string"
++        },
++        "worker_os": {
++          "description": "Worker operating-system family and version.",
++          "type": "string"
++        },
++        "xcode_version": {
++          "description": "Normalized Xcode version evidence.",
++          "type": "string"
++        }
++      },
++      "additionalProperties": false,
++      "required": [
++        "worker_os",
++        "worker_architecture",
++        "xcode_version",
++        "iphoneos_sdk_version",
++        "iphoneos_sdk_build_version",
++        "developer_directory_sha256",
++        "rust_version",
++        "rust_target"
++      ]
++    },
+     "DevelopmentTeam": {
+       "description": "Apple development team selected for signing.",
+       "type": "object",
+@@ -652,12 +879,12 @@
+             "null"
+           ]
+         },
+-        "udid": {
++        "udid_sha256": {
+           "type": "string"
+         }
+       },
+       "required": [
+-        "udid"
++        "udid_sha256"
+       ]
+     },
+     "DiagnosticSeverity": {
+@@ -878,6 +1105,10 @@
+           "description": "Caller-owned operation identifier copied into every event.",
+           "type": "string"
+         },
++        "product": {
++          "description": "Client-derived product identity used for independent output validation.",
++          "$ref": "#/$defs/IosDeviceProductExpectation"
++        },
+         "product_name": {
+           "description": "Human-readable product name.",
+           "type": "string"
+@@ -931,6 +1162,7 @@
+         "product_name",
+         "bundle_identifier",
+         "minimum_ios_version",
++        "product",
+         "profile",
+         "source_mode",
+         "source",
+@@ -985,6 +1217,43 @@
+         "artifacts"
+       ]
+     },
++    "IosDeviceProductExpectation": {
++      "description": "Client-owned product identity used to validate both unsigned and signed outputs.\n\nUnlike [`UnsignedXcarchiveExpectation`], this contains no worker-selected SDK fields. Every\nvalue is derived before provider submission and is therefore safe to use as an independent\nartifact expectation.",
++      "type": "object",
++      "properties": {
++        "app_directory_name": {
++          "description": "Exact main application directory name, including `.app`.",
++          "type": "string"
++        },
++        "app_version": {
++          "description": "Exact `CFBundleShortVersionString`.",
++          "type": "string"
++        },
++        "build_number": {
++          "description": "Exact `CFBundleVersion`.",
++          "type": "string"
++        },
++        "executable": {
++          "description": "Exact main `CFBundleExecutable` and executable filename.",
++          "type": "string"
++        },
++        "nested_bundles": {
++          "description": "Exact generated extension and framework set.",
++          "type": "array",
++          "items": {
++            "$ref": "#/$defs/UnsignedNestedBundleExpectation"
++          }
++        }
++      },
++      "additionalProperties": false,
++      "required": [
++        "app_directory_name",
++        "executable",
++        "app_version",
++        "build_number",
++        "nested_bundles"
++      ]
++    },
+     "JobHandle": {
+       "description": "Provider response after accepting a build request.",
+       "type": "object",
+@@ -1065,6 +1334,39 @@
+         }
+       ]
+     },
++    "MachOSliceEvidence": {
++      "description": "Cross-platform Mach-O platform evidence for one architecture slice.",
++      "type": "object",
++      "properties": {
++        "architecture": {
++          "description": "Architecture name.",
++          "type": "string"
++        },
++        "minimum_os": {
++          "description": "Minimum operating-system version.",
++          "type": [
++            "string",
++            "null"
++          ]
++        },
++        "platform": {
++          "description": "Apple platform.",
++          "$ref": "#/$defs/ApplePlatform"
++        },
++        "sdk": {
++          "description": "SDK version recorded by the linker.",
++          "type": [
++            "string",
++            "null"
++          ]
++        }
++      },
++      "additionalProperties": false,
++      "required": [
++        "architecture",
++        "platform"
++      ]
++    },
+     "ProtocolPath": {
+       "description": "Path string paired with explicit machine and root semantics.",
+       "type": "object",
+@@ -2308,6 +2610,37 @@
+         "retryable"
+       ]
+     },
++    "SealedUnsignedArchive": {
++      "description": "Public descriptor for one exact unsigned `.xcarchive` ZIP.",
++      "type": "object",
++      "properties": {
++        "contents": {
++          "description": "Exact file paths, modes, sizes, and hashes inside the archive.",
++          "$ref": "#/$defs/SourceManifest"
++        },
++        "expectation": {
++          "description": "Structural and physical-device invariants recomputed after extraction.",
++          "$ref": "#/$defs/UnsignedXcarchiveExpectation"
++        },
++        "schema_version": {
++          "description": "Sealed-handoff schema version.",
++          "type": "integer",
++          "format": "uint32",
++          "minimum": 0
++        },
++        "transport": {
++          "description": "Exact deterministic ZIP size and SHA-256.",
++          "$ref": "#/$defs/SourceArchive"
++        }
++      },
++      "additionalProperties": false,
++      "required": [
++        "schema_version",
++        "transport",
++        "contents",
++        "expectation"
++      ]
++    },
+     "SecretReference": {
+       "description": "Serializable reference to secret material, never the material itself.\n\nConstruction and deserialization validate the identifier. The restricted\nalphabet prevents paths, URLs, shell fragments, control characters, and\naccidental inline `NAME=value` secret material from entering a protocol.",
+       "type": "object",
+@@ -2353,6 +2686,56 @@
+       "type": "string",
+       "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-((?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\\.(?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\\+([0-9a-zA-Z-]+(?:\\.[0-9a-zA-Z-]+)*))?$"
+     },
++    "SigningCertificate": {
++      "description": "Public certificate metadata used for validation and reporting.",
++      "type": "object",
++      "properties": {
++        "common_name": {
++          "description": "Public certificate subject name.",
++          "type": "string"
++        },
++        "expires_at_unix_seconds": {
++          "description": "Certificate expiration as a Unix timestamp.",
++          "type": "integer",
++          "format": "uint64",
++          "minimum": 0
++        },
++        "sha256_fingerprint": {
++          "description": "Uppercase SHA-256 fingerprint without separators.",
++          "type": "string"
++        },
++        "team": {
++          "description": "Team encoded by the signing certificate.",
++          "$ref": "#/$defs/DevelopmentTeam"
++        }
++      },
++      "additionalProperties": false,
++      "required": [
++        "common_name",
++        "sha256_fingerprint",
++        "team",
++        "expires_at_unix_seconds"
++      ]
++    },
++    "SigningIdentity": {
++      "description": "Certificate metadata paired with an opaque private-key reference.",
++      "type": "object",
++      "properties": {
++        "certificate": {
++          "description": "Public certificate metadata.",
++          "$ref": "#/$defs/SigningCertificate"
++        },
++        "private_key": {
++          "description": "Reference only; private-key bytes are never serializable.",
++          "$ref": "#/$defs/SigningPrivateKeyReference"
++        }
++      },
++      "additionalProperties": false,
++      "required": [
++        "certificate",
++        "private_key"
++      ]
++    },
+     "SigningMode": {
+       "description": "Supported Apple signing mode.",
+       "oneOf": [
+@@ -2426,7 +2809,7 @@
+           }
+         },
+         "signing": {
+-          "description": "Opaque identity/password references for modes that import an identity.",
++          "description": "Public identity metadata plus opaque key/password references.",
+           "anyOf": [
+             {
+               "$ref": "#/$defs/SigningReference"
+@@ -2464,13 +2847,27 @@
+         "allow_provisioning_updates"
+       ]
+     },
++    "SigningPrivateKeyReference": {
++      "description": "Opaque reference to private-key material held outside project configuration.",
++      "type": "object",
++      "properties": {
++        "reference": {
++          "description": "Validated credential-store, workflow-secret, environment, or worker handle.",
++          "$ref": "#/$defs/SecretReference"
++        }
++      },
++      "additionalProperties": false,
++      "required": [
++        "reference"
++      ]
++    },
+     "SigningReference": {
+-      "description": "Serializable signing inputs containing references only, never secret bytes.",
++      "description": "Serializable signing inputs containing public identity metadata and opaque\nreferences only, never secret bytes.",
+       "type": "object",
+       "properties": {
+         "identity": {
+-          "description": "Opaque reference to an encrypted identity bundle or configured identity.",
+-          "$ref": "#/$defs/SecretReference"
++          "description": "Expected public certificate paired with the opaque private-key reference.",
++          "$ref": "#/$defs/SigningIdentity"
+         },
+         "password": {
+           "description": "Opaque reference to its password or passphrase, when required.",
+@@ -2583,6 +2980,27 @@
+         }
+       ]
+     },
++    "SourceArchive": {
++      "description": "Integrity descriptor for the deterministic source ZIP transport.",
++      "type": "object",
++      "properties": {
++        "sha256": {
++          "description": "Lowercase hexadecimal SHA-256 digest of the complete ZIP.",
++          "type": "string"
++        },
++        "size": {
++          "description": "Exact ZIP size in bytes.",
++          "type": "integer",
++          "format": "uint64",
++          "minimum": 0
++        }
++      },
++      "additionalProperties": false,
++      "required": [
++        "size",
++        "sha256"
++      ]
++    },
+     "SourceManifest": {
+       "description": "Canonical description of a source snapshot.",
+       "type": "object",
+@@ -2670,6 +3088,217 @@
+         }
+       ]
+     },
++    "UnsignedAppInspection": {
++      "description": "Cross-platform evidence for one unsigned physical-iPhone `.app` directory.",
++      "type": "object",
++      "properties": {
++        "app_directory_name": {
++          "description": "Exact application directory name.",
++          "type": "string"
++        },
++        "bundle_identifier": {
++          "description": "Main application bundle identifier.",
++          "type": "string"
++        },
++        "entries": {
++          "description": "Sorted app-relative files and directories inspected.",
++          "type": "array",
++          "items": {
++            "type": "string"
++          }
++        },
++        "executable": {
++          "description": "Main executable name.",
++          "type": "string"
++        },
++        "extensions": {
++          "description": "Sorted extension bundle identifiers.",
++          "type": "array",
++          "items": {
++            "type": "string"
++          }
++        },
++        "main_executable": {
++          "description": "Main executable device-platform evidence.",
++          "type": "array",
++          "items": {
++            "$ref": "#/$defs/MachOSliceEvidence"
++          }
++        },
++        "nested_executables": {
++          "description": "Every other Mach-O path relative to the app and its device evidence.",
++          "type": "object",
++          "additionalProperties": {
++            "type": "array",
++            "items": {
++              "$ref": "#/$defs/MachOSliceEvidence"
++            }
++          }
++        },
++        "resources": {
++          "description": "Verified required resource hashes.",
++          "type": "object",
++          "additionalProperties": {
++            "type": "string"
++          }
++        }
++      },
++      "additionalProperties": false,
++      "required": [
++        "app_directory_name",
++        "bundle_identifier",
++        "executable",
++        "main_executable",
++        "nested_executables",
++        "extensions",
++        "resources",
++        "entries"
++      ]
++    },
++    "UnsignedNestedBundleExpectation": {
++      "description": "Expected identity of one generated extension or framework in an unsigned app.",
++      "type": "object",
++      "properties": {
++        "bundle_identifier": {
++          "description": "Exact nested bundle identifier.",
++          "type": "string"
++        },
++        "executable": {
++          "description": "Exact `CFBundleExecutable` and executable filename.",
++          "type": "string"
++        },
++        "kind": {
++          "description": "Expected nested code kind.",
++          "$ref": "#/$defs/UnsignedNestedBundleKind"
++        },
++        "relative_path": {
++          "description": "Slash-separated path relative to the main `.app` root.",
++          "type": "string"
++        }
++      },
++      "additionalProperties": false,
++      "required": [
++        "relative_path",
++        "bundle_identifier",
++        "executable",
++        "kind"
++      ]
++    },
++    "UnsignedNestedBundleKind": {
++      "description": "Kind and expected package type of code nested inside an application bundle.",
++      "oneOf": [
++        {
++          "description": "An iOS application extension (`.appex`, package type `XPC!`).",
++          "type": "string",
++          "const": "app_extension"
++        },
++        {
++          "description": "An embedded dynamic framework (`.framework`, package type `FMWK`).",
++          "type": "string",
++          "const": "framework"
++        }
++      ]
++    },
++    "UnsignedXcarchiveExpectation": {
++      "description": "Exact generated-product invariants for an unsigned physical-iPhone archive.",
++      "type": "object",
++      "properties": {
++        "app_directory_name": {
++          "description": "Exact application directory name, including `.app`.",
++          "type": "string"
++        },
++        "app_version": {
++          "description": "Exact `CFBundleShortVersionString`.",
++          "type": "string"
++        },
++        "build_number": {
++          "description": "Exact `CFBundleVersion`.",
++          "type": "string"
++        },
++        "bundle_identifier": {
++          "description": "Main application bundle identifier.",
++          "type": "string"
++        },
++        "executable": {
++          "description": "Exact `CFBundleExecutable` and executable filename.",
++          "type": "string"
++        },
++        "minimum_os": {
++          "description": "Configured minimum iOS version.",
++          "type": "string"
++        },
++        "nested_bundles": {
++          "description": "Exact generated extension and framework set.",
++          "type": "array",
++          "items": {
++            "$ref": "#/$defs/UnsignedNestedBundleExpectation"
++          }
++        },
++        "required_resources": {
++          "description": "Required app-relative resource path to lowercase SHA-256.",
++          "type": "object",
++          "additionalProperties": {
++            "type": "string"
++          }
++        },
++        "sdk_build_version": {
++          "description": "Exact selected iPhoneOS SDK build version injected into processed plists.",
++          "type": "string"
++        },
++        "sdk_version": {
++          "description": "Exact selected iPhoneOS SDK version encoded by newly built code.",
++          "type": "string"
++        }
++      },
++      "additionalProperties": false,
++      "required": [
++        "app_directory_name",
++        "bundle_identifier",
++        "executable",
++        "app_version",
++        "build_number",
++        "minimum_os",
++        "sdk_version",
++        "sdk_build_version",
++        "nested_bundles",
++        "required_resources"
++      ]
++    },
++    "UnsignedXcarchiveInspection": {
++      "description": "Cross-platform evidence for an unsigned physical-iPhone `.xcarchive`.",
++      "type": "object",
++      "properties": {
++        "app": {
++          "description": "Independently inspected application evidence.",
++          "$ref": "#/$defs/UnsignedAppInspection"
++        },
++        "application_path": {
++          "description": "Main application path relative to `Products/`.",
++          "type": "string"
++        },
++        "architectures": {
++          "description": "Architectures declared by the archive metadata.",
++          "type": "array",
++          "items": {
++            "type": "string"
++          }
++        },
++        "entries": {
++          "description": "Sorted archive-relative files and directories inspected.",
++          "type": "array",
++          "items": {
++            "type": "string"
++          }
++        }
++      },
++      "additionalProperties": false,
++      "required": [
++        "application_path",
++        "architectures",
++        "app",
++        "entries"
++      ]
++    },
+     "ValidationLevel": {
+       "description": "One validation level proven by a concrete build or inspection step.",
+       "oneOf": [
+-- 
+2.55.0
+

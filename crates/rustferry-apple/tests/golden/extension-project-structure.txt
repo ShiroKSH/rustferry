@@ -1,14 +1,22 @@
 com.apple.product-type.application: 1
 com.apple.product-type.app-extension: 2
+com.apple.product-type.framework: 2
 FerryWidgetExtension.appex in Embed App Extensions: 2
 FerryLiveActivityExtension.appex in Embed App Extensions: 2
 Widget.swift in Sources: 2
 LiveActivity.swift in Sources: 2
-PBXTargetDependency: 14
+FerryActivityAttributes.swift in Sources: 2
+FerryActivityModel.framework in Embed Frameworks: 2
+FerryActivityModel.framework in RuntimeBridge Frameworks: 2
+FerryActivityModel.framework in Live Activity Frameworks: 2
+unsafe RuntimeBridge framework links: 0
+PBXTargetDependency: 20
 Install Rust Executable: 5
-AD_HOC_CODE_SIGNING_ALLOWED = YES: 8
-CODE_SIGN_IDENTITY = "-": 8
-CODE_SIGNING_ALLOWED = YES: 8
-CODE_SIGNING_REQUIRED = YES: 8
-SUPPORTED_PLATFORMS = iphonesimulator: 8
+AD_HOC_CODE_SIGNING_ALLOWED = YES: 10
+CODE_SIGN_IDENTITY = "-": 10
+CODE_SIGNING_ALLOWED = YES: 10
+CODE_SIGNING_REQUIRED = YES: 10
+SUPPORTED_PLATFORMS = iphonesimulator: 10
+APPLICATION_EXTENSION_API_ONLY = YES: 6
+APPLICATION_EXTENSION_API_ONLY = NO: 2
 disabled signing settings: 0

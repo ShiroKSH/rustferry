@@ -1,0 +1,48 @@
+From 3383a4aedb518336b56d0ee5ac3c66d32450b6ff Mon Sep 17 00:00:00 2001
+From: ShiroKSH <kushidashiro@gmail.com>
+Date: Sun, 2 Aug 2026 06:07:20 +0300
+Subject: [PATCH 22/33] ci: pin manual signing worker
+
+---
+ .github/workflows/rustferry-goal3-iphone.yml                  | 4 ++--
+ .github/workflows/rustferry-goal3-linux-client-acceptance.yml | 2 +-
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/.github/workflows/rustferry-goal3-iphone.yml b/.github/workflows/rustferry-goal3-iphone.yml
+index 7446302..127683c 100644
+--- a/.github/workflows/rustferry-goal3-iphone.yml
++++ b/.github/workflows/rustferry-goal3-iphone.yml
+@@ -17,7 +17,7 @@ env:
+   RUST_BACKTRACE: '0'
+   RUSTUP_TOOLCHAIN: '1.92.0'
+   RUSTFERRY_WORKER_REPOSITORY: 'https://github.com/shiroksh/rustferry'
+-  RUSTFERRY_WORKER_REVISION: '9a62db39eacda0daf8f6f3951452bad7c3aad582'
++  RUSTFERRY_WORKER_REVISION: 'e28e08cddf31c1d703df987f92b2dfe1c19fffaf'
+   RUSTFERRY_WORKER_VERSION: '0.1.0'
+   RUSTFERRY_SOURCE_REPOSITORY: 'https://github.com/shiroksh/rustferry'
+   RUSTFERRY_TRUSTED_SOURCE_REF: 'refs/heads/goal3/macless-iphone-builds'
+@@ -40,7 +40,7 @@ jobs:
+         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+         with:
+           repository: 'shiroksh/rustferry'
+-          ref: '9a62db39eacda0daf8f6f3951452bad7c3aad582'
++          ref: 'e28e08cddf31c1d703df987f92b2dfe1c19fffaf'
+           fetch-depth: 1
+           persist-credentials: false
+           path: .rustferry-worker-source
+diff --git a/.github/workflows/rustferry-goal3-linux-client-acceptance.yml b/.github/workflows/rustferry-goal3-linux-client-acceptance.yml
+index 8fa12d3..38d14a5 100644
+--- a/.github/workflows/rustferry-goal3-linux-client-acceptance.yml
++++ b/.github/workflows/rustferry-goal3-linux-client-acceptance.yml
+@@ -37,7 +37,7 @@ jobs:
+       CARGO_TERM_COLOR: 'never'
+       RUST_BACKTRACE: '0'
+       RUSTUP_TOOLCHAIN: '1.92.0'
+-      RUSTFERRY_WORKER_REVISION: '9a62db39eacda0daf8f6f3951452bad7c3aad582'
++      RUSTFERRY_WORKER_REVISION: 'e28e08cddf31c1d703df987f92b2dfe1c19fffaf'
+     steps:
+       - name: Checkout exact acceptance source
+         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+-- 
+2.55.0
+

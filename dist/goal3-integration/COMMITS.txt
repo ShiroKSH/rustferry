@@ -1,0 +1,33 @@
+cf4569e8169da27bfbde002966f8c15fc73c8132	2026-08-01T17:21:32+03:00	goal3: add isolated development environment
+126ce051d525328ff6c1b96afe42730e4d9131f8	2026-08-01T18:14:53+03:00	goal3: add remote build protocol contracts
+50366ec204bae35d8d0d92295d5816fc855a8c7d	2026-08-01T19:56:18+03:00	goal3: harden source and unsigned artifact transport
+e08456c092af20739901cd49142bd81035b9ee11	2026-08-01T19:56:35+03:00	goal3: add physical iPhone compile checkpoint
+1034835208010459bdc1048c462b66dc554759e6	2026-08-01T23:28:06+03:00	goal3: bind device product across remote handoff
+1370bf756dc6b3dafc011e74156d81912b5c14b3	2026-08-02T01:09:31+03:00	feat: add GitHub macless iPhone build pipeline
+3332f8ed850a009e70465be1a7938db68c02cec4	2026-08-02T01:34:26+03:00	fix: isolate GitHub CLI process state
+64bdb3e3d5d167f72402efc99bb20d1260ea4914	2026-08-02T01:36:58+03:00	ci: add Goal 3 iPhone build workflow
+743f8c8956f0ac14253b63ea3611b781bcbaf2b2	2026-08-02T01:54:00+03:00	ci: add Linux macless acceptance
+676c706771fc45d61e23f770b855a77a7bff6dc0	2026-08-02T02:15:58+03:00	fix: prove repository-scoped GitHub access
+e2beb888b1eba18e592e27e41ddcc02624099d21	2026-08-02T02:25:47+03:00	fix: preserve Rustup proxy entrypoints
+836958137a6a655cdab17a96b04ab455567ab2b0	2026-08-02T02:27:02+03:00	ci: rerun Goal 3 acceptance on provider changes
+66555a41f32398d74b2e437d73aa0b2d53af0343	2026-08-02T02:43:46+03:00	fix: parse Cargo documents on trusted workers
+f7d1418f8c7a4021a662dc42afdb89158d3d87bb	2026-08-02T02:44:29+03:00	ci: pin the Cargo document worker fix
+052f6ed18d3eb95a053264e32dd7417c131e0155	2026-08-02T02:57:48+03:00	fix: harden remote compile workspace lifecycle
+2d037649870a254104991f951ac62d0a70b02794	2026-08-02T02:58:18+03:00	ci: pin the hardened compile worker
+1a49cd57e4828033008064b7227e567dbdede977	2026-08-02T03:01:25+03:00	fix: discover first Actions workflow runs
+f7f43261967964dc50b0a70c03431c7d204a7ef0	2026-08-02T03:05:36+03:00	ci: verify the request-bound archive path
+9a62db39eacda0daf8f6f3951452bad7c3aad582	2026-08-02T04:02:09+03:00	feat: separate GitHub source and execution repositories
+d4fe76ff0d81afab140d1713b39431f310c3fbc1	2026-08-02T04:04:22+03:00	ci: pin split-repository iPhone worker
+e28e08cddf31c1d703df987f92b2dfe1c19fffaf	2026-08-02T06:05:27+03:00	feat: configure manual iPhone signing
+3383a4aedb518336b56d0ee5ac3c66d32450b6ff	2026-08-02T06:07:20+03:00	ci: pin manual signing worker
+c172f329ea6fe72b0629d82b67b2cbb05fb0e081	2026-08-02T06:07:59+03:00	docs: document manual iPhone signing
+756cd85868d5c371ccaf2fdf5e722474895e39d2	2026-08-02T06:11:13+03:00	docs: record final signing verification
+79a70d24ae9873e7290b2422b4d1769c9368ca31	2026-08-02T06:13:24+03:00	ci: review BSD-3-Clause dependency
+a6cc1ff867b03bc8fd66b8c6af7f1b0f7ca000c9	2026-08-02T06:19:11+03:00	fix: keep worker checks portable
+02ac9d5c37224eb5249bba4a4a84f2ebde8ce4bf	2026-08-02T06:20:17+03:00	ci: pin portable iPhone worker
+6182bc57e51ab951e2142a468440e37e7651909d	2026-08-02T06:25:35+03:00	test: canonicalize macOS artifact destinations
+8e7f728bb628939cca0fdb21a2cac67f5fdd0a51	2026-08-02T06:33:22+03:00	fix: compile non-macOS keychain test
+25d1b00ce9239912f67d3293177e45cdee545d8f	2026-08-02T06:39:18+03:00	test: canonicalize macOS worker roots
+1a6f05e8b4400c91c48b48ba10e86c5c287ffd17	2026-08-02T06:58:43+03:00	fix: keep artifact identity stable on Windows
+ce1cd180e8abd1dc4bbbf97b5556587aec6f3dd6	2026-08-08T12:20:48+03:00	fix: harden remote file transactions
+d39ba324aecaba85a69ca0bd749edc74bc4cc621	2026-08-08T12:36:22+03:00	test: normalize CLI help whitespace

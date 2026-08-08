@@ -58,6 +58,10 @@ pub enum Command {
     Check(ProjectArgs),
     /// Inspect host and mobile toolchain prerequisites.
     Doctor(DoctorArgs),
+    /// Configure and inspect remote Apple build providers.
+    Remote(RemoteArgs),
+    /// Configure remote Apple signing or inspect local development identities.
+    Signing(SigningArgs),
     /// Build a mobile artifact without installing or launching it.
     Build(BuildArgs),
     /// Discover Android, Simulator, and physical Apple devices.
@@ -68,8 +72,6 @@ pub enum Command {
     Run(RunArgs),
     /// Collect a finite log snapshot, or stream logs with `--json-stream`.
     Logs(LogsArgs),
-    /// Inspect local development-signing configuration.
-    Signing(SigningArgs),
     /// Validate or generate platform image assets.
     Assets(AssetsArgs),
     /// Remove generated build output only.
@@ -427,8 +429,14 @@ pub struct BuildArgs {
     /// Build optimized Rust code.
     #[arg(long, global = true)]
     pub release: bool,
-    /// Project root or a child directory.
+    /// Remote provider for a physical-iPhone build.
+    #[arg(long, global = true, value_enum)]
+    pub remote: Option<RemoteProviderChoice>,
+    /// Compile a physical-iPhone archive without signing or provisioning.
     #[arg(long, global = true)]
+    pub unsigned: bool,
+    /// Project root or a child directory.
+    #[arg(long, visible_alias = "project", global = true)]
     pub project_dir: Option<Utf8PathBuf>,
 }
 
@@ -437,8 +445,18 @@ pub struct BuildArgs {
 pub enum BuildPlatform {
     /// Build a signed APK without a device.
     Android(AndroidBuildArgs),
+    /// Build for a physical iPhone through the configured remote provider.
+    Iphone(IphoneBuildArgs),
     /// Build an Apple application.
     Ios(IosBuildArgs),
+}
+
+/// Physical-iPhone build options.
+#[derive(Debug, Args)]
+pub struct IphoneBuildArgs {
+    /// Expected Apple Development Team identifier; checked against the configured signing plan.
+    #[arg(long)]
+    pub team: Option<String>,
 }
 
 /// Android build options.
@@ -678,6 +696,8 @@ pub struct SigningArgs {
 /// Supported signing operations.
 #[derive(Debug, Subcommand)]
 pub enum SigningCommand {
+    /// Configure signing assets for a remote build provider.
+    Setup(SigningSetupArgs),
     /// List usable Apple Development identities grouped by Team ID.
     Teams(ProjectArgs),
 }
@@ -707,6 +727,136 @@ pub struct GenerateAssetsArgs {
     pub source: Option<Utf8PathBuf>,
     /// Project root or a child directory.
     #[arg(long)]
+    pub project_dir: Option<Utf8PathBuf>,
+}
+
+/// Remote-provider command wrapper.
+#[derive(Debug, Args)]
+pub struct RemoteArgs {
+    /// Remote-provider operation.
+    #[command(subcommand)]
+    pub command: RemoteCommand,
+}
+
+/// Supported remote-provider operations.
+#[derive(Debug, Subcommand)]
+pub enum RemoteCommand {
+    /// Authenticate, verify, and create-only install the GitHub workflow and local provider config.
+    Setup(RemoteSetupArgs),
+    /// Run bounded authentication, repository, workflow, and artifact-store checks.
+    Doctor(RemoteDoctorArgs),
+    /// Show local provider configuration and workflow integrity without mutation.
+    Status(RemoteStatusArgs),
+}
+
+/// Remote providers implemented by this CLI surface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum RemoteProviderChoice {
+    /// GitHub Actions on a GitHub-hosted macOS runner.
+    Github,
+}
+
+/// Signing-setup mode wrapper.
+#[derive(Debug, Args)]
+pub struct SigningSetupArgs {
+    /// Source of the signing assets.
+    #[command(subcommand)]
+    pub mode: SigningSetupMode,
+}
+
+/// Supported signing-setup modes.
+#[derive(Debug, Subcommand)]
+pub enum SigningSetupMode {
+    /// Configure user-supplied development certificate and provisioning profile files.
+    Manual(ManualSigningSetupArgs),
+}
+
+/// Manual development-signing setup arguments.
+#[derive(Debug, Args)]
+pub struct ManualSigningSetupArgs {
+    /// PKCS#12 Apple Development certificate and private-key archive.
+    #[arg(long)]
+    pub certificate: Utf8PathBuf,
+    /// Development provisioning-profile file.
+    #[arg(long)]
+    pub profile: Utf8PathBuf,
+    /// Remote provider that will receive the validated signing assets.
+    #[arg(long, value_enum)]
+    pub remote: RemoteProviderChoice,
+    /// Project root or a child directory.
+    #[arg(long, visible_alias = "project")]
+    pub project_dir: Option<Utf8PathBuf>,
+    /// Read the certificate password from standard input.
+    #[arg(long, conflicts_with_all = ["password_env", "password_credential"])]
+    pub password_stdin: bool,
+    /// Read the certificate password from this environment-variable name.
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["password_stdin", "password_credential"])]
+    pub password_env: Option<String>,
+    /// Read the certificate password from this operating-system credential-store entry.
+    #[arg(long, value_name = "ENTRY", conflicts_with_all = ["password_stdin", "password_env"])]
+    pub password_credential: Option<String>,
+    /// Select one registered profile device by its lowercase SHA-256 digest.
+    #[arg(long)]
+    pub device_sha256: Option<String>,
+    /// Confirm upload after the public validation preview without an interactive prompt.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+/// GitHub provider setup arguments.
+#[derive(Debug, Args)]
+pub struct RemoteSetupArgs {
+    /// Provider to configure.
+    #[arg(value_enum)]
+    pub provider: RemoteProviderChoice,
+    /// Project root or a child directory.
+    #[arg(long, visible_alias = "project")]
+    pub project_dir: Option<Utf8PathBuf>,
+    /// Exact GitHub execution owner/repository; defaults to the execution Git remote.
+    #[arg(long)]
+    pub execution_repository: Option<String>,
+    /// Git remote containing the public trusted source and installed workflow.
+    #[arg(long, default_value = "origin")]
+    pub source_remote_name: String,
+    /// Git remote receiving isolated temporary workflow-dispatch refs.
+    #[arg(long, default_value = "origin")]
+    pub execution_remote_name: String,
+    /// Full trusted ref; defaults to the current branch under refs/heads/.
+    #[arg(long)]
+    pub trusted_ref: Option<String>,
+    /// Public `RustFerry` worker source repository or owner/repository.
+    #[arg(long, default_value = env!("CARGO_PKG_REPOSITORY"))]
+    pub worker_repository: String,
+    /// Exact lowercase 40-hex revision containing the compatible macOS worker.
+    #[arg(long)]
+    pub worker_revision: Option<String>,
+    /// Compatible worker semantic version.
+    #[arg(long, default_value = env!("CARGO_PKG_VERSION"))]
+    pub worker_version: String,
+    /// Print the deterministic workflow and config plan without installing either file.
+    #[arg(long)]
+    pub preview: bool,
+}
+
+/// GitHub provider doctor arguments.
+#[derive(Debug, Args)]
+pub struct RemoteDoctorArgs {
+    /// Provider to inspect.
+    #[arg(value_enum)]
+    pub provider: RemoteProviderChoice,
+    /// Project root or a child directory.
+    #[arg(long, visible_alias = "project")]
+    pub project_dir: Option<Utf8PathBuf>,
+}
+
+/// GitHub provider status arguments.
+#[derive(Debug, Args)]
+pub struct RemoteStatusArgs {
+    /// Provider to inspect.
+    #[arg(value_enum)]
+    pub provider: RemoteProviderChoice,
+    /// Project root or a child directory.
+    #[arg(long, visible_alias = "project")]
     pub project_dir: Option<Utf8PathBuf>,
 }
 
@@ -780,4 +930,230 @@ pub struct CompletionArgs {
     /// Shell syntax to generate.
     #[arg(value_enum)]
     pub shell: clap_complete::Shell,
+}
+
+#[cfg(test)]
+mod tests {
+    use camino::Utf8PathBuf;
+    use clap::Parser as _;
+
+    use super::{
+        BuildPlatform, Cli, Command, RemoteCommand, RemoteProviderChoice, SigningCommand,
+        SigningSetupMode,
+    };
+
+    #[test]
+    fn iphone_and_ios_device_grammars_share_the_github_selector() {
+        let iphone = Cli::try_parse_from([
+            "cargo-ferry",
+            "build",
+            "iphone",
+            "--remote",
+            "github",
+            "--unsigned",
+        ])
+        .expect("iPhone grammar");
+        let Command::Build(iphone) = iphone.command else {
+            panic!("expected build command");
+        };
+        assert!(matches!(iphone.platform, BuildPlatform::Iphone(_)));
+        assert_eq!(iphone.remote, Some(RemoteProviderChoice::Github));
+        assert!(iphone.unsigned);
+
+        let ios = Cli::try_parse_from([
+            "cargo-ferry",
+            "build",
+            "ios",
+            "--device",
+            "--remote",
+            "github",
+        ])
+        .expect("iOS device grammar");
+        let Command::Build(ios) = ios.command else {
+            panic!("expected build command");
+        };
+        assert!(matches!(ios.platform, BuildPlatform::Ios(_)));
+        assert_eq!(ios.remote, Some(RemoteProviderChoice::Github));
+    }
+
+    #[test]
+    fn simulator_and_remote_management_grammars_remain_available() {
+        let simulator = Cli::try_parse_from(["cargo-ferry", "build", "ios", "--simulator"])
+            .expect("simulator grammar");
+        let Command::Build(simulator) = simulator.command else {
+            panic!("expected build command");
+        };
+        assert!(matches!(simulator.platform, BuildPlatform::Ios(_)));
+
+        for operation in ["setup", "doctor", "status"] {
+            let parsed = Cli::try_parse_from(["cargo-ferry", "remote", operation, "github"])
+                .expect("remote grammar");
+            let Command::Remote(remote) = parsed.command else {
+                panic!("expected remote command");
+            };
+            assert!(matches!(
+                remote.command,
+                RemoteCommand::Setup(_) | RemoteCommand::Doctor(_) | RemoteCommand::Status(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn github_setup_selects_distinct_source_and_execution_remotes() {
+        let parsed = Cli::try_parse_from([
+            "cargo-ferry",
+            "remote",
+            "setup",
+            "github",
+            "--source-remote-name",
+            "public",
+            "--execution-remote-name",
+            "signing",
+            "--execution-repository",
+            "owner/private-builds",
+        ])
+        .expect("split repository grammar");
+        let Command::Remote(remote) = parsed.command else {
+            panic!("expected remote command");
+        };
+        let RemoteCommand::Setup(arguments) = remote.command else {
+            panic!("expected setup command");
+        };
+        assert_eq!(arguments.source_remote_name, "public");
+        assert_eq!(arguments.execution_remote_name, "signing");
+        assert_eq!(
+            arguments.execution_repository.as_deref(),
+            Some("owner/private-builds")
+        );
+    }
+
+    #[test]
+    fn manual_signing_setup_requires_explicit_asset_paths_and_remote() {
+        let parsed = Cli::try_parse_from([
+            "cargo-ferry",
+            "signing",
+            "setup",
+            "manual",
+            "--certificate",
+            "development.p12",
+            "--profile",
+            "Weather.mobileprovision",
+            "--remote",
+            "github",
+        ])
+        .expect("manual signing grammar");
+        let Command::Signing(signing) = parsed.command else {
+            panic!("expected signing command");
+        };
+        let SigningCommand::Setup(setup) = signing.command else {
+            panic!("expected signing setup command");
+        };
+        let SigningSetupMode::Manual(arguments) = setup.mode;
+        assert_eq!(arguments.certificate, Utf8PathBuf::from("development.p12"));
+        assert_eq!(
+            arguments.profile,
+            Utf8PathBuf::from("Weather.mobileprovision")
+        );
+        assert_eq!(arguments.remote, RemoteProviderChoice::Github);
+        assert!(!arguments.password_stdin);
+        assert!(arguments.password_env.is_none());
+        assert!(arguments.password_credential.is_none());
+        assert!(arguments.device_sha256.is_none());
+        assert!(!arguments.yes);
+    }
+
+    #[test]
+    fn manual_signing_password_sources_are_references_not_values() {
+        let parsed = Cli::try_parse_from([
+            "cargo-ferry",
+            "signing",
+            "setup",
+            "manual",
+            "--certificate",
+            "development.p12",
+            "--profile",
+            "Weather.mobileprovision",
+            "--remote",
+            "github",
+            "--password-env",
+            "RUSTFERRY_P12_PASSWORD",
+            "--device-sha256",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--yes",
+        ])
+        .expect("noninteractive password reference grammar");
+        let Command::Signing(signing) = parsed.command else {
+            panic!("expected signing command");
+        };
+        let SigningCommand::Setup(setup) = signing.command else {
+            panic!("expected signing setup command");
+        };
+        let SigningSetupMode::Manual(arguments) = setup.mode;
+        assert_eq!(
+            arguments.password_env.as_deref(),
+            Some("RUSTFERRY_P12_PASSWORD")
+        );
+        assert_eq!(
+            arguments.device_sha256.as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+        assert!(arguments.yes);
+    }
+
+    #[test]
+    fn manual_signing_setup_rejects_password_argv_flags() {
+        for password_flag in [
+            "--password",
+            "--password-file",
+            "--p12-password",
+            "--certificate-password",
+        ] {
+            let error = Cli::try_parse_from([
+                "cargo-ferry",
+                "signing",
+                "setup",
+                "manual",
+                "--certificate",
+                "development.p12",
+                "--profile",
+                "Weather.mobileprovision",
+                "--remote",
+                "github",
+                password_flag,
+                "secret",
+            ])
+            .expect_err("password argv must be rejected");
+            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
+    }
+
+    #[test]
+    fn local_signing_teams_and_device_build_grammars_remain_available() {
+        let parsed = Cli::try_parse_from(["cargo-ferry", "signing", "teams"])
+            .expect("local signing teams grammar");
+        let Command::Signing(signing) = parsed.command else {
+            panic!("expected signing command");
+        };
+        assert!(matches!(signing.command, SigningCommand::Teams(_)));
+
+        let parsed = Cli::try_parse_from([
+            "cargo-ferry",
+            "build",
+            "ios",
+            "--device",
+            "--team",
+            "TEAM123456",
+        ])
+        .expect("local physical-device grammar");
+        let Command::Build(build) = parsed.command else {
+            panic!("expected build command");
+        };
+        let BuildPlatform::Ios(ios) = build.platform else {
+            panic!("expected iOS build");
+        };
+        assert!(ios.device);
+        assert_eq!(ios.team.as_deref(), Some("TEAM123456"));
+        assert!(build.remote.is_none());
+        assert!(!build.unsigned);
+    }
 }

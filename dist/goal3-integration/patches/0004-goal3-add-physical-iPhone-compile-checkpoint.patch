@@ -1,0 +1,3421 @@
+From e08456c092af20739901cd49142bd81035b9ee11 Mon Sep 17 00:00:00 2001
+From: ShiroKSH <kushidashiro@gmail.com>
+Date: Sat, 1 Aug 2026 19:56:35 +0300
+Subject: [PATCH 04/33] goal3: add physical iPhone compile checkpoint
+
+---
+ Cargo.lock                                    |    2 +
+ crates/rustferry-apple/Cargo.toml             |    2 +
+ crates/rustferry-apple/src/artifact.rs        |  204 ++-
+ crates/rustferry-apple/src/device.rs          | 1128 +++++++++++++++++
+ crates/rustferry-apple/src/discovery.rs       |  360 +++++-
+ crates/rustferry-apple/src/lib.rs             |   18 +-
+ crates/rustferry-apple/src/project.rs         |  462 ++++++-
+ .../FerryActivityAttributes.swift.tpl         |   36 +
+ .../templates/FerryActivityModel-Info.plist   |   24 +
+ .../templates/FerryRuntimeBridge.swift.tpl    |   38 +-
+ crates/rustferry-apple/tests/device.rs        |  395 ++++++
+ crates/rustferry-apple/tests/golden.rs        |   32 +
+ .../golden/extension-project-structure.txt    |   20 +-
+ .../tests/golden/extensions-files.txt         |    2 +
+ crates/rustferry-apple/tests/xcode_smoke.rs   |   14 +
+ docs/GOAL3_COMMAND_AUDIT.jsonl                |    4 +
+ docs/GOAL3_CONFLICT_REPORT.md                 |    8 +-
+ docs/GOAL3_OWNERSHIP.md                       |    5 +-
+ docs/GOAL3_STATUS.md                          |   11 +-
+ docs/STATUS.md                                |   10 +-
+ 20 files changed, 2673 insertions(+), 102 deletions(-)
+ create mode 100644 crates/rustferry-apple/src/device.rs
+ create mode 100644 crates/rustferry-apple/templates/FerryActivityAttributes.swift.tpl
+ create mode 100644 crates/rustferry-apple/templates/FerryActivityModel-Info.plist
+ create mode 100644 crates/rustferry-apple/tests/device.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 2d881ac..8370116 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1223,8 +1223,10 @@ version = "0.1.0"
+ dependencies = [
+  "camino",
+  "rustferry-core",
++ "rustferry-remote",
+  "serde",
+  "serde_json",
++ "sha2",
+  "tempfile",
+  "thiserror 2.0.19",
+ ]
+diff --git a/crates/rustferry-apple/Cargo.toml b/crates/rustferry-apple/Cargo.toml
+index 7877775..c2ee126 100644
+--- a/crates/rustferry-apple/Cargo.toml
++++ b/crates/rustferry-apple/Cargo.toml
+@@ -15,8 +15,10 @@ description = "Generated Xcode host and iOS artifact backend for RustFerry"
+ [dependencies]
+ camino.workspace = true
+ rustferry-core = { version = "0.1.0", path = "../rustferry-core" }
++rustferry-remote = { version = "0.1.0", path = "../rustferry-remote" }
+ serde.workspace = true
+ serde_json.workspace = true
++sha2.workspace = true
+ tempfile.workspace = true
+ thiserror.workspace = true
+ 
+diff --git a/crates/rustferry-apple/src/artifact.rs b/crates/rustferry-apple/src/artifact.rs
+index eb97031..a3c69b5 100644
+--- a/crates/rustferry-apple/src/artifact.rs
++++ b/crates/rustferry-apple/src/artifact.rs
+@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
+ 
+ use crate::{AppleError, AppleToolchain, CommandSpec, ExtensionKind, error::io_error, run_command};
+ 
++const ACTIVITY_MODEL_BUNDLE_IDENTIFIER: &str = "org.rustferry.activity-model";
++const ACTIVITY_MODEL_INSTALL_NAME: &str = "@rpath/FerryActivityModel.framework/FerryActivityModel";
++const RUNTIME_BRIDGE_INSTALL_NAME: &str = "@rpath/FerryRuntimeBridge.framework/FerryRuntimeBridge";
++
+ /// Expected embedded app extension.
+ #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+ pub struct IosExtensionExpectation {
+@@ -81,8 +85,8 @@ pub struct IosExtensionValidation {
+     pub architectures: Vec<String>,
+     /// Validated extension-point identifier.
+     pub extension_point_identifier: String,
+-    /// Whether an `ActivityKit` extension links the shared runtime bridge type module.
+-    pub runtime_bridge_linked: bool,
++    /// Whether an `ActivityKit` extension links the extension-safe shared model framework.
++    pub activity_model_linked: bool,
+     /// Strictly verified extension code signature.
+     pub code_signature: IosCodeSignatureValidation,
+ }
+@@ -293,6 +297,21 @@ pub fn validate_ios_app(
+         toolchain,
+         expected.log_dir.as_deref(),
+     )?;
++    let live_activity_enabled = expected
++        .extensions
++        .iter()
++        .any(|extension| extension.kind == ExtensionKind::ActivityKit);
++    if live_activity_enabled {
++        validate_activity_model(
++            &expected.app_path,
++            &expected_architectures,
++            &runtime_bridge.executable,
++            toolchain,
++            expected.log_dir.as_deref(),
++        )?;
++    } else {
++        reject_unexpected_activity_model(&expected.app_path)?;
++    }
+     let application_delegate = if expected.deep_link_schemes.is_empty() {
+         None
+     } else if runtime_bridge.application_delegate_hook {
+@@ -346,7 +365,7 @@ pub fn validate_ios_app(
+     )?;
+ 
+     Ok(IosArtifactValidation {
+-        schema_version: 5,
++        schema_version: 6,
+         app_path: expected.app_path.clone(),
+         bundle_identifier,
+         executable,
+@@ -478,18 +497,9 @@ fn validate_extension_at(
+             format!("extension architectures are {architectures:?}, expected {required:?}"),
+         );
+     }
+-    let runtime_bridge_linked = if extension.kind == ExtensionKind::ActivityKit {
++    let activity_model_linked = if extension.kind == ExtensionKind::ActivityKit {
+         let dependencies = macho_dependencies(&executable, toolchain, log_dir, log_index + 5)?;
+-        if !dependencies.iter().any(|dependency| {
+-            dependency == "@rpath/FerryRuntimeBridge.framework/FerryRuntimeBridge"
+-        }) {
+-            return invalid(
+-                &executable,
+-                "ActivityKit extension does not link FerryRuntimeBridge's shared attributes module"
+-                    .to_owned(),
+-            );
+-        }
+-        true
++        validate_activity_extension_dependencies(&executable, &dependencies)?
+     } else {
+         false
+     };
+@@ -509,11 +519,141 @@ fn validate_extension_at(
+         executable,
+         architectures,
+         extension_point_identifier,
+-        runtime_bridge_linked,
++        activity_model_linked,
+         code_signature,
+     })
+ }
+ 
++fn validate_activity_extension_dependencies(
++    executable: &Utf8Path,
++    dependencies: &[String],
++) -> Result<bool, AppleError> {
++    if dependencies
++        .iter()
++        .any(|dependency| dependency == RUNTIME_BRIDGE_INSTALL_NAME)
++    {
++        return invalid(
++            executable,
++            "ActivityKit extension links the app-only FerryRuntimeBridge framework; extensions may only share FerryActivityModel"
++                .to_owned(),
++        );
++    }
++    if !dependencies
++        .iter()
++        .any(|dependency| dependency == ACTIVITY_MODEL_INSTALL_NAME)
++    {
++        return invalid(
++            executable,
++            "ActivityKit extension does not link the extension-safe FerryActivityModel framework"
++                .to_owned(),
++        );
++    }
++    Ok(true)
++}
++
++fn validate_activity_model(
++    app_path: &Utf8Path,
++    expected_architectures: &[String],
++    runtime_bridge_executable: &Utf8Path,
++    toolchain: &AppleToolchain,
++    log_dir: Option<&Utf8Path>,
++) -> Result<(), AppleError> {
++    let path = app_path.join("Frameworks/FerryActivityModel.framework");
++    validate_real_directory(&path, "embedded Live Activity model framework")?;
++    let info_plist = path.join("Info.plist");
++    validate_regular_file(&info_plist, "Live Activity model framework Info.plist")?;
++    lint_plist(&info_plist, toolchain, log_dir, 170)?;
++
++    let bundle_identifier =
++        plist_value(&info_plist, "CFBundleIdentifier", toolchain, log_dir, 171)?;
++    if bundle_identifier != ACTIVITY_MODEL_BUNDLE_IDENTIFIER {
++        return invalid(
++            &path,
++            format!(
++                "Live Activity model framework bundle identifier is `{bundle_identifier}`, expected `{ACTIVITY_MODEL_BUNDLE_IDENTIFIER}`"
++            ),
++        );
++    }
++    let executable_name = plist_value(&info_plist, "CFBundleExecutable", toolchain, log_dir, 172)?;
++    if executable_name != "FerryActivityModel" {
++        return invalid(
++            &path,
++            format!(
++                "Live Activity model framework executable is `{executable_name}`, expected `FerryActivityModel`"
++            ),
++        );
++    }
++    let package_type = plist_value(&info_plist, "CFBundlePackageType", toolchain, log_dir, 173)?;
++    if package_type != "FMWK" {
++        return invalid(
++            &path,
++            format!(
++                "Live Activity model framework package type is `{package_type}`, expected `FMWK`"
++            ),
++        );
++    }
++
++    let executable = path.join(executable_name);
++    validate_executable(&executable)?;
++    let architectures = macho_architectures(&executable, toolchain, log_dir, 174)?;
++    if architectures != expected_architectures {
++        return invalid(
++            &executable,
++            format!(
++                "Live Activity model framework architectures are {architectures:?}, expected {expected_architectures:?}"
++            ),
++        );
++    }
++    let install_name = macho_install_name(&executable, toolchain, log_dir, 175)?;
++    if install_name != ACTIVITY_MODEL_INSTALL_NAME {
++        return invalid(
++            &executable,
++            format!(
++                "Live Activity model framework install name is `{install_name}`, expected `{ACTIVITY_MODEL_INSTALL_NAME}`"
++            ),
++        );
++    }
++
++    let runtime_dependencies =
++        macho_dependencies(runtime_bridge_executable, toolchain, log_dir, 176)?;
++    if !runtime_dependencies
++        .iter()
++        .any(|dependency| dependency == ACTIVITY_MODEL_INSTALL_NAME)
++    {
++        return invalid(
++            runtime_bridge_executable,
++            "FerryRuntimeBridge does not link the shared FerryActivityModel framework".to_owned(),
++        );
++    }
++    let _ = validate_code_signature(
++        &path,
++        ACTIVITY_MODEL_BUNDLE_IDENTIFIER,
++        None,
++        false,
++        toolchain,
++        log_dir,
++        177,
++    )?;
++    Ok(())
++}
++
++fn reject_unexpected_activity_model(app_path: &Utf8Path) -> Result<(), AppleError> {
++    let path = app_path.join("Frameworks/FerryActivityModel.framework");
++    match fs::symlink_metadata(&path) {
++        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
++        Ok(_) => invalid(
++            &path,
++            "Live Activity model framework is embedded but no ActivityKit extension was requested"
++                .to_owned(),
++        ),
++        Err(source) => Err(io_error(
++            "inspect unexpected Live Activity model framework",
++            &path,
++            source,
++        )),
++    }
++}
++
+ fn validate_runtime_bridge(
+     app_path: &Utf8Path,
+     expected_architectures: &[String],
+@@ -555,7 +695,7 @@ fn validate_runtime_bridge(
+         );
+     }
+     let install_name = macho_install_name(&executable, toolchain, log_dir, 14)?;
+-    if install_name != "@rpath/FerryRuntimeBridge.framework/FerryRuntimeBridge" {
++    if install_name != RUNTIME_BRIDGE_INSTALL_NAME {
+         return invalid(
+             &executable,
+             format!(
+@@ -1247,4 +1387,36 @@ mod tests {
+             ));
+         }
+     }
++
++    #[test]
++    fn activity_extension_requires_only_the_safe_model_framework() {
++        let executable = Utf8Path::new("FerryLiveActivityExtension");
++        assert!(
++            validate_activity_extension_dependencies(
++                executable,
++                &[ACTIVITY_MODEL_INSTALL_NAME.to_owned()]
++            )
++            .unwrap()
++        );
++        assert!(validate_activity_extension_dependencies(executable, &[]).is_err());
++        assert!(
++            validate_activity_extension_dependencies(
++                executable,
++                &[
++                    ACTIVITY_MODEL_INSTALL_NAME.to_owned(),
++                    RUNTIME_BRIDGE_INSTALL_NAME.to_owned(),
++                ],
++            )
++            .is_err()
++        );
++    }
++
++    #[test]
++    fn rejects_stale_activity_model_without_an_activity_extension() {
++        let temporary = tempfile::tempdir().unwrap();
++        let app = Utf8Path::from_path(temporary.path()).unwrap();
++        assert!(reject_unexpected_activity_model(app).is_ok());
++        fs::create_dir_all(app.join("Frameworks/FerryActivityModel.framework")).unwrap();
++        assert!(reject_unexpected_activity_model(app).is_err());
++    }
+ }
+diff --git a/crates/rustferry-apple/src/device.rs b/crates/rustferry-apple/src/device.rs
+new file mode 100644
+index 0000000..f38ebaa
+--- /dev/null
++++ b/crates/rustferry-apple/src/device.rs
+@@ -0,0 +1,1128 @@
++use std::fs;
++
++use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
++use rustferry_core::{FerryConfig, ProjectAssets, brand};
++use rustferry_remote::{
++    UnsignedNestedBundleExpectation, UnsignedNestedBundleKind, UnsignedXcarchiveExpectation,
++    UnsignedXcarchiveInspection, inspect_unsigned_xcarchive,
++};
++use serde::{Deserialize, Serialize};
++use sha2::{Digest, Sha256};
++
++use crate::{
++    AppleBuildProfile, AppleError, CommandSpec, IOS_DEVICE_TARGET, IosDeviceToolchain,
++    IosProjectPlatform, IosProjectSpec, PlannedCopy, error::io_error,
++    generate_ios_project_for_platform, run_command, write_ios_project,
++};
++
++const IOS_DEVICE_SDK: &str = "iphoneos";
++const IOS_GENERIC_DESTINATION: &str = "generic/platform=iOS";
++
++/// Inputs for an unsigned physical-iPhone compilation and Xcode archive.
++#[derive(Clone, Debug, PartialEq)]
++pub struct IosDeviceArchiveRequest {
++    /// Rust project containing `Cargo.toml` and `ferry.toml`.
++    pub project_dir: Utf8PathBuf,
++    /// Validated application configuration.
++    pub config: FerryConfig,
++    /// Cargo binary target and final `CFBundleExecutable` name.
++    pub binary_name: String,
++    /// Optional Cargo package selector for workspace projects.
++    pub package_name: Option<String>,
++    /// Cargo/Xcode profile.
++    pub profile: AppleBuildProfile,
++    /// Explicit Cargo features enabled for the target build.
++    pub cargo_features: Vec<String>,
++    /// Plan only; perform no writes or subprocess execution.
++    pub dry_run: bool,
++}
++
++impl IosDeviceArchiveRequest {
++    /// Construct a release-mode unsigned physical-device archive request.
++    pub fn new(
++        project_dir: impl Into<Utf8PathBuf>,
++        config: FerryConfig,
++        binary_name: impl Into<String>,
++    ) -> Self {
++        Self {
++            project_dir: project_dir.into(),
++            config,
++            binary_name: binary_name.into(),
++            package_name: None,
++            profile: AppleBuildProfile::Release,
++            cargo_features: Vec::new(),
++            dry_run: false,
++        }
++    }
++}
++
++/// Installation status of a physical-device build product.
++#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
++#[serde(rename_all = "kebab-case")]
++pub enum IosDeviceArtifactDisposition {
++    /// Compiled device code in an unsigned archive; not installable until separately signed.
++    UnsignedCompileOnly,
++}
++
++/// Commands and invariants used to reject Simulator Mach-O output.
++#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
++pub struct IosDeviceMachOValidationPlan {
++    /// Archived application executable to inspect.
++    pub executable_path: Utf8PathBuf,
++    /// Required thin Mach-O architecture.
++    pub expected_architecture: String,
++    /// Required `LC_BUILD_VERSION` platform reported by `vtool`.
++    pub expected_platform: String,
++    /// Required minimum iOS version reported by `vtool`.
++    pub expected_minimum_os: String,
++    /// Required iPhoneOS SDK version reported by `vtool`.
++    pub expected_sdk: String,
++    /// Tokenized architecture and platform inspection commands.
++    pub commands: Vec<CommandSpec>,
++}
++
++/// Complete serializable plan for an unsigned physical-device Xcode archive.
++#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
++pub struct IosDeviceArchivePlan {
++    /// Stable plan schema version.
++    pub schema_version: u32,
++    /// Rust compilation target.
++    pub rust_target: String,
++    /// Xcode SDK identifier.
++    pub sdk: String,
++    /// Xcode generic destination.
++    pub destination: String,
++    /// Build profile.
++    pub profile: AppleBuildProfile,
++    /// Explicitly non-installable output classification.
++    pub disposition: IosDeviceArtifactDisposition,
++    /// Internal generated Xcode root.
++    pub generated_root: Utf8PathBuf,
++    /// Isolated Cargo target directory.
++    pub cargo_target_dir: Utf8PathBuf,
++    /// Xcode `DerivedData` directory.
++    pub xcode_derived_data: Utf8PathBuf,
++    /// Xcode destination preflight, Rust compilation, and Xcode archive commands, in order.
++    pub commands: Vec<CommandSpec>,
++    /// Deterministic generated file paths.
++    pub generated_files: Vec<Utf8PathBuf>,
++    /// Stable identity of icon and splash bytes embedded as app resources.
++    pub asset_fingerprint: String,
++    /// Rust executable staging copy.
++    pub rust_binary_copy: PlannedCopy,
++    /// Expected unsigned `.xcarchive` output.
++    pub archive_path: Utf8PathBuf,
++    /// Expected unsigned `.app` inside the archive.
++    pub app_path: Utf8PathBuf,
++    /// Post-archive device Mach-O validation hook.
++    pub macho_validation: IosDeviceMachOValidationPlan,
++    /// Cross-platform structural invariants for the unsigned archive and every nested code object.
++    pub archive_expectation: UnsignedXcarchiveExpectation,
++}
++
++/// Evidence that an archived executable is arm64 physical-iOS code.
++#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
++pub struct IosDeviceMachOValidation {
++    /// Validated executable path.
++    pub executable_path: Utf8PathBuf,
++    /// Architecture reported by `lipo`.
++    pub architecture: String,
++    /// Build platform reported by `vtool`.
++    pub platform: String,
++    /// Minimum iOS version reported by `vtool`.
++    pub minimum_os: String,
++    /// iPhoneOS SDK version reported by `vtool`.
++    pub sdk: String,
++}
++
++/// Result of an unsigned physical-device archive operation.
++#[derive(Debug)]
++pub struct IosDeviceArchiveOutcome {
++    /// Exact plan used by the operation.
++    pub plan: IosDeviceArchivePlan,
++    /// Produced archive path, absent for dry-run.
++    pub archive: Option<Utf8PathBuf>,
++    /// Produced application path, absent for dry-run.
++    pub app: Option<Utf8PathBuf>,
++    /// Physical-device Mach-O evidence, absent for dry-run.
++    pub macho_validation: Option<IosDeviceMachOValidation>,
++    /// Full cross-platform archive/app/nested-code evidence, absent for dry-run.
++    pub archive_inspection: Option<UnsignedXcarchiveInspection>,
++}
++
++/// Produce a deterministic, side-effect-free unsigned device archive plan.
++///
++/// # Errors
++///
++/// Returns [`AppleError`] when request/config values are invalid or assets
++/// cannot be loaded safely.
++pub fn plan_ios_device_unsigned(
++    request: &IosDeviceArchiveRequest,
++    toolchain: &IosDeviceToolchain,
++) -> Result<IosDeviceArchivePlan, AppleError> {
++    validate_request(request)?;
++    let assets = ProjectAssets::load(&request.project_dir)?;
++    plan_with_assets(request, toolchain, &assets)
++}
++
++fn plan_with_assets(
++    request: &IosDeviceArchiveRequest,
++    toolchain: &IosDeviceToolchain,
++    assets: &ProjectAssets,
++) -> Result<IosDeviceArchivePlan, AppleError> {
++    if parse_apple_version(&toolchain.device_sdk.version).is_none()
++        || toolchain.device_sdk.build_version.trim().is_empty()
++    {
++        return Err(AppleError::InvalidRequest(format!(
++            "selected iPhoneOS SDK evidence is incomplete or invalid: version `{}`, build `{}`",
++            toolchain.device_sdk.version, toolchain.device_sdk.build_version
++        )));
++    }
++    let generated = generate_ios_project_for_platform(
++        &IosProjectSpec::new(request.config.clone(), request.binary_name.clone())
++            .with_assets(assets.clone()),
++        IosProjectPlatform::DeviceUnsigned,
++    )?;
++    let device_root = request
++        .project_dir
++        .join("target")
++        .join(brand::TARGET_DIRECTORY)
++        .join("ios")
++        .join("device");
++    let generated_root = device_root.join("generated");
++    let cargo_target_dir = device_root.join("cargo");
++    let profile_directory = profile_directory(request.profile);
++    let xcode_derived_data = device_root.join("xcode").join(profile_directory);
++    let archive_path = device_root
++        .join("archives")
++        .join(profile_directory)
++        .join(format!("{}.xcarchive", request.binary_name));
++    let app_path = archive_path
++        .join("Products")
++        .join("Applications")
++        .join(format!("{}.app", request.binary_name));
++    let cargo_binary = cargo_target_dir
++        .join(IOS_DEVICE_TARGET)
++        .join(profile_directory)
++        .join(&request.binary_name);
++    let staged_binary = generated_root.join(&request.binary_name);
++
++    let archived_executable = app_path.join(&request.binary_name);
++    let destination_preflight = xcode_destination_command(request, toolchain, &generated_root);
++    let cargo = cargo_build_command(request, toolchain, &cargo_target_dir);
++    let xcodebuild = xcode_archive_command(
++        request,
++        toolchain,
++        &generated_root,
++        &xcode_derived_data,
++        &archive_path,
++    );
++    let macho_validation = macho_validation_plan(request, toolchain, archived_executable);
++    let archive_expectation = archive_expectation(request, toolchain, &generated)?;
++
++    Ok(IosDeviceArchivePlan {
++        schema_version: 1,
++        rust_target: IOS_DEVICE_TARGET.to_owned(),
++        sdk: IOS_DEVICE_SDK.to_owned(),
++        destination: IOS_GENERIC_DESTINATION.to_owned(),
++        profile: request.profile,
++        disposition: IosDeviceArtifactDisposition::UnsignedCompileOnly,
++        generated_root,
++        cargo_target_dir,
++        xcode_derived_data,
++        commands: vec![destination_preflight, cargo, xcodebuild],
++        generated_files: generated
++            .files
++            .keys()
++            .map(|relative| device_root.join("generated").join(relative))
++            .collect(),
++        asset_fingerprint: assets.fingerprint().to_owned(),
++        rust_binary_copy: PlannedCopy {
++            source: cargo_binary,
++            destination: staged_binary,
++        },
++        archive_path,
++        app_path,
++        macho_validation,
++        archive_expectation,
++    })
++}
++
++fn archive_expectation(
++    request: &IosDeviceArchiveRequest,
++    toolchain: &IosDeviceToolchain,
++    generated: &crate::GeneratedAppleProject,
++) -> Result<UnsignedXcarchiveExpectation, AppleError> {
++    let mut nested_bundles = vec![UnsignedNestedBundleExpectation {
++        relative_path: "Frameworks/FerryRuntimeBridge.framework".to_owned(),
++        bundle_identifier: "org.rustferry.runtime-bridge".to_owned(),
++        executable: "FerryRuntimeBridge".to_owned(),
++        kind: UnsignedNestedBundleKind::Framework,
++    }];
++    if request.config.extensions.live_activity.enabled {
++        nested_bundles.push(UnsignedNestedBundleExpectation {
++            relative_path: "Frameworks/FerryActivityModel.framework".to_owned(),
++            bundle_identifier: "org.rustferry.activity-model".to_owned(),
++            executable: "FerryActivityModel".to_owned(),
++            kind: UnsignedNestedBundleKind::Framework,
++        });
++        nested_bundles.push(UnsignedNestedBundleExpectation {
++            relative_path: "PlugIns/FerryLiveActivityExtension.appex".to_owned(),
++            bundle_identifier: format!("{}.liveactivity", request.config.app.identifier),
++            executable: "FerryLiveActivityExtension".to_owned(),
++            kind: UnsignedNestedBundleKind::AppExtension,
++        });
++    }
++    if request.config.extensions.widget.enabled {
++        nested_bundles.push(UnsignedNestedBundleExpectation {
++            relative_path: "PlugIns/FerryWidgetExtension.appex".to_owned(),
++            bundle_identifier: format!("{}.widget", request.config.app.identifier),
++            executable: "FerryWidgetExtension".to_owned(),
++            kind: UnsignedNestedBundleKind::AppExtension,
++        });
++    }
++    nested_bundles.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
++
++    let mut required_resources = std::collections::BTreeMap::new();
++    for relative in ["FerryResources.json", "FerryIcon.png", "FerrySplash.png"] {
++        let bytes = generated
++            .files
++            .get(Utf8Path::new(relative))
++            .ok_or_else(|| {
++                AppleError::InvalidRequest(format!(
++                    "generated physical-iOS project omitted required resource `{relative}`"
++                ))
++            })?;
++        required_resources.insert(relative.to_owned(), format!("{:x}", Sha256::digest(bytes)));
++    }
++    let version = &request.config.app.version;
++    Ok(UnsignedXcarchiveExpectation {
++        app_directory_name: format!("{}.app", request.binary_name),
++        bundle_identifier: request.config.app.identifier.clone(),
++        executable: request.binary_name.clone(),
++        app_version: request.config.app.display_version.clone(),
++        build_number: format!("{}.{}.{}", version.major, version.minor, version.patch),
++        minimum_os: request.config.ios.min_version.clone(),
++        sdk_version: toolchain.device_sdk.version.clone(),
++        sdk_build_version: toolchain.device_sdk.build_version.clone(),
++        nested_bundles,
++        required_resources,
++    })
++}
++
++fn cargo_build_command(
++    request: &IosDeviceArchiveRequest,
++    toolchain: &IosDeviceToolchain,
++    cargo_target_dir: &Utf8Path,
++) -> CommandSpec {
++    let mut command = CommandSpec::new(
++        "cross-compile Rust executable for physical iOS device",
++        &toolchain.cargo,
++        &request.project_dir,
++    );
++    command.args = vec![
++        "build".to_owned(),
++        "--target".to_owned(),
++        IOS_DEVICE_TARGET.to_owned(),
++        "--bin".to_owned(),
++        request.binary_name.clone(),
++    ];
++    if let Some(package) = &request.package_name {
++        command.args.push("--package".to_owned());
++        command.args.push(package.clone());
++    }
++    if request.profile == AppleBuildProfile::Release {
++        command.args.push("--release".to_owned());
++    }
++    if !request.cargo_features.is_empty() {
++        command.args.push("--features".to_owned());
++        command.args.push(request.cargo_features.join(","));
++    }
++    command
++        .environment
++        .insert("CARGO_TARGET_DIR".to_owned(), cargo_target_dir.to_string());
++    command.environment.insert(
++        "IPHONEOS_DEPLOYMENT_TARGET".to_owned(),
++        request.config.ios.min_version.clone(),
++    );
++    command.environment.insert(
++        "DEVELOPER_DIR".to_owned(),
++        toolchain.developer_dir.to_string(),
++    );
++    command
++        .environment
++        .insert("CARGO_TERM_COLOR".to_owned(), "never".to_owned());
++    command
++}
++
++fn xcode_destination_command(
++    request: &IosDeviceArchiveRequest,
++    toolchain: &IosDeviceToolchain,
++    generated_root: &Utf8Path,
++) -> CommandSpec {
++    let mut command = CommandSpec::new(
++        "preflight physical-iOS Xcode destination",
++        &toolchain.xcodebuild,
++        &request.project_dir,
++    );
++    command.args = vec![
++        "-project".to_owned(),
++        generated_root.join("FerryHost.xcodeproj").to_string(),
++        "-scheme".to_owned(),
++        "FerryApp".to_owned(),
++        "-configuration".to_owned(),
++        xcode_configuration(request.profile).to_owned(),
++        "-sdk".to_owned(),
++        IOS_DEVICE_SDK.to_owned(),
++        "-showdestinations".to_owned(),
++    ];
++    command.environment.insert(
++        "DEVELOPER_DIR".to_owned(),
++        toolchain.developer_dir.to_string(),
++    );
++    command
++        .environment
++        .insert("LC_ALL".to_owned(), "C".to_owned());
++    command
++}
++
++fn xcode_archive_command(
++    request: &IosDeviceArchiveRequest,
++    toolchain: &IosDeviceToolchain,
++    generated_root: &Utf8Path,
++    xcode_derived_data: &Utf8Path,
++    archive_path: &Utf8Path,
++) -> CommandSpec {
++    let mut command = CommandSpec::new(
++        "assemble unsigned physical-iOS Xcode archive",
++        &toolchain.xcodebuild,
++        &request.project_dir,
++    );
++    command.args = vec![
++        "-project".to_owned(),
++        generated_root.join("FerryHost.xcodeproj").to_string(),
++        "-scheme".to_owned(),
++        "FerryApp".to_owned(),
++        "-configuration".to_owned(),
++        xcode_configuration(request.profile).to_owned(),
++        "-sdk".to_owned(),
++        IOS_DEVICE_SDK.to_owned(),
++        "-destination".to_owned(),
++        IOS_GENERIC_DESTINATION.to_owned(),
++        "-derivedDataPath".to_owned(),
++        xcode_derived_data.to_string(),
++        "-archivePath".to_owned(),
++        archive_path.to_string(),
++        "AD_HOC_CODE_SIGNING_ALLOWED=NO".to_owned(),
++        "CODE_SIGN_IDENTITY=".to_owned(),
++        "CODE_SIGNING_ALLOWED=NO".to_owned(),
++        "CODE_SIGNING_REQUIRED=NO".to_owned(),
++        "DEVELOPMENT_TEAM=".to_owned(),
++        "PROVISIONING_PROFILE_SPECIFIER=".to_owned(),
++        "ARCHS=arm64".to_owned(),
++        "ONLY_ACTIVE_ARCH=NO".to_owned(),
++        "archive".to_owned(),
++    ];
++    command.environment.insert(
++        "DEVELOPER_DIR".to_owned(),
++        toolchain.developer_dir.to_string(),
++    );
++    command
++        .environment
++        .insert("NSUnbufferedIO".to_owned(), "YES".to_owned());
++    command
++}
++
++fn macho_validation_plan(
++    request: &IosDeviceArchiveRequest,
++    toolchain: &IosDeviceToolchain,
++    executable_path: Utf8PathBuf,
++) -> IosDeviceMachOValidationPlan {
++    IosDeviceMachOValidationPlan {
++        expected_architecture: "arm64".to_owned(),
++        expected_platform: "IOS".to_owned(),
++        expected_minimum_os: request.config.ios.min_version.clone(),
++        expected_sdk: toolchain.device_sdk.version.clone(),
++        commands: vec![
++            inspection_command(
++                "validate physical-iOS Mach-O architecture",
++                toolchain,
++                &request.project_dir,
++                vec![
++                    "lipo".to_owned(),
++                    "-archs".to_owned(),
++                    executable_path.to_string(),
++                ],
++            ),
++            inspection_command(
++                "validate physical-iOS Mach-O platform",
++                toolchain,
++                &request.project_dir,
++                vec![
++                    "vtool".to_owned(),
++                    "-show-build".to_owned(),
++                    executable_path.to_string(),
++                ],
++            ),
++        ],
++        executable_path,
++    }
++}
++
++/// Cross-compile, archive without signing, and prove the main Mach-O targets physical iOS.
++///
++/// The returned `.xcarchive` and `.app` are compile evidence only. They are not
++/// installable until a later signing phase applies an Apple development identity
++/// and matching provisioning profile.
++///
++/// # Errors
++///
++/// Returns [`AppleError`] for invalid inputs, unsafe internal paths, command
++/// failures, missing archive products, or Simulator/device Mach-O confusion.
++pub fn build_ios_device_unsigned(
++    request: &IosDeviceArchiveRequest,
++    toolchain: &IosDeviceToolchain,
++) -> Result<IosDeviceArchiveOutcome, AppleError> {
++    validate_request(request)?;
++    let assets = ProjectAssets::load(&request.project_dir)?;
++    let plan = plan_with_assets(request, toolchain, &assets)?;
++    if request.dry_run {
++        return Ok(IosDeviceArchiveOutcome {
++            plan,
++            archive: None,
++            app: None,
++            macho_validation: None,
++            archive_inspection: None,
++        });
++    }
++
++    let logs = request
++        .project_dir
++        .join("target")
++        .join(brand::TARGET_DIRECTORY)
++        .join("ios")
++        .join("device")
++        .join("logs")
++        .join(profile_directory(request.profile));
++    execute_unsigned_archive(request, &assets, &plan, &logs)?;
++    let (archive_inspection, macho_validation) =
++        inspect_unsigned_archive_output(request, &plan, &logs)?;
++
++    Ok(IosDeviceArchiveOutcome {
++        archive: Some(plan.archive_path.clone()),
++        app: Some(plan.app_path.clone()),
++        macho_validation: Some(macho_validation),
++        archive_inspection: Some(archive_inspection),
++        plan,
++    })
++}
++
++fn execute_unsigned_archive(
++    request: &IosDeviceArchiveRequest,
++    assets: &ProjectAssets,
++    plan: &IosDeviceArchivePlan,
++    logs: &Utf8Path,
++) -> Result<(), AppleError> {
++    for directory in [
++        &plan.cargo_target_dir,
++        logs,
++        plan.archive_path.parent().unwrap_or(&plan.archive_path),
++    ] {
++        prepare_directory(&request.project_dir, directory)?;
++    }
++
++    reset_directory(&request.project_dir, &plan.generated_root)?;
++    write_trusted_generated_project(request, assets, &plan.generated_root)?;
++    let destination = run_command(
++        &plan.commands[0],
++        Some(&logs.join("00-xcode-destination-preflight.log")),
++    )?;
++    validate_device_destination(&destination.stdout, &plan.commands[0].program)?;
++
++    run_command(&plan.commands[1], Some(&logs.join("01-cargo-build.log")))?;
++    validate_regular_file(
++        &plan.rust_binary_copy.source,
++        "Cargo-produced physical-iOS executable",
++    )?;
++    for directory in [
++        logs,
++        plan.archive_path.parent().unwrap_or(&plan.archive_path),
++    ] {
++        prepare_directory(&request.project_dir, directory)?;
++    }
++    reset_directory(&request.project_dir, &plan.xcode_derived_data)?;
++
++    // Cargo build scripts are project-controlled. Recreate trusted Xcode input
++    // only after Cargo exits so they cannot persistently alter the generated host.
++    reset_directory(&request.project_dir, &plan.generated_root)?;
++    write_trusted_generated_project(request, assets, &plan.generated_root)?;
++    fs::copy(
++        &plan.rust_binary_copy.source,
++        &plan.rust_binary_copy.destination,
++    )
++    .map_err(|source| {
++        io_error(
++            "stage physical-iOS Rust executable for Xcode",
++            &plan.rust_binary_copy.destination,
++            source,
++        )
++    })?;
++    make_executable(&plan.rust_binary_copy.destination)?;
++
++    remove_stale_archive(&request.project_dir, &plan.archive_path)?;
++    run_command(
++        &plan.commands[2],
++        Some(&logs.join("02-xcodebuild-archive.log")),
++    )?;
++    Ok(())
++}
++
++fn write_trusted_generated_project(
++    request: &IosDeviceArchiveRequest,
++    assets: &ProjectAssets,
++    generated_root: &Utf8Path,
++) -> Result<(), AppleError> {
++    let generated = generate_ios_project_for_platform(
++        &IosProjectSpec::new(request.config.clone(), request.binary_name.clone())
++            .with_assets(assets.clone()),
++        IosProjectPlatform::DeviceUnsigned,
++    )?;
++    write_ios_project(&generated, generated_root)
++}
++
++fn inspect_unsigned_archive_output(
++    request: &IosDeviceArchiveRequest,
++    plan: &IosDeviceArchivePlan,
++    logs: &Utf8Path,
++) -> Result<(UnsignedXcarchiveInspection, IosDeviceMachOValidation), AppleError> {
++    reject_symlink_components(&request.project_dir, &plan.archive_path)?;
++    reject_symlink_components(&request.project_dir, &plan.macho_validation.executable_path)?;
++    validate_real_directory(&plan.archive_path, "unsigned Xcode archive")?;
++    validate_regular_file(&plan.archive_path.join("Info.plist"), "archive Info.plist")?;
++    validate_real_directory(&plan.app_path, "unsigned archived application")?;
++    validate_regular_file(
++        &plan.macho_validation.executable_path,
++        "archived application executable",
++    )?;
++    let archive_inspection =
++        inspect_unsigned_xcarchive(&plan.archive_path, &plan.archive_expectation).map_err(
++            |error| AppleError::InvalidArtifact {
++                path: plan.archive_path.clone(),
++                reason: error.to_string(),
++            },
++        )?;
++
++    let architecture_output = run_command(
++        &plan.macho_validation.commands[0],
++        Some(&logs.join("03-lipo-architecture.log")),
++    )?;
++    let architecture = validate_architecture(
++        &architecture_output.stdout,
++        &plan.macho_validation.expected_architecture,
++        &plan.macho_validation.executable_path,
++    )?;
++    let platform_output = run_command(
++        &plan.macho_validation.commands[1],
++        Some(&logs.join("04-vtool-platform.log")),
++    )?;
++    let (platform, minimum_os, sdk) = validate_platform(
++        &platform_output.stdout,
++        &plan.macho_validation.expected_platform,
++        &plan.macho_validation.expected_minimum_os,
++        &plan.macho_validation.expected_sdk,
++        &plan.macho_validation.executable_path,
++    )?;
++    Ok((
++        archive_inspection,
++        IosDeviceMachOValidation {
++            executable_path: plan.macho_validation.executable_path.clone(),
++            architecture,
++            platform,
++            minimum_os,
++            sdk,
++        },
++    ))
++}
++
++fn inspection_command(
++    stage: &str,
++    toolchain: &IosDeviceToolchain,
++    project_dir: &Utf8Path,
++    args: Vec<String>,
++) -> CommandSpec {
++    let mut command = CommandSpec::new(stage, &toolchain.xcrun, project_dir);
++    command.args = args;
++    command.environment.insert(
++        "DEVELOPER_DIR".to_owned(),
++        toolchain.developer_dir.to_string(),
++    );
++    command
++}
++
++fn validate_request(request: &IosDeviceArchiveRequest) -> Result<(), AppleError> {
++    validate_binary_name(&request.binary_name)?;
++    if !request.project_dir.is_dir() {
++        return Err(AppleError::InvalidRequest(format!(
++            "project directory does not exist: {}",
++            request.project_dir
++        )));
++    }
++    if !request.project_dir.join("Cargo.toml").is_file() {
++        return Err(AppleError::InvalidRequest(format!(
++            "Cargo.toml was not found in project directory {}",
++            request.project_dir
++        )));
++    }
++    if let Some(package) = &request.package_name {
++        validate_cargo_selector("package", package)?;
++    }
++    for feature in &request.cargo_features {
++        validate_cargo_selector("feature", feature)?;
++    }
++    let _ = generate_ios_project_for_platform(
++        &IosProjectSpec::new(request.config.clone(), request.binary_name.clone()),
++        IosProjectPlatform::DeviceUnsigned,
++    )?;
++    Ok(())
++}
++
++fn validate_binary_name(name: &str) -> Result<(), AppleError> {
++    if name.is_empty()
++        || name == "."
++        || name == ".."
++        || !name
++            .chars()
++            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
++    {
++        return Err(AppleError::InvalidRequest(format!(
++            "binary name `{name}` must contain only ASCII letters, digits, `-`, or `_`"
++        )));
++    }
++    Ok(())
++}
++
++fn validate_cargo_selector(kind: &str, value: &str) -> Result<(), AppleError> {
++    if value.is_empty()
++        || !value
++            .chars()
++            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
++    {
++        return Err(AppleError::InvalidRequest(format!(
++            "Cargo {kind} `{value}` must contain only ASCII letters, digits, `-`, or `_`"
++        )));
++    }
++    Ok(())
++}
++
++const fn profile_directory(profile: AppleBuildProfile) -> &'static str {
++    match profile {
++        AppleBuildProfile::Debug => "debug",
++        AppleBuildProfile::Release => "release",
++    }
++}
++
++const fn xcode_configuration(profile: AppleBuildProfile) -> &'static str {
++    match profile {
++        AppleBuildProfile::Debug => "Debug",
++        AppleBuildProfile::Release => "Release",
++    }
++}
++
++fn validate_architecture(
++    output: &[u8],
++    expected: &str,
++    executable: &Utf8Path,
++) -> Result<String, AppleError> {
++    let output = std::str::from_utf8(output).map_err(|_| AppleError::InvalidArtifact {
++        path: executable.to_owned(),
++        reason: "`lipo -archs` emitted non-UTF-8 output".to_owned(),
++    })?;
++    let architectures = output.split_whitespace().collect::<Vec<_>>();
++    if architectures != [expected] {
++        return Err(AppleError::InvalidArtifact {
++            path: executable.to_owned(),
++            reason: format!(
++                "archived Mach-O architectures are {architectures:?}, expected only `{expected}`"
++            ),
++        });
++    }
++    Ok(expected.to_owned())
++}
++
++fn validate_platform(
++    output: &[u8],
++    expected_platform: &str,
++    expected_minimum_os: &str,
++    expected_sdk: &str,
++    executable: &Utf8Path,
++) -> Result<(String, String, String), AppleError> {
++    let output = std::str::from_utf8(output).map_err(|_| AppleError::InvalidArtifact {
++        path: executable.to_owned(),
++        reason: "`vtool -show-build` emitted non-UTF-8 output".to_owned(),
++    })?;
++    let platforms = output
++        .lines()
++        .filter_map(|line| line.trim().strip_prefix("platform "))
++        .collect::<Vec<_>>();
++    let minimum_versions = output
++        .lines()
++        .filter_map(|line| line.trim().strip_prefix("minos "))
++        .collect::<Vec<_>>();
++    let sdk_versions = output
++        .lines()
++        .filter_map(|line| line.trim().strip_prefix("sdk "))
++        .collect::<Vec<_>>();
++    if platforms != [expected_platform] {
++        return Err(AppleError::InvalidArtifact {
++            path: executable.to_owned(),
++            reason: format!(
++                "archived Mach-O build platforms are {platforms:?}, expected only `{expected_platform}`; Simulator output is not a physical-device artifact"
++            ),
++        });
++    }
++    let [minimum_os] = minimum_versions.as_slice() else {
++        return Err(AppleError::InvalidArtifact {
++            path: executable.to_owned(),
++            reason: format!(
++                "archived Mach-O minimum-OS evidence is {minimum_versions:?}, expected exactly one numeric value"
++            ),
++        });
++    };
++    let [sdk] = sdk_versions.as_slice() else {
++        return Err(AppleError::InvalidArtifact {
++            path: executable.to_owned(),
++            reason: format!(
++                "archived Mach-O SDK evidence is {sdk_versions:?}, expected exactly one numeric value"
++            ),
++        });
++    };
++    if parse_apple_version(minimum_os) != parse_apple_version(expected_minimum_os) {
++        return Err(AppleError::InvalidArtifact {
++            path: executable.to_owned(),
++            reason: format!(
++                "archived Mach-O minimum OS is `{minimum_os}`, expected `{expected_minimum_os}`"
++            ),
++        });
++    }
++    if parse_apple_version(sdk) != parse_apple_version(expected_sdk) {
++        return Err(AppleError::InvalidArtifact {
++            path: executable.to_owned(),
++            reason: format!("archived Mach-O SDK is `{sdk}`, expected `{expected_sdk}`"),
++        });
++    }
++    Ok((
++        expected_platform.to_owned(),
++        (*minimum_os).to_owned(),
++        (*sdk).to_owned(),
++    ))
++}
++
++fn validate_device_destination(output: &[u8], xcodebuild: &Utf8Path) -> Result<(), AppleError> {
++    let output = std::str::from_utf8(output).map_err(|_| AppleError::InvalidArtifact {
++        path: xcodebuild.to_owned(),
++        reason: "`xcodebuild -showdestinations` emitted non-UTF-8 output".to_owned(),
++    })?;
++    let available = output
++        .split_once("Available destinations for")
++        .map(|(_, suffix)| suffix)
++        .and_then(|suffix| suffix.split("Ineligible destinations for").next())
++        .unwrap_or_default();
++    let eligible = available.lines().any(|line| {
++        let line = line.trim();
++        line.starts_with('{')
++            && line.ends_with('}')
++            && line.contains("platform:iOS")
++            && (line.contains("name:Any iOS Device") || line.contains("generic:1"))
++            && !line.contains("error:")
++    });
++    if !eligible {
++        return Err(AppleError::InvalidRequest(
++            "Xcode reports no eligible generic physical-iOS destination. Install the matching iOS platform in Xcode Settings > Components; an SDK directory alone is insufficient."
++                .to_owned(),
++        ));
++    }
++    Ok(())
++}
++
++fn parse_apple_version(value: &str) -> Option<[u32; 3]> {
++    let components = value.split('.').collect::<Vec<_>>();
++    if components.is_empty()
++        || components.len() > 3
++        || components.iter().any(|component| {
++            component.is_empty() || !component.bytes().all(|byte| byte.is_ascii_digit())
++        })
++    {
++        return None;
++    }
++    let mut version = [0_u32; 3];
++    for (index, component) in components.iter().enumerate() {
++        version[index] = component.parse().ok()?;
++    }
++    Some(version)
++}
++
++fn prepare_directory(project_dir: &Utf8Path, directory: &Utf8Path) -> Result<(), AppleError> {
++    let ferry_root = project_dir.join("target").join(brand::TARGET_DIRECTORY);
++    ensure_descendant(&ferry_root, directory)?;
++    reject_symlink_components(project_dir, directory)?;
++    match fs::symlink_metadata(directory) {
++        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
++            return Err(AppleError::UnsafeGeneratedPath {
++                path: directory.to_owned(),
++                reason: "internal device build output must be a real directory".to_owned(),
++            });
++        }
++        Ok(_) => return Ok(()),
++        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
++        Err(source) => {
++            return Err(io_error(
++                "inspect physical-iOS output directory",
++                directory,
++                source,
++            ));
++        }
++    }
++    fs::create_dir_all(directory)
++        .map_err(|source| io_error("create physical-iOS output directory", directory, source))
++}
++
++fn reset_directory(project_dir: &Utf8Path, directory: &Utf8Path) -> Result<(), AppleError> {
++    let ferry_root = project_dir.join("target").join(brand::TARGET_DIRECTORY);
++    ensure_descendant(&ferry_root, directory)?;
++    reject_symlink_components(project_dir, directory)?;
++    if directory.exists() {
++        validate_real_directory(directory, "generated physical-iOS project")?;
++        fs::remove_dir_all(directory).map_err(|source| {
++            io_error("replace generated physical-iOS project", directory, source)
++        })?;
++    }
++    fs::create_dir_all(directory)
++        .map_err(|source| io_error("create generated physical-iOS project", directory, source))
++}
++
++fn remove_stale_archive(project_dir: &Utf8Path, archive: &Utf8Path) -> Result<(), AppleError> {
++    let ferry_root = project_dir.join("target").join(brand::TARGET_DIRECTORY);
++    ensure_descendant(&ferry_root, archive)?;
++    reject_symlink_components(project_dir, archive.parent().unwrap_or(archive))?;
++    match fs::symlink_metadata(archive) {
++        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
++            return Err(AppleError::UnsafeGeneratedPath {
++                path: archive.to_owned(),
++                reason: "stale physical-iOS archive must be a real directory".to_owned(),
++            });
++        }
++        Ok(_) => {
++            fs::remove_dir_all(archive)
++                .map_err(|source| io_error("remove stale physical-iOS archive", archive, source))?;
++        }
++        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
++        Err(source) => {
++            return Err(io_error(
++                "inspect stale physical-iOS archive",
++                archive,
++                source,
++            ));
++        }
++    }
++    Ok(())
++}
++
++fn ensure_descendant(root: &Utf8Path, path: &Utf8Path) -> Result<(), AppleError> {
++    let relative = path
++        .strip_prefix(root)
++        .map_err(|_| AppleError::UnsafeGeneratedPath {
++            path: path.to_owned(),
++            reason: format!("path is outside internal root `{root}`"),
++        })?;
++    if relative.as_str().is_empty()
++        || relative
++            .components()
++            .any(|component| !matches!(component, Utf8Component::Normal(_)))
++    {
++        return Err(AppleError::UnsafeGeneratedPath {
++            path: path.to_owned(),
++            reason: "path must be a non-empty normalized descendant".to_owned(),
++        });
++    }
++    Ok(())
++}
++
++fn reject_symlink_components(root: &Utf8Path, path: &Utf8Path) -> Result<(), AppleError> {
++    let relative = path
++        .strip_prefix(root)
++        .map_err(|_| AppleError::UnsafeGeneratedPath {
++            path: path.to_owned(),
++            reason: format!("path is outside project root `{root}`"),
++        })?;
++    let mut current = root.to_owned();
++    for component in relative.components() {
++        let Utf8Component::Normal(component) = component else {
++            return Err(AppleError::UnsafeGeneratedPath {
++                path: path.to_owned(),
++                reason: "path contains a traversal component".to_owned(),
++            });
++        };
++        current.push(component);
++        match fs::symlink_metadata(&current) {
++            Ok(metadata) if metadata.file_type().is_symlink() => {
++                return Err(AppleError::UnsafeGeneratedPath {
++                    path: current,
++                    reason: "internal device build output cannot traverse a symbolic link"
++                        .to_owned(),
++                });
++            }
++            Ok(_) => {}
++            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
++            Err(source) => {
++                return Err(io_error(
++                    "inspect physical-iOS internal path",
++                    &current,
++                    source,
++                ));
++            }
++        }
++    }
++    Ok(())
++}
++
++fn validate_real_directory(path: &Utf8Path, kind: &str) -> Result<(), AppleError> {
++    let metadata = fs::symlink_metadata(path)
++        .map_err(|source| io_error("inspect physical-iOS archive directory", path, source))?;
++    if metadata.file_type().is_symlink() || !metadata.is_dir() {
++        return Err(AppleError::InvalidArtifact {
++            path: path.to_owned(),
++            reason: format!("{kind} is not a real directory"),
++        });
++    }
++    Ok(())
++}
++
++fn validate_regular_file(path: &Utf8Path, kind: &str) -> Result<(), AppleError> {
++    let metadata = fs::symlink_metadata(path)
++        .map_err(|source| io_error("inspect physical-iOS artifact file", path, source))?;
++    if metadata.file_type().is_symlink() || !metadata.is_file() {
++        return Err(AppleError::InvalidArtifact {
++            path: path.to_owned(),
++            reason: format!("{kind} is not a regular file"),
++        });
++    }
++    Ok(())
++}
++
++#[cfg(unix)]
++fn make_executable(path: &Utf8Path) -> Result<(), AppleError> {
++    use std::os::unix::fs::PermissionsExt;
++
++    let mut permissions = fs::metadata(path)
++        .map_err(|source| io_error("inspect staged physical-iOS executable", path, source))?
++        .permissions();
++    permissions.set_mode(permissions.mode() | 0o755);
++    fs::set_permissions(path, permissions).map_err(|source| {
++        io_error(
++            "mark staged physical-iOS executable executable",
++            path,
++            source,
++        )
++    })
++}
++
++#[cfg(not(unix))]
++fn make_executable(_path: &Utf8Path) -> Result<(), AppleError> {
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn architecture_parser_rejects_extra_slices() {
++        let executable = Utf8Path::new("Weather.app/weather");
++        assert_eq!(
++            validate_architecture(b"arm64\n", "arm64", executable).unwrap(),
++            "arm64"
++        );
++        assert!(
++            validate_architecture(
++                b"Architectures in the fat file: weather are: arm64 x86_64\n",
++                "arm64",
++                executable
++            )
++            .is_err()
++        );
++    }
++
++    #[test]
++    fn platform_parser_rejects_simulator_and_unproven_binaries() {
++        let executable = Utf8Path::new("Weather.app/weather");
++        assert_eq!(
++            validate_platform(
++                b"Load command 1\n      platform IOS\n        minos 16.0\n          sdk 26.0\n",
++                "IOS",
++                "16.0",
++                "26.0",
++                executable
++            )
++            .unwrap(),
++            ("IOS".to_owned(), "16.0".to_owned(), "26.0".to_owned())
++        );
++        assert!(
++            validate_platform(
++                b"Load command 1\n      platform IOSSIMULATOR\n        minos 16.0\n          sdk 26.0\n",
++                "IOS",
++                "16.0",
++                "26.0",
++                executable
++            )
++            .is_err()
++        );
++        assert!(
++            validate_platform(
++                b"LC_VERSION_MIN_IPHONEOS\n",
++                "IOS",
++                "16.0",
++                "26.0",
++                executable
++            )
++            .is_err()
++        );
++        assert!(
++            validate_platform(
++                b"Load command 1\n      platform IOS\n        minos 15.0\n          sdk 26.0\n",
++                "IOS",
++                "16.0",
++                "26.0",
++                executable
++            )
++            .is_err()
++        );
++    }
++
++    #[test]
++    fn destination_parser_requires_eligible_generic_iphoneos() {
++        let xcodebuild = Utf8Path::new("/Applications/Xcode.app/xcodebuild");
++        let eligible = b"Available destinations for the \"FerryApp\" scheme:\n\t{ platform:iOS, arch:arm64, id:dvtdevice-DVTiPhonePlaceholder-iphoneos:placeholder, name:Any iOS Device }\n";
++        validate_device_destination(eligible, xcodebuild).unwrap();
++
++        let missing_component = b"Available destinations for the \"FerryApp\" scheme:\n\nIneligible destinations for the \"FerryApp\" scheme:\n\t{ platform:iOS, id:dvtdevice-DVTiPhonePlaceholder-iphoneos:placeholder, name:Any iOS Device, error:iOS 26.5 is not installed. }\n";
++        assert!(validate_device_destination(missing_component, xcodebuild).is_err());
++        assert!(validate_device_destination(b"", xcodebuild).is_err());
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn stale_archive_rejects_a_dangling_symlink() {
++        use std::os::unix::fs::symlink;
++
++        let temporary = tempfile::tempdir().unwrap();
++        let project = Utf8Path::from_path(temporary.path()).unwrap();
++        let archive = project.join("target/ferry/ios/device/archives/release/app.xcarchive");
++        fs::create_dir_all(archive.parent().unwrap()).unwrap();
++        symlink(project.join("missing-outside"), &archive).unwrap();
++
++        assert!(matches!(
++            remove_stale_archive(project, &archive),
++            Err(AppleError::UnsafeGeneratedPath { .. })
++        ));
++    }
++}
+diff --git a/crates/rustferry-apple/src/discovery.rs b/crates/rustferry-apple/src/discovery.rs
+index 5392fea..ceb5d0b 100644
+--- a/crates/rustferry-apple/src/discovery.rs
++++ b/crates/rustferry-apple/src/discovery.rs
+@@ -3,7 +3,7 @@ use std::env;
+ use camino::{Utf8Path, Utf8PathBuf};
+ use serde::{Deserialize, Serialize};
+ 
+-use crate::{AppleError, CommandSpec, IOS_SIMULATOR_TARGET, run_command};
++use crate::{AppleError, CommandSpec, IOS_DEVICE_TARGET, IOS_SIMULATOR_TARGET, run_command};
+ 
+ /// Explicit, read-only inputs for Apple toolchain discovery.
+ #[derive(Clone, Debug, Eq, PartialEq)]
+@@ -80,6 +80,17 @@ pub struct SimulatorSdk {
+     pub build_version: Option<String>,
+ }
+ 
++/// Installed physical-iPhone SDK selected by Xcode.
++#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
++pub struct IosDeviceSdk {
++    /// Canonical SDK root returned by `xcrun --sdk iphoneos`.
++    pub path: Utf8PathBuf,
++    /// Marketing SDK version.
++    pub version: String,
++    /// SDK build version.
++    pub build_version: String,
++}
++
+ /// One `CoreSimulator` runtime reported by `simctl`.
+ #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+ pub struct SimulatorRuntime {
+@@ -106,6 +117,8 @@ pub struct AppleDiscovery {
+     pub xcode_version: Option<String>,
+     /// Selected iPhone Simulator SDK.
+     pub simulator_sdk: Option<SimulatorSdk>,
++    /// Selected physical-iPhone SDK.
++    pub device_sdk: Option<IosDeviceSdk>,
+     /// Installed `CoreSimulator` runtimes; optional for build-only workflows.
+     pub simulator_runtimes: Vec<SimulatorRuntime>,
+     /// Rust targets reported as installed by rustup.
+@@ -194,6 +207,100 @@ impl AppleDiscovery {
+             host_arch: self.host_arch.clone(),
+         })
+     }
++
++    /// Select a complete physical-iPhone toolchain without requiring Simulator support.
++    ///
++    /// # Errors
++    ///
++    /// Returns [`AppleError`] when the host is unsupported, the selected developer
++    /// directory is not a full Xcode installation with iPhoneOS support, required
++    /// tools are absent or non-absolute, SDK evidence is incomplete, or the exact
++    /// physical-iPhone Rust target is not installed.
++    pub fn select_device_toolchain(&self) -> Result<IosDeviceToolchain, AppleError> {
++        if self.host_os != "macos" {
++            return Err(AppleError::UnsupportedHost {
++                host: self.host_os.clone(),
++            });
++        }
++        let developer_dir = self
++            .developer_dir
++            .as_ref()
++            .and_then(|path| path.canonicalize_utf8().ok())
++            .filter(|path| is_full_device_xcode(path))
++            .ok_or_else(|| AppleError::XcodeMissing {
++                developer_dir: self.developer_dir.clone(),
++                fix: "Install full Xcode with the iOS platform, then select that exact developer directory. cargo-ferry never invokes sudo or changes xcode-select.".to_owned(),
++            })?;
++        let device_sdk = self
++            .device_sdk
++            .as_ref()
++            .and_then(|sdk| canonical_device_sdk(sdk, &developer_dir))
++            .ok_or_else(|| {
++                AppleError::InvalidRequest(
++                    "an iPhoneOS SDK with path, version, and build-version evidence was not found through `xcrun --sdk iphoneos`; install the iOS platform in the selected Xcode installation"
++                        .to_owned(),
++                )
++            })?;
++        let xcode_version = self
++            .xcode_version
++            .clone()
++            .filter(|value| !value.trim().is_empty())
++            .ok_or_else(|| {
++                AppleError::InvalidRequest(
++                    "the selected Xcode installation did not report version evidence".to_owned(),
++                )
++            })?;
++        let cargo = require_absolute_tool(
++            "cargo",
++            self.host_tools.cargo.as_ref(),
++            &self.executable_search_paths,
++            "Install Rust with rustup and expose cargo through an absolute PATH entry.",
++        )?;
++        let rustup = require_absolute_tool(
++            "rustup",
++            self.host_tools.rustup.as_ref(),
++            &self.executable_search_paths,
++            "Install rustup and expose it through an absolute PATH entry so the physical-iPhone target can be verified.",
++        )?;
++        let xcodebuild = require_absolute_tool(
++            "xcodebuild",
++            self.host_tools.xcodebuild.as_ref(),
++            &self.executable_search_paths,
++            "Install full Xcode and expose xcodebuild through an absolute PATH entry.",
++        )?;
++        let xcrun = require_absolute_tool(
++            "xcrun",
++            self.host_tools.xcrun.as_ref(),
++            &self.executable_search_paths,
++            "Restore the macOS command-line tools and expose xcrun through an absolute PATH entry.",
++        )?;
++        let plutil = require_absolute_tool(
++            "plutil",
++            self.host_tools.plutil.as_ref(),
++            &self.executable_search_paths,
++            "Restore the macOS command-line tools and expose plutil through an absolute PATH entry.",
++        )?;
++        if !self
++            .installed_rust_targets
++            .iter()
++            .any(|target| target == IOS_DEVICE_TARGET)
++        {
++            return Err(AppleError::RustTargetMissing {
++                target: IOS_DEVICE_TARGET.to_owned(),
++            });
++        }
++        Ok(IosDeviceToolchain {
++            developer_dir,
++            xcode_version,
++            device_sdk,
++            cargo,
++            rustup,
++            xcodebuild,
++            xcrun,
++            plutil,
++            host_arch: self.host_arch.clone(),
++        })
++    }
+ }
+ 
+ /// Selected tools and SDK used by one iOS Simulator build.
+@@ -219,6 +326,29 @@ pub struct AppleToolchain {
+     pub host_arch: String,
+ }
+ 
++/// Selected tools and SDK for one physical-iPhone build.
++#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
++pub struct IosDeviceToolchain {
++    /// Canonical full-Xcode developer directory.
++    pub developer_dir: Utf8PathBuf,
++    /// Exact `xcodebuild -version` output.
++    pub xcode_version: String,
++    /// Selected physical-iPhone SDK evidence.
++    pub device_sdk: IosDeviceSdk,
++    /// Absolute Cargo executable.
++    pub cargo: Utf8PathBuf,
++    /// Absolute rustup executable used to verify targets.
++    pub rustup: Utf8PathBuf,
++    /// Absolute Xcode build driver.
++    pub xcodebuild: Utf8PathBuf,
++    /// Absolute Xcode SDK/tool driver.
++    pub xcrun: Utf8PathBuf,
++    /// Absolute property-list tool.
++    pub plutil: Utf8PathBuf,
++    /// Host architecture retained for diagnostics.
++    pub host_arch: String,
++}
++
+ /// Inspect Xcode, the Simulator SDK/runtimes, and Rust targets without changing the host.
+ ///
+ /// # Errors
+@@ -276,6 +406,10 @@ pub fn discover_apple(options: &AppleDiscoveryOptions) -> Result<AppleDiscovery,
+     let simulator_sdk = tools.xcrun.as_ref().and_then(|xcrun| {
+         discover_simulator_sdk(xcrun, &options.current_dir, developer_environment)
+     });
++    let device_sdk = tools
++        .xcrun
++        .as_ref()
++        .and_then(|xcrun| discover_device_sdk(xcrun, &options.current_dir, developer_environment));
+     let simulator_runtimes = tools
+         .xcrun
+         .as_ref()
+@@ -331,6 +465,7 @@ pub fn discover_apple(options: &AppleDiscoveryOptions) -> Result<AppleDiscovery,
+         developer_dir,
+         xcode_version,
+         simulator_sdk,
++        device_sdk,
+         simulator_runtimes,
+         installed_rust_targets,
+         host_tools: tools,
+@@ -338,6 +473,44 @@ pub fn discover_apple(options: &AppleDiscoveryOptions) -> Result<AppleDiscovery,
+     })
+ }
+ 
++fn discover_device_sdk(
++    xcrun: &Utf8Path,
++    current_dir: &Utf8Path,
++    developer_environment: Option<(&str, &str)>,
++) -> Option<IosDeviceSdk> {
++    let path = probe_text(
++        "locate physical-iPhone SDK",
++        xcrun,
++        &["--sdk", "iphoneos", "--show-sdk-path"],
++        current_dir,
++        developer_environment,
++    )
++    .map(Utf8PathBuf::from)
++    .filter(|path| path.is_absolute())?
++    .canonicalize_utf8()
++    .ok()
++    .filter(|path| path.is_dir())?;
++    let version = probe_text(
++        "read physical-iPhone SDK version",
++        xcrun,
++        &["--sdk", "iphoneos", "--show-sdk-version"],
++        current_dir,
++        developer_environment,
++    )?;
++    let build_version = probe_text(
++        "read physical-iPhone SDK build version",
++        xcrun,
++        &["--sdk", "iphoneos", "--show-sdk-build-version"],
++        current_dir,
++        developer_environment,
++    )?;
++    Some(IosDeviceSdk {
++        path,
++        version,
++        build_version,
++    })
++}
++
+ fn discover_simulator_sdk(
+     xcrun: &Utf8Path,
+     current_dir: &Utf8Path,
+@@ -438,6 +611,30 @@ fn is_full_xcode(developer_dir: &Utf8Path) -> bool {
+                 .is_dir())
+ }
+ 
++fn is_full_device_xcode(developer_dir: &Utf8Path) -> bool {
++    developer_dir.is_absolute()
++        && developer_dir.is_dir()
++        && developer_dir.join("Platforms/iPhoneOS.platform").is_dir()
++        && developer_dir
++            .join("Platforms/iPhoneOS.platform/Developer/SDKs")
++            .is_dir()
++}
++
++fn canonical_device_sdk(sdk: &IosDeviceSdk, developer_dir: &Utf8Path) -> Option<IosDeviceSdk> {
++    if sdk.version.trim().is_empty() || sdk.build_version.trim().is_empty() {
++        return None;
++    }
++    let path = sdk.path.canonicalize_utf8().ok()?;
++    if !path.is_dir() || !path.starts_with(developer_dir) {
++        return None;
++    }
++    Some(IosDeviceSdk {
++        path,
++        version: sdk.version.clone(),
++        build_version: sdk.build_version.clone(),
++    })
++}
++
+ fn require_tool(
+     name: &str,
+     value: Option<&Utf8PathBuf>,
+@@ -454,10 +651,94 @@ fn require_tool(
+     })
+ }
+ 
++fn require_absolute_tool(
++    name: &str,
++    value: Option<&Utf8PathBuf>,
++    searched: &[Utf8PathBuf],
++    fix: &str,
++) -> Result<Utf8PathBuf, AppleError> {
++    value
++        .filter(|path| path.is_absolute() && is_executable_file(path))
++        .cloned()
++        .ok_or_else(|| AppleError::ToolMissing {
++            tool: name.to_owned(),
++            searched: searched
++                .iter()
++                .map(|directory| directory.join(name))
++                .collect(),
++            fix: fix.to_owned(),
++        })
++}
++
++fn is_executable_file(path: &Utf8Path) -> bool {
++    let Ok(metadata) = path.metadata() else {
++        return false;
++    };
++    if !metadata.is_file() {
++        return false;
++    }
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::PermissionsExt as _;
++        metadata.permissions().mode() & 0o111 != 0
++    }
++    #[cfg(not(unix))]
++    true
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
++    fn executable(path: &Utf8Path) {
++        std::fs::write(path, "fixture").unwrap();
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::PermissionsExt as _;
++
++            let mut permissions = path.metadata().unwrap().permissions();
++            permissions.set_mode(0o755);
++            std::fs::set_permissions(path, permissions).unwrap();
++        }
++    }
++
++    fn device_discovery_fixture() -> (tempfile::TempDir, AppleDiscovery) {
++        let temporary = tempfile::tempdir().unwrap();
++        let root = Utf8PathBuf::from_path_buf(temporary.path().to_owned()).unwrap();
++        let developer_dir = root.join("Xcode.app/Contents/Developer");
++        let sdk = developer_dir.join("Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS26.0.sdk");
++        std::fs::create_dir_all(&sdk).unwrap();
++        let bin = root.join("bin");
++        std::fs::create_dir(&bin).unwrap();
++        for tool in ["cargo", "rustup", "xcodebuild", "xcrun", "plutil"] {
++            executable(&bin.join(tool));
++        }
++        let discovery = AppleDiscovery {
++            host_os: "macos".to_owned(),
++            host_arch: "arm64".to_owned(),
++            developer_dir: Some(developer_dir),
++            xcode_version: Some("Xcode 26.0\nBuild version 23A1".to_owned()),
++            simulator_sdk: None,
++            device_sdk: Some(IosDeviceSdk {
++                path: sdk,
++                version: "26.0".to_owned(),
++                build_version: "23A1".to_owned(),
++            }),
++            simulator_runtimes: Vec::new(),
++            installed_rust_targets: vec![IOS_DEVICE_TARGET.to_owned()],
++            host_tools: AppleHostTools {
++                cargo: Some(bin.join("cargo")),
++                rustup: Some(bin.join("rustup")),
++                xcode_select: None,
++                xcodebuild: Some(bin.join("xcodebuild")),
++                xcrun: Some(bin.join("xcrun")),
++                plutil: Some(bin.join("plutil")),
++            },
++            executable_search_paths: vec![bin],
++        };
++        (temporary, discovery)
++    }
++
+     #[test]
+     fn parses_available_and_unavailable_runtimes() {
+         let source = r#"{"runtimes":[{"identifier":"z","name":"iOS 18","version":"18.0","isAvailable":false},{"identifier":"a","name":"iOS 17","version":"17.5","isAvailable":true}]}"#;
+@@ -476,4 +757,81 @@ mod tests {
+         fs::write(directory.join("cargo;echo-pwned"), "not executable").unwrap();
+         assert!(find_executable("cargo", &[directory.to_owned()]).is_none());
+     }
++
++    #[test]
++    fn device_selection_is_independent_of_simulator_sdk_and_target() {
++        let (_temporary, discovery) = device_discovery_fixture();
++
++        let selected = discovery.select_device_toolchain().unwrap();
++
++        assert_eq!(selected.device_sdk.version, "26.0");
++        assert_eq!(selected.device_sdk.build_version, "23A1");
++        assert!(selected.device_sdk.path.is_absolute());
++        assert!(
++            selected
++                .device_sdk
++                .path
++                .starts_with(&selected.developer_dir)
++        );
++        assert_eq!(selected.host_arch, "arm64");
++        for tool in [
++            &selected.cargo,
++            &selected.rustup,
++            &selected.xcodebuild,
++            &selected.xcrun,
++            &selected.plutil,
++        ] {
++            assert!(tool.is_absolute());
++        }
++    }
++
++    #[test]
++    fn device_selection_requires_exact_physical_rust_target() {
++        let (_temporary, mut discovery) = device_discovery_fixture();
++        discovery.installed_rust_targets = vec![IOS_SIMULATOR_TARGET.to_owned()];
++
++        assert!(matches!(
++            discovery.select_device_toolchain(),
++            Err(AppleError::RustTargetMissing { target }) if target == IOS_DEVICE_TARGET
++        ));
++    }
++
++    #[test]
++    fn device_selection_distinguishes_missing_iphoneos_sdk() {
++        let (_temporary, mut discovery) = device_discovery_fixture();
++        discovery.device_sdk = None;
++
++        assert!(matches!(
++            discovery.select_device_toolchain(),
++            Err(AppleError::InvalidRequest(message)) if message.contains("iPhoneOS SDK")
++        ));
++    }
++
++    #[test]
++    fn device_selection_rejects_sdk_from_another_developer_directory() {
++        let (_temporary, mut discovery) = device_discovery_fixture();
++        let developer_dir = discovery.developer_dir.as_ref().unwrap();
++        let outside = developer_dir
++            .parent()
++            .unwrap()
++            .join("OtherXcode/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk");
++        std::fs::create_dir_all(&outside).unwrap();
++        discovery.device_sdk.as_mut().unwrap().path = outside;
++
++        assert!(matches!(
++            discovery.select_device_toolchain(),
++            Err(AppleError::InvalidRequest(message)) if message.contains("iPhoneOS SDK")
++        ));
++    }
++
++    #[test]
++    fn device_selection_rejects_relative_tool_paths() {
++        let (_temporary, mut discovery) = device_discovery_fixture();
++        discovery.host_tools.cargo = Some(Utf8PathBuf::from("bin/cargo"));
++
++        assert!(matches!(
++            discovery.select_device_toolchain(),
++            Err(AppleError::ToolMissing { tool, .. }) if tool == "cargo"
++        ));
++    }
+ }
+diff --git a/crates/rustferry-apple/src/lib.rs b/crates/rustferry-apple/src/lib.rs
+index b8d30de..3404bc1 100644
+--- a/crates/rustferry-apple/src/lib.rs
++++ b/crates/rustferry-apple/src/lib.rs
+@@ -7,6 +7,7 @@
+ mod artifact;
+ mod build;
+ mod command;
++mod device;
+ mod discovery;
+ mod doctor;
+ mod error;
+@@ -22,15 +23,26 @@ pub use build::{
+     PlannedCopy, build_ios_simulator, plan_ios_simulator,
+ };
+ pub use command::{CommandOutput, CommandSpec, DEFAULT_COMMAND_TIMEOUT, run_command};
++pub use device::{
++    IosDeviceArchiveOutcome, IosDeviceArchivePlan, IosDeviceArchiveRequest,
++    IosDeviceArtifactDisposition, IosDeviceMachOValidation, IosDeviceMachOValidationPlan,
++    build_ios_device_unsigned, plan_ios_device_unsigned,
++};
+ pub use discovery::{
+-    AppleDiscovery, AppleDiscoveryOptions, AppleHostTools, AppleToolchain, SimulatorRuntime,
+-    SimulatorSdk, discover_apple,
++    AppleDiscovery, AppleDiscoveryOptions, AppleHostTools, AppleToolchain, IosDeviceSdk,
++    IosDeviceToolchain, SimulatorRuntime, SimulatorSdk, discover_apple,
+ };
+ pub use doctor::{
+     AppleDoctorCheck, AppleDoctorOptions, AppleDoctorReport, DoctorStatus, doctor_apple,
+ };
+ pub use error::AppleError;
+-pub use project::{GeneratedAppleProject, IosProjectSpec, generate_ios_project, write_ios_project};
++pub use project::{
++    GeneratedAppleProject, IosProjectPlatform, IosProjectSpec, generate_ios_project,
++    generate_ios_project_for_platform, write_ios_project,
++};
++
++/// Rust target used for physical iPhone artifacts.
++pub const IOS_DEVICE_TARGET: &str = "aarch64-apple-ios";
+ 
+ /// Rust target used for Apple Silicon iOS Simulator artifacts.
+ pub const IOS_SIMULATOR_TARGET: &str = "aarch64-apple-ios-sim";
+diff --git a/crates/rustferry-apple/src/project.rs b/crates/rustferry-apple/src/project.rs
+index 635bca5..fba8ca4 100644
+--- a/crates/rustferry-apple/src/project.rs
++++ b/crates/rustferry-apple/src/project.rs
+@@ -19,6 +19,26 @@ pub struct IosProjectSpec {
+     pub assets: Option<ProjectAssets>,
+ }
+ 
++/// Apple SDK and signing behavior encoded in a generated Xcode project.
++#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
++#[serde(rename_all = "kebab-case")]
++pub enum IosProjectPlatform {
++    /// Apple Silicon iOS Simulator with local ad-hoc signing.
++    #[default]
++    Simulator,
++    /// Physical iOS device compilation with all code signing disabled.
++    DeviceUnsigned,
++}
++
++impl IosProjectPlatform {
++    pub(crate) const fn rust_target(self) -> &'static str {
++        match self {
++            Self::Simulator => "aarch64-apple-ios-sim",
++            Self::DeviceUnsigned => "aarch64-apple-ios",
++        }
++    }
++}
++
+ impl IosProjectSpec {
+     /// Construct a project specification.
+     pub fn new(config: FerryConfig, binary_name: impl Into<String>) -> Self {
+@@ -61,12 +81,29 @@ impl GeneratedAppleProject {
+ /// binary names, application groups, or generated metadata are invalid.
+ #[allow(clippy::too_many_lines)]
+ pub fn generate_ios_project(spec: &IosProjectSpec) -> Result<GeneratedAppleProject, AppleError> {
++    generate_ios_project_for_platform(spec, IosProjectPlatform::Simulator)
++}
++
++/// Render an Xcode app target for an explicit simulator or physical-device platform.
++///
++/// The physical-device variant is compile-only: its generated project disables
++/// signing and therefore cannot produce an installable application on its own.
++///
++/// # Errors
++///
++/// Returns [`AppleError`] when configuration, bundle identifiers, versions,
++/// binary names, application groups, or generated metadata are invalid.
++#[allow(clippy::too_many_lines)]
++pub fn generate_ios_project_for_platform(
++    spec: &IosProjectSpec,
++    platform: IosProjectPlatform,
++) -> Result<GeneratedAppleProject, AppleError> {
+     validate_spec(spec)?;
+     let mut files = BTreeMap::new();
+     insert_text(
+         &mut files,
+         "FerryHost.xcodeproj/project.pbxproj",
+-        render_pbxproj(spec),
++        render_pbxproj(spec, platform),
+     );
+     insert_text(
+         &mut files,
+@@ -84,7 +121,7 @@ pub fn generate_ios_project(spec: &IosProjectSpec) -> Result<GeneratedAppleProje
+     insert_text(
+         &mut files,
+         "FerryResources.json",
+-        render_resource_metadata(spec)?,
++        render_resource_metadata(spec, platform)?,
+     );
+     insert_text(
+         &mut files,
+@@ -100,6 +137,22 @@ pub fn generate_ios_project(spec: &IosProjectSpec) -> Result<GeneratedAppleProje
+         ),
+     );
+ 
++    if spec.config.extensions.live_activity.enabled {
++        insert_text(
++            &mut files,
++            "ActivityModel/FerryActivityAttributes.swift",
++            render_activity_model_source(),
++        );
++        insert_text(
++            &mut files,
++            "ActivityModel/Info.plist",
++            include_str!("../templates/FerryActivityModel-Info.plist").replace(
++                "{{minimum_version}}",
++                &xml_escape(&spec.config.ios.min_version),
++            ),
++        );
++    }
++
+     if spec.config.extensions.widget.enabled {
+         let Some(app_group) = spec.config.extensions.widget.app_group.as_deref() else {
+             return Err(AppleError::InvalidConfig(
+@@ -386,12 +439,33 @@ fn render_widget_source(app_group: &str) -> String {
+ }
+ 
+ fn render_live_activity_source() -> String {
+-    "import ActivityKit\nimport FerryRuntimeBridge\nimport SwiftUI\nimport WidgetKit\n\n@main\nstruct FerryLiveActivity: Widget {\n    var body: some WidgetConfiguration {\n        ActivityConfiguration(for: FerryActivityAttributes.self) { context in\n            VStack(alignment: .leading) {\n                Text(context.state.title).font(.headline)\n                Text(context.state.status)\n                ProgressView(value: context.state.progress)\n            }\n            .widgetURL(context.state.deepLink.flatMap(URL.init(string:)))\n        } dynamicIsland: { context in\n            DynamicIsland {\n                DynamicIslandExpandedRegion(.leading) { Text(context.state.leadingText) }\n                DynamicIslandExpandedRegion(.trailing) { Text(context.state.trailingText) }\n                DynamicIslandExpandedRegion(.bottom) { ProgressView(value: context.state.progress) }\n            } compactLeading: {\n                Text(context.state.leadingText)\n            } compactTrailing: {\n                Text(context.state.trailingText)\n            } minimal: {\n                Text(context.state.status.prefix(1))\n            }\n            .widgetURL(context.state.deepLink.flatMap(URL.init(string:)))\n        }\n    }\n}\n"
++    "import ActivityKit\nimport FerryActivityModel\nimport SwiftUI\nimport WidgetKit\n\n@main\nstruct FerryLiveActivity: Widget {\n    var body: some WidgetConfiguration {\n        ActivityConfiguration(for: FerryActivityAttributes.self) { context in\n            VStack(alignment: .leading) {\n                Text(context.state.title).font(.headline)\n                Text(context.state.status)\n                ProgressView(value: context.state.progress)\n            }\n            .widgetURL(context.state.deepLink.flatMap(URL.init(string:)))\n        } dynamicIsland: { context in\n            DynamicIsland {\n                DynamicIslandExpandedRegion(.leading) { Text(context.state.leadingText) }\n                DynamicIslandExpandedRegion(.trailing) { Text(context.state.trailingText) }\n                DynamicIslandExpandedRegion(.bottom) { ProgressView(value: context.state.progress) }\n            } compactLeading: {\n                Text(context.state.leadingText)\n            } compactTrailing: {\n                Text(context.state.trailingText)\n            } minimal: {\n                Text(context.state.status.prefix(1))\n            }\n            .widgetURL(context.state.deepLink.flatMap(URL.init(string:)))\n        }\n    }\n}\n"
+         .to_owned()
+ }
+ 
++fn render_activity_model_source() -> String {
++    format!(
++        "import ActivityKit\nimport Foundation\n\n{}\n",
++        include_str!("../templates/FerryActivityAttributes.swift.tpl").trim_end()
++    )
++}
++
+ fn render_runtime_bridge_source(spec: &IosProjectSpec) -> String {
+     let enabled = |value: bool| if value { "true" } else { "false" };
++    let live_activity = spec.config.extensions.live_activity.enabled;
++    let model_import = if live_activity {
++        "import FerryActivityModel\n"
++    } else {
++        ""
++    };
++    let attributes_declaration = if live_activity {
++        String::new()
++    } else {
++        format!(
++            "{}\n\n",
++            include_str!("../templates/FerryActivityAttributes.swift.tpl").trim_end()
++        )
++    };
+     let widget_group = spec
+         .config
+         .extensions
+@@ -400,6 +474,11 @@ fn render_runtime_bridge_source(spec: &IosProjectSpec) -> String {
+         .as_deref()
+         .map_or_else(|| "nil".to_owned(), swift_string_literal);
+     include_str!("../templates/FerryRuntimeBridge.swift.tpl")
++        .replace("{{activity_model_import}}\n", model_import)
++        .replace(
++            "{{activity_attributes_declaration}}\n\n",
++            &attributes_declaration,
++        )
+         .replace(
+             "{{storage_enabled}}",
+             enabled(spec.config.capabilities.storage.enabled),
+@@ -466,12 +545,15 @@ fn render_runtime_bridge_source(spec: &IosProjectSpec) -> String {
+         )
+ }
+ 
+-fn render_resource_metadata(spec: &IosProjectSpec) -> Result<String, AppleError> {
++fn render_resource_metadata(
++    spec: &IosProjectSpec,
++    platform: IosProjectPlatform,
++) -> Result<String, AppleError> {
+     let value = serde_json::json!({
+         "schema_version": 1,
+         "generator": "cargo-ferry",
+         "ui_backend": "slint-1.17.1",
+-        "rust_target": "aarch64-apple-ios-sim",
++        "rust_target": platform.rust_target(),
+         "bundle_identifier": spec.config.app.identifier,
+     });
+     serde_json::to_string_pretty(&value)
+@@ -494,8 +576,32 @@ fn render_scheme(binary_name: &str) -> String {
+     )
+ }
+ 
++fn render_pbxproj(spec: &IosProjectSpec, platform: IosProjectPlatform) -> String {
++    let project = render_simulator_pbxproj(spec);
++    match platform {
++        IosProjectPlatform::Simulator => project,
++        IosProjectPlatform::DeviceUnsigned => project
++            .replace("SDKROOT = iphonesimulator", "SDKROOT = iphoneos")
++            .replace(
++                "SUPPORTED_PLATFORMS = iphonesimulator",
++                "SUPPORTED_PLATFORMS = iphoneos",
++            )
++            .replace(
++                "AD_HOC_CODE_SIGNING_ALLOWED = YES",
++                "AD_HOC_CODE_SIGNING_ALLOWED = NO",
++            )
++            .replace("CODE_SIGN_IDENTITY = \"-\"", "CODE_SIGN_IDENTITY = \"\"")
++            .replace("CODE_SIGNING_ALLOWED = YES", "CODE_SIGNING_ALLOWED = NO")
++            .replace("CODE_SIGNING_REQUIRED = YES", "CODE_SIGNING_REQUIRED = NO")
++            .replace(
++                "ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, );",
++                "ATTRIBUTES = (RemoveHeadersOnCopy, );",
++            ),
++    }
++}
++
+ #[allow(clippy::too_many_lines, clippy::write_with_newline)]
+-fn render_pbxproj(spec: &IosProjectSpec) -> String {
++fn render_simulator_pbxproj(spec: &IosProjectSpec) -> String {
+     let binary = pbx_quote(&spec.binary_name);
+     let app_product = pbx_quote(&format!("{}.app", spec.binary_name));
+     let bundle = pbx_quote(&spec.config.app.identifier);
+@@ -570,9 +676,27 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
+     if live_activity {
+         let _ = writeln!(
+             output,
+-            "\t\t{} /* FerryRuntimeBridge.framework in Frameworks */ = {{isa = PBXBuildFile; fileRef = {} /* FerryRuntimeBridge.framework */; }};",
+-            id(85),
+-            id(82)
++            "\t\t{} /* FerryActivityAttributes.swift in Sources */ = {{isa = PBXBuildFile; fileRef = {} /* FerryActivityAttributes.swift */; }};",
++            id(100),
++            id(101)
++        );
++        let _ = writeln!(
++            output,
++            "\t\t{} /* FerryActivityModel.framework in Embed Frameworks */ = {{isa = PBXBuildFile; fileRef = {} /* FerryActivityModel.framework */; settings = {{ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }}; }};",
++            id(103),
++            id(102)
++        );
++        let _ = writeln!(
++            output,
++            "\t\t{} /* FerryActivityModel.framework in RuntimeBridge Frameworks */ = {{isa = PBXBuildFile; fileRef = {} /* FerryActivityModel.framework */; }};",
++            id(104),
++            id(102)
++        );
++        let _ = writeln!(
++            output,
++            "\t\t{} /* FerryActivityModel.framework in Live Activity Frameworks */ = {{isa = PBXBuildFile; fileRef = {} /* FerryActivityModel.framework */; }};",
++            id(105),
++            id(102)
+         );
+         let _ = writeln!(
+             output,
+@@ -614,13 +738,20 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
+             id(1),
+             id(56)
+         );
+-        let _ = writeln!(
+-            output,
+-            "\t\t{} /* PBXContainerItemProxy */ = {{isa = PBXContainerItemProxy; containerPortal = {} /* Project object */; proxyType = 1; remoteGlobalIDString = {}; remoteInfo = FerryRuntimeBridge; }};",
+-            id(88),
+-            id(1),
+-            id(90)
+-        );
++        for (proxy, target, owner) in [
++            (114, 108, "FerryActivityModel"),
++            (116, 108, "FerryActivityModel"),
++            (118, 108, "FerryActivityModel"),
++        ] {
++            let _ = writeln!(
++                output,
++                "\t\t{} /* PBXContainerItemProxy */ = {{isa = PBXContainerItemProxy; containerPortal = {} /* Project object */; proxyType = 1; remoteGlobalIDString = {}; remoteInfo = {}; }};",
++                id(proxy),
++                id(1),
++                id(target),
++                owner
++            );
++        }
+     }
+     output.push_str("/* End PBXContainerItemProxy section */\n\n");
+ 
+@@ -634,10 +765,20 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
+     );
+     let _ = write!(
+         output,
+-        "\t\t{} /* Embed Frameworks */ = {{\n\t\t\tisa = PBXCopyFilesBuildPhase;\n\t\t\tbuildActionMask = 2147483647;\n\t\t\tdstPath = \"\";\n\t\t\tdstSubfolderSpec = 10;\n\t\t\tfiles = ({} /* FerryRuntimeBridge.framework in Embed Frameworks */,);\n\t\t\tname = \"Embed Frameworks\";\n\t\t\trunOnlyForDeploymentPostprocessing = 0;\n\t\t}};\n",
++        "\t\t{} /* Embed Frameworks */ = {{\n\t\t\tisa = PBXCopyFilesBuildPhase;\n\t\t\tbuildActionMask = 2147483647;\n\t\t\tdstPath = \"\";\n\t\t\tdstSubfolderSpec = 10;\n\t\t\tfiles = ({} /* FerryRuntimeBridge.framework in Embed Frameworks */,",
+         id(93),
+         id(84)
+     );
++    if live_activity {
++        let _ = write!(
++            output,
++            " {} /* FerryActivityModel.framework in Embed Frameworks */,",
++            id(103)
++        );
++    }
++    output.push_str(
++        ");\n\t\t\tname = \"Embed Frameworks\";\n\t\t\trunOnlyForDeploymentPostprocessing = 0;\n\t\t};\n",
++    );
+     if widget || live_activity {
+         let _ = write!(
+             output,
+@@ -742,6 +883,21 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
+         );
+     }
+     if live_activity {
++        let _ = writeln!(
++            output,
++            "\t\t{} /* FerryActivityAttributes.swift */ = {{isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FerryActivityAttributes.swift; sourceTree = \"<group>\"; }};",
++            id(101)
++        );
++        let _ = writeln!(
++            output,
++            "\t\t{} /* FerryActivityModel.framework */ = {{isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = FerryActivityModel.framework; sourceTree = BUILT_PRODUCTS_DIR; }};",
++            id(102)
++        );
++        let _ = writeln!(
++            output,
++            "\t\t{} /* Info.plist */ = {{isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = \"<group>\"; }};",
++            id(106)
++        );
+         let _ = writeln!(
+             output,
+             "\t\t{} /* LiveActivity.swift */ = {{isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveActivity.swift; sourceTree = \"<group>\"; }};",
+@@ -780,6 +936,7 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
+         let _ = writeln!(output, "\t\t\t\t{} /* WidgetExtension */,", id(38));
+     }
+     if live_activity {
++        let _ = writeln!(output, "\t\t\t\t{} /* ActivityModel */,", id(107));
+         let _ = writeln!(output, "\t\t\t\t{} /* LiveActivityExtension */,", id(58));
+     }
+     let _ = write!(
+@@ -807,6 +964,11 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
+         );
+     }
+     if live_activity {
++        let _ = writeln!(
++            output,
++            "\t\t\t\t{} /* FerryActivityModel.framework */,",
++            id(102)
++        );
+         let _ = writeln!(
+             output,
+             "\t\t\t\t{} /* FerryLiveActivityExtension.appex */,",
+@@ -832,6 +994,13 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
+         );
+     }
+     if live_activity {
++        let _ = write!(
++            output,
++            "\t\t{} /* ActivityModel */ = {{\n\t\t\tisa = PBXGroup;\n\t\t\tchildren = (\n\t\t\t\t{} /* FerryActivityAttributes.swift */,\n\t\t\t\t{} /* Info.plist */,\n\t\t\t);\n\t\t\tpath = ActivityModel;\n\t\t\tsourceTree = \"<group>\";\n\t\t}};\n",
++            id(107),
++            id(101),
++            id(106)
++        );
+         let _ = write!(
+             output,
+             "\t\t{} /* LiveActivityExtension */ = {{\n\t\t\tisa = PBXGroup;\n\t\t\tchildren = (\n\t\t\t\t{} /* LiveActivity.swift */,\n\t\t\t\t{} /* Info.plist */,\n\t\t\t);\n\t\t\tpath = LiveActivityExtension;\n\t\t\tsourceTree = \"<group>\";\n\t\t}};\n",
+@@ -864,6 +1033,7 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
+         let _ = writeln!(output, "\t\t\t\t{} /* PBXTargetDependency */,", id(42));
+     }
+     if live_activity {
++        let _ = writeln!(output, "\t\t\t\t{} /* PBXTargetDependency */,", id(115));
+         let _ = writeln!(output, "\t\t\t\t{} /* PBXTargetDependency */,", id(62));
+     }
+     let _ = write!(
+@@ -875,10 +1045,21 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
+     );
+     let _ = write!(
+         output,
+-        "\t\t{} /* FerryRuntimeBridge */ = {{\n\t\t\tisa = PBXNativeTarget;\n\t\t\tbuildConfigurationList = {} /* Build configuration list for PBXNativeTarget \"FerryRuntimeBridge\" */;\n\t\t\tbuildPhases = ({} /* Sources */,);\n\t\t\tbuildRules = ();\n\t\t\tdependencies = ();\n\t\t\tname = FerryRuntimeBridge;\n\t\t\tproductName = FerryRuntimeBridge;\n\t\t\tproductReference = {} /* FerryRuntimeBridge.framework */;\n\t\t\tproductType = \"com.apple.product-type.framework\";\n\t\t}};\n",
++        "\t\t{} /* FerryRuntimeBridge */ = {{\n\t\t\tisa = PBXNativeTarget;\n\t\t\tbuildConfigurationList = {} /* Build configuration list for PBXNativeTarget \"FerryRuntimeBridge\" */;\n\t\t\tbuildPhases = ({} /* Sources */,",
+         id(90),
+         id(95),
+-        id(92),
++        id(92)
++    );
++    if live_activity {
++        let _ = write!(output, " {} /* Frameworks */,", id(113));
++    }
++    output.push_str(");\n\t\t\tbuildRules = ();\n\t\t\tdependencies = (");
++    if live_activity {
++        let _ = write!(output, "{} /* PBXTargetDependency */,", id(117));
++    }
++    let _ = write!(
++        output,
++        ");\n\t\t\tname = FerryRuntimeBridge;\n\t\t\tproductName = FerryRuntimeBridge;\n\t\t\tproductReference = {} /* FerryRuntimeBridge.framework */;\n\t\t\tproductType = \"com.apple.product-type.framework\";\n\t\t}};\n",
+         id(82)
+     );
+     if widget {
+@@ -892,6 +1073,14 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
+         );
+     }
+     if live_activity {
++        let _ = write!(
++            output,
++            "\t\t{} /* FerryActivityModel */ = {{\n\t\t\tisa = PBXNativeTarget;\n\t\t\tbuildConfigurationList = {} /* Build configuration list for PBXNativeTarget \"FerryActivityModel\" */;\n\t\t\tbuildPhases = ({} /* Sources */,);\n\t\t\tbuildRules = ();\n\t\t\tdependencies = ();\n\t\t\tname = FerryActivityModel;\n\t\t\tproductName = FerryActivityModel;\n\t\t\tproductReference = {} /* FerryActivityModel.framework */;\n\t\t\tproductType = \"com.apple.product-type.framework\";\n\t\t}};\n",
++            id(108),
++            id(112),
++            id(109),
++            id(102)
++        );
+         let _ = write!(
+             output,
+             "\t\t{} /* FerryLiveActivityExtension */ = {{\n\t\t\tisa = PBXNativeTarget;\n\t\t\tbuildConfigurationList = {} /* Build configuration list for PBXNativeTarget \"FerryLiveActivityExtension\" */;\n\t\t\tbuildPhases = ({} /* Sources */, {} /* Frameworks */,);\n\t\t\tbuildRules = ();\n\t\t\tdependencies = ({} /* PBXTargetDependency */,);\n\t\t\tname = FerryLiveActivityExtension;\n\t\t\tproductName = FerryLiveActivityExtension;\n\t\t\tproductReference = {} /* FerryLiveActivityExtension.appex */;\n\t\t\tproductType = \"com.apple.product-type.app-extension\";\n\t\t}};\n",
+@@ -899,7 +1088,7 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
+             id(59),
+             id(55),
+             id(94),
+-            id(89),
++            id(119),
+             id(53)
+         );
+     }
+@@ -920,6 +1109,7 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
+         let _ = writeln!(output, "\t\t\t\t{} /* FerryWidgetExtension */,", id(36));
+     }
+     if live_activity {
++        let _ = writeln!(output, "\t\t\t\t{} /* FerryActivityModel */,", id(108));
+         let _ = writeln!(
+             output,
+             "\t\t\t\t{} /* FerryLiveActivityExtension */,",
+@@ -952,9 +1142,15 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
+         output.push_str("/* Begin PBXFrameworksBuildPhase section */\n");
+         let _ = write!(
+             output,
+-            "\t\t{} /* Frameworks */ = {{isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = ({} /* FerryRuntimeBridge.framework in Frameworks */,); runOnlyForDeploymentPostprocessing = 0; }};\n",
++            "\t\t{} /* Frameworks */ = {{isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = ({} /* FerryActivityModel.framework in RuntimeBridge Frameworks */,); runOnlyForDeploymentPostprocessing = 0; }};\n",
++            id(113),
++            id(104)
++        );
++        let _ = write!(
++            output,
++            "\t\t{} /* Frameworks */ = {{isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = ({} /* FerryActivityModel.framework in Live Activity Frameworks */,); runOnlyForDeploymentPostprocessing = 0; }};\n",
+             id(94),
+-            id(85)
++            id(105)
+         );
+         output.push_str("/* End PBXFrameworksBuildPhase section */\n\n");
+     }
+@@ -975,6 +1171,12 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
+         );
+     }
+     if live_activity {
++        let _ = write!(
++            output,
++            "\t\t{} /* Sources */ = {{isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = ({} /* FerryActivityAttributes.swift in Sources */,); runOnlyForDeploymentPostprocessing = 0; }};\n",
++            id(109),
++            id(100)
++        );
+         let _ = write!(
+             output,
+             "\t\t{} /* Sources */ = {{isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = ({} /* LiveActivity.swift in Sources */,); runOnlyForDeploymentPostprocessing = 0; }};\n",
+@@ -1011,10 +1213,24 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
+         );
+         let _ = writeln!(
+             output,
+-            "\t\t{} /* PBXTargetDependency */ = {{isa = PBXTargetDependency; target = {} /* FerryRuntimeBridge */; targetProxy = {} /* PBXContainerItemProxy */; }};",
+-            id(89),
+-            id(90),
+-            id(88)
++            "\t\t{} /* PBXTargetDependency */ = {{isa = PBXTargetDependency; target = {} /* FerryActivityModel */; targetProxy = {} /* PBXContainerItemProxy */; }};",
++            id(115),
++            id(108),
++            id(114)
++        );
++        let _ = writeln!(
++            output,
++            "\t\t{} /* PBXTargetDependency */ = {{isa = PBXTargetDependency; target = {} /* FerryActivityModel */; targetProxy = {} /* PBXContainerItemProxy */; }};",
++            id(117),
++            id(108),
++            id(116)
++        );
++        let _ = writeln!(
++            output,
++            "\t\t{} /* PBXTargetDependency */ = {{isa = PBXTargetDependency; target = {} /* FerryActivityModel */; targetProxy = {} /* PBXContainerItemProxy */; }};",
++            id(119),
++            id(108),
++            id(118)
+         );
+     }
+     output.push_str("/* End PBXTargetDependency section */\n\n");
+@@ -1051,15 +1267,33 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
+         );
+     }
+     for (config_id, name) in [(96, "Debug"), (97, "Release")] {
++        let activity_model_runpath = if live_activity {
++            "LD_RUNPATH_SEARCH_PATHS = (\"$(inherited)\", \"@loader_path\",); "
++        } else {
++            ""
++        };
+         let _ = write!(
+             output,
+-            "\t\t{} /* {} */ = {{isa = XCBuildConfiguration; buildSettings = {{AD_HOC_CODE_SIGNING_ALLOWED = YES; APPLICATION_EXTENSION_API_ONLY = NO; ARCHS = arm64; CODE_SIGN_IDENTITY = \"-\"; CODE_SIGNING_ALLOWED = YES; CODE_SIGNING_REQUIRED = YES; CURRENT_PROJECT_VERSION = 1; DEFINES_MODULE = YES; DYLIB_INSTALL_NAME_BASE = \"@rpath\"; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = RuntimeBridge/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = {}; MARKETING_VERSION = 1.0; ONLY_ACTIVE_ARCH = NO; PRODUCT_BUNDLE_IDENTIFIER = org.rustferry.runtime-bridge; PRODUCT_NAME = FerryRuntimeBridge; SDKROOT = iphonesimulator; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = iphonesimulator; SWIFT_EMIT_LOC_STRINGS = NO; SWIFT_INSTALL_OBJC_HEADER = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = \"1,2\"; }}; name = {}; }};\n",
++            "\t\t{} /* {} */ = {{isa = XCBuildConfiguration; buildSettings = {{AD_HOC_CODE_SIGNING_ALLOWED = YES; APPLICATION_EXTENSION_API_ONLY = NO; ARCHS = arm64; CODE_SIGN_IDENTITY = \"-\"; CODE_SIGNING_ALLOWED = YES; CODE_SIGNING_REQUIRED = YES; CURRENT_PROJECT_VERSION = 1; DEFINES_MODULE = YES; DYLIB_INSTALL_NAME_BASE = \"@rpath\"; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = RuntimeBridge/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = {}; {}MARKETING_VERSION = 1.0; ONLY_ACTIVE_ARCH = NO; PRODUCT_BUNDLE_IDENTIFIER = org.rustferry.runtime-bridge; PRODUCT_NAME = FerryRuntimeBridge; SDKROOT = iphonesimulator; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = iphonesimulator; SWIFT_EMIT_LOC_STRINGS = NO; SWIFT_INSTALL_OBJC_HEADER = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = \"1,2\"; }}; name = {}; }};\n",
+             id(config_id),
+             name,
+             min_version,
++            activity_model_runpath,
+             name
+         );
+     }
++    if live_activity {
++        for (config_id, name) in [(110, "Debug"), (111, "Release")] {
++            let _ = write!(
++                output,
++                "\t\t{} /* {} */ = {{isa = XCBuildConfiguration; buildSettings = {{AD_HOC_CODE_SIGNING_ALLOWED = YES; APPLICATION_EXTENSION_API_ONLY = YES; ARCHS = arm64; CODE_SIGN_IDENTITY = \"-\"; CODE_SIGNING_ALLOWED = YES; CODE_SIGNING_REQUIRED = YES; CURRENT_PROJECT_VERSION = 1; DEFINES_MODULE = YES; DYLIB_INSTALL_NAME_BASE = \"@rpath\"; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = ActivityModel/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = {}; MARKETING_VERSION = 1.0; ONLY_ACTIVE_ARCH = NO; PRODUCT_BUNDLE_IDENTIFIER = org.rustferry.activity-model; PRODUCT_NAME = FerryActivityModel; SDKROOT = iphonesimulator; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = iphonesimulator; SWIFT_EMIT_LOC_STRINGS = NO; SWIFT_INSTALL_OBJC_HEADER = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = \"1,2\"; }}; name = {}; }};\n",
++                id(config_id),
++                name,
++                min_version,
++                name
++            );
++        }
++    }
+     if widget {
+         render_extension_build_configs(
+             &mut output,
+@@ -1108,6 +1342,15 @@ fn render_pbxproj(spec: &IosProjectSpec) -> String {
+         id(96),
+         id(97)
+     );
++    if live_activity {
++        let _ = write!(
++            output,
++            "\t\t{} /* Build configuration list for PBXNativeTarget \"FerryActivityModel\" */ = {{isa = XCConfigurationList; buildConfigurations = ({} /* Debug */, {} /* Release */,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; }};\n",
++            id(112),
++            id(110),
++            id(111)
++        );
++    }
+     if widget {
+         let _ = write!(
+             output,
+@@ -1318,6 +1561,13 @@ mod tests {
+         assert!(bridge.contains("@_cdecl(\"ferry_bridge_init\")"));
+         assert!(bridge.contains("method_setImplementation"));
+         assert!(!bridge.contains("UIApplication.shared"));
++        assert!(!bridge.contains("import FerryActivityModel"));
++        assert!(bridge.contains("public struct FerryActivityAttributes"));
++        assert!(
++            !first
++                .files
++                .contains_key(Utf8Path::new("ActivityModel/FerryActivityAttributes.swift"))
++        );
+     }
+ 
+     #[test]
+@@ -1378,6 +1628,38 @@ mod tests {
+                 .files
+                 .contains_key(Utf8Path::new("LiveActivityExtension/LiveActivity.swift"))
+         );
++        let activity_model = generated
++            .text(Utf8Path::new("ActivityModel/FerryActivityAttributes.swift"))
++            .unwrap();
++        assert!(activity_model.contains("public struct FerryActivityAttributes"));
++        assert!(activity_model.contains("import ActivityKit"));
++        assert!(!activity_model.contains("UIKit"));
++        assert!(!activity_model.contains("UIApplication"));
++        assert!(!activity_model.contains("FerryBridge"));
++        let bridge = generated
++            .text(Utf8Path::new("RuntimeBridge/FerryRuntimeBridge.swift"))
++            .unwrap();
++        assert!(bridge.contains("import FerryActivityModel"));
++        assert!(!bridge.contains("public struct FerryActivityAttributes"));
++        assert!(bridge.contains("UIApplicationDelegate"));
++        let live_activity = generated
++            .text(Utf8Path::new("LiveActivityExtension/LiveActivity.swift"))
++            .unwrap();
++        assert!(live_activity.contains("import FerryActivityModel"));
++        assert!(!live_activity.contains("FerryRuntimeBridge"));
++        assert!(pbx.contains("FerryActivityModel.framework in RuntimeBridge Frameworks"));
++        assert!(pbx.contains("FerryActivityModel.framework in Live Activity Frameworks"));
++        assert!(pbx.contains("LD_RUNPATH_SEARCH_PATHS = (\"$(inherited)\", \"@loader_path\",)"));
++        assert!(pbx.contains("@executable_path/../../Frameworks"));
++        assert!(!pbx.contains("FerryRuntimeBridge.framework in Frameworks"));
++        assert_eq!(
++            pbx.matches("APPLICATION_EXTENSION_API_ONLY = NO").count(),
++            2
++        );
++        assert_eq!(
++            pbx.matches("APPLICATION_EXTENSION_API_ONLY = YES").count(),
++            6
++        );
+         let widget = generated
+             .text(Utf8Path::new("WidgetExtension/Widget.swift"))
+             .unwrap();
+@@ -1387,6 +1669,132 @@ mod tests {
+         assert!(widget.contains(".widgetURL(entry.deepLink)"));
+     }
+ 
++    #[test]
++    fn device_live_activity_model_is_extension_safe_and_iphoneos_only() {
++        let mut spec = starter();
++        spec.config.extensions.live_activity.enabled = true;
++        spec.config.ios.min_version = "16.1".into();
++        let generated =
++            generate_ios_project_for_platform(&spec, IosProjectPlatform::DeviceUnsigned).unwrap();
++        let pbx = generated
++            .text(Utf8Path::new("FerryHost.xcodeproj/project.pbxproj"))
++            .unwrap();
++
++        assert!(!pbx.contains("iphonesimulator"));
++        assert!(pbx.contains("SDKROOT = iphoneos"));
++        assert!(pbx.contains("SUPPORTED_PLATFORMS = iphoneos"));
++        assert!(pbx.contains("PRODUCT_NAME = FerryActivityModel"));
++        assert_eq!(
++            pbx.matches("APPLICATION_EXTENSION_API_ONLY = NO").count(),
++            2
++        );
++        assert_eq!(
++            pbx.matches("APPLICATION_EXTENSION_API_ONLY = YES").count(),
++            4
++        );
++        assert!(!pbx.contains("FerryRuntimeBridge.framework in Frameworks"));
++    }
++
++    #[cfg(target_os = "macos")]
++    #[test]
++    #[ignore = "requires full Xcode"]
++    fn xcode_builds_the_safe_activity_model_dependency_graph() {
++        let mut spec = starter();
++        spec.config.extensions.live_activity.enabled = true;
++        spec.config.ios.min_version = "16.1".into();
++        let generated = generate_ios_project(&spec).unwrap();
++        let temporary = tempfile::tempdir().unwrap();
++        let root = Utf8Path::from_path(temporary.path()).unwrap();
++        write_ios_project(&generated, root).unwrap();
++
++        let output = std::process::Command::new("/usr/bin/xcrun")
++            .args(["xcodebuild", "-project"])
++            .arg(root.join("FerryHost.xcodeproj"))
++            .args(["-list", "-json"])
++            .current_dir(root)
++            .output()
++            .unwrap();
++        assert!(
++            output.status.success(),
++            "xcodebuild failed: {}",
++            String::from_utf8_lossy(&output.stderr)
++        );
++        let listing: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
++        let targets = listing["project"]["targets"].as_array().unwrap();
++        for expected in [
++            "FerryApp",
++            "FerryRuntimeBridge",
++            "FerryActivityModel",
++            "FerryLiveActivityExtension",
++        ] {
++            assert!(targets.iter().any(|target| target == expected));
++        }
++
++        let products = root.join("Products");
++        let intermediates = root.join("Intermediates");
++        let build = std::process::Command::new("/usr/bin/xcrun")
++            .args(["xcodebuild", "-project"])
++            .arg(root.join("FerryHost.xcodeproj"))
++            .args([
++                "-target",
++                "FerryRuntimeBridge",
++                "-target",
++                "FerryLiveActivityExtension",
++                "-configuration",
++                "Debug",
++                "-sdk",
++                "iphonesimulator",
++                "AD_HOC_CODE_SIGNING_ALLOWED=YES",
++                "CODE_SIGN_IDENTITY=-",
++                "CODE_SIGNING_ALLOWED=YES",
++                "CODE_SIGNING_REQUIRED=YES",
++                "ARCHS=arm64",
++                "ONLY_ACTIVE_ARCH=NO",
++            ])
++            .arg(format!("SYMROOT={products}"))
++            .arg(format!("OBJROOT={intermediates}"))
++            .arg(format!("CONFIGURATION_BUILD_DIR={products}"))
++            .arg("build")
++            .current_dir(root)
++            .output()
++            .unwrap();
++        assert!(
++            build.status.success(),
++            "xcodebuild failed: {}",
++            String::from_utf8_lossy(&build.stderr)
++        );
++
++        let executable =
++            products.join("FerryLiveActivityExtension.appex/FerryLiveActivityExtension");
++        assert!(executable.is_file());
++        assert!(
++            products
++                .join("FerryActivityModel.framework/FerryActivityModel")
++                .is_file()
++        );
++        let linked_libraries = |executable: &Utf8Path| {
++            let output = std::process::Command::new("/usr/bin/xcrun")
++                .args(["otool", "-L"])
++                .arg(executable)
++                .output()
++                .unwrap();
++            assert!(
++                output.status.success(),
++                "otool failed: {}",
++                String::from_utf8_lossy(&output.stderr)
++            );
++            String::from_utf8(output.stdout).unwrap()
++        };
++        let dependencies = linked_libraries(&executable);
++        assert!(dependencies.contains("@rpath/FerryActivityModel.framework/FerryActivityModel"));
++        assert!(!dependencies.contains("FerryRuntimeBridge"));
++        let runtime_dependencies =
++            linked_libraries(&products.join("FerryRuntimeBridge.framework/FerryRuntimeBridge"));
++        assert!(
++            runtime_dependencies.contains("@rpath/FerryActivityModel.framework/FerryActivityModel")
++        );
++    }
++
+     #[test]
+     fn emits_only_enabled_permission_purpose_strings() {
+         let mut spec = starter();
+diff --git a/crates/rustferry-apple/templates/FerryActivityAttributes.swift.tpl b/crates/rustferry-apple/templates/FerryActivityAttributes.swift.tpl
+new file mode 100644
+index 0000000..2a91510
+--- /dev/null
++++ b/crates/rustferry-apple/templates/FerryActivityAttributes.swift.tpl
+@@ -0,0 +1,36 @@
++@available(iOS 16.1, *)
++public struct FerryActivityAttributes: ActivityAttributes {
++    public struct ContentState: Codable, Hashable {
++        public var stateJSON: String
++        public var title: String
++        public var status: String
++        public var progress: Double
++        public var leadingText: String
++        public var trailingText: String
++        public var deepLink: String?
++
++        public init(
++            stateJSON: String,
++            title: String,
++            status: String,
++            progress: Double,
++            leadingText: String,
++            trailingText: String,
++            deepLink: String?
++        ) {
++            self.stateJSON = stateJSON
++            self.title = title
++            self.status = status
++            self.progress = progress
++            self.leadingText = leadingText
++            self.trailingText = trailingText
++            self.deepLink = deepLink
++        }
++    }
++
++    public var attributesJSON: String
++
++    public init(attributesJSON: String) {
++        self.attributesJSON = attributesJSON
++    }
++}
+diff --git a/crates/rustferry-apple/templates/FerryActivityModel-Info.plist b/crates/rustferry-apple/templates/FerryActivityModel-Info.plist
+new file mode 100644
+index 0000000..370ac08
+--- /dev/null
++++ b/crates/rustferry-apple/templates/FerryActivityModel-Info.plist
+@@ -0,0 +1,24 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++  <key>CFBundleDevelopmentRegion</key>
++  <string>en</string>
++  <key>CFBundleExecutable</key>
++  <string>FerryActivityModel</string>
++  <key>CFBundleIdentifier</key>
++  <string>org.rustferry.activity-model</string>
++  <key>CFBundleInfoDictionaryVersion</key>
++  <string>6.0</string>
++  <key>CFBundleName</key>
++  <string>FerryActivityModel</string>
++  <key>CFBundlePackageType</key>
++  <string>FMWK</string>
++  <key>CFBundleShortVersionString</key>
++  <string>1.0</string>
++  <key>CFBundleVersion</key>
++  <string>1</string>
++  <key>MinimumOSVersion</key>
++  <string>{{minimum_version}}</string>
++</dict>
++</plist>
+diff --git a/crates/rustferry-apple/templates/FerryRuntimeBridge.swift.tpl b/crates/rustferry-apple/templates/FerryRuntimeBridge.swift.tpl
+index b73a6c1..26121dd 100644
+--- a/crates/rustferry-apple/templates/FerryRuntimeBridge.swift.tpl
++++ b/crates/rustferry-apple/templates/FerryRuntimeBridge.swift.tpl
+@@ -9,6 +9,7 @@ import Photos
+ import UIKit
+ import UserNotifications
+ import WidgetKit
++{{activity_model_import}}
+ 
+ private let ferryStorageEnabled = {{storage_enabled}}
+ private let ferryNetworkEnabled = {{network_enabled}}
+@@ -126,42 +127,7 @@ private func awaitCallback<T>(
+     return try result.get()
+ }
+ 
+-@available(iOS 16.1, *)
+-public struct FerryActivityAttributes: ActivityAttributes {
+-    public struct ContentState: Codable, Hashable {
+-        public var stateJSON: String
+-        public var title: String
+-        public var status: String
+-        public var progress: Double
+-        public var leadingText: String
+-        public var trailingText: String
+-        public var deepLink: String?
+-
+-        public init(
+-            stateJSON: String,
+-            title: String,
+-            status: String,
+-            progress: Double,
+-            leadingText: String,
+-            trailingText: String,
+-            deepLink: String?
+-        ) {
+-            self.stateJSON = stateJSON
+-            self.title = title
+-            self.status = status
+-            self.progress = progress
+-            self.leadingText = leadingText
+-            self.trailingText = trailingText
+-            self.deepLink = deepLink
+-        }
+-    }
+-
+-    public var attributesJSON: String
+-
+-    public init(attributesJSON: String) {
+-        self.attributesJSON = attributesJSON
+-    }
+-}
++{{activity_attributes_declaration}}
+ 
+ private final class LocationPermissionWaiter: NSObject, CLLocationManagerDelegate {
+     let manager = CLLocationManager()
+diff --git a/crates/rustferry-apple/tests/device.rs b/crates/rustferry-apple/tests/device.rs
+new file mode 100644
+index 0000000..6ae6f51
+--- /dev/null
++++ b/crates/rustferry-apple/tests/device.rs
+@@ -0,0 +1,395 @@
++//! Physical-iPhone compile/archive planning contracts.
++
++use std::fs;
++#[cfg(target_os = "macos")]
++use std::process::Command;
++
++use camino::Utf8Path;
++#[cfg(target_os = "macos")]
++use rustferry_apple::{
++    AppleDiscoveryOptions, build_ios_device_unsigned, discover_apple, write_ios_project,
++};
++use rustferry_apple::{
++    IOS_DEVICE_TARGET, IosDeviceArchiveRequest, IosDeviceArtifactDisposition, IosDeviceSdk,
++    IosDeviceToolchain, IosProjectPlatform, IosProjectSpec, generate_ios_project,
++    generate_ios_project_for_platform, plan_ios_device_unsigned,
++};
++use rustferry_core::FerryConfig;
++#[cfg(target_os = "macos")]
++use rustferry_core::ProjectAssets;
++#[cfg(target_os = "macos")]
++use rustferry_remote::inspect_unsigned_xcarchive;
++
++fn fake_toolchain(root: &Utf8Path) -> IosDeviceToolchain {
++    IosDeviceToolchain {
++        developer_dir: root.join("Xcode.app/Contents/Developer"),
++        xcode_version: "Xcode 26.0".to_owned(),
++        device_sdk: IosDeviceSdk {
++            path: root.join("iPhoneOS.sdk"),
++            version: "26.0".to_owned(),
++            build_version: "23A1".to_owned(),
++        },
++        cargo: root.join("bin/cargo"),
++        rustup: root.join("bin/rustup"),
++        xcodebuild: root.join("bin/xcodebuild"),
++        xcrun: root.join("bin/xcrun"),
++        plutil: root.join("bin/plutil"),
++        host_arch: "aarch64".to_owned(),
++    }
++}
++
++fn request(root: &Utf8Path) -> IosDeviceArchiveRequest {
++    const PNG: &[u8] = include_bytes!("../../../examples/counter/assets/icon.png");
++
++    fs::write(
++        root.join("Cargo.toml"),
++        "[package]\nname='weather'\nversion='0.1.0'\n",
++    )
++    .unwrap();
++    fs::create_dir_all(root.join("assets")).unwrap();
++    fs::write(root.join("assets/icon.png"), PNG).unwrap();
++    fs::write(root.join("assets/splash.png"), PNG).unwrap();
++    IosDeviceArchiveRequest::new(
++        root,
++        FerryConfig::starter("Weather", "com.example.weather"),
++        "weather",
++    )
++}
++
++fn adjacent_argument<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
++    args.windows(2)
++        .find(|arguments| arguments[0] == flag)
++        .map(|arguments| arguments[1].as_str())
++}
++
++#[test]
++fn device_plan_uses_physical_target_sdk_destination_and_unsigned_archive() {
++    let temporary = tempfile::tempdir().unwrap();
++    let root = Utf8Path::from_path(temporary.path()).unwrap();
++    let plan = plan_ios_device_unsigned(&request(root), &fake_toolchain(root)).unwrap();
++
++    assert_eq!(plan.rust_target, IOS_DEVICE_TARGET);
++    assert_eq!(plan.sdk, "iphoneos");
++    assert_eq!(plan.destination, "generic/platform=iOS");
++    assert_eq!(
++        plan.disposition,
++        IosDeviceArtifactDisposition::UnsignedCompileOnly
++    );
++    assert!(plan.generated_root.starts_with(root.join("target/ferry")));
++    assert!(plan.archive_path.as_str().ends_with("weather.xcarchive"));
++    assert_eq!(
++        plan.app_path,
++        plan.archive_path.join("Products/Applications/weather.app")
++    );
++
++    let preflight = &plan.commands[0];
++    assert_eq!(adjacent_argument(&preflight.args, "-sdk"), Some("iphoneos"));
++    assert_eq!(
++        preflight.args.last().map(String::as_str),
++        Some("-showdestinations")
++    );
++    let cargo = &plan.commands[1];
++    assert_eq!(
++        adjacent_argument(&cargo.args, "--target"),
++        Some(IOS_DEVICE_TARGET)
++    );
++    let xcode = &plan.commands[2];
++    assert_eq!(adjacent_argument(&xcode.args, "-sdk"), Some("iphoneos"));
++    assert_eq!(
++        adjacent_argument(&xcode.args, "-destination"),
++        Some("generic/platform=iOS")
++    );
++    assert_eq!(
++        adjacent_argument(&xcode.args, "-archivePath"),
++        Some(plan.archive_path.as_str())
++    );
++    assert_eq!(xcode.args.last().map(String::as_str), Some("archive"));
++    for setting in [
++        "AD_HOC_CODE_SIGNING_ALLOWED=NO",
++        "CODE_SIGN_IDENTITY=",
++        "CODE_SIGNING_ALLOWED=NO",
++        "CODE_SIGNING_REQUIRED=NO",
++        "DEVELOPMENT_TEAM=",
++        "PROVISIONING_PROFILE_SPECIFIER=",
++        "ARCHS=arm64",
++        "ONLY_ACTIVE_ARCH=NO",
++    ] {
++        assert!(xcode.args.iter().any(|argument| argument == setting));
++    }
++    assert!(!xcode.args.iter().any(|argument| {
++        argument.contains("iphonesimulator")
++            || argument.contains("aarch64-apple-ios-sim")
++            || argument == "CODE_SIGNING_ALLOWED=YES"
++    }));
++}
++
++#[test]
++fn validation_hook_requires_arm64_and_physical_ios_platform() {
++    let temporary = tempfile::tempdir().unwrap();
++    let root = Utf8Path::from_path(temporary.path()).unwrap();
++    let toolchain = fake_toolchain(root);
++    let plan = plan_ios_device_unsigned(&request(root), &toolchain).unwrap();
++    let validation = &plan.macho_validation;
++
++    assert_eq!(validation.executable_path, plan.app_path.join("weather"));
++    assert_eq!(validation.expected_architecture, "arm64");
++    assert_eq!(validation.expected_platform, "IOS");
++    assert_eq!(validation.expected_minimum_os, "16.0");
++    assert_eq!(validation.expected_sdk, "26.0");
++    assert_eq!(validation.commands.len(), 2);
++    assert_eq!(validation.commands[0].program, toolchain.xcrun);
++    assert_eq!(
++        validation.commands[0].args,
++        vec!["lipo", "-archs", validation.executable_path.as_str(),]
++    );
++    assert_eq!(
++        validation.commands[1].args,
++        vec!["vtool", "-show-build", validation.executable_path.as_str(),]
++    );
++}
++
++#[test]
++fn device_project_switches_every_target_to_iphoneos_without_signing() {
++    let mut config = FerryConfig::starter("Weather", "com.example.weather");
++    config.extensions.widget.enabled = true;
++    config.extensions.widget.app_group = Some("group.com.example.weather".to_owned());
++    config.extensions.live_activity.enabled = true;
++    config.ios.min_version = "16.1".to_owned();
++    let spec = IosProjectSpec::new(config, "weather");
++    let generated =
++        generate_ios_project_for_platform(&spec, IosProjectPlatform::DeviceUnsigned).unwrap();
++    let project = generated
++        .text(Utf8Path::new("FerryHost.xcodeproj/project.pbxproj"))
++        .unwrap();
++
++    assert!(!project.contains("iphonesimulator"));
++    assert!(!project.contains("CODE_SIGNING_ALLOWED = YES"));
++    assert!(!project.contains("CODE_SIGNING_REQUIRED = YES"));
++    assert!(!project.contains("CODE_SIGN_IDENTITY = \"-\""));
++    assert!(!project.contains("CodeSignOnCopy"));
++    assert!(project.contains("SDKROOT = iphoneos"));
++    assert!(project.contains("SUPPORTED_PLATFORMS = iphoneos"));
++    assert!(project.contains("AD_HOC_CODE_SIGNING_ALLOWED = NO"));
++    assert!(project.contains("CODE_SIGN_IDENTITY = \"\""));
++    assert!(project.contains("CODE_SIGNING_ALLOWED = NO"));
++    assert!(project.contains("CODE_SIGNING_REQUIRED = NO"));
++    let resources = generated
++        .text(Utf8Path::new("FerryResources.json"))
++        .unwrap();
++    assert!(resources.contains("\"rust_target\": \"aarch64-apple-ios\""));
++    assert!(!resources.contains("aarch64-apple-ios-sim"));
++}
++
++#[test]
++fn device_project_platform_rewrite_does_not_change_user_identifiers() {
++    let config = FerryConfig::starter(
++        "iPhone Simulator Weather",
++        "com.example.iphonesimulator.weather",
++    );
++    let spec = IosProjectSpec::new(config, "iphonesimulator-weather");
++    let generated =
++        generate_ios_project_for_platform(&spec, IosProjectPlatform::DeviceUnsigned).unwrap();
++    let project = generated
++        .text(Utf8Path::new("FerryHost.xcodeproj/project.pbxproj"))
++        .unwrap();
++
++    assert!(project.contains("com.example.iphonesimulator.weather"));
++    assert!(project.contains("iphonesimulator-weather"));
++    assert!(!project.contains("SDKROOT = iphonesimulator"));
++    assert!(!project.contains("SUPPORTED_PLATFORMS = iphonesimulator"));
++}
++
++#[test]
++fn default_simulator_generation_remains_byte_for_byte_identical() {
++    let spec = IosProjectSpec::new(
++        FerryConfig::starter("Weather", "com.example.weather"),
++        "weather",
++    );
++    let default = generate_ios_project(&spec).unwrap();
++    let explicit = generate_ios_project_for_platform(&spec, IosProjectPlatform::Simulator).unwrap();
++
++    assert_eq!(default.files, explicit.files);
++    let project = default
++        .text(Utf8Path::new("FerryHost.xcodeproj/project.pbxproj"))
++        .unwrap();
++    assert!(project.contains("SDKROOT = iphonesimulator"));
++    assert!(project.contains("SUPPORTED_PLATFORMS = iphonesimulator"));
++    assert!(project.contains("AD_HOC_CODE_SIGNING_ALLOWED = YES"));
++    assert!(project.contains("CODE_SIGN_IDENTITY = \"-\""));
++    assert!(project.contains("CODE_SIGNING_ALLOWED = YES"));
++    assert!(project.contains("CODE_SIGNING_REQUIRED = YES"));
++}
++
++#[cfg(target_os = "macos")]
++#[test]
++#[ignore = "requires full Xcode"]
++fn xcode_accepts_generated_unsigned_device_project() {
++    let temporary = tempfile::tempdir().unwrap();
++    let root = Utf8Path::from_path(temporary.path()).unwrap();
++    let generated_root = root.join("generated");
++    let spec = IosProjectSpec::new(
++        FerryConfig::starter("Weather", "com.example.weather"),
++        "weather",
++    );
++    let generated =
++        generate_ios_project_for_platform(&spec, IosProjectPlatform::DeviceUnsigned).unwrap();
++    write_ios_project(&generated, &generated_root).unwrap();
++
++    let discovery = discover_apple(&AppleDiscoveryOptions {
++        current_dir: root.to_owned(),
++        ..AppleDiscoveryOptions::from_environment()
++    })
++    .unwrap();
++    let toolchain = discovery.select_toolchain().unwrap();
++    let output = Command::new(&toolchain.xcodebuild)
++        .args([
++            "-project",
++            generated_root.join("FerryHost.xcodeproj").as_str(),
++            "-list",
++        ])
++        .env("DEVELOPER_DIR", &toolchain.developer_dir)
++        .output()
++        .unwrap();
++    assert!(
++        output.status.success(),
++        "xcodebuild rejected generated project: {}",
++        String::from_utf8_lossy(&output.stderr)
++    );
++}
++
++#[cfg(target_os = "macos")]
++#[test]
++#[ignore = "requires full Xcode with an installed physical-iOS platform component"]
++fn xcode_archives_real_unsigned_device_products_for_structural_validation() {
++    for extensions in [false, true] {
++        let temporary = tempfile::tempdir().unwrap();
++        let root = Utf8Path::from_path(temporary.path()).unwrap();
++        let mut request = request(root);
++        if extensions {
++            request.config.extensions.widget.enabled = true;
++            request.config.extensions.widget.app_group =
++                Some("group.com.example.weather".to_owned());
++            request.config.extensions.live_activity.enabled = true;
++            request.config.ios.min_version = "16.1".to_owned();
++        }
++        let discovery = discover_apple(&AppleDiscoveryOptions {
++            current_dir: root.to_owned(),
++            ..AppleDiscoveryOptions::from_environment()
++        })
++        .unwrap();
++        let simulator_tools = discovery.select_toolchain().unwrap();
++        let toolchain = IosDeviceToolchain {
++            developer_dir: simulator_tools.developer_dir,
++            xcode_version: simulator_tools.xcode_version,
++            device_sdk: discovery.device_sdk.unwrap(),
++            cargo: simulator_tools.cargo,
++            rustup: simulator_tools.rustup,
++            xcodebuild: simulator_tools.xcodebuild,
++            xcrun: simulator_tools.xcrun,
++            plutil: simulator_tools.plutil,
++            host_arch: simulator_tools.host_arch,
++        };
++        let plan = plan_ios_device_unsigned(&request, &toolchain).unwrap();
++        let assets = ProjectAssets::load(root).unwrap();
++        let generated = generate_ios_project_for_platform(
++            &IosProjectSpec::new(request.config.clone(), request.binary_name.clone())
++                .with_assets(assets),
++            IosProjectPlatform::DeviceUnsigned,
++        )
++        .unwrap();
++        write_ios_project(&generated, &plan.generated_root).unwrap();
++
++        let source = root.join("physical-device-fixture.c");
++        fs::write(&source, "int main(void) { return 0; }\n").unwrap();
++        let target = format!("arm64-apple-ios{}", request.config.ios.min_version);
++        let output = Command::new(&toolchain.xcrun)
++            .args([
++                "--sdk",
++                "iphoneos",
++                "clang",
++                "-target",
++                &target,
++                "-isysroot",
++                toolchain.device_sdk.path.as_str(),
++                "-Wl,-e,_main",
++                "-o",
++                plan.rust_binary_copy.destination.as_str(),
++                source.as_str(),
++            ])
++            .env("DEVELOPER_DIR", &toolchain.developer_dir)
++            .output()
++            .unwrap();
++        assert!(
++            output.status.success(),
++            "clang could not create physical-iOS fixture: {}",
++            String::from_utf8_lossy(&output.stderr)
++        );
++
++        fs::create_dir_all(&plan.xcode_derived_data).unwrap();
++        fs::create_dir_all(plan.archive_path.parent().unwrap()).unwrap();
++        let xcode = &plan.commands[2];
++        let output = Command::new(&xcode.program)
++            .args(&xcode.args)
++            .current_dir(&xcode.current_dir)
++            .envs(&xcode.environment)
++            .output()
++            .unwrap();
++        assert!(
++            output.status.success(),
++            "xcodebuild could not create unsigned device archive: {}\n{}",
++            String::from_utf8_lossy(&output.stdout),
++            String::from_utf8_lossy(&output.stderr)
++        );
++        let inspection =
++            inspect_unsigned_xcarchive(&plan.archive_path, &plan.archive_expectation).unwrap();
++        assert_eq!(inspection.architectures, ["arm64"]);
++        assert_eq!(
++            inspection.app.extensions.len(),
++            if extensions { 2 } else { 0 }
++        );
++    }
++}
++
++#[test]
++fn serialized_plan_never_claims_installability_or_signing() {
++    let temporary = tempfile::tempdir().unwrap();
++    let root = Utf8Path::from_path(temporary.path()).unwrap();
++    let plan = plan_ios_device_unsigned(&request(root), &fake_toolchain(root)).unwrap();
++    let encoded = serde_json::to_string(&plan).unwrap();
++
++    assert!(encoded.contains("unsigned-compile-only"));
++    assert!(encoded.contains("CODE_SIGNING_ALLOWED=NO"));
++    assert!(!encoded.contains("CODE_SIGNING_ALLOWED=YES"));
++    assert!(!encoded.contains("iphonesimulator"));
++}
++
++#[cfg(target_os = "macos")]
++#[test]
++#[ignore = "requires full Xcode and the aarch64-apple-ios Rust target"]
++fn builds_and_validates_real_unsigned_device_archive() {
++    let temporary = tempfile::tempdir().unwrap();
++    let root = Utf8Path::from_path(temporary.path()).unwrap();
++    let request = request(root);
++    fs::create_dir_all(root.join("src")).unwrap();
++    fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
++    let discovery = discover_apple(&AppleDiscoveryOptions {
++        current_dir: root.to_owned(),
++        ..AppleDiscoveryOptions::from_environment()
++    })
++    .unwrap();
++    let toolchain = discovery.select_device_toolchain().unwrap();
++
++    let outcome = build_ios_device_unsigned(&request, &toolchain).unwrap();
++    assert_eq!(
++        outcome.plan.disposition,
++        IosDeviceArtifactDisposition::UnsignedCompileOnly
++    );
++    assert!(outcome.archive.as_ref().is_some_and(|path| path.is_dir()));
++    assert!(outcome.app.as_ref().is_some_and(|path| path.is_dir()));
++    let validation = outcome.macho_validation.unwrap();
++    assert_eq!(validation.architecture, "arm64");
++    assert_eq!(validation.platform, "IOS");
++    assert_eq!(validation.minimum_os, request.config.ios.min_version);
++    assert_eq!(validation.sdk, toolchain.device_sdk.version);
++    assert!(outcome.archive_inspection.is_some());
++}
+diff --git a/crates/rustferry-apple/tests/golden.rs b/crates/rustferry-apple/tests/golden.rs
+index fe46a5a..ec6a32b 100644
+--- a/crates/rustferry-apple/tests/golden.rs
++++ b/crates/rustferry-apple/tests/golden.rs
+@@ -62,6 +62,10 @@ fn project_structure_snapshot(project: &str) -> String {
+             "com.apple.product-type.app-extension",
+             "com.apple.product-type.app-extension",
+         ),
++        (
++            "com.apple.product-type.framework",
++            "com.apple.product-type.framework",
++        ),
+         (
+             "FerryWidgetExtension.appex in Embed App Extensions",
+             "FerryWidgetExtension.appex in Embed App Extensions",
+@@ -75,6 +79,26 @@ fn project_structure_snapshot(project: &str) -> String {
+             "LiveActivity.swift in Sources",
+             "LiveActivity.swift in Sources",
+         ),
++        (
++            "FerryActivityAttributes.swift in Sources",
++            "FerryActivityAttributes.swift in Sources",
++        ),
++        (
++            "FerryActivityModel.framework in Embed Frameworks",
++            "FerryActivityModel.framework in Embed Frameworks",
++        ),
++        (
++            "FerryActivityModel.framework in RuntimeBridge Frameworks",
++            "FerryActivityModel.framework in RuntimeBridge Frameworks",
++        ),
++        (
++            "FerryActivityModel.framework in Live Activity Frameworks",
++            "FerryActivityModel.framework in Live Activity Frameworks",
++        ),
++        (
++            "unsafe RuntimeBridge framework links",
++            "FerryRuntimeBridge.framework in Frameworks",
++        ),
+         ("PBXTargetDependency", "PBXTargetDependency"),
+         ("Install Rust Executable", "Install Rust Executable"),
+         (
+@@ -88,6 +112,14 @@ fn project_structure_snapshot(project: &str) -> String {
+             "SUPPORTED_PLATFORMS = iphonesimulator",
+             "SUPPORTED_PLATFORMS = iphonesimulator",
+         ),
++        (
++            "APPLICATION_EXTENSION_API_ONLY = YES",
++            "APPLICATION_EXTENSION_API_ONLY = YES",
++        ),
++        (
++            "APPLICATION_EXTENSION_API_ONLY = NO",
++            "APPLICATION_EXTENSION_API_ONLY = NO",
++        ),
+     ] {
+         writeln!(output, "{label}: {}", project.matches(needle).count()).unwrap();
+     }
+diff --git a/crates/rustferry-apple/tests/golden/extension-project-structure.txt b/crates/rustferry-apple/tests/golden/extension-project-structure.txt
+index 1da7892..2086c82 100644
+--- a/crates/rustferry-apple/tests/golden/extension-project-structure.txt
++++ b/crates/rustferry-apple/tests/golden/extension-project-structure.txt
+@@ -1,14 +1,22 @@
+ com.apple.product-type.application: 1
+ com.apple.product-type.app-extension: 2
++com.apple.product-type.framework: 2
+ FerryWidgetExtension.appex in Embed App Extensions: 2
+ FerryLiveActivityExtension.appex in Embed App Extensions: 2
+ Widget.swift in Sources: 2
+ LiveActivity.swift in Sources: 2
+-PBXTargetDependency: 14
++FerryActivityAttributes.swift in Sources: 2
++FerryActivityModel.framework in Embed Frameworks: 2
++FerryActivityModel.framework in RuntimeBridge Frameworks: 2
++FerryActivityModel.framework in Live Activity Frameworks: 2
++unsafe RuntimeBridge framework links: 0
++PBXTargetDependency: 20
+ Install Rust Executable: 5
+-AD_HOC_CODE_SIGNING_ALLOWED = YES: 8
+-CODE_SIGN_IDENTITY = "-": 8
+-CODE_SIGNING_ALLOWED = YES: 8
+-CODE_SIGNING_REQUIRED = YES: 8
+-SUPPORTED_PLATFORMS = iphonesimulator: 8
++AD_HOC_CODE_SIGNING_ALLOWED = YES: 10
++CODE_SIGN_IDENTITY = "-": 10
++CODE_SIGNING_ALLOWED = YES: 10
++CODE_SIGNING_REQUIRED = YES: 10
++SUPPORTED_PLATFORMS = iphonesimulator: 10
++APPLICATION_EXTENSION_API_ONLY = YES: 6
++APPLICATION_EXTENSION_API_ONLY = NO: 2
+ disabled signing settings: 0
+diff --git a/crates/rustferry-apple/tests/golden/extensions-files.txt b/crates/rustferry-apple/tests/golden/extensions-files.txt
+index 322a5ad..534bdb0 100644
+--- a/crates/rustferry-apple/tests/golden/extensions-files.txt
++++ b/crates/rustferry-apple/tests/golden/extensions-files.txt
+@@ -1,3 +1,5 @@
++ActivityModel/FerryActivityAttributes.swift
++ActivityModel/Info.plist
+ App.entitlements
+ FerryHost.xcodeproj/project.pbxproj
+ FerryHost.xcodeproj/xcshareddata/xcschemes/FerryApp.xcscheme
+diff --git a/crates/rustferry-apple/tests/xcode_smoke.rs b/crates/rustferry-apple/tests/xcode_smoke.rs
+index 5a5f3c4..8c6cc02 100644
+--- a/crates/rustferry-apple/tests/xcode_smoke.rs
++++ b/crates/rustferry-apple/tests/xcode_smoke.rs
+@@ -235,6 +235,10 @@ fn builds_real_widgetkit_and_activitykit_targets() {
+         )
+         .expect("validate generated extension product");
+         assert_eq!(validation.kind, expected.kind);
++        assert_eq!(
++            validation.activity_model_linked,
++            expected.kind == ExtensionKind::ActivityKit
++        );
+         assert!(validation.code_signature.strict_verified);
+         assert_eq!(
+             validation.code_signature.app_groups,
+@@ -265,6 +269,12 @@ fn builds_app_with_embedded_widgetkit_and_activitykit_extensions() {
+     let outcome = build_ios_simulator(&request).expect("build extension app");
+     let validation = outcome.validation.expect("artifact validation");
+     assert_eq!(validation.extensions.len(), 2);
++    assert!(
++        validation
++            .embedded_frameworks
++            .iter()
++            .any(|path| path.file_name() == Some("FerryActivityModel.framework"))
++    );
+     assert_eq!(
+         validation.code_signature.app_groups,
+         ["group.com.example.ferryextensionapp"]
+@@ -283,6 +293,10 @@ fn builds_app_with_embedded_widgetkit_and_activitykit_extensions() {
+             .any(|extension| extension.kind == ExtensionKind::ActivityKit)
+     );
+     for extension in validation.extensions {
++        assert_eq!(
++            extension.activity_model_linked,
++            extension.kind == ExtensionKind::ActivityKit
++        );
+         assert_eq!(extension.architectures, ["arm64"]);
+         assert_eq!(
+             extension.extension_point_identifier,
+diff --git a/docs/GOAL3_COMMAND_AUDIT.jsonl b/docs/GOAL3_COMMAND_AUDIT.jsonl
+index 1bda0c4..48a5b57 100644
+--- a/docs/GOAL3_COMMAND_AUDIT.jsonl
++++ b/docs/GOAL3_COMMAND_AUDIT.jsonl
+@@ -342,3 +342,7 @@
+ {"timestamp":"2026-08-01T16:55:40Z","operation_id":"goal3-20260801T165540Z-68729-4217","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"git-stage","affected_path_category":"index","result":"started","exit_code":null}
+ {"timestamp":"2026-08-01T16:55:56Z","operation_id":"goal3-20260801T165540Z-68729-4217","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"git-stage","affected_path_category":"index","result":"success","exit_code":0}
+ {"timestamp":"2026-08-01T16:56:05Z","operation_id":"goal3-20260801T165605Z-69161-457","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"git-stage","affected_path_category":"index","result":"started","exit_code":null}
++{"timestamp":"2026-08-01T16:56:06Z","operation_id":"goal3-20260801T165605Z-69161-457","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"git-stage","affected_path_category":"index","result":"success","exit_code":0}
++{"timestamp":"2026-08-01T16:56:18Z","operation_id":"goal3-20260801T165618Z-69412-22317","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"git-commit","affected_path_category":"index","result":"started","exit_code":null}
++{"timestamp":"2026-08-01T16:56:18Z","operation_id":"goal3-20260801T165618Z-69412-22317","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"git-commit","affected_path_category":"index","result":"success","exit_code":0}
++{"timestamp":"2026-08-01T16:56:27Z","operation_id":"goal3-20260801T165627Z-69569-32028","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"git-stage","affected_path_category":"index","result":"started","exit_code":null}
+diff --git a/docs/GOAL3_CONFLICT_REPORT.md b/docs/GOAL3_CONFLICT_REPORT.md
+index 79a8e51..f6f5c36 100644
+--- a/docs/GOAL3_CONFLICT_REPORT.md
++++ b/docs/GOAL3_CONFLICT_REPORT.md
+@@ -2,12 +2,12 @@
+ 
+ - Goal 3 base: `d6887eba95b8116799801118c5026210628397f9`
+ - Latest observed Goal 2/source commit: `d6887eba95b8116799801118c5026210628397f9`
+-- Latest observation: `2026-08-01T15:12:08Z`
++- Latest observation: `2026-08-01T16:15:06Z`
+ - Source status at isolation: clean
+ - Source status at latest observation: actively changing, with tracked and untracked Goal 2 work
+-- Goal 2 tracked changes after base: root Cargo manifests; `crates/cargo-ferry/` manifests, CLI, commands, errors, main, and tests; Android manifest/tests; Apple manifest; `crates/rustferry-codegen/` manifests/templates/assets; `crates/rustferry-core/` assets/exports; runtime manifest; ADR/status/summary/threat model; license checker; example assets
++- Goal 2 tracked changes after base: root CI, changelog, Cargo manifests, and README; `crates/cargo-ferry/` manifests, CLI, commands, errors, main, project, and tests; Android manifest, implementation, Java bridge, and tests; Apple manifest, artifact/build/command/discovery/error/library/project implementation, and Xcode smoke; `crates/rustferry-codegen/` manifests/templates/assets; `crates/rustferry-core/` assets/exports/process control; runtime manifest; ADR, CLI, installation, iOS, quickstart, status, support, summary, and threat-model docs; license checker; example assets
+ - Goal 2 untracked additions after base: license inventory, IDE/deployment modules and fixtures, editor integration, codegen assets, IDE/NEXT_PHASE/release/license docs, IDE schema, and replacement branding assets
+-- Goal 3 files changed through Milestone 0: isolated-environment files; root Cargo manifests; additive `crates/rustferry-remote/`; remote protocol schema/docs
+-- Current textual intersections: root `Cargo.toml` and `Cargo.lock`. Physical-device work in progress will also intersect `crates/rustferry-apple/Cargo.toml`; Goal 2 has not changed the Apple implementation files currently targeted by Goal 3.
++- Goal 3 files changed through Milestone 1: isolated-environment files; root Cargo manifests; additive `crates/rustferry-remote/`; remote protocol schema/docs; additive Apple device pipeline/tests/templates; narrow Apple artifact/discovery/library/project/Xcode-smoke changes; Goal 3 status and ownership docs
++- Current textual intersections: root `Cargo.toml` and `Cargo.lock`; `crates/rustferry-apple/Cargo.toml`, `src/artifact.rs`, `src/discovery.rs`, `src/lib.rs`, `src/project.rs`, and `tests/xcode_smoke.rs`; `docs/STATUS.md` once this checkpoint records its new validation level. Goal 3's `device.rs`, device tests, and activity-model templates are additive.
+ 
+ Semantic conflicts remain visible: Goal 2 is adding JSON streaming, IDE events, diagnostics, artifacts, device/deployment models, signing, and physical-build types. Goal 3 isolated these concerns in an additive neutral remote-contract crate and has not edited Goal 2 IDE/device surfaces. Resolution order: shared core models; workspace dependencies; CLI dispatch; provider workflows; generated IDE adapters; docs/status. This report is a point-in-time observation and will be regenerated at integration. Stable Goal 2 integration has not occurred and no merged test matrix has run.
+diff --git a/docs/GOAL3_OWNERSHIP.md b/docs/GOAL3_OWNERSHIP.md
+index 3667c45..4ad011b 100644
+--- a/docs/GOAL3_OWNERSHIP.md
++++ b/docs/GOAL3_OWNERSHIP.md
+@@ -2,8 +2,9 @@
+ 
+ ## Goal 3 additions
+ 
+-- `crates/rustferry-remote/`: protocol v1, provider contracts, source manifests, signing plans, redaction, artifact manifests and cross-platform inspection.
++- `crates/rustferry-remote/`: protocol v1, provider contracts, deterministic source archives, strict worker extraction, signing plans, redaction, artifact manifests, and cross-platform inspection.
+ - `schemas/ferry-remote-protocol-v1.schema.json` and `docs/remote/protocol.md`.
++- `crates/rustferry-apple/src/device.rs` plus narrow target-aware project-generation changes for unsigned physical-iPhone archives.
+ - Remote build protocol and provider contracts.
+ - Physical-iPhone compile, signing, provisioning, artifact inspection, and worker components.
+ - GitHub Actions, SSH Mac, and local Mac providers.
+@@ -23,7 +24,7 @@
+ - Existing process, artifact, diagnostic, and cancellation models.
+ - Generic GitHub workflows and user-facing status documentation.
+ 
+-Current additive remote-contract files have no Goal 2 textual overlap. Root `Cargo.toml` and `Cargo.lock` already overlap. Goal 3 physical-device work also targets `crates/rustferry-apple/`; Goal 2 currently changes that crate's manifest but not its implementation files.
++Current additive remote-contract files have no Goal 2 textual overlap. Root `Cargo.toml` and `Cargo.lock` already overlap. Goal 3 physical-device work also targets `crates/rustferry-apple/`; Goal 2 now changes its manifest, artifact, discovery, library, project, and Xcode-smoke files.
+ 
+ ## Goal 2 boundary
+ 
+diff --git a/docs/GOAL3_STATUS.md b/docs/GOAL3_STATUS.md
+index 94c9ed5..9d35039 100644
+--- a/docs/GOAL3_STATUS.md
++++ b/docs/GOAL3_STATUS.md
+@@ -2,16 +2,17 @@
+ 
+ ## Current milestone
+ 
+-Milestone -2 — isolation: complete. Milestone -1 — inherited baseline: complete. Milestone 0 — remote/signing/source/artifact contracts: complete. Milestone 1 — physical-device compile: in progress.
++Milestone -2 — isolation: complete. Milestone -1 — inherited baseline: complete. Milestone 0 — remote/signing/source/artifact contracts: complete. Milestone 1 — physical-device compile: implementation complete, real archive validation blocked by the local toolchain.
+ 
+ ## Validation levels
+ 
+ - Source baseline: isolated at `d6887eba95b8116799801118c5026210628397f9`; metadata and workspace check passed; workspace tests reported 158 passed, 0 failed, 7 intentionally ignored.
+-- Remote protocol: v1.0 Rust contracts, provider boundary, cancellation, 24 typed events, and checked-in JSON Schema implemented; 44 unit/integration tests and 4 compile-fail doctests passed.
+-- Source snapshots: deterministic manifest selection and exact verification implemented; source archive transport is not implemented yet and returns a typed refusal without touching output.
++- Isolation audit: source checkout remains read-only. Review agents bypassed the Goal 3 command wrapper for a bounded set of checks; exact commands/outcomes and recovery are recorded in `GOAL3_COMMAND_AUDIT_EXCEPTIONS.md`. Their accidental Goal 3-only root build cache was removed with an audited `cargo clean`; subsequent checks use the wrapper.
++- Remote protocol: v1.0 Rust contracts, provider boundary, cancellation, 24 typed events, and checked-in JSON Schema implemented.
++- Source snapshots: deterministic manifest selection, deterministic ZIP transport, atomic publication, strict worker extraction, and exact post-extraction verification implemented.
+ - Signing/provisioning: reference-only typed plans, staged validation state, central chunk-safe redaction, and metadata validation implemented; no certificate/profile bytes or Apple signing operation validated.
+-- Artifact inspection: cross-platform ZIP/plist/Mach-O parser implemented and rejects arm64 Simulator platform metadata; only synthetic unit fixtures have run, not a produced IPA.
+-- Physical-device compile: not validated.
++- Artifact inspection: cross-platform strict unsigned `.xcarchive`/`.app` and IPA ZIP/plist/Mach-O parsers implemented. They reject Simulator code, signing residue in unsigned input, hidden code, bundle-set drift, resource drift, links, collisions, and archive-limit violations. `rustferry-remote` reported 67 unit/integration tests plus 4 compile-fail doctests passing; strict clippy and Linux/Windows cross-target checks pass. The license review covers 238 packages and 19 expressions. Produced physical-device artifacts have not run through either validator.
++- Physical-device compile: deterministic unsigned `aarch64-apple-ios`/`iphoneos`/generic-device archive plan and executor implemented. `rustferry-apple` reported 38 passed and 8 intentionally ignored; strict clippy and macOS, Linux, and Windows planner checks passed. Local Xcode 26.6 accepted the generated device project and a real signed Simulator extension smoke passed. A real physical archive remains unvalidated: the isolated host lacks the `aarch64-apple-ios` Rust target, and `xcodebuild` reports the discoverable iPhoneOS 26.5 SDK's platform component is not installed. The executor now fails this condition before Cargo work.
+ - IPA export: not validated.
+ - Client download: not validated.
+ - Install, launch, runtime: not validated.
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 3aff9ab..1c10528 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -34,6 +34,12 @@ At commit `be5206c`, [Platform artifacts run 30699379465](https://github.com/Shi
+ 
+ This is artifact validation only. The workflow did not boot an emulator or Simulator, install or launch either application, or exercise behavior on a physical device.
+ 
++## Isolated physical-iPhone work
++
++The Goal 3 branch implements a deterministic unsigned `aarch64-apple-ios` archive planner/executor plus a cross-platform strict `.xcarchive` validator. Host, synthetic security-matrix, generated-project, strict-clippy, and Linux/Windows planner checks pass. A real signed Simulator extension smoke also passes, but it is not physical-device evidence.
++
++Physical-device artifact validation remains blocked on this host. The isolated toolchain lacks the `aarch64-apple-ios` Rust target, and Xcode reports that the discoverable iPhoneOS 26.5 SDK's platform component is not installed. No real physical-device Mach-O, `.xcarchive`, signed IPA, install, launch, or runtime behavior is therefore claimed.
++
+ ## Recorded checks
+ 
+ The local results in this subsection predate the rename and remain historical host/test evidence. The Platform run above supplies current rename-integration artifact evidence; commands below use RustFerry names for reproduction.
+@@ -79,7 +85,7 @@ See [Apple implementation status](ios/status.md) for identifiers, checks, and ru
+ ## Toolchain inventory
+ 
+ - Rust/Cargo 1.96.0; host target `aarch64-apple-darwin` installed.
+-- Xcode 26.6; iPhoneOS and iPhoneSimulator 26.5 SDKs available.
++- Xcode 26.6; iPhoneSimulator 26.5 available. An iPhoneOS 26.5 SDK directory is discoverable, but `xcodebuild` reports its platform component is not installed.
+ - Android SDK roots resolve to `~/Library/Android/sdk`; platforms 35 and 37.0, build-tools 34.0.0 and 37.0.0, and NDK 29.0.14206865 are available.
+ - `aapt2`, `d8`, `zipalign`, `apksigner`, `adb`, Java 21, `javac`, and `keytool` available.
+-- Rust targets `aarch64-linux-android` and `aarch64-apple-ios-sim` are installed. No Simulator runtime/device or physical-device validation is available.
++- Rust targets `aarch64-linux-android` and `aarch64-apple-ios-sim` are installed; `aarch64-apple-ios` is absent. No Simulator runtime/device or physical-device validation is available.
+-- 
+2.55.0
+

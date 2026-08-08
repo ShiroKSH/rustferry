@@ -1,18 +1,21 @@
 # Publish Rust crates
 
-RustFerry contains six publishable crates with one workspace version. They must be published in dependency order:
+RustFerry contains eight publishable crates with one workspace version. They must be published in dependency order:
 
-1. `rustferry-core` and `rustferry`;
+1. `rustferry-core`, `rustferry`, and `rustferry-remote`;
 2. `rustferry-codegen`;
-3. `rustferry-apple` and `rustferry-android`;
+3. `rustferry-apple`, `rustferry-android`, and `rustferry-github`;
 4. `cargo-ferry`.
+
+`rustferry-worker-macos` is a non-publishable workspace tool. Keep it in normal
+workspace checks and exclude it from package/publish selection.
 
 Run package and upload dry-runs from a clean release revision:
 
 ```console
-cargo package --workspace --locked --list
-cargo package --workspace --locked
-cargo publish --workspace --dry-run --locked --no-verify
+cargo package --workspace --exclude rustferry-worker-macos --locked --list
+cargo package --workspace --exclude rustferry-worker-macos --locked
+cargo publish --workspace --exclude rustferry-worker-macos --dry-run --locked --no-verify
 python3 scripts/check-release-contract.py
 python3 scripts/check-release-archives.py \
   --check-sources \

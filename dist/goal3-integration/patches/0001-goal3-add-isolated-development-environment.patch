@@ -1,0 +1,305 @@
+From cf4569e8169da27bfbde002966f8c15fc73c8132 Mon Sep 17 00:00:00 2001
+From: ShiroKSH <kushidashiro@gmail.com>
+Date: Sat, 1 Aug 2026 17:21:32 +0300
+Subject: [PATCH 01/33] goal3: add isolated development environment
+
+---
+ .gitignore                     |  1 +
+ docs/GOAL3_BASELINE.md         | 21 ++++++++
+ docs/GOAL3_COMMAND_AUDIT.jsonl | 17 ++++++
+ docs/GOAL3_CONFLICT_REPORT.md  | 13 +++++
+ docs/GOAL3_ISOLATION.md        | 15 ++++++
+ docs/GOAL3_OWNERSHIP.md        | 26 +++++++++
+ docs/GOAL3_PLAN.md             | 12 +++++
+ docs/GOAL3_STATUS.md           | 19 +++++++
+ scripts/goal3-run              | 96 ++++++++++++++++++++++++++++++++++
+ 9 files changed, 220 insertions(+)
+ create mode 100644 docs/GOAL3_BASELINE.md
+ create mode 100644 docs/GOAL3_COMMAND_AUDIT.jsonl
+ create mode 100644 docs/GOAL3_CONFLICT_REPORT.md
+ create mode 100644 docs/GOAL3_ISOLATION.md
+ create mode 100644 docs/GOAL3_OWNERSHIP.md
+ create mode 100644 docs/GOAL3_PLAN.md
+ create mode 100644 docs/GOAL3_STATUS.md
+ create mode 100755 scripts/goal3-run
+
+diff --git a/.gitignore b/.gitignore
+index 7ebbbf9..562b8b3 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,4 +1,5 @@
+ /target/
++/.goal3/
+ /.idea/
+ /.vscode/
+ *.log
+diff --git a/docs/GOAL3_BASELINE.md b/docs/GOAL3_BASELINE.md
+new file mode 100644
+index 0000000..781f3dd
+--- /dev/null
++++ b/docs/GOAL3_BASELINE.md
+@@ -0,0 +1,21 @@
++# Goal 3 baseline
++
++- Captured: `2026-08-01T13:53:08Z`
++- Source repository: `/Users/kushida/Documents/rust-and-iphone`
++- Goal 3 repository: `/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone`
++- Stable base commit: `d6887eba95b8116799801118c5026210628397f9`
++- Source branch: `master`
++- Goal 3 branch: `goal3/macless-iphone-builds`
++- Isolation mode: A — Git worktree
++- Source status at isolation: clean
++- Source remote state: `HEAD == origin/master`
++- Existing worktrees before isolation: source checkout only
++- Disk at isolation: 228 GiB total, 19 GiB available, 91% capacity
++
++## Baseline checks
++
++- `cargo metadata --no-deps --format-version 1`: passed; target directory resolved to `.goal3/target`.
++- `cargo check --workspace --all-targets --all-features`: passed in 1 minute 11 seconds.
++- `cargo test --workspace --all-features`: 158 passed, 0 failed, 7 ignored. The ignored tests explicitly require Android tooling, Xcode/iOS Simulator tooling, or opt-in performance measurement.
++
++The full test process took about 20 minutes because generated projects run nested Cargo checks. After the successful first suite, editing the still-running wrapper caused Bash to re-read shifted script contents and start an unintended duplicate test command. That duplicate alone was cancelled with exit 130; no source files or external state were affected. The wrapper is no longer edited while one of its processes is active.
+diff --git a/docs/GOAL3_COMMAND_AUDIT.jsonl b/docs/GOAL3_COMMAND_AUDIT.jsonl
+new file mode 100644
+index 0000000..8810a35
+--- /dev/null
++++ b/docs/GOAL3_COMMAND_AUDIT.jsonl
+@@ -0,0 +1,17 @@
++{"timestamp":"2026-08-01T13:52:15Z","operation_id":"goal3-isolation-worktree","cwd":"/Users/kushida/Documents/rust-and-iphone","command_category":"isolation","affected_path_category":"goal3-worktree-and-git-metadata","result":"success","exit_code":0}
++{"timestamp":"2026-08-01T13:52:54Z","operation_id":"goal3-isolation-directories","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"bootstrap","affected_path_category":"goal3-development-directories","result":"success","exit_code":0}
++{"timestamp":"2026-08-01T13:53:08Z","operation_id":"goal3-isolation-files","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"bootstrap","affected_path_category":"goal3-isolation-files","result":"success","exit_code":0}
++{"timestamp":"2026-08-01T13:54:38Z","operation_id":"goal3-20260801T135437Z-49254-32516","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"bootstrap","affected_path_category":"scripts","result":"success","exit_code":0}
++{"timestamp":"2026-08-01T13:55:13Z","operation_id":"goal3-20260801T135512Z-49796-24515","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"baseline","affected_path_category":"cargo-metadata","result":"success","exit_code":0}
++{"timestamp":"2026-08-01T13:56:41Z","operation_id":"goal3-20260801T135529Z-50088-31939","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"baseline","affected_path_category":"cargo-check","result":"success","exit_code":0}
++{"timestamp":"2026-08-01T14:15:15Z","operation_id":"goal3-20260801T141515Z-85859-24458","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"verification","affected_path_category":"isolation-script","result":"started","exit_code":null}
++{"timestamp":"2026-08-01T14:15:15Z","operation_id":"goal3-20260801T141515Z-85859-24458","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"verification","affected_path_category":"isolation-script","result":"success","exit_code":0}
++{"timestamp":"2026-08-01T14:16:58Z","operation_id":"goal3-20260801T135700Z-53421-24815","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"baseline","affected_path_category":"cargo-test","result":"started","exit_code":null}
++{"timestamp":"2026-08-01T14:16:58Z","operation_id":"goal3-baseline-cargo-test-first-run","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"baseline","affected_path_category":"cargo-test","result":"success","exit_code":0,"detail":"158 passed; 0 failed; 7 ignored before wrapper reread"}
++{"timestamp":"2026-08-01T14:19:12Z","operation_id":"goal3-20260801T135700Z-53421-24815","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"baseline","affected_path_category":"duplicate-cargo-test","result":"failure","exit_code":130,"detail":"unintended duplicate cancelled after successful first run"}
++{"timestamp":"2026-08-01T14:19:58Z","operation_id":"goal3-20260801T141958Z-97431-4923","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"verification","affected_path_category":"isolation-script","result":"started","exit_code":null}
++{"timestamp":"2026-08-01T14:19:58Z","operation_id":"goal3-20260801T141958Z-97431-4923","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"verification","affected_path_category":"isolation-script","result":"success","exit_code":0}
++{"timestamp":"2026-08-01T14:20:09Z","operation_id":"goal3-20260801T142009Z-97593-26642","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"verification","affected_path_category":"audit-failure","result":"started","exit_code":null}
++{"timestamp":"2026-08-01T14:20:09Z","operation_id":"goal3-20260801T142009Z-97593-26642","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"verification","affected_path_category":"audit-failure","result":"failure","exit_code":1}
++{"timestamp":"2026-08-01T14:20:58Z","operation_id":"goal3-20260801T142058Z-99126-25174","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"git-stage","affected_path_category":"isolation-files","result":"started","exit_code":null}
++{"timestamp":"2026-08-01T14:20:58Z","operation_id":"goal3-20260801T142058Z-99126-25174","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"git-stage","affected_path_category":"isolation-files","result":"success","exit_code":0}
+diff --git a/docs/GOAL3_CONFLICT_REPORT.md b/docs/GOAL3_CONFLICT_REPORT.md
+new file mode 100644
+index 0000000..053a710
+--- /dev/null
++++ b/docs/GOAL3_CONFLICT_REPORT.md
+@@ -0,0 +1,13 @@
++# Goal 3 conflict report
++
++- Goal 3 base: `d6887eba95b8116799801118c5026210628397f9`
++- Latest observed Goal 2/source commit: `d6887eba95b8116799801118c5026210628397f9`
++- Latest observation: `2026-08-01T14:13:28Z`
++- Source status at isolation: clean
++- Source status at latest observation: actively changing, with tracked and untracked Goal 2 work
++- Goal 2 tracked changes after base: root Cargo manifests; `crates/cargo-ferry/` manifests, CLI, commands, errors, main, and tests; `crates/rustferry-codegen/` manifests/templates; `crates/rustferry-core/` assets/exports; summary; example assets
++- Goal 2 untracked additions after base: IDE/deployment modules and fixtures, editor integration, codegen assets, IDE/NEXT_PHASE docs, and replacement branding assets
++- Goal 3 files changed: isolation files and documentation only
++- Current textual intersection: none, because Goal 3 has not edited shared implementation files
++
++Semantic conflicts are already visible: Goal 2 is adding JSON streaming, IDE events, diagnostics, artifacts, device/deployment models, signing, and physical-build types. Goal 3 will begin with an additive neutral remote-contract crate and will not duplicate or edit those shared surfaces. Resolution order: shared core models; workspace dependencies; CLI dispatch; provider workflows; generated IDE adapters; docs/status. This report is a point-in-time observation and will be regenerated at integration. Stable Goal 2 integration has not occurred and no merged test matrix has run.
+diff --git a/docs/GOAL3_ISOLATION.md b/docs/GOAL3_ISOLATION.md
+new file mode 100644
+index 0000000..747b0f6
+--- /dev/null
++++ b/docs/GOAL3_ISOLATION.md
+@@ -0,0 +1,15 @@
++# Goal 3 isolation
++
++- Source repository: `/Users/kushida/Documents/rust-and-iphone`
++- Goal 3 repository: `/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone`
++- Mode: A — Git worktree
++- Branch: `goal3/macless-iphone-builds`
++- Stable base: `d6887eba95b8116799801118c5026210628397f9`
++
++The source checkout is read-only for Goal 3. The only source-side mutation was the explicitly permitted `git worktree add`, which created this sibling checkout and its branch. All builds, tests, generated output, caches, and later mutations run in the Goal 3 checkout through `scripts/goal3-run` where practical.
++
++The wrapper rejects execution when its canonical current directory is inside the source repository and rejects direct absolute arguments targeting that repository. It exports isolated target, cache, config, artifact, and temporary roots, creates an operation ID, and records only command/path categories—not command arguments or secret material. A negative test from the source checkout exited 64 before running `/usr/bin/true`.
++
++The wrapper is defense in depth, not an operating-system write sandbox: opaque child behavior and encoded shell scripts cannot be proven safe by argument inspection. Goal 3 therefore also relies on the physical sibling checkout, narrow commands, explicit target paths, and the invariant that no Goal 3 command receives a source path.
++
++Direct bootstrap mutations before the wrapper became available are recorded in `GOAL3_COMMAND_AUDIT.jsonl`.
+diff --git a/docs/GOAL3_OWNERSHIP.md b/docs/GOAL3_OWNERSHIP.md
+new file mode 100644
+index 0000000..03afa6c
+--- /dev/null
++++ b/docs/GOAL3_OWNERSHIP.md
+@@ -0,0 +1,26 @@
++# Goal 3 ownership
++
++## Goal 3 additions
++
++- Remote build protocol and provider contracts.
++- Physical-iPhone compile, signing, provisioning, artifact inspection, and worker components.
++- GitHub Actions, SSH Mac, and local Mac providers.
++- Goal 3 workflow, `docs/remote/`, `docs/iphone/`, security guidance, fixtures, and integration package.
++
++## Shared files likely to change
++
++- Root `Cargo.toml` and `Cargo.lock` for additive workspace crates.
++- `crates/cargo-ferry/` for thin command integration.
++- `crates/rustferry-apple/` for device-host reuse where a narrow extension is safer than duplication.
++- README, changelog, status, support matrix, summary, and security documentation.
++
++## High-conflict surfaces
++
++- CLI parser and command dispatch.
++- Root workspace membership/dependencies.
++- Existing process, artifact, diagnostic, and cancellation models.
++- Generic GitHub workflows and user-facing status documentation.
++
++## Goal 2 boundary
++
++Goal 3 will not modify `editors/vscode/`, the current IDE protocol, or current device/install/run/logs implementations until a stable Goal 2 commit is available. Temporary compatibility types remain in one `goal2_compat` boundary. Final integration reconciles, rather than duplicates, Goal 2 models.
+diff --git a/docs/GOAL3_PLAN.md b/docs/GOAL3_PLAN.md
+new file mode 100644
+index 0000000..c253864
+--- /dev/null
++++ b/docs/GOAL3_PLAN.md
+@@ -0,0 +1,12 @@
++# Goal 3 plan
++
++1. Isolation and baseline: guarded workspace, audit, ownership, existing checks.
++2. Contracts: remote protocol v1, provider traits, signing plans, artifact manifests, cancellation.
++3. Device compile: `aarch64-apple-ios`, `iphoneos`, hidden host, archive, device/simulator proof.
++4. Signing: certificates, profiles, entitlements, nested signing, temporary keychain, validated development IPA.
++5. GitHub provider: exact revision, secure workflow, dispatch/events/cancel/download, protected signing.
++6. SSH and local Mac providers: verified host/worker handshakes, secure bundles, cleanup.
++7. Real acceptance: Linux/Windows client to remote macOS, signed IPA download and integrity proof.
++8. Reconciliation: Goal 2 compatibility, conflict report, tests, docs, integration bundle and patches.
++
++No phase may promote a validation level without inspecting the produced artifact. Unsigned compilation, fake providers, generated workflows, and unit tests are supporting evidence only.
+diff --git a/docs/GOAL3_STATUS.md b/docs/GOAL3_STATUS.md
+new file mode 100644
+index 0000000..0a92d37
+--- /dev/null
++++ b/docs/GOAL3_STATUS.md
+@@ -0,0 +1,19 @@
++# Goal 3 status
++
++## Current milestone
++
++Milestone -2 — isolation: complete. Milestone -1 — inherited baseline: complete. Milestone 0 — contracts: next.
++
++## Validation levels
++
++- Source baseline: isolated at `d6887eba95b8116799801118c5026210628397f9`; metadata and workspace check passed; workspace tests reported 158 passed, 0 failed, 7 intentionally ignored.
++- Remote protocol: not implemented.
++- Physical-device compile: not validated.
++- Signing/provisioning: not validated.
++- IPA export: not validated.
++- Client download: not validated.
++- Install, launch, runtime: not validated.
++
++## Honest product status
++
++Goal 3 is isolated but not yet implemented. Existing iOS Simulator support is not evidence of physical-iPhone support.
+diff --git a/scripts/goal3-run b/scripts/goal3-run
+new file mode 100755
+index 0000000..24ba97c
+--- /dev/null
++++ b/scripts/goal3-run
+@@ -0,0 +1,96 @@
++#!/usr/bin/env bash
++set -u
++
++fail() {
++  printf 'goal3-run: %s\n' "$1" >&2
++  exit 64
++}
++
++canonical_dir() {
++  (cd -P -- "$1" 2>/dev/null && pwd -P)
++}
++
++[[ $# -ge 4 ]] || fail "usage: goal3-run <category> <path-category> -- <command> [args...]"
++
++command_category="$1"
++path_category="$2"
++shift 2
++[[ "$1" == "--" ]] || fail "missing -- before command"
++shift
++[[ $# -gt 0 ]] || fail "missing command"
++[[ "$command_category" =~ ^[A-Za-z0-9_.-]+$ ]] || fail "invalid command category"
++[[ "$path_category" =~ ^[A-Za-z0-9_.-]+$ ]] || fail "invalid path category"
++
++script_dir="$(canonical_dir "$(dirname -- "${BASH_SOURCE[0]}")")" || fail "cannot resolve script directory"
++goal3_repo="$(canonical_dir "$script_dir/..")" || fail "cannot resolve Goal 3 repository"
++source_file="$goal3_repo/.goal3/SOURCE_REPO.txt"
++goal3_file="$goal3_repo/.goal3/GOAL3_REPO.txt"
++[[ -f "$source_file" && -f "$goal3_file" ]] || fail "isolation path files are missing"
++
++source_recorded="$(<"$source_file")"
++goal3_recorded="$(<"$goal3_file")"
++source_repo="$(canonical_dir "$source_recorded")" || fail "cannot resolve source repository"
++goal3_expected="$(canonical_dir "$goal3_recorded")" || fail "cannot resolve recorded Goal 3 repository"
++[[ "$goal3_repo" == "$goal3_expected" ]] || fail "Goal 3 repository path mismatch"
++
++cwd="$(pwd -P)" || fail "cannot resolve current directory"
++case "$cwd/" in
++  "$source_repo/"*) fail "refusing a mutating command inside SOURCE_REPO" ;;
++esac
++case "$cwd/" in
++  "$goal3_repo/"*) ;;
++  *) fail "commands are allowed only inside GOAL3_REPO" ;;
++esac
++
++for argument in "$@"; do
++  case "$argument" in
++    "$source_repo"|"$source_repo/"*) fail "refusing a command argument that targets SOURCE_REPO" ;;
++  esac
++done
++
++export CARGO_TARGET_DIR="$goal3_repo/.goal3/target"
++export RUSTFERRY_GOAL="3"
++export RUSTFERRY_CACHE_DIR="$goal3_repo/.goal3/cache"
++export RUSTFERRY_CONFIG_HOME="$goal3_repo/.goal3/config"
++export RUSTFERRY_ARTIFACT_DIR="$goal3_repo/.goal3/artifacts"
++export TMPDIR="$goal3_repo/.goal3/tmp"
++
++mkdir -p -- "$CARGO_TARGET_DIR" "$RUSTFERRY_CACHE_DIR" "$RUSTFERRY_CONFIG_HOME" \
++  "$RUSTFERRY_ARTIFACT_DIR" "$TMPDIR" "$goal3_repo/.goal3/logs"
++
++operation_id="goal3-$(date -u +%Y%m%dT%H%M%SZ)-$$-${RANDOM:-0}"
++export RUSTFERRY_OPERATION_ID="$operation_id"
++audit_file="$goal3_repo/docs/GOAL3_COMMAND_AUDIT.jsonl"
++started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
++printf '{"timestamp":"%s","operation_id":"%s","cwd":"%s","command_category":"%s","affected_path_category":"%s","result":"started","exit_code":null}\n' \
++  "$started_at" "$operation_id" "$cwd" "$command_category" "$path_category" >> "$audit_file"
++
++audit_complete=0
++audit_on_exit() {
++  trapped_exit=$?
++  if [[ "$audit_complete" -eq 0 ]]; then
++    if [[ "$trapped_exit" -eq 0 ]]; then
++      trapped_result="success"
++    else
++      trapped_result="failure"
++    fi
++    trapped_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
++    printf '{"timestamp":"%s","operation_id":"%s","cwd":"%s","command_category":"%s","affected_path_category":"%s","result":"%s","exit_code":%d}\n' \
++      "$trapped_at" "$operation_id" "$cwd" "$command_category" "$path_category" "$trapped_result" "$trapped_exit" >> "$audit_file"
++  fi
++}
++trap audit_on_exit EXIT
++
++"$@"
++exit_code=$?
++if [[ $exit_code -eq 0 ]]; then
++  result="success"
++else
++  result="failure"
++fi
++timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
++printf '{"timestamp":"%s","operation_id":"%s","cwd":"%s","command_category":"%s","affected_path_category":"%s","result":"%s","exit_code":%d}\n' \
++  "$timestamp" "$operation_id" "$cwd" "$command_category" "$path_category" "$result" "$exit_code" >> "$audit_file"
++audit_complete=1
++
++exit "$exit_code"
+-- 
+2.55.0
+

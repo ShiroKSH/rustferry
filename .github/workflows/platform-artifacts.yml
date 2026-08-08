@@ -310,7 +310,7 @@ jobs:
           jq -e '
             .status == "ok" and
             .data.validated == true and
-            .data.validation.schema_version == 8 and
+            .data.validation.schema_version == 9 and
             .data.validation.bundle_identifier == "org.rustferry.cimobile" and
             .data.validation.rust_binary_embedded == true and
             .data.validation.code_signature.identifier == "org.rustferry.cimobile" and
@@ -400,7 +400,7 @@ jobs:
           jq -e '
             .status == "ok" and
             .data.validated == true and
-            .data.validation.schema_version == 8 and
+            .data.validation.schema_version == 9 and
             .data.validation.bundle_identifier == "org.rustferry.ciextensions" and
             .data.validation.code_signature.identifier == "org.rustferry.ciextensions" and
             .data.validation.code_signature.ad_hoc == true and
@@ -427,7 +427,7 @@ jobs:
             ([.data.validation.extensions[].code_signature.resources_sealed] | all) and
             ([.data.validation.extensions[] | select(.kind == "widget-kit")][0].code_signature.identifier == "org.rustferry.ciextensions.widget") and
             ([.data.validation.extensions[] | select(.kind == "widget-kit")][0].code_signature.app_groups == ["group.org.rustferry.ciextensions"]) and
-            ([.data.validation.extensions[] | select(.kind == "activity-kit")][0].runtime_bridge_linked == true) and
+            ([.data.validation.extensions[] | select(.kind == "activity-kit")][0].activity_model_linked == true) and
             ([.data.validation.extensions[] | select(.kind == "activity-kit")][0].code_signature.identifier == "org.rustferry.ciextensions.liveactivity") and
             ([.data.validation.extensions[] | select(.kind == "activity-kit")][0].code_signature.app_groups == [])
           ' "$result" > /dev/null

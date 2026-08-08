@@ -35,7 +35,7 @@ pub use logs::{
 pub use run::{LaunchOutcome, LaunchRequest, Launcher};
 pub use signing::{
     AppleDevelopmentTeam, PhysicalBuildOutcome, PhysicalBuildPlan, PhysicalBuildRequest,
-    PhysicalIosValidation, SigningService, parse_development_teams,
+    PhysicalIosValidation, SigningService, parse_development_teams, plan_physical_build,
 };
 
 const MAX_COREDEVICE_JSON_BYTES: usize = 8 * 1024 * 1024;

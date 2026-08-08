@@ -81,16 +81,17 @@ pub fn handshake() -> HandshakeResponse {
 /// Discover Apple Development identities without exposing credentials or private keys.
 pub fn signing_teams(workspace: &Utf8Path) -> Result<SigningTeamsResponse, CliError> {
     let root = find_project_root(Some(workspace))?;
-    let teams =
-        cargo_ferry::deployment::SigningService::new(cargo_ferry::deployment::SystemExecutor)
-            .teams(&root)?
-            .into_iter()
-            .map(|team| SigningTeam {
-                team_id: team.team_id,
-                identity: team.identity,
-                certificate_fingerprint: team.certificate_fingerprint,
-            })
-            .collect();
+    let teams = cargo_ferry::deployment::SigningService::for_team_discovery(
+        cargo_ferry::deployment::SystemExecutor,
+    )?
+    .teams(&root)?
+    .into_iter()
+    .map(|team| SigningTeam {
+        team_id: team.team_id,
+        identity: team.identity,
+        certificate_fingerprint: team.certificate_fingerprint,
+    })
+    .collect();
     Ok(SigningTeamsResponse {
         protocol_version: PROTOCOL_VERSION,
         teams,

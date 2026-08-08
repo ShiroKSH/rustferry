@@ -1,0 +1,1828 @@
+From ce1cd180e8abd1dc4bbbf97b5556587aec6f3dd6 Mon Sep 17 00:00:00 2001
+From: ShiroKSH <kushidashiro@gmail.com>
+Date: Sat, 8 Aug 2026 12:20:48 +0300
+Subject: [PATCH 32/33] fix: harden remote file transactions
+
+---
+ CHANGELOG.md                                  |   1 +
+ Cargo.lock                                    |   1 +
+ crates/cargo-ferry/Cargo.toml                 |   1 +
+ crates/cargo-ferry/src/commands/remote.rs     | 679 +++++++++++++++---
+ crates/cargo-ferry/src/commands/signing.rs    | 211 +++---
+ crates/rustferry-github/src/transport.rs      | 181 +++--
+ crates/rustferry-worker-macos/src/process.rs  |   4 +-
+ .../rustferry-worker-macos/src/signed_ipa.rs  | 142 +++-
+ 8 files changed, 943 insertions(+), 277 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c16b4a7..a0f2f47 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,6 +4,7 @@ All notable changes to this project will be documented in this file.
+ 
+ ## Unreleased
+ 
++- Harden remote build file-identity checks across Windows and macOS, make provider-config replacement no-clobber, and bound GitHub CLI process cleanup.
+ - Add manual GitHub remote-signing setup with local Apple Development asset validation, secure bounded secret upload after confirmation, and signing-plan persistence only after remote verification.
+ - Add versioned remote-build contracts and a GitHub-hosted macOS physical-iPhone pipeline with exact-ref publication, unsigned archive validation, protected development signing, verified artifact download, cancellation, and cleanup.
+ - Establish the RustFerry workspace, strict configuration, atomic project templates, host-testable runtime, platform build foundations, documentation, and cross-platform CI.
+diff --git a/Cargo.lock b/Cargo.lock
+index 068b842..1bf5914 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -418,6 +418,7 @@ dependencies = [
+  "rustferry-core",
+  "rustferry-github",
+  "rustferry-remote",
++ "same-file",
+  "semver",
+  "serde",
+  "serde_json",
+diff --git a/crates/cargo-ferry/Cargo.toml b/crates/cargo-ferry/Cargo.toml
+index 28f391d..b236f21 100644
+--- a/crates/cargo-ferry/Cargo.toml
++++ b/crates/cargo-ferry/Cargo.toml
+@@ -31,6 +31,7 @@ rustferry-core = { version = "0.1.0", path = "../rustferry-core" }
+ rustferry-github = { version = "0.1.0", path = "../rustferry-github" }
+ rustferry-remote = { version = "0.1.0", path = "../rustferry-remote" }
+ rpassword.workspace = true
++same-file.workspace = true
+ semver.workspace = true
+ serde.workspace = true
+ serde_json.workspace = true
+diff --git a/crates/cargo-ferry/src/commands/remote.rs b/crates/cargo-ferry/src/commands/remote.rs
+index c1b8b2f..89d02a5 100644
+--- a/crates/cargo-ferry/src/commands/remote.rs
++++ b/crates/cargo-ferry/src/commands/remote.rs
+@@ -33,6 +33,7 @@ use rustferry_remote::{
+     SourceLimits, SourceManifest, SourceManifestEntry, SourceMode, UnsignedNestedBundleKind,
+     ValidationLevel, plan_source_bundle, validate_source_manifest,
+ };
++use same_file::Handle as FileIdentityHandle;
+ use semver::Version;
+ use serde::{Deserialize, Serialize};
+ use sha2::{Digest as _, Sha256};
+@@ -51,6 +52,7 @@ use crate::project::{
+ const CONFIG_SCHEMA_VERSION: u32 = 2;
+ const CONFIG_RELATIVE_PATH: &str = "target/ferry/github/provider.json";
+ const CONFIG_LOCK_RELATIVE_PATH: &str = "target/ferry/github/.provider.lock";
++const CONFIG_BACKUP_PREFIX: &str = ".provider-backup-";
+ const CACHE_RELATIVE_PATH: &str = "target/ferry/github/cache";
+ const GIT_ISOLATION_RELATIVE_PATH: &str = "target/ferry/github/git-isolation";
+ const WORKFLOW_FILE: &str = "rustferry-goal3-iphone.yml";
+@@ -456,6 +458,7 @@ struct ProviderConfigLock {
+     _file: File,
+ }
+ 
++#[derive(Debug)]
+ enum ConfigCommitError {
+     NotCommitted(Box<CliError>),
+     CommittedNeedsInspection(Box<CliError>),
+@@ -486,74 +489,39 @@ struct ExpectedDownload {
+     path: Utf8PathBuf,
+ }
+ 
+-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+-struct ArtifactFileIdentity {
+-    #[cfg(unix)]
+-    device: u64,
+-    #[cfg(unix)]
+-    inode: u64,
+-    #[cfg(windows)]
+-    volume_serial_number: u32,
+-    #[cfg(windows)]
+-    file_index: u64,
+-    #[cfg(not(any(unix, windows)))]
+-    length: u64,
+-    #[cfg(not(any(unix, windows)))]
+-    created: std::time::SystemTime,
+-    #[cfg(not(any(unix, windows)))]
+-    modified: std::time::SystemTime,
+-}
++#[derive(Debug, Eq, PartialEq)]
++struct ArtifactFileIdentity(FileIdentityHandle);
+ 
+ impl ArtifactFileIdentity {
+     fn capture(path: &Utf8Path) -> std::io::Result<Self> {
+         let metadata = fs::symlink_metadata(path)?;
+-        Self::from_metadata(&metadata)
++        Self::validate_metadata(&metadata)?;
++        let identity = FileIdentityHandle::from_path(path)?;
++        Self::validate_metadata(&identity.as_file().metadata()?)?;
++        let final_metadata = fs::symlink_metadata(path)?;
++        Self::validate_metadata(&final_metadata)?;
++        if FileIdentityHandle::from_path(path)? != identity {
++            return Err(std::io::Error::new(
++                std::io::ErrorKind::WouldBlock,
++                "file identity changed while it was captured",
++            ));
++        }
++        Ok(Self(identity))
+     }
+ 
+-    fn from_metadata(metadata: &fs::Metadata) -> std::io::Result<Self> {
+-        if !metadata.file_type().is_file() {
++    fn from_file(file: &File) -> std::io::Result<Self> {
++        Self::validate_metadata(&file.metadata()?)?;
++        Ok(Self(FileIdentityHandle::from_file(file.try_clone()?)?))
++    }
++
++    fn validate_metadata(metadata: &fs::Metadata) -> std::io::Result<()> {
++        if !metadata.is_file() || metadata.file_type().is_symlink() {
+             return Err(std::io::Error::new(
+                 std::io::ErrorKind::InvalidData,
+-                "downloaded artifact is not a regular file",
++                "file identity target is not a regular file",
+             ));
+         }
+-
+-        #[cfg(unix)]
+-        let identity = {
+-            use std::os::unix::fs::MetadataExt as _;
+-
+-            Self {
+-                device: metadata.dev(),
+-                inode: metadata.ino(),
+-            }
+-        };
+-        #[cfg(windows)]
+-        let identity = {
+-            use std::os::windows::fs::MetadataExt as _;
+-
+-            Self {
+-                volume_serial_number: metadata.volume_serial_number().ok_or_else(|| {
+-                    std::io::Error::new(
+-                        std::io::ErrorKind::Unsupported,
+-                        "artifact volume identity is unavailable",
+-                    )
+-                })?,
+-                file_index: metadata.file_index().ok_or_else(|| {
+-                    std::io::Error::new(
+-                        std::io::ErrorKind::Unsupported,
+-                        "artifact file identity is unavailable",
+-                    )
+-                })?,
+-            }
+-        };
+-        #[cfg(not(any(unix, windows)))]
+-        let identity = Self {
+-            length: metadata.len(),
+-            created: metadata.created()?,
+-            modified: metadata.modified()?,
+-        };
+-
+-        Ok(identity)
++        Ok(())
+     }
+ }
+ 
+@@ -586,15 +554,67 @@ impl ArtifactDownloadRollback {
+ impl Drop for ArtifactDownloadRollback {
+     fn drop(&mut self) {
+         if !self.committed {
+-            for artifact in self.created.iter().rev() {
+-                if ArtifactFileIdentity::capture(&artifact.path).ok() == Some(artifact.identity) {
+-                    let _ = fs::remove_file(&artifact.path);
+-                }
++            while let Some(artifact) = self.created.pop() {
++                rollback_created_artifact(artifact);
+             }
+         }
+     }
+ }
+ 
++fn rollback_created_artifact(artifact: CreatedArtifact) {
++    rollback_created_artifact_with(artifact, |_| {});
++}
++
++fn rollback_created_artifact_with(
++    artifact: CreatedArtifact,
++    after_quarantine: impl FnOnce(&Utf8Path),
++) {
++    let Some(parent) = artifact.path.parent() else {
++        return;
++    };
++    let Ok(quarantine) = tempfile::Builder::new()
++        .prefix(".rustferry-rollback-")
++        .tempdir_in(parent)
++    else {
++        return;
++    };
++    let Ok(quarantine_root) = Utf8PathBuf::from_path_buf(quarantine.path().to_path_buf()) else {
++        return;
++    };
++    let quarantined = quarantine_root.join("artifact");
++    if fs::rename(&artifact.path, &quarantined).is_err() {
++        return;
++    }
++    after_quarantine(&quarantined);
++
++    let current = ArtifactFileIdentity::capture(&quarantined);
++    let unchanged = current
++        .as_ref()
++        .is_ok_and(|current| current == &artifact.identity);
++    drop(current);
++    drop(artifact.identity);
++    let Ok(temporary_path) = tempfile::TempPath::try_from_path(quarantined.to_path_buf()) else {
++        let _ = quarantine.keep();
++        return;
++    };
++    if unchanged {
++        let _ = temporary_path.close();
++        let _ = quarantine.close();
++        return;
++    }
++
++    match temporary_path.persist_noclobber(&artifact.path) {
++        Ok(()) => {
++            let _ = quarantine.close();
++        }
++        Err(mut error) => {
++            error.path.disable_cleanup(true);
++            drop(error);
++            let _ = quarantine.keep();
++        }
++    }
++}
++
+ pub fn run(arguments: RemoteArgs, dry_run: bool, reporter: &Reporter) -> Result<(), CliError> {
+     match arguments.command {
+         RemoteCommand::Setup(arguments) => setup(arguments, dry_run, reporter),
+@@ -871,7 +891,7 @@ impl<R: ManualSigningRemote> ManualGithubSigningSession<R> {
+             &self.root,
+             &self.paths.config,
+             &bytes,
+-            self.original_config_identity,
++            &self.original_config_identity,
+             &self.original_config_bytes,
+             &self.stored,
+             config_lock,
+@@ -1124,7 +1144,7 @@ pub fn build_iphone(
+     reporter: &Reporter,
+ ) -> Result<(), CliError> {
+     let RemoteProviderChoice::Github = provider;
+-    let stored = load_config(root)?;
++    let (stored, _config_lock) = load_config_for_build(root)?;
+     let signing = select_signing_plan(&stored, ferry_config, binary_name, expected_team, unsigned)?;
+     let git = git_context(root, &stored.source_remote_name, reporter)?;
+     let execution = git_remote_context(&git.root, &stored.execution_remote_name, reporter)?;
+@@ -3257,6 +3277,14 @@ fn provider_config_lock_for_signing(
+ fn acquire_provider_config_lock(
+     root: &Utf8Path,
+     path: &Utf8Path,
++) -> Result<ProviderConfigLock, CliError> {
++    acquire_provider_config_lock_with_interlock(root, path, || {})
++}
++
++fn acquire_provider_config_lock_with_interlock(
++    root: &Utf8Path,
++    path: &Utf8Path,
++    after_recovery_preflight: impl FnOnce(),
+ ) -> Result<ProviderConfigLock, CliError> {
+     if path != root.join(CONFIG_LOCK_RELATIVE_PATH) {
+         return Err(remote_error(
+@@ -3274,6 +3302,8 @@ fn acquire_provider_config_lock(
+         )
+     })?;
+     require_private_directory(parent, "GitHub provider config lock")?;
++    reject_config_recovery_entries(parent)?;
++    after_recovery_preflight();
+     if let Ok(metadata) = fs::symlink_metadata(path)
+         && (!metadata.is_file() || metadata.file_type().is_symlink())
+     {
+@@ -3303,7 +3333,7 @@ fn acquire_provider_config_lock(
+     })?;
+     require_single_link(&metadata, "provider-config lock")?;
+     require_private_mode(path, &metadata)?;
+-    let opened = ArtifactFileIdentity::from_metadata(&metadata).map_err(|source| CliError::Io {
++    let opened = ArtifactFileIdentity::from_file(&file).map_err(|source| CliError::Io {
+         action: "identify open provider-config lock",
+         path: path.to_owned(),
+         source,
+@@ -3339,6 +3369,7 @@ fn acquire_provider_config_lock(
+             "Stop concurrent filesystem changes and retry.",
+         ));
+     }
++    reject_config_recovery_entries(parent)?;
+     Ok(ProviderConfigLock { _file: file })
+ }
+ 
+@@ -3358,9 +3389,33 @@ fn require_single_link(metadata: &fs::Metadata, label: &'static str) -> Result<(
+     Ok(())
+ }
+ 
++fn reject_config_recovery_entries(parent: &Utf8Path) -> Result<(), CliError> {
++    let entries = fs::read_dir(parent).map_err(|source| CliError::Io {
++        action: "inspect provider-config recovery entries",
++        path: parent.to_owned(),
++        source,
++    })?;
++    for entry in entries {
++        let entry = entry.map_err(|source| CliError::Io {
++            action: "inspect provider-config recovery entry",
++            path: parent.to_owned(),
++            source,
++        })?;
++        let name = entry.file_name();
++        if name.to_string_lossy().starts_with(CONFIG_BACKUP_PREFIX) {
++            return Err(remote_error_with_details(
++                "provider_config_recovery_required",
++                "a preserved provider-config transaction requires inspection",
++                "Restore or remove the preserved transaction only after comparing it with the current provider config.",
++                vec![format!("recovery={}", entry.path().display())],
++            ));
++        }
++    }
++    Ok(())
++}
++
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ struct ConfigFileState {
+-    identity: ArtifactFileIdentity,
+     length: u64,
+     modified: Option<std::time::SystemTime>,
+ }
+@@ -3378,20 +3433,36 @@ impl ConfigFileState {
+             ));
+         }
+         require_single_link(metadata, "provider_config")?;
+-        let identity =
+-            ArtifactFileIdentity::from_metadata(metadata).map_err(|source| CliError::Io {
+-                action: "identify GitHub provider config",
+-                path: Utf8PathBuf::from(CONFIG_RELATIVE_PATH),
+-                source,
+-            })?;
+         Ok(Self {
+-            identity,
+             length: metadata.len(),
+             modified: metadata.modified().ok(),
+         })
+     }
+ }
+ 
++fn identify_config_file(
++    file: &File,
++    path: &Utf8Path,
++    action: &'static str,
++) -> Result<ArtifactFileIdentity, CliError> {
++    ArtifactFileIdentity::from_file(file).map_err(|source| CliError::Io {
++        action,
++        path: path.to_owned(),
++        source,
++    })
++}
++
++fn identify_config_path(
++    path: &Utf8Path,
++    action: &'static str,
++) -> Result<ArtifactFileIdentity, CliError> {
++    ArtifactFileIdentity::capture(path).map_err(|source| CliError::Io {
++        action,
++        path: path.to_owned(),
++        source,
++    })
++}
++
+ fn read_private_config_snapshot(
+     root: &Utf8Path,
+     path: &Utf8Path,
+@@ -3404,20 +3475,31 @@ fn read_private_config_snapshot(
+         ));
+     }
+     reject_linked_components(root, Utf8Path::new(CONFIG_RELATIVE_PATH), true)?;
+-    let initial_metadata = fs::symlink_metadata(path).map_err(|source| {
+-        if source.kind() == std::io::ErrorKind::NotFound {
+-            remote_error(
++    match fs::symlink_metadata(path) {
++        Ok(_) => {}
++        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
++            return Err(remote_error(
+                 "remote_not_configured",
+                 "the GitHub remote provider is not configured for this project",
+                 "Run `cargo ferry remote setup github --worker-revision <exact-commit>` first.",
+-            )
+-        } else {
+-            CliError::Io {
++            ));
++        }
++        Err(source) => {
++            return Err(CliError::Io {
+                 action: "inspect GitHub provider config",
+                 path: path.to_owned(),
+                 source,
+-            }
++            });
+         }
++    }
++    read_private_config_file(path)
++}
++
++fn read_private_config_file(path: &Utf8Path) -> Result<(ArtifactFileIdentity, Vec<u8>), CliError> {
++    let initial_metadata = fs::symlink_metadata(path).map_err(|source| CliError::Io {
++        action: "inspect private provider file",
++        path: path.to_owned(),
++        source,
+     })?;
+     require_private_mode(path, &initial_metadata)?;
+     let initial = ConfigFileState::capture(&initial_metadata)?;
+@@ -3441,7 +3523,10 @@ fn read_private_config_snapshot(
+     })?;
+     require_private_mode(path, &opened_metadata)?;
+     let opened = ConfigFileState::capture(&opened_metadata)?;
+-    if opened != initial {
++    let opened_identity =
++        identify_config_file(&file, path, "identify open GitHub provider config")?;
++    let linked_identity = identify_config_path(path, "identify GitHub provider config path")?;
++    if opened != initial || linked_identity != opened_identity {
+         return Err(provider_config_changed());
+     }
+ 
+@@ -3456,23 +3541,31 @@ fn read_private_config_snapshot(
+             path: path.to_owned(),
+             source,
+         })?;
+-    let final_handle =
++    let final_handle_state =
+         ConfigFileState::capture(&file.metadata().map_err(|source| CliError::Io {
+             action: "reinspect open GitHub provider config",
+             path: path.to_owned(),
+             source,
+         })?)?;
++    let final_handle_identity =
++        identify_config_file(&file, path, "reidentify open GitHub provider config")?;
+     let final_path_metadata = fs::symlink_metadata(path).map_err(|source| CliError::Io {
+         action: "reinspect GitHub provider config path",
+         path: path.to_owned(),
+         source,
+     })?;
+     require_private_mode(path, &final_path_metadata)?;
+-    let final_path = ConfigFileState::capture(&final_path_metadata)?;
+-    if bytes.len() as u64 != initial.length || final_handle != initial || final_path != initial {
++    let final_path_state = ConfigFileState::capture(&final_path_metadata)?;
++    let final_path_identity = identify_config_path(path, "reidentify GitHub provider config path")?;
++    if bytes.len() as u64 != initial.length
++        || final_handle_state != initial
++        || final_path_state != initial
++        || final_handle_identity != opened_identity
++        || final_path_identity != opened_identity
++    {
+         return Err(provider_config_changed());
+     }
+-    Ok((initial.identity, bytes))
++    Ok((opened_identity, bytes))
+ }
+ 
+ fn provider_config_changed() -> CliError {
+@@ -3497,6 +3590,16 @@ fn load_config(root: &Utf8Path) -> Result<StoredGithubConfig, CliError> {
+     Ok(stored)
+ }
+ 
++fn load_config_for_build(
++    root: &Utf8Path,
++) -> Result<(StoredGithubConfig, ProviderConfigLock), CliError> {
++    let _ = load_config(root)?;
++    let lock_path = root.join(CONFIG_LOCK_RELATIVE_PATH);
++    let lock = acquire_provider_config_lock(root, &lock_path)?;
++    let stored = load_config(root)?;
++    Ok((stored, lock))
++}
++
+ fn encode_stored_config(stored: &StoredGithubConfig) -> Result<Vec<u8>, CliError> {
+     let mut bytes = serde_json::to_vec_pretty(stored).map_err(|error| {
+         remote_error_with_details(
+@@ -3521,10 +3624,33 @@ fn replace_private_config(
+     root: &Utf8Path,
+     path: &Utf8Path,
+     bytes: &[u8],
+-    expected_original_identity: ArtifactFileIdentity,
++    expected_original_identity: &ArtifactFileIdentity,
+     expected_original_bytes: &[u8],
+     expected_installed: &StoredGithubConfig,
+     _config_lock: &ProviderConfigLock,
++) -> Result<(), ConfigCommitError> {
++    replace_private_config_with(
++        root,
++        path,
++        bytes,
++        expected_original_identity,
++        expected_original_bytes,
++        expected_installed,
++        || {},
++        |_| {},
++    )
++}
++
++#[allow(clippy::too_many_arguments)]
++fn replace_private_config_with(
++    root: &Utf8Path,
++    path: &Utf8Path,
++    bytes: &[u8],
++    expected_original_identity: &ArtifactFileIdentity,
++    expected_original_bytes: &[u8],
++    expected_installed: &StoredGithubConfig,
++    before_quarantine: impl FnOnce(),
++    after_quarantine: impl FnOnce(&Utf8Path),
+ ) -> Result<(), ConfigCommitError> {
+     let StagedPrivateConfig { temporary, parent } = stage_private_config(
+         root,
+@@ -3534,14 +3660,61 @@ fn replace_private_config(
+         expected_original_bytes,
+     )
+     .map_err(|error| ConfigCommitError::NotCommitted(Box::new(error)))?;
+-    temporary.persist(path).map_err(|error| {
+-        ConfigCommitError::NotCommitted(Box::new(CliError::Io {
+-            action: "atomically replace GitHub provider config",
+-            path: path.to_owned(),
+-            source: error.error,
++    before_quarantine();
++    let quarantine = ConfigQuarantine::capture(&parent, path)
++        .map_err(|error| ConfigCommitError::NotCommitted(Box::new(error)))?;
++    let quarantined_snapshot = read_private_config_file(&quarantine.path);
++    let quarantine_matches = quarantined_snapshot
++        .as_ref()
++        .is_ok_and(|(identity, current)| {
++            identity == expected_original_identity && current == expected_original_bytes
++        });
++    if !quarantine_matches {
++        let cause = quarantined_snapshot
++            .err()
++            .unwrap_or_else(provider_config_changed);
++        return Err(restore_config_or_preserve(quarantine, path, cause));
++    }
++    drop(quarantined_snapshot);
++    if let Err(error) = sync_private_config_directory(&parent) {
++        return Err(restore_config_or_preserve(quarantine, path, error));
++    }
++    after_quarantine(&quarantine.path);
++
++    let installed = match temporary.persist_noclobber(path) {
++        Ok(file) => file,
++        Err(error) => {
++            let recovery = quarantine.keep();
++            return Err(ConfigCommitError::CommittedNeedsInspection(Box::new(
++                remote_error_with_details(
++                    "provider_config_commit_uncertain",
++                    "the provider config could not be installed without overwriting a concurrent path",
++                    "Inspect the current provider config and the preserved original before retrying.",
++                    vec![format!("recovery={recovery}"), error.error.to_string()],
++                ),
++            )));
++        }
++    };
++    drop(installed);
++    if let Err(error) = finish_private_config_commit(root, &parent, expected_installed) {
++        let recovery = quarantine.keep();
++        return Err(ConfigCommitError::CommittedNeedsInspection(Box::new(
++            remote_error_with_details(
++                "provider_config_commit_uncertain",
++                "the updated provider config could not be verified after installation",
++                "Inspect the installed provider config and the preserved original before building.",
++                vec![format!("recovery={recovery}"), error.to_string()],
++            ),
++        )));
++    }
++    quarantine.delete().map_err(|(recovery, source)| {
++        ConfigCommitError::CommittedNeedsInspection(Box::new(CliError::Io {
++            action: "remove verified provider-config backup",
++            path: recovery,
++            source,
+         }))
+     })?;
+-    finish_private_config_commit(root, &parent, expected_installed)
++    sync_private_config_directory(&parent)
+         .map_err(|error| ConfigCommitError::CommittedNeedsInspection(Box::new(error)))
+ }
+ 
+@@ -3550,11 +3723,120 @@ struct StagedPrivateConfig {
+     parent: Utf8PathBuf,
+ }
+ 
++struct ConfigQuarantine {
++    directory: tempfile::TempDir,
++    path: Utf8PathBuf,
++}
++
++impl ConfigQuarantine {
++    fn capture(parent: &Utf8Path, path: &Utf8Path) -> Result<Self, CliError> {
++        let directory = tempfile::Builder::new()
++            .prefix(CONFIG_BACKUP_PREFIX)
++            .tempdir_in(parent)
++            .map_err(|source| CliError::Io {
++                action: "create provider-config backup directory",
++                path: parent.to_owned(),
++                source,
++            })?;
++        let root = Utf8PathBuf::from_path_buf(directory.path().to_path_buf())
++            .map_err(CliError::NonUtf8Path)?;
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::PermissionsExt as _;
++            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).map_err(|source| {
++                CliError::Io {
++                    action: "secure provider-config backup directory",
++                    path: root.clone(),
++                    source,
++                }
++            })?;
++        }
++        require_private_directory(&root, "provider-config backup")?;
++        let quarantined = root.join("provider.json");
++        fs::rename(path, &quarantined).map_err(|source| CliError::Io {
++            action: "quarantine original provider config",
++            path: path.to_owned(),
++            source,
++        })?;
++        Ok(Self {
++            directory,
++            path: quarantined,
++        })
++    }
++
++    fn keep(self) -> Utf8PathBuf {
++        let path = self.path.clone();
++        let _ = self.directory.keep();
++        path
++    }
++
++    fn restore_noclobber(
++        self,
++        destination: &Utf8Path,
++    ) -> Result<(), (Utf8PathBuf, std::io::Error)> {
++        let recovery = self.path.clone();
++        let temporary = match tempfile::TempPath::try_from_path(self.path.to_path_buf()) {
++            Ok(temporary) => temporary,
++            Err(source) => {
++                let _ = self.directory.keep();
++                return Err((recovery, source));
++            }
++        };
++        match temporary.persist_noclobber(destination) {
++            Ok(()) => {
++                let _ = self.directory.close();
++                Ok(())
++            }
++            Err(mut error) => {
++                error.path.disable_cleanup(true);
++                let source = error.error;
++                drop(error.path);
++                let _ = self.directory.keep();
++                Err((recovery, source))
++            }
++        }
++    }
++
++    fn delete(self) -> Result<(), (Utf8PathBuf, std::io::Error)> {
++        let recovery = self.path.clone();
++        if let Err(source) = fs::remove_file(&self.path) {
++            let _ = self.directory.keep();
++            return Err((recovery, source));
++        }
++        match self.directory.close() {
++            Ok(()) => Ok(()),
++            Err(source) => Err((recovery, source)),
++        }
++    }
++}
++
++fn restore_config_or_preserve(
++    quarantine: ConfigQuarantine,
++    destination: &Utf8Path,
++    cause: CliError,
++) -> ConfigCommitError {
++    match quarantine.restore_noclobber(destination) {
++        Ok(()) => ConfigCommitError::NotCommitted(Box::new(cause)),
++        Err((recovery, source)) => {
++            ConfigCommitError::CommittedNeedsInspection(Box::new(remote_error_with_details(
++                "provider_config_recovery_required",
++                "the changed provider config could not be restored without overwriting another path",
++                "Inspect the current provider config and preserved file before retrying.",
++                vec![
++                    format!("recovery={recovery}"),
++                    source.to_string(),
++                    cause.to_string(),
++                ],
++            )))
++        }
++    }
++}
++
+ fn stage_private_config(
+     root: &Utf8Path,
+     path: &Utf8Path,
+     bytes: &[u8],
+-    expected_original_identity: ArtifactFileIdentity,
++    expected_original_identity: &ArtifactFileIdentity,
+     expected_original_bytes: &[u8],
+ ) -> Result<StagedPrivateConfig, CliError> {
+     reject_linked_components(root, Utf8Path::new(CONFIG_RELATIVE_PATH), true)?;
+@@ -3617,14 +3899,7 @@ fn finish_private_config_commit(
+     parent: &Utf8Path,
+     expected_installed: &StoredGithubConfig,
+ ) -> Result<(), CliError> {
+-    #[cfg(unix)]
+-    File::open(parent)
+-        .and_then(|directory| directory.sync_all())
+-        .map_err(|source| CliError::Io {
+-            action: "synchronize GitHub provider config directory",
+-            path: parent.to_owned(),
+-            source,
+-        })?;
++    sync_private_config_directory(parent)?;
+     let installed = load_config(root)?;
+     if &installed != expected_installed {
+         return Err(remote_error(
+@@ -3636,14 +3911,26 @@ fn finish_private_config_commit(
+     Ok(())
+ }
+ 
++fn sync_private_config_directory(parent: &Utf8Path) -> Result<(), CliError> {
++    #[cfg(unix)]
++    File::open(parent)
++        .and_then(|directory| directory.sync_all())
++        .map_err(|source| CliError::Io {
++            action: "synchronize GitHub provider config directory",
++            path: parent.to_owned(),
++            source,
++        })?;
++    Ok(())
++}
++
+ fn ensure_config_snapshot_unchanged(
+     root: &Utf8Path,
+     path: &Utf8Path,
+-    expected_identity: ArtifactFileIdentity,
++    expected_identity: &ArtifactFileIdentity,
+     expected_bytes: &[u8],
+ ) -> Result<(), CliError> {
+     let (identity, current_bytes) = read_private_config_snapshot(root, path)?;
+-    if identity != expected_identity || current_bytes != expected_bytes {
++    if &identity != expected_identity || current_bytes != expected_bytes {
+         return Err(provider_config_changed());
+     }
+     Ok(())
+@@ -4444,18 +4731,20 @@ mod tests {
+         ManualSigningRemote, PROTECTED_ENVIRONMENT, RawSigningPassword, StoredGithubConfig,
+         TEMPORARY_NAMESPACE, WORKFLOW_FILE, acquire_provider_config_lock, downloaded_manifest,
+         encode_stored_config, ensure_config_snapshot_unchanged, ensure_doctor_ready,
+-        ensure_provider_directories, ensure_workflow_directory, executable_entrypoint,
+-        expected_artifact_downloads, load_config, parse_repository_spec, preflight_file,
+-        prepare_artifact_destination, provider_config_lock_for_signing,
+-        read_private_config_snapshot, remote_error, replace_private_config,
+-        required_signing_secret_names, retry_artifact_listing, source_manifest_digest,
+-        unsigned_signing_plan, validate_git_remote_name, validate_stored_config, write_create_only,
++        ensure_provider_directories, ensure_workflow_directory, expected_artifact_downloads,
++        load_config, parse_repository_spec, preflight_file, prepare_artifact_destination,
++        provider_config_lock_for_signing, read_private_config_snapshot, remote_error,
++        replace_private_config, required_signing_secret_names, retry_artifact_listing,
++        source_manifest_digest, unsigned_signing_plan, validate_git_remote_name,
++        validate_stored_config, write_create_only,
+     };
+     use std::cell::RefCell;
+     use std::collections::{BTreeSet, VecDeque};
+     use std::rc::Rc;
+     use std::time::{Duration, Instant};
+ 
++    #[cfg(unix)]
++    use super::executable_entrypoint;
+     use crate::error::CliError;
+     use crate::output::Reporter;
+     use rustferry_github::transport::{
+@@ -4867,7 +5156,7 @@ mod tests {
+         same_length_mutation[0] ^= 1;
+         std::fs::write(&paths.config, &same_length_mutation).expect("same-length mutation");
+         assert_eq!(
+-            ensure_config_snapshot_unchanged(&root, &paths.config, identity, &original)
++            ensure_config_snapshot_unchanged(&root, &paths.config, &identity, &original)
+                 .expect_err("content mutation must fail")
+                 .code(),
+             "provider_config_changed"
+@@ -4882,13 +5171,50 @@ mod tests {
+         std::fs::rename(&paths.config, &displaced).expect("displace original config");
+         std::fs::rename(&replacement, &paths.config).expect("replace config path");
+         assert_eq!(
+-            ensure_config_snapshot_unchanged(&root, &paths.config, identity, &original)
++            ensure_config_snapshot_unchanged(&root, &paths.config, &identity, &original)
+                 .expect_err("identity replacement must fail")
+                 .code(),
+             "provider_config_changed"
+         );
+     }
+ 
++    #[test]
++    fn build_config_rejects_an_unresolved_recovery_backup() {
++        let (_temporary, root, paths, expected) = provider_config_fixture();
++        let recovery = paths
++            .config
++            .parent()
++            .expect("provider parent")
++            .join(format!("{}fixture", super::CONFIG_BACKUP_PREFIX));
++        std::fs::create_dir(&recovery).expect("recovery directory");
++
++        assert_eq!(load_config(&root).expect("inspectable config"), expected);
++        let Err(error) = super::load_config_for_build(&root) else {
++            panic!("build must stop for unresolved recovery");
++        };
++        assert_eq!(error.code(), "provider_config_recovery_required");
++    }
++
++    #[test]
++    fn config_lock_rechecks_recovery_after_the_preflight_window() {
++        let (_temporary, root, paths, _config) = provider_config_fixture();
++        let recovery = paths
++            .config
++            .parent()
++            .expect("provider parent")
++            .join(format!("{}interleaved", super::CONFIG_BACKUP_PREFIX));
++
++        let Err(error) =
++            super::acquire_provider_config_lock_with_interlock(&root, &paths.config_lock, || {
++                std::fs::create_dir(&recovery).expect("interleaved recovery directory");
++            })
++        else {
++            panic!("post-lock recovery recheck must fail");
++        };
++
++        assert_eq!(error.code(), "provider_config_recovery_required");
++    }
++
+     #[test]
+     fn post_replace_verification_failure_reports_committed_state() {
+         let (_temporary, root, paths, original_config) = provider_config_fixture();
+@@ -4906,19 +5232,117 @@ mod tests {
+             &root,
+             &paths.config,
+             &installed_bytes,
+-            identity,
++            &identity,
+             &original_bytes,
+             &wrong_expectation,
+             &config_lock,
+         )
+         .expect_err("post-commit mismatch must be typed");
+-        assert!(matches!(
+-            error,
+-            ConfigCommitError::CommittedNeedsInspection(_)
+-        ));
++        assert!(
++            matches!(error, ConfigCommitError::CommittedNeedsInspection(_)),
++            "unexpected commit state: {error:?}"
++        );
+         assert_eq!(load_config(&root).expect("committed config"), installed);
+     }
+ 
++    #[test]
++    fn provider_config_commit_does_not_overwrite_a_late_replacement() {
++        let (_temporary, root, paths, original_config) = provider_config_fixture();
++        let config_lock =
++            acquire_provider_config_lock(&root, &paths.config_lock).expect("config lock");
++        let (identity, original_bytes) =
++            read_private_config_snapshot(&root, &paths.config).expect("original snapshot");
++        let mut installed = original_config.clone();
++        installed.worker_version = "0.1.1".to_owned();
++        let installed_bytes = encode_stored_config(&installed).expect("installed bytes");
++        let late = paths.config.with_extension("late");
++
++        let error = super::replace_private_config_with(
++            &root,
++            &paths.config,
++            &installed_bytes,
++            &identity,
++            &original_bytes,
++            &installed,
++            || {
++                write_create_only(&late, &original_bytes, true).expect("late replacement");
++                std::fs::remove_file(&paths.config).expect("remove original path");
++                std::fs::rename(&late, &paths.config).expect("install late replacement");
++            },
++            |_| {},
++        )
++        .expect_err("late replacement must abort commit");
++
++        assert!(matches!(error, ConfigCommitError::NotCommitted(_)));
++        assert_eq!(
++            std::fs::read(&paths.config).expect("preserved late replacement"),
++            original_bytes
++        );
++        assert_eq!(
++            load_config(&root).expect("restored config"),
++            original_config
++        );
++        drop(config_lock);
++    }
++
++    #[test]
++    fn provider_config_commit_preserves_an_occupied_path_and_backup() {
++        let (_temporary, root, paths, original_config) = provider_config_fixture();
++        let config_lock =
++            acquire_provider_config_lock(&root, &paths.config_lock).expect("config lock");
++        let (identity, original_bytes) =
++            read_private_config_snapshot(&root, &paths.config).expect("original snapshot");
++        let mut installed = original_config.clone();
++        installed.worker_version = "0.1.1".to_owned();
++        let installed_bytes = encode_stored_config(&installed).expect("installed bytes");
++        let occupied = b"concurrent provider config";
++
++        let error = super::replace_private_config_with(
++            &root,
++            &paths.config,
++            &installed_bytes,
++            &identity,
++            &original_bytes,
++            &installed,
++            || {},
++            |_| {
++                std::fs::write(&paths.config, occupied).expect("occupy provider config path");
++            },
++        )
++        .expect_err("occupied path must make commit uncertain");
++
++        assert!(
++            matches!(error, ConfigCommitError::CommittedNeedsInspection(_)),
++            "unexpected commit state: {error:?}"
++        );
++        assert_eq!(
++            std::fs::read(&paths.config).expect("preserved occupied path"),
++            occupied
++        );
++        let parent = paths.config.parent().expect("provider parent");
++        let recovery = std::fs::read_dir(parent)
++            .expect("provider directory")
++            .filter_map(Result::ok)
++            .find(|entry| {
++                entry
++                    .file_name()
++                    .to_string_lossy()
++                    .starts_with(super::CONFIG_BACKUP_PREFIX)
++            })
++            .expect("preserved backup");
++        assert_eq!(
++            std::fs::read(recovery.path().join("provider.json")).expect("backup bytes"),
++            original_bytes
++        );
++        assert_eq!(
++            super::reject_config_recovery_entries(parent)
++                .expect_err("recovery entry must block another mutation")
++                .code(),
++            "provider_config_recovery_required"
++        );
++        drop(config_lock);
++    }
++
+     #[test]
+     fn manual_signing_install_writes_password_last_and_commits_config_last() {
+         let names = SigningSecretNames::goal3_defaults();
+@@ -5388,6 +5812,29 @@ mod tests {
+         assert!(!supporting.exists());
+     }
+ 
++    #[test]
++    fn partial_download_rollback_never_unlinks_a_new_path_occupant() {
++        let temporary = tempfile::tempdir().expect("temporary directory");
++        let root = camino::Utf8Path::from_path(temporary.path()).expect("UTF-8 temp path");
++        let primary = root.join("new.ipa");
++        std::fs::write(&primary, b"downloaded primary").expect("primary download");
++        let artifact = super::CreatedArtifact {
++            identity: super::ArtifactFileIdentity::capture(&primary)
++                .expect("record primary identity"),
++            path: primary.clone(),
++        };
++
++        super::rollback_created_artifact_with(artifact, |_| {
++            std::fs::write(&primary, b"concurrent replacement")
++                .expect("install concurrent replacement");
++        });
++
++        assert_eq!(
++            std::fs::read(&primary).expect("preserved concurrent replacement"),
++            b"concurrent replacement"
++        );
++    }
++
+     #[test]
+     fn create_only_setup_is_idempotent_and_refuses_different_bytes() {
+         let temporary = tempfile::tempdir().expect("temporary directory");
+diff --git a/crates/cargo-ferry/src/commands/signing.rs b/crates/cargo-ferry/src/commands/signing.rs
+index 10d24ab..87a6413 100644
+--- a/crates/cargo-ferry/src/commands/signing.rs
++++ b/crates/cargo-ferry/src/commands/signing.rs
+@@ -10,6 +10,7 @@ use rustferry_remote::{
+     SigningIdentity, SigningMode, SigningPlan, SigningPrivateKeyReference, SigningReference,
+     SigningTargetKind, validate_profile_for_target,
+ };
++use same_file::Handle as FileIdentityHandle;
+ 
+ use crate::cli::{
+     ManualSigningSetupArgs, RemoteProviderChoice, SigningArgs, SigningCommand, SigningSetupArgs,
+@@ -564,12 +565,7 @@ fn read_signing_asset(
+         path: resolved.clone(),
+         source,
+     })?;
+-    let opened = FileSnapshot::capture(&file.metadata().map_err(|source| CliError::Io {
+-        action: "inspect open manual signing asset",
+-        path: resolved.clone(),
+-        source,
+-    })?)
+-    .map_err(|source| CliError::Io {
++    let opened = FileSnapshot::capture_file(&file).map_err(|source| CliError::Io {
+         action: "identify open manual signing asset",
+         path: resolved.clone(),
+         source,
+@@ -589,7 +585,7 @@ fn read_signing_asset(
+             path: resolved.clone(),
+             source,
+         })?;
+-    verify_final_asset_state(&resolved, &reader, &bytes.0, initial, maximum, role)?;
++    verify_final_asset_state(&resolved, &reader, &bytes.0, &initial, maximum, role)?;
+     Ok(bytes.into_secret())
+ }
+ 
+@@ -620,6 +616,11 @@ fn resolve_signing_asset(
+             vec![format!("role={role}"), format!("maximum_raw={maximum}")],
+         ));
+     }
++    let source_snapshot = FileSnapshot::capture_path(path).map_err(|source| CliError::Io {
++        action: "identify manual signing asset",
++        path: path.to_owned(),
++        source,
++    })?;
+     let resolved = path.canonicalize_utf8().map_err(|source| CliError::Io {
+         action: "resolve manual signing asset",
+         path: path.to_owned(),
+@@ -633,29 +634,28 @@ fn resolve_signing_asset(
+             vec![format!("role={role}")],
+         ));
+     }
+-    let snapshot = FileSnapshot::capture(&initial_metadata).map_err(|source| CliError::Io {
+-        action: "identify manual signing asset",
+-        path: resolved.clone(),
+-        source,
+-    })?;
+-    Ok((resolved, snapshot))
++    let resolved_snapshot =
++        FileSnapshot::capture_path(&resolved).map_err(|source| CliError::Io {
++            action: "identify resolved manual signing asset",
++            path: resolved.clone(),
++            source,
++        })?;
++    if source_snapshot != resolved_snapshot {
++        return Err(asset_changed(role));
++    }
++    Ok((resolved, resolved_snapshot))
+ }
+ 
+ fn verify_final_asset_state(
+     resolved: &Utf8Path,
+     reader: &io::Take<fs::File>,
+     bytes: &[u8],
+-    initial: FileSnapshot,
++    initial: &FileSnapshot,
+     maximum: u64,
+     role: &'static str,
+ ) -> Result<(), CliError> {
+     let open_final =
+-        FileSnapshot::capture(&reader.get_ref().metadata().map_err(|source| CliError::Io {
+-            action: "reinspect open manual signing asset",
+-            path: resolved.to_owned(),
+-            source,
+-        })?)
+-        .map_err(|source| CliError::Io {
++        FileSnapshot::capture_file(reader.get_ref()).map_err(|source| CliError::Io {
+             action: "reidentify open manual signing asset",
+             path: resolved.to_owned(),
+             source,
+@@ -668,16 +668,15 @@ fn verify_final_asset_state(
+     if path_final_metadata.file_type().is_symlink() {
+         return Err(asset_changed(role));
+     }
+-    let path_final =
+-        FileSnapshot::capture(&path_final_metadata).map_err(|source| CliError::Io {
+-            action: "reidentify manual signing asset",
+-            path: resolved.to_owned(),
+-            source,
+-        })?;
++    let path_final = FileSnapshot::capture_path(resolved).map_err(|source| CliError::Io {
++        action: "reidentify manual signing asset",
++        path: resolved.to_owned(),
++        source,
++    })?;
+     if bytes.len() as u64 > maximum
+         || bytes.len() as u64 != initial.length
+-        || open_final != initial
+-        || path_final != initial
++        || &open_final != initial
++        || &path_final != initial
+     {
+         return Err(asset_changed(role));
+     }
+@@ -707,15 +706,48 @@ fn asset_changed(role: &'static str) -> CliError {
+     )
+ }
+ 
+-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++#[derive(Debug, Eq, PartialEq)]
+ struct FileSnapshot {
+-    identity: FileIdentity,
++    identity: FileIdentityHandle,
+     length: u64,
+     modified: Option<SystemTime>,
+ }
+ 
+ impl FileSnapshot {
+-    fn capture(metadata: &Metadata) -> io::Result<Self> {
++    fn capture_path(path: &Utf8Path) -> io::Result<Self> {
++        let before = fs::symlink_metadata(path)?;
++        Self::validate_metadata(&before)?;
++        let identity = FileIdentityHandle::from_path(path)?;
++        let snapshot = Self::from_identity(identity)?;
++        let after = fs::symlink_metadata(path)?;
++        Self::validate_metadata(&after)?;
++        if !snapshot.matches_metadata(&before)
++            || !snapshot.matches_metadata(&after)
++            || FileIdentityHandle::from_path(path)? != snapshot.identity
++        {
++            return Err(io::Error::new(
++                io::ErrorKind::WouldBlock,
++                "signing asset changed while its identity was captured",
++            ));
++        }
++        Ok(snapshot)
++    }
++
++    fn capture_file(file: &fs::File) -> io::Result<Self> {
++        Self::from_identity(FileIdentityHandle::from_file(file.try_clone()?)?)
++    }
++
++    fn from_identity(identity: FileIdentityHandle) -> io::Result<Self> {
++        let metadata = identity.as_file().metadata()?;
++        Self::validate_metadata(&metadata)?;
++        Ok(Self {
++            identity,
++            length: metadata.len(),
++            modified: metadata.modified().ok(),
++        })
++    }
++
++    fn validate_metadata(metadata: &Metadata) -> io::Result<()> {
+         if !metadata.is_file() {
+             return Err(io::Error::new(
+                 io::ErrorKind::InvalidData,
+@@ -732,63 +764,13 @@ impl FileSnapshot {
+                 ));
+             }
+         }
+-        #[cfg(windows)]
+-        let identity = FileIdentity::capture(metadata)?;
+-        #[cfg(not(windows))]
+-        let identity = FileIdentity::capture(metadata);
+-        Ok(Self {
+-            identity,
+-            length: metadata.len(),
+-            modified: metadata.modified().ok(),
+-        })
+-    }
+-}
+-
+-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+-struct FileIdentity {
+-    #[cfg(unix)]
+-    device: u64,
+-    #[cfg(unix)]
+-    inode: u64,
+-    #[cfg(windows)]
+-    volume_serial_number: u32,
+-    #[cfg(windows)]
+-    file_index: u64,
+-    #[cfg(not(any(unix, windows)))]
+-    created: Option<SystemTime>,
+-}
+-
+-impl FileIdentity {
+-    #[cfg(unix)]
+-    fn capture(metadata: &Metadata) -> Self {
+-        use std::os::unix::fs::MetadataExt as _;
+-        Self {
+-            device: metadata.dev(),
+-            inode: metadata.ino(),
+-        }
+-    }
+-
+-    #[cfg(windows)]
+-    fn capture(metadata: &Metadata) -> io::Result<Self> {
+-        use std::os::windows::fs::MetadataExt as _;
+-        Ok(Self {
+-            volume_serial_number: metadata.volume_serial_number().ok_or_else(|| {
+-                io::Error::new(
+-                    io::ErrorKind::Unsupported,
+-                    "file volume identity is unavailable",
+-                )
+-            })?,
+-            file_index: metadata.file_index().ok_or_else(|| {
+-                io::Error::new(io::ErrorKind::Unsupported, "file identity is unavailable")
+-            })?,
+-        })
++        Ok(())
+     }
+ 
+-    #[cfg(not(any(unix, windows)))]
+-    fn capture(metadata: &Metadata) -> Self {
+-        Self {
+-            created: metadata.created().ok(),
+-        }
++    fn matches_metadata(&self, metadata: &Metadata) -> bool {
++        metadata.is_file()
++            && metadata.len() == self.length
++            && metadata.modified().ok() == self.modified
+     }
+ }
+ 
+@@ -836,8 +818,10 @@ fn manual_error_with_details(
+ 
+ #[cfg(test)]
+ mod tests {
++    #[cfg(unix)]
++    use super::read_signing_asset;
+     use super::{
+-        WipingBuffer, password_environment_reference, read_password_from, read_signing_asset,
++        WipingBuffer, password_environment_reference, read_password_from,
+         reject_unsupported_extensions, remote, select_device, validate_password,
+     };
+     use rustferry_remote::SecretBytes;
+@@ -845,6 +829,59 @@ mod tests {
+     const DEVICE_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+     const DEVICE_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+ 
++    #[test]
++    fn signing_asset_reader_binds_a_stable_file_outside_git() {
++        let project = tempfile::tempdir().expect("project tempdir");
++        std::fs::create_dir(project.path().join(".git")).expect("git marker");
++        let repository_root = camino::Utf8PathBuf::from_path_buf(
++            project.path().canonicalize().expect("canonical project"),
++        )
++        .expect("UTF-8 project");
++        #[cfg(unix)]
++        let outside = tempfile::tempdir_in("/tmp").expect("outside tempdir");
++        #[cfg(not(unix))]
++        let outside = tempfile::tempdir().expect("outside tempdir");
++        let asset = camino::Utf8PathBuf::from_path_buf(outside.path().join("development.p12"))
++            .expect("UTF-8 asset");
++        std::fs::write(&asset, b"opaque-asset").expect("asset bytes");
++
++        assert_eq!(
++            super::read_signing_asset(&asset, &repository_root, 32, "certificate_p12")
++                .expect("outside regular asset")
++                .expose_secret_bytes(),
++            b"opaque-asset"
++        );
++    }
++
++    #[test]
++    fn signing_asset_snapshot_rejects_same_metadata_replacement() {
++        let temporary = tempfile::tempdir().expect("temporary directory");
++        let asset = camino::Utf8PathBuf::from_path_buf(temporary.path().join("development.p12"))
++            .expect("UTF-8 asset");
++        let replacement = asset.with_extension("replacement");
++        std::fs::write(&asset, b"first-asset").expect("original asset");
++        std::fs::write(&replacement, b"other-asset").expect("replacement asset");
++        let fixed_modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
++        for path in [&asset, &replacement] {
++            std::fs::OpenOptions::new()
++                .write(true)
++                .open(path)
++                .expect("open fixture for timestamp")
++                .set_times(std::fs::FileTimes::new().set_modified(fixed_modified))
++                .expect("set fixture timestamp");
++        }
++
++        let original = super::FileSnapshot::capture_path(&asset).expect("original snapshot");
++        let displaced = asset.with_extension("displaced");
++        std::fs::rename(&asset, &displaced).expect("displace original asset");
++        std::fs::rename(&replacement, &asset).expect("install replacement asset");
++        let current = super::FileSnapshot::capture_path(&asset).expect("replacement snapshot");
++
++        assert_eq!(original.length, current.length);
++        assert_eq!(original.modified, current.modified);
++        assert_ne!(original, current);
++    }
++
+     #[test]
+     fn stdin_password_strips_one_line_ending_and_allows_empty_passwords() {
+         let password = read_password_from(&b"correct horse\r\n"[..]).expect("password");
+diff --git a/crates/rustferry-github/src/transport.rs b/crates/rustferry-github/src/transport.rs
+index 0d0238f..bcc2555 100644
+--- a/crates/rustferry-github/src/transport.rs
++++ b/crates/rustferry-github/src/transport.rs
+@@ -14,7 +14,10 @@ use std::{
+     io::{self, Read, Write},
+     path::{Component, Path, PathBuf},
+     process::{Child, Command, ExitStatus, Stdio},
+-    sync::Arc,
++    sync::{
++        Arc,
++        mpsc::{self, Receiver, RecvTimeoutError},
++    },
+     thread,
+     time::{Duration, Instant},
+ };
+@@ -33,6 +36,7 @@ const API_ACCEPT: &str = "Accept: application/vnd.github+json";
+ const API_VERSION: &str = "X-GitHub-Api-Version: 2022-11-28";
+ const MAX_STDERR_BYTES: usize = 64 * 1024;
+ const MAX_SECRET_SET_OUTPUT_BYTES: usize = 4 * 1024;
++const PROCESS_CLEANUP_GRACE: Duration = Duration::from_secs(1);
+ const MAX_API_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+ const MAX_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+ const MAX_PAGES: u16 = 100;
+@@ -2437,26 +2441,28 @@ fn run_process_inner(
+ ) -> Result<Vec<u8>, GhExecutionError> {
+     let mut child = command.spawn().map_err(|_| GhExecutionError::SpawnFailed)?;
+     let mut process_tree = ProcessTreeGuard::attach(&child).inspect_err(|_| {
+-        let _ = child.kill();
+-        let _ = child.wait();
++        terminate_child(&mut child, process_cleanup_deadline());
+     })?;
+     let Some(stdout) = child.stdout.take() else {
+-        terminate_process_tree(&mut child, &mut process_tree);
++        let cleanup_deadline = process_cleanup_deadline();
++        terminate_process_tree(&mut child, &mut process_tree, cleanup_deadline);
+         return Err(GhExecutionError::ProcessIo);
+     };
+     let Some(stderr) = child.stderr.take() else {
+-        terminate_process_tree(&mut child, &mut process_tree);
++        let cleanup_deadline = process_cleanup_deadline();
++        terminate_process_tree(&mut child, &mut process_tree, cleanup_deadline);
+         return Err(GhExecutionError::ProcessIo);
+     };
+     let stdin_writer = if let Some(input) = input {
+         let Some(mut stdin) = child.stdin.take() else {
+-            terminate_process_tree(&mut child, &mut process_tree);
++            let cleanup_deadline = process_cleanup_deadline();
++            terminate_process_tree(&mut child, &mut process_tree, cleanup_deadline);
+             return Err(GhExecutionError::ProcessIo);
+         };
+         // A bounded zeroizing copy lets timeout handling kill `gh` even if its
+         // stdin reader stalls while the writer thread is active.
+         let input = SecretBytes::new(input.expose_secret_bytes().to_vec());
+-        Some(thread::spawn(move || {
++        Some(spawn_process_worker(move || {
+             stdin
+                 .write_all(input.expose_secret_bytes())
+                 .map_err(|_| GhExecutionError::ProcessIo)
+@@ -2464,15 +2470,18 @@ fn run_process_inner(
+     } else {
+         None
+     };
+-    let stdout_reader = thread::spawn(move || read_capped(stdout, stdout_limit, retain_stdout));
+-    let stderr_reader = thread::spawn(move || read_capped(stderr, MAX_STDERR_BYTES, false));
++    let stdout_reader =
++        spawn_process_worker(move || read_capped(stdout, stdout_limit, retain_stdout));
++    let stderr_reader = spawn_process_worker(move || read_capped(stderr, MAX_STDERR_BYTES, false));
+     let Some(deadline) = Instant::now().checked_add(timeout) else {
+-        terminate_process_tree(&mut child, &mut process_tree);
+-        if let Some(writer) = stdin_writer {
+-            let _ = writer.join();
+-        }
+-        let _ = stdout_reader.join();
+-        let _ = stderr_reader.join();
++        let cleanup_deadline = process_cleanup_deadline();
++        terminate_process_tree(&mut child, &mut process_tree, cleanup_deadline);
++        let _ = collect_process_workers(
++            stdin_writer.as_ref(),
++            &stdout_reader,
++            &stderr_reader,
++            cleanup_deadline,
++        );
+         return Err(GhExecutionError::TimedOut);
+     };
+ 
+@@ -2483,47 +2492,95 @@ fn run_process_inner(
+                 thread::sleep(Duration::from_millis(20));
+             }
+             Ok(None) => {
+-                terminate_process_tree(&mut child, &mut process_tree);
+-                if let Some(writer) = stdin_writer {
+-                    let _ = writer.join();
+-                }
+-                let _ = stdout_reader.join();
+-                let _ = stderr_reader.join();
++                let cleanup_deadline = process_cleanup_deadline();
++                terminate_process_tree(&mut child, &mut process_tree, cleanup_deadline);
++                let _ = collect_process_workers(
++                    stdin_writer.as_ref(),
++                    &stdout_reader,
++                    &stderr_reader,
++                    cleanup_deadline,
++                );
+                 return Err(GhExecutionError::TimedOut);
+             }
+             Err(_) => {
+-                terminate_process_tree(&mut child, &mut process_tree);
+-                if let Some(writer) = stdin_writer {
+-                    let _ = writer.join();
+-                }
+-                let _ = stdout_reader.join();
+-                let _ = stderr_reader.join();
++                let cleanup_deadline = process_cleanup_deadline();
++                terminate_process_tree(&mut child, &mut process_tree, cleanup_deadline);
++                let _ = collect_process_workers(
++                    stdin_writer.as_ref(),
++                    &stdout_reader,
++                    &stderr_reader,
++                    cleanup_deadline,
++                );
+                 return Err(GhExecutionError::ProcessIo);
+             }
+         }
+     };
+     // `gh` has exited, but a descendant may still hold one of its inherited
+-    // pipes open. End the complete supervised tree before joining readers.
++    // pipes open. End the complete supervised tree before collecting output.
+     process_tree.terminate_descendants();
+-    let stdin_result = stdin_writer
+-        .map(|writer| writer.join().map_err(|_| GhExecutionError::ProcessIo)?)
+-        .transpose();
+-    let stdout = stdout_reader
+-        .join()
+-        .map_err(|_| GhExecutionError::ProcessIo)??;
+-    let stderr = stderr_reader
+-        .join()
+-        .map_err(|_| GhExecutionError::ProcessIo)??;
++    let (stdout, stderr) = collect_process_workers(
++        stdin_writer.as_ref(),
++        &stdout_reader,
++        &stderr_reader,
++        process_cleanup_deadline(),
++    )?;
+     if !status.success() {
+         return Err(command_failed(status));
+     }
+-    stdin_result.map(drop)?;
+     if stdout.truncated || stderr.truncated {
+         return Err(GhExecutionError::OutputLimitExceeded);
+     }
+     Ok(stdout.bytes)
+ }
+ 
++fn spawn_process_worker<T>(
++    worker: impl FnOnce() -> Result<T, GhExecutionError> + Send + 'static,
++) -> Receiver<Result<T, GhExecutionError>>
++where
++    T: Send + 'static,
++{
++    let (sender, receiver) = mpsc::sync_channel(1);
++    // Completion is observed through the bounded receiver; the detached handle
++    // must never turn a process timeout into an unbounded thread join.
++    drop(thread::spawn(move || {
++        let _ = sender.send(worker());
++    }));
++    receiver
++}
++
++fn collect_process_workers(
++    stdin_writer: Option<&Receiver<Result<(), GhExecutionError>>>,
++    stdout_reader: &Receiver<Result<CapturedOutput, GhExecutionError>>,
++    stderr_reader: &Receiver<Result<CapturedOutput, GhExecutionError>>,
++    deadline: Instant,
++) -> Result<(CapturedOutput, CapturedOutput), GhExecutionError> {
++    if let Some(stdin_writer) = stdin_writer {
++        receive_process_worker(stdin_writer, deadline)?;
++    }
++    let stdout = receive_process_worker(stdout_reader, deadline)?;
++    let stderr = receive_process_worker(stderr_reader, deadline)?;
++    Ok((stdout, stderr))
++}
++
++fn receive_process_worker<T>(
++    receiver: &Receiver<Result<T, GhExecutionError>>,
++    deadline: Instant,
++) -> Result<T, GhExecutionError> {
++    let remaining = deadline.saturating_duration_since(Instant::now());
++    match receiver.recv_timeout(remaining) {
++        Ok(result) => result,
++        Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
++            Err(GhExecutionError::ProcessIo)
++        }
++    }
++}
++
++fn process_cleanup_deadline() -> Instant {
++    Instant::now()
++        .checked_add(PROCESS_CLEANUP_GRACE)
++        .unwrap_or_else(Instant::now)
++}
++
+ #[cfg(unix)]
+ fn configure_process_tree(command: &mut Command) {
+     use std::os::unix::process::CommandExt as _;
+@@ -2574,10 +2631,29 @@ impl Drop for ProcessTreeGuard {
+     }
+ }
+ 
+-fn terminate_process_tree(child: &mut Child, process_tree: &mut ProcessTreeGuard) {
++fn terminate_process_tree(
++    child: &mut Child,
++    process_tree: &mut ProcessTreeGuard,
++    deadline: Instant,
++) {
+     process_tree.terminate_descendants();
++    terminate_child(child, deadline);
++}
++
++fn terminate_child(child: &mut Child, deadline: Instant) {
+     let _ = child.kill();
+-    let _ = child.wait();
++    loop {
++        match child.try_wait() {
++            Ok(Some(_)) | Err(_) => return,
++            Ok(None) => {
++                let remaining = deadline.saturating_duration_since(Instant::now());
++                if remaining.is_zero() {
++                    return;
++                }
++                thread::sleep(remaining.min(Duration::from_millis(20)));
++            }
++        }
++    }
+ }
+ 
+ fn command_failed(status: ExitStatus) -> GhExecutionError {
+@@ -3270,6 +3346,29 @@ mod tests {
+         assert!(rendered.contains("status 23"));
+     }
+ 
++    #[test]
++    fn process_worker_drain_stops_at_cleanup_deadline() {
++        let (_stdout_sender, stdout_reader) =
++            mpsc::sync_channel::<Result<CapturedOutput, GhExecutionError>>(1);
++        let (_stderr_sender, stderr_reader) =
++            mpsc::sync_channel::<Result<CapturedOutput, GhExecutionError>>(1);
++        let started = Instant::now();
++        let deadline = started
++            .checked_add(Duration::from_millis(50))
++            .expect("short cleanup deadline");
++
++        let Err(error) = collect_process_workers(None, &stdout_reader, &stderr_reader, deadline)
++        else {
++            panic!("open output pipe must stop at the cleanup deadline");
++        };
++
++        assert_eq!(error, GhExecutionError::ProcessIo);
++        assert!(
++            started.elapsed() < Duration::from_secs(1),
++            "bounded output drain exceeded its grace"
++        );
++    }
++
+     #[cfg(unix)]
+     #[test]
+     fn gh_process_runner_timeout_kills_descendants_holding_output_pipes() {
+@@ -3280,7 +3379,7 @@ mod tests {
+         let executable = executable_directory.path().join("gh");
+         fs::write(
+             &executable,
+-            b"#!/bin/sh\nset -eu\n/bin/cat >/dev/null\n/bin/sleep 30 &\nprintf '%s\\n' \"$!\" > descendant-pid\n/bin/sleep 30\n",
++            b"#!/bin/sh\nset -eu\n/bin/sleep 5 &\nprintf '%s\\n' \"$!\" > descendant-pid\n/bin/cat >/dev/null\n/bin/sleep 5\n",
+         )
+         .expect("fake gh executable");
+         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+diff --git a/crates/rustferry-worker-macos/src/process.rs b/crates/rustferry-worker-macos/src/process.rs
+index 74cd369..7176bae 100644
+--- a/crates/rustferry-worker-macos/src/process.rs
++++ b/crates/rustferry-worker-macos/src/process.rs
+@@ -1,8 +1,10 @@
+ //! Bounded subprocess execution for the worker's fixed Apple tools.
+ 
++#[cfg(unix)]
++use std::ffi::OsStr;
+ use std::{
+     collections::BTreeMap,
+-    ffi::{OsStr, OsString},
++    ffi::OsString,
+     io::Read,
+     path::Path,
+     process::{Child, Command, ExitStatus, Stdio},
+diff --git a/crates/rustferry-worker-macos/src/signed_ipa.rs b/crates/rustferry-worker-macos/src/signed_ipa.rs
+index faf1f9e..acfc3ad 100644
+--- a/crates/rustferry-worker-macos/src/signed_ipa.rs
++++ b/crates/rustferry-worker-macos/src/signed_ipa.rs
+@@ -763,11 +763,18 @@ fn extract_inspected_ipa(
+     {
+         return Err(SignedIpaValidationError::IpaChangedDuringValidation);
+     }
+-    let mut file = File::open(ipa_path).map_err(|source| io_error("open IPA", source))?;
++    let initial_identity = FileIdentityHandle::from_path(ipa_path)
++        .map_err(|source| io_error("identify IPA", source))?;
++    let mut file = initial_identity
++        .as_file()
++        .try_clone()
++        .map_err(|source| io_error("clone open IPA", source))?;
+     let opened_metadata = file
+         .metadata()
+         .map_err(|source| io_error("inspect open IPA", source))?;
+-    if !same_file_metadata(&path_metadata, &opened_metadata) {
++    if !file_binding_unchanged(ipa_path, &path_metadata, &initial_identity, &file)
++        .map_err(|source| io_error("rebind open IPA", source))?
++    {
+         return Err(SignedIpaValidationError::IpaChangedDuringValidation);
+     }
+     let (size, sha256) = describe_open_file(&mut file)?;
+@@ -787,7 +794,7 @@ fn extract_inspected_ipa(
+     if final_size != size || final_sha256 != sha256 {
+         return Err(SignedIpaValidationError::IpaChangedDuringValidation);
+     }
+-    ensure_ipa_path_stable(ipa_path, &opened_metadata, &file)?;
++    ensure_ipa_path_stable(ipa_path, &opened_metadata, &initial_identity, &file)?;
+     Ok(())
+ }
+ 
+@@ -1025,13 +1032,25 @@ fn describe_open_file(file: &mut File) -> Result<(u64, String), SignedIpaValidat
+ fn ensure_ipa_path_stable(
+     path: &Utf8Path,
+     initial: &Metadata,
++    initial_identity: &FileIdentityHandle,
+     file: &File,
+ ) -> Result<(), SignedIpaValidationError> {
+-    let open_final = file
+-        .metadata()
+-        .map_err(|source| io_error("reinspect open IPA", source))?;
+-    let path_final =
+-        fs::symlink_metadata(path).map_err(|source| io_error("reinspect IPA path", source))?;
++    if !file_binding_unchanged(path, initial, initial_identity, file)
++        .map_err(|source| io_error("reinspect IPA binding", source))?
++    {
++        return Err(SignedIpaValidationError::IpaChangedDuringValidation);
++    }
++    Ok(())
++}
++
++fn file_binding_unchanged(
++    path: &Utf8Path,
++    initial: &Metadata,
++    initial_identity: &FileIdentityHandle,
++    file: &File,
++) -> io::Result<bool> {
++    let open_final = file.metadata()?;
++    let path_final = fs::symlink_metadata(path)?;
+     if path_final.file_type().is_symlink()
+         || !path_final.is_file()
+         || !metadata_has_single_link(&open_final)
+@@ -1043,9 +1062,11 @@ fn ensure_ipa_path_stable(
+         || open_final.modified().ok() != initial.modified().ok()
+         || path_final.modified().ok() != initial.modified().ok()
+     {
+-        return Err(SignedIpaValidationError::IpaChangedDuringValidation);
++        return Ok(false);
+     }
+-    Ok(())
++    let open_identity = FileIdentityHandle::from_file(file.try_clone()?)?;
++    let path_identity = FileIdentityHandle::from_path(path)?;
++    Ok(&open_identity == initial_identity && &path_identity == initial_identity)
+ }
+ 
+ fn metadata_has_single_link(metadata: &Metadata) -> bool {
+@@ -1067,13 +1088,7 @@ fn same_file_metadata(left: &Metadata, right: &Metadata) -> bool {
+         use std::os::unix::fs::MetadataExt as _;
+         left.dev() == right.dev() && left.ino() == right.ino()
+     }
+-    #[cfg(windows)]
+-    {
+-        use std::os::windows::fs::MetadataExt as _;
+-        left.volume_serial_number() == right.volume_serial_number()
+-            && left.file_index() == right.file_index()
+-    }
+-    #[cfg(not(any(unix, windows)))]
++    #[cfg(not(unix))]
+     {
+         left.len() == right.len() && left.modified().ok() == right.modified().ok()
+     }
+@@ -1576,11 +1591,15 @@ fn file_has_macho_magic(path: &Utf8Path) -> Result<bool, SignedIpaValidationErro
+     if initial.file_type().is_symlink() || !initial.is_file() {
+         return Err(SignedIpaValidationError::UnsafeIpaArchive);
+     }
+-    let mut file = File::open(path).map_err(|source| io_error("open potential Mach-O", source))?;
+-    let opened = file
+-        .metadata()
++    let identity = FileIdentityHandle::from_path(path)
+         .map_err(|source| io_error("identify potential Mach-O", source))?;
+-    if !same_file_metadata(&initial, &opened) {
++    let mut file = identity
++        .as_file()
++        .try_clone()
++        .map_err(|source| io_error("clone potential Mach-O", source))?;
++    if !file_binding_unchanged(path, &initial, &identity, &file)
++        .map_err(|source| io_error("rebind potential Mach-O", source))?
++    {
+         return Err(SignedIpaValidationError::UnsafeIpaArchive);
+     }
+     let mut magic = [0_u8; 4];
+@@ -2010,11 +2029,15 @@ fn read_bounded_file(path: &Utf8Path, maximum: u64) -> Result<Vec<u8>, SignedIpa
+     if metadata.len() > maximum {
+         return Err(SignedIpaValidationError::BundleLayoutMismatch);
+     }
+-    let mut file = File::open(path).map_err(|source| io_error("open validation file", source))?;
+-    let opened = file
+-        .metadata()
+-        .map_err(|source| io_error("inspect open validation file", source))?;
+-    if !same_file_metadata(&metadata, &opened) {
++    let identity = FileIdentityHandle::from_path(path)
++        .map_err(|source| io_error("identify validation file", source))?;
++    let mut file = identity
++        .as_file()
++        .try_clone()
++        .map_err(|source| io_error("clone validation file", source))?;
++    if !file_binding_unchanged(path, &metadata, &identity, &file)
++        .map_err(|source| io_error("rebind validation file", source))?
++    {
+         return Err(SignedIpaValidationError::UnsafeIpaArchive);
+     }
+     let capacity = usize::try_from(metadata.len())
+@@ -2029,6 +2052,11 @@ fn read_bounded_file(path: &Utf8Path, maximum: u64) -> Result<Vec<u8>, SignedIpa
+     if actual_size != metadata.len() || actual_size > maximum {
+         return Err(SignedIpaValidationError::UnsafeIpaArchive);
+     }
++    if !file_binding_unchanged(path, &metadata, &identity, &file)
++        .map_err(|source| io_error("reinspect validation file binding", source))?
++    {
++        return Err(SignedIpaValidationError::UnsafeIpaArchive);
++    }
+     Ok(bytes)
+ }
+ 
+@@ -2043,13 +2071,17 @@ fn ensure_real_regular_file(
+     Ok(())
+ }
+ 
++#[cfg(unix)]
+ fn secure_private_directory(path: &Utf8Path) -> Result<(), SignedIpaValidationError> {
+-    #[cfg(unix)]
+-    {
+-        use std::os::unix::fs::PermissionsExt as _;
+-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+-            .map_err(|source| io_error("secure certificate evidence directory", source))?;
+-    }
++    use std::os::unix::fs::PermissionsExt as _;
++
++    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
++        .map_err(|source| io_error("secure certificate evidence directory", source))?;
++    Ok(())
++}
++
++#[cfg(not(unix))]
++fn secure_private_directory(_path: &Utf8Path) -> Result<(), SignedIpaValidationError> {
+     Ok(())
+ }
+ 
+@@ -2318,6 +2350,52 @@ mod tests {
+     use super::*;
+     use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
+ 
++    #[test]
++    fn file_binding_requires_the_same_open_file() {
++        let temporary = tempfile::tempdir().expect("temporary directory");
++        let first = Utf8PathBuf::from_path_buf(temporary.path().join("first.bin"))
++            .expect("UTF-8 first path");
++        let second = Utf8PathBuf::from_path_buf(temporary.path().join("second.bin"))
++            .expect("UTF-8 second path");
++        fs::write(&first, b"same-size").expect("first file");
++        fs::write(&second, b"different").expect("second file");
++
++        let fixed_modified = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
++        for path in [&first, &second] {
++            OpenOptions::new()
++                .write(true)
++                .open(path)
++                .expect("open fixture for timestamp")
++                .set_times(std::fs::FileTimes::new().set_modified(fixed_modified))
++                .expect("set fixture timestamp");
++        }
++
++        let metadata = fs::symlink_metadata(&first).expect("first metadata");
++        let second_metadata = fs::symlink_metadata(&second).expect("second metadata");
++        assert_eq!(metadata.len(), second_metadata.len());
++        assert_eq!(metadata.modified().ok(), second_metadata.modified().ok());
++        let identity = FileIdentityHandle::from_path(&first).expect("first identity");
++        assert_ne!(
++            identity,
++            FileIdentityHandle::from_path(&second).expect("second identity")
++        );
++        let file = identity.as_file().try_clone().expect("clone first file");
++        assert!(
++            file_binding_unchanged(&first, &metadata, &identity, &file)
++                .expect("stable first binding")
++        );
++        assert!(
++            !file_binding_unchanged(&second, &metadata, &identity, &file)
++                .expect("distinct second binding")
++        );
++
++        fs::write(&first, b"mutated-in-place").expect("mutate first file in place");
++        assert!(
++            !file_binding_unchanged(&first, &metadata, &identity, &file)
++                .expect("same-inode mutation check")
++        );
++    }
++
+     #[test]
+     fn apple_commands_are_fixed_absolute_argument_arrays() {
+         let bundle = Utf8Path::new("/private/tmp/job/Payload/App.app");
+-- 
+2.55.0
+

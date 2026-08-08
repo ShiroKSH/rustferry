@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import tempfile
 import unittest
 
 
@@ -32,6 +33,18 @@ class ReleaseContractTests(unittest.TestCase):
             ),
             ("rustferry", "=1.2.3", False),
         )
+
+    def test_manifest_discovery_ignores_goal3_scratch_manifests(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            tracked = root / "crates" / "example" / "Cargo.toml"
+            scratch = root / ".goal3" / "tmp" / "probe" / "Cargo.toml"
+            tracked.parent.mkdir(parents=True)
+            scratch.parent.mkdir(parents=True)
+            tracked.write_text("[package]\nname = 'example'\n", encoding="utf-8")
+            scratch.write_text("not valid TOML", encoding="utf-8")
+
+            self.assertEqual(MODULE.manifest_paths(root), [tracked])
 
 
 if __name__ == "__main__":

@@ -5,7 +5,9 @@ use std::io::Write as _;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use camino::{Utf8Path, Utf8PathBuf};
-use rustferry_apple::{IosProjectSpec, generate_ios_project, write_ios_project};
+use rustferry_apple::{
+    IosDeviceToolchain, IosProjectSpec, generate_ios_project, write_ios_project,
+};
 use rustferry_core::{
     ArtifactDigest, ArtifactDigestKind, FerryConfig, ProjectAssets, brand, digest_artifact,
 };
@@ -139,34 +141,100 @@ pub struct PhysicalBuildOutcome {
 /// Apple Development identity, physical build, and signing-validation service.
 pub struct SigningService<E> {
     executor: E,
-    cargo: Utf8PathBuf,
-    xcrun: Utf8PathBuf,
+    cargo: Option<Utf8PathBuf>,
+    xcrun: Option<Utf8PathBuf>,
     security: Utf8PathBuf,
+    developer_dir: Option<Utf8PathBuf>,
 }
 
 impl<E: CommandExecutor> SigningService<E> {
-    /// Create a service using installed tools resolved from PATH.
-    pub fn new(executor: E) -> Self {
-        Self {
+    /// Create a physical-device service from an independently discovered Apple toolchain.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a required tool path is not safely bound.
+    pub fn for_physical_build(
+        executor: E,
+        toolchain: &IosDeviceToolchain,
+    ) -> DeploymentResult<Self> {
+        let service = Self::from_tools(
             executor,
-            cargo: Utf8PathBuf::from("cargo"),
-            xcrun: Utf8PathBuf::from("xcrun"),
-            security: Utf8PathBuf::from("security"),
+            &toolchain.cargo,
+            &toolchain.xcrun,
+            Utf8Path::new("/usr/bin/security"),
+            &toolchain.developer_dir,
+        )?;
+        let system_xcrun = bind_executable(Utf8Path::new("/usr/bin/xcrun"), "xcrun")?;
+        if service.xcrun.as_ref() != Some(&system_xcrun) {
+            return Err(missing_bound_tool("/usr/bin/xcrun"));
         }
+        Ok(service)
     }
 
-    /// Override executable paths for configured toolchains or deterministic tests.
-    #[must_use]
-    pub fn with_tools(
-        mut self,
-        cargo: impl Into<Utf8PathBuf>,
-        xcrun: impl Into<Utf8PathBuf>,
-        security: impl Into<Utf8PathBuf>,
-    ) -> Self {
-        self.cargo = cargo.into();
-        self.xcrun = xcrun.into();
-        self.security = security.into();
-        self
+    /// Create a Keychain-only service without consulting PATH.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error off macOS or when `/usr/bin/security` is unavailable or unsafe.
+    pub fn for_team_discovery(executor: E) -> DeploymentResult<Self> {
+        require_macos()?;
+        Ok(Self {
+            executor,
+            cargo: None,
+            xcrun: None,
+            security: bind_executable(Utf8Path::new("/usr/bin/security"), "security")?,
+            developer_dir: None,
+        })
+    }
+
+    /// Create a service from explicit executable paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for relative, linked, non-regular, or non-executable tools.
+    pub fn from_tools(
+        executor: E,
+        cargo: &Utf8Path,
+        xcrun: &Utf8Path,
+        security: &Utf8Path,
+        developer_dir: &Utf8Path,
+    ) -> DeploymentResult<Self> {
+        Ok(Self {
+            executor,
+            cargo: Some(bind_executable(cargo, "cargo")?),
+            xcrun: Some(bind_executable(xcrun, "xcrun")?),
+            security: bind_executable(security, "security")?,
+            developer_dir: Some(bind_directory(developer_dir, "Xcode developer directory")?),
+        })
+    }
+
+    fn require_cargo(&self) -> DeploymentResult<&Utf8Path> {
+        self.cargo
+            .as_deref()
+            .ok_or_else(|| missing_bound_tool("cargo"))
+    }
+
+    fn require_xcrun(&self) -> DeploymentResult<&Utf8Path> {
+        self.xcrun
+            .as_deref()
+            .ok_or_else(|| missing_bound_tool("xcrun"))
+    }
+
+    fn require_developer_dir(&self) -> DeploymentResult<&Utf8Path> {
+        self.developer_dir
+            .as_deref()
+            .ok_or_else(|| missing_bound_tool("Xcode developer directory"))
+    }
+
+    fn xcrun_command(
+        &self,
+        current_directory: &Utf8Path,
+        operation: &'static str,
+    ) -> DeploymentResult<ToolCommand> {
+        Ok(
+            ToolCommand::new(self.require_xcrun()?, current_directory, operation)
+                .env("DEVELOPER_DIR", self.require_developer_dir()?.as_str()),
+        )
     }
 
     /// List Apple Development teams from usable Keychain code-signing identities.
@@ -209,127 +277,158 @@ impl<E: CommandExecutor> SigningService<E> {
     /// # Errors
     ///
     /// Returns an error for invalid project/config/Cargo selectors or Development Team ID.
-    #[allow(clippy::too_many_lines)]
     pub fn plan(&self, request: &PhysicalBuildRequest) -> DeploymentResult<PhysicalBuildPlan> {
-        validate_request(request)?;
-        let configuration = if request.release { "Release" } else { "Debug" };
-        let profile = if request.release { "release" } else { "debug" };
-        let ios_root = request
-            .project_dir
-            .join("target")
-            .join(brand::TARGET_DIRECTORY)
-            .join("ios-device");
-        let generated_root = ios_root.join("generated");
-        let cargo_target_dir = ios_root.join("cargo");
-        let cargo_binary = cargo_target_dir
-            .join(IOS_DEVICE_TARGET)
-            .join(profile)
-            .join(&request.binary_name);
-        let staged_binary = generated_root.join(&request.binary_name);
-        let artifact_directory = ios_root.join(profile);
-        let artifact_path = artifact_directory.join(format!("{}.app", request.binary_name));
-        let derived_data = ios_root.join("xcode").join(profile);
-
-        let mut cargo_arguments = vec![
-            OsString::from("build"),
-            OsString::from("--target"),
-            OsString::from(IOS_DEVICE_TARGET),
-            OsString::from("--bin"),
-            OsString::from(&request.binary_name),
-        ];
-        if let Some(package) = &request.package_name {
-            cargo_arguments.extend([OsString::from("--package"), OsString::from(package)]);
-        }
-        if request.release {
-            cargo_arguments.push(OsString::from("--release"));
-        }
-        if !request.cargo_features.is_empty() {
-            cargo_arguments.extend([
-                OsString::from("--features"),
-                OsString::from(request.cargo_features.join(",")),
-            ]);
-        }
-        let cargo_command = ToolCommand::new(
-            &self.cargo,
-            &request.project_dir,
-            "cross-compile Rust executable for physical iOS",
+        plan_physical_build(
+            request,
+            self.require_cargo()?,
+            self.require_xcrun()?,
+            self.require_developer_dir()?,
         )
-        .args(cargo_arguments)
-        .env("CARGO_TARGET_DIR", cargo_target_dir.as_str())
-        .env(
-            "IPHONEOS_DEPLOYMENT_TARGET",
-            request.config.ios.min_version.as_str(),
-        )
-        .env("CARGO_TERM_COLOR", "never")
-        .timeout(request.timeout)
-        .output_limit(8 * 1024 * 1024);
-
-        let mut xcode_arguments = vec![OsString::from("xcodebuild")];
-        if request.allow_provisioning_updates {
-            xcode_arguments.push(OsString::from("-allowProvisioningUpdates"));
-        }
-        let (signing_style, provisioning) = request.provisioning_profile.as_ref().map_or_else(
-            || ("Automatic", None),
-            |profile| {
-                (
-                    "Manual",
-                    Some(format!("PROVISIONING_PROFILE_SPECIFIER={profile}")),
-                )
-            },
-        );
-        xcode_arguments.extend([
-            OsString::from("-project"),
-            OsString::from(generated_root.join("FerryHost.xcodeproj").as_str()),
-            OsString::from("-scheme"),
-            OsString::from("FerryApp"),
-            OsString::from("-configuration"),
-            OsString::from(configuration),
-            OsString::from("-sdk"),
-            OsString::from("iphoneos"),
-            OsString::from("-destination"),
-            OsString::from("generic/platform=iOS"),
-            OsString::from("AD_HOC_CODE_SIGNING_ALLOWED=NO"),
-            OsString::from(format!("CODE_SIGN_STYLE={signing_style}")),
-            OsString::from("CODE_SIGN_IDENTITY=Apple Development"),
-            OsString::from("CODE_SIGNING_ALLOWED=YES"),
-            OsString::from("CODE_SIGNING_REQUIRED=YES"),
-            OsString::from(format!("DEVELOPMENT_TEAM={}", request.team_id)),
-            OsString::from("ARCHS=arm64"),
-            OsString::from("ONLY_ACTIVE_ARCH=NO"),
-            OsString::from("SDKROOT=iphoneos"),
-            OsString::from("SUPPORTED_PLATFORMS=iphoneos"),
-            OsString::from(format!("SYMROOT={derived_data}")),
-            OsString::from(format!("OBJROOT={}", derived_data.join("Intermediates"))),
-            OsString::from(format!("CONFIGURATION_BUILD_DIR={artifact_directory}")),
-            OsString::from("build"),
-        ]);
-        if let Some(provisioning) = provisioning {
-            let build_index = xcode_arguments.len().saturating_sub(1);
-            xcode_arguments.insert(build_index, OsString::from(provisioning));
-        }
-        let xcodebuild_command = ToolCommand::new(
-            &self.xcrun,
-            &request.project_dir,
-            "assemble and development-sign physical iOS application",
-        )
-        .args(xcode_arguments)
-        .timeout(request.timeout)
-        .output_limit(8 * 1024 * 1024);
-
-        Ok(PhysicalBuildPlan {
-            schema_version: 1,
-            rust_target: IOS_DEVICE_TARGET.to_owned(),
-            generated_root,
-            cargo_target_dir,
-            cargo_binary,
-            staged_binary,
-            artifact_path,
-            cargo_command,
-            xcodebuild_command,
-            allow_provisioning_updates: request.allow_provisioning_updates,
-        })
     }
+}
 
+/// Build a side-effect-free physical-device plan from intended absolute tool paths.
+///
+/// This planner does not execute or inspect tools. Execution must use a validated
+/// [`SigningService`] constructed from a discovered toolchain.
+///
+/// # Errors
+///
+/// Returns an error for relative tool paths or invalid project/build selectors.
+#[allow(clippy::too_many_lines)]
+pub fn plan_physical_build(
+    request: &PhysicalBuildRequest,
+    cargo: &Utf8Path,
+    xcrun: &Utf8Path,
+    developer_dir: &Utf8Path,
+) -> DeploymentResult<PhysicalBuildPlan> {
+    validate_request(request)?;
+    if !cargo.is_absolute() || !xcrun.is_absolute() || !developer_dir.is_absolute() {
+        return Err(DeploymentError::Unsupported {
+            message: "physical iOS plan tool paths must be absolute".to_owned(),
+            help: "Use deterministic intended Cargo, xcrun, and DEVELOPER_DIR paths.".to_owned(),
+        });
+    }
+    let configuration = if request.release { "Release" } else { "Debug" };
+    let profile = if request.release { "release" } else { "debug" };
+    let ios_root = request
+        .project_dir
+        .join("target")
+        .join(brand::TARGET_DIRECTORY)
+        .join("ios-device");
+    let generated_root = ios_root.join("generated");
+    let cargo_target_dir = ios_root.join("cargo");
+    let cargo_binary = cargo_target_dir
+        .join(IOS_DEVICE_TARGET)
+        .join(profile)
+        .join(&request.binary_name);
+    let staged_binary = generated_root.join(&request.binary_name);
+    let artifact_directory = ios_root.join(profile);
+    let artifact_path = artifact_directory.join(format!("{}.app", request.binary_name));
+    let derived_data = ios_root.join("xcode").join(profile);
+
+    let mut cargo_arguments = vec![
+        OsString::from("build"),
+        OsString::from("--target"),
+        OsString::from(IOS_DEVICE_TARGET),
+        OsString::from("--bin"),
+        OsString::from(&request.binary_name),
+    ];
+    if let Some(package) = &request.package_name {
+        cargo_arguments.extend([OsString::from("--package"), OsString::from(package)]);
+    }
+    if request.release {
+        cargo_arguments.push(OsString::from("--release"));
+    }
+    if !request.cargo_features.is_empty() {
+        cargo_arguments.extend([
+            OsString::from("--features"),
+            OsString::from(request.cargo_features.join(",")),
+        ]);
+    }
+    let cargo_command = ToolCommand::new(
+        cargo,
+        &request.project_dir,
+        "cross-compile Rust executable for physical iOS",
+    )
+    .args(cargo_arguments)
+    .env("CARGO_TARGET_DIR", cargo_target_dir.as_str())
+    .env(
+        "IPHONEOS_DEPLOYMENT_TARGET",
+        request.config.ios.min_version.as_str(),
+    )
+    .env("CARGO_TERM_COLOR", "never")
+    .timeout(request.timeout)
+    .output_limit(8 * 1024 * 1024);
+
+    let mut xcode_arguments = vec![OsString::from("xcodebuild")];
+    if request.allow_provisioning_updates {
+        xcode_arguments.push(OsString::from("-allowProvisioningUpdates"));
+    }
+    let (signing_style, provisioning) = request.provisioning_profile.as_ref().map_or_else(
+        || ("Automatic", None),
+        |profile| {
+            (
+                "Manual",
+                Some(format!("PROVISIONING_PROFILE_SPECIFIER={profile}")),
+            )
+        },
+    );
+    xcode_arguments.extend([
+        OsString::from("-project"),
+        OsString::from(generated_root.join("FerryHost.xcodeproj").as_str()),
+        OsString::from("-scheme"),
+        OsString::from("FerryApp"),
+        OsString::from("-configuration"),
+        OsString::from(configuration),
+        OsString::from("-sdk"),
+        OsString::from("iphoneos"),
+        OsString::from("-destination"),
+        OsString::from("generic/platform=iOS"),
+        OsString::from("AD_HOC_CODE_SIGNING_ALLOWED=NO"),
+        OsString::from(format!("CODE_SIGN_STYLE={signing_style}")),
+        OsString::from("CODE_SIGN_IDENTITY=Apple Development"),
+        OsString::from("CODE_SIGNING_ALLOWED=YES"),
+        OsString::from("CODE_SIGNING_REQUIRED=YES"),
+        OsString::from(format!("DEVELOPMENT_TEAM={}", request.team_id)),
+        OsString::from("ARCHS=arm64"),
+        OsString::from("ONLY_ACTIVE_ARCH=NO"),
+        OsString::from("SDKROOT=iphoneos"),
+        OsString::from("SUPPORTED_PLATFORMS=iphoneos"),
+        OsString::from(format!("SYMROOT={derived_data}")),
+        OsString::from(format!("OBJROOT={}", derived_data.join("Intermediates"))),
+        OsString::from(format!("CONFIGURATION_BUILD_DIR={artifact_directory}")),
+        OsString::from("build"),
+    ]);
+    if let Some(provisioning) = provisioning {
+        let build_index = xcode_arguments.len().saturating_sub(1);
+        xcode_arguments.insert(build_index, OsString::from(provisioning));
+    }
+    let xcodebuild_command = ToolCommand::new(
+        xcrun,
+        &request.project_dir,
+        "assemble and development-sign physical iOS application",
+    )
+    .args(xcode_arguments)
+    .env("DEVELOPER_DIR", developer_dir.as_str())
+    .timeout(request.timeout)
+    .output_limit(8 * 1024 * 1024);
+
+    Ok(PhysicalBuildPlan {
+        schema_version: 1,
+        rust_target: IOS_DEVICE_TARGET.to_owned(),
+        generated_root,
+        cargo_target_dir,
+        cargo_binary,
+        staged_binary,
+        artifact_path,
+        cargo_command,
+        xcodebuild_command,
+        allow_provisioning_updates: request.allow_provisioning_updates,
+    })
+}
+
+impl<E: CommandExecutor> SigningService<E> {
     /// Generate the hidden project, build through Cargo/Xcode, then independently validate signing.
     ///
     /// # Errors
@@ -344,7 +443,7 @@ impl<E: CommandExecutor> SigningService<E> {
 
         let cargo_output = self.executor.execute(&plan.cargo_command)?;
         ensure_success(
-            &self.cargo,
+            self.require_cargo()?,
             "cross-compile Rust executable for physical iOS",
             &cargo_output,
             "ios_rust_build_failed",
@@ -369,7 +468,7 @@ impl<E: CommandExecutor> SigningService<E> {
 
         let xcode_output = self.executor.execute(&plan.xcodebuild_command)?;
         if !xcode_output.status.success() {
-            return Err(xcodebuild_failure(&self.xcrun, &xcode_output));
+            return Err(xcodebuild_failure(self.require_xcrun()?, &xcode_output));
         }
         let validation = self.validate_physical_artifact(
             &request.project_dir,
@@ -601,13 +700,13 @@ impl<E: CommandExecutor> SigningService<E> {
             OsString::from(bundle.as_str()),
         ]);
         let verify = self.executor.execute(
-            &ToolCommand::new(
-                &self.xcrun,
-                bundle.parent().unwrap_or_else(|| Utf8Path::new(".")),
-                "verify Apple Development signature",
-            )
-            .args(verify_arguments)
-            .timeout(Duration::from_mins(1)),
+            &self
+                .xcrun_command(
+                    bundle.parent().unwrap_or_else(|| Utf8Path::new(".")),
+                    "verify Apple Development signature",
+                )?
+                .args(verify_arguments)
+                .timeout(Duration::from_mins(1)),
         )?;
         ensure_signing_success(bundle, "verify Apple Development signature", &verify)?;
 
@@ -643,23 +742,23 @@ impl<E: CommandExecutor> SigningService<E> {
             ),
         })?;
         let display = self.executor.execute(
-            &ToolCommand::new(
-                &self.xcrun,
-                bundle.parent().unwrap_or_else(|| Utf8Path::new(".")),
-                "inspect Apple Development signature",
-            )
-            .args([
-                OsString::from("codesign"),
-                OsString::from("--display"),
-                OsString::from("--verbose=4"),
-                OsString::from("--entitlements"),
-                OsString::from(entitlement_path.as_str()),
-                OsString::from("--xml"),
-                OsString::from("--extract-certificates"),
-                OsString::from(certificate_prefix.as_str()),
-                OsString::from(bundle.as_str()),
-            ])
-            .timeout(Duration::from_secs(30)),
+            &self
+                .xcrun_command(
+                    bundle.parent().unwrap_or_else(|| Utf8Path::new(".")),
+                    "inspect Apple Development signature",
+                )?
+                .args([
+                    OsString::from("codesign"),
+                    OsString::from("--display"),
+                    OsString::from("--verbose=4"),
+                    OsString::from("--entitlements"),
+                    OsString::from(entitlement_path.as_str()),
+                    OsString::from("--xml"),
+                    OsString::from("--extract-certificates"),
+                    OsString::from(certificate_prefix.as_str()),
+                    OsString::from(bundle.as_str()),
+                ])
+                .timeout(Duration::from_secs(30)),
         )?;
         ensure_signing_success(bundle, "inspect Apple Development signature", &display)?;
         let metadata = combined_text(&display);
@@ -874,21 +973,21 @@ impl<E: CommandExecutor> SigningService<E> {
         operation: &'static str,
     ) -> DeploymentResult<String> {
         let output = self.executor.execute(
-            &ToolCommand::new(
-                &self.xcrun,
-                plist.parent().unwrap_or_else(|| Utf8Path::new(".")),
-                operation,
-            )
-            .args([
-                "plutil",
-                "-extract",
-                key_path,
-                "raw",
-                "-o",
-                "-",
-                plist.as_str(),
-            ])
-            .timeout(Duration::from_secs(15)),
+            &self
+                .xcrun_command(
+                    plist.parent().unwrap_or_else(|| Utf8Path::new(".")),
+                    operation,
+                )?
+                .args([
+                    "plutil",
+                    "-extract",
+                    key_path,
+                    "raw",
+                    "-o",
+                    "-",
+                    plist.as_str(),
+                ])
+                .timeout(Duration::from_secs(15)),
         )?;
         ensure_signing_success(plist, operation, &output)?;
         let value =
@@ -913,21 +1012,21 @@ impl<E: CommandExecutor> SigningService<E> {
         operation: &'static str,
     ) -> DeploymentResult<serde_json::Value> {
         let output = self.executor.execute(
-            &ToolCommand::new(
-                &self.xcrun,
-                plist.parent().unwrap_or_else(|| Utf8Path::new(".")),
-                operation,
-            )
-            .args([
-                "plutil",
-                "-extract",
-                key_path,
-                "json",
-                "-o",
-                "-",
-                plist.as_str(),
-            ])
-            .timeout(Duration::from_secs(15)),
+            &self
+                .xcrun_command(
+                    plist.parent().unwrap_or_else(|| Utf8Path::new(".")),
+                    operation,
+                )?
+                .args([
+                    "plutil",
+                    "-extract",
+                    key_path,
+                    "json",
+                    "-o",
+                    "-",
+                    plist.as_str(),
+                ])
+                .timeout(Duration::from_secs(15)),
         )?;
         ensure_signing_success(plist, operation, &output)?;
         serde_json::from_slice(&output.stdout).map_err(|error| DeploymentError::InvalidSigning {
@@ -942,13 +1041,13 @@ impl<E: CommandExecutor> SigningService<E> {
         operation: &'static str,
     ) -> DeploymentResult<serde_json::Value> {
         let output = self.executor.execute(
-            &ToolCommand::new(
-                &self.xcrun,
-                plist.parent().unwrap_or_else(|| Utf8Path::new(".")),
-                operation,
-            )
-            .args(["plutil", "-convert", "json", "-o", "-", plist.as_str()])
-            .timeout(Duration::from_secs(15)),
+            &self
+                .xcrun_command(
+                    plist.parent().unwrap_or_else(|| Utf8Path::new(".")),
+                    operation,
+                )?
+                .args(["plutil", "-convert", "json", "-o", "-", plist.as_str()])
+                .timeout(Duration::from_secs(15)),
         )?;
         ensure_signing_success(plist, operation, &output)?;
         serde_json::from_slice(&output.stdout).map_err(|error| DeploymentError::InvalidSigning {
@@ -959,13 +1058,13 @@ impl<E: CommandExecutor> SigningService<E> {
 
     fn architectures(&self, executable: &Utf8Path) -> DeploymentResult<Vec<String>> {
         let output = self.executor.execute(
-            &ToolCommand::new(
-                &self.xcrun,
-                executable.parent().unwrap_or_else(|| Utf8Path::new(".")),
-                "inspect physical iOS executable architectures",
-            )
-            .args(["lipo", "-archs", executable.as_str()])
-            .timeout(Duration::from_secs(15)),
+            &self
+                .xcrun_command(
+                    executable.parent().unwrap_or_else(|| Utf8Path::new(".")),
+                    "inspect physical iOS executable architectures",
+                )?
+                .args(["lipo", "-archs", executable.as_str()])
+                .timeout(Duration::from_secs(15)),
         )?;
         ensure_signing_success(
             executable,
@@ -986,13 +1085,13 @@ impl<E: CommandExecutor> SigningService<E> {
         operation: &'static str,
     ) -> DeploymentResult<Vec<String>> {
         let output = self.executor.execute(
-            &ToolCommand::new(
-                &self.xcrun,
-                executable.parent().unwrap_or_else(|| Utf8Path::new(".")),
-                operation,
-            )
-            .args(["dwarfdump", "--uuid", executable.as_str()])
-            .timeout(Duration::from_secs(15)),
+            &self
+                .xcrun_command(
+                    executable.parent().unwrap_or_else(|| Utf8Path::new(".")),
+                    operation,
+                )?
+                .args(["dwarfdump", "--uuid", executable.as_str()])
+                .timeout(Duration::from_secs(15)),
         )?;
         ensure_signing_success(executable, operation, &output)?;
         let source =
@@ -1001,6 +1100,54 @@ impl<E: CommandExecutor> SigningService<E> {
                 message: format!("dwarfdump UUID output was not UTF-8: {error}"),
             })?;
         parse_macho_uuids(executable, &source)
+    }
+}
+
+fn bind_executable(path: &Utf8Path, tool: &str) -> DeploymentResult<Utf8PathBuf> {
+    if !path.is_absolute() {
+        return Err(missing_bound_tool(tool));
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|_| missing_bound_tool(tool))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(missing_bound_tool(tool));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(missing_bound_tool(tool));
+        }
+    }
+    let canonical = path
+        .canonicalize_utf8()
+        .map_err(|_| missing_bound_tool(tool))?;
+    let canonical_metadata =
+        fs::symlink_metadata(&canonical).map_err(|_| missing_bound_tool(tool))?;
+    if canonical_metadata.file_type().is_symlink() || !canonical_metadata.is_file() {
+        return Err(missing_bound_tool(tool));
+    }
+    Ok(canonical)
+}
+
+fn bind_directory(path: &Utf8Path, description: &str) -> DeploymentResult<Utf8PathBuf> {
+    if !path.is_absolute() {
+        return Err(missing_bound_tool(description));
+    }
+    let canonical = path
+        .canonicalize_utf8()
+        .map_err(|_| missing_bound_tool(description))?;
+    if !canonical.is_dir() {
+        return Err(missing_bound_tool(description));
+    }
+    Ok(canonical)
+}
+
+fn missing_bound_tool(tool: &str) -> DeploymentError {
+    DeploymentError::ToolMissing {
+        tool: tool.to_owned(),
+        help: format!(
+            "Use an absolute, canonical, non-symlink regular executable path for {tool}."
+        ),
     }
 }
 
@@ -2074,6 +2221,34 @@ fn make_executable(_path: &Utf8Path) -> DeploymentResult<()> {
 mod tests {
     use super::*;
 
+    fn executable(path: &Utf8Path) {
+        fs::write(path, b"fixture").expect("write executable fixture");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut permissions = fs::metadata(path).expect("fixture metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).expect("fixture executable mode");
+        }
+    }
+
+    fn explicit_service(root: &Utf8Path) -> SigningService<super::super::SystemExecutor> {
+        let cargo = root.join("trusted-cargo");
+        let xcrun = root.join("trusted-xcrun");
+        let security = root.join("trusted-security");
+        for path in [&cargo, &xcrun, &security] {
+            executable(path);
+        }
+        SigningService::from_tools(
+            super::super::SystemExecutor,
+            &cargo,
+            &xcrun,
+            &security,
+            root,
+        )
+        .expect("explicit tools")
+    }
+
     #[test]
     fn team_parser_ignores_distribution_and_malformed_identities() {
         let teams = parse_development_teams(
@@ -2128,8 +2303,15 @@ mod tests {
             "app",
             "ABC123DEF4",
         );
-        let service = SigningService::new(super::super::SystemExecutor);
+        let service = explicit_service(&project);
         let plan = service.plan(&request).expect("plan");
+        let canonical_project = project.canonicalize_utf8().expect("canonical project");
+        assert!(plan.cargo_command.program.is_absolute());
+        assert!(plan.xcodebuild_command.program.is_absolute());
+        assert_eq!(
+            plan.xcodebuild_command.environment.get("DEVELOPER_DIR"),
+            Some(&OsString::from(canonical_project.as_str()))
+        );
         assert!(
             !plan
                 .xcodebuild_command
@@ -2143,6 +2325,51 @@ mod tests {
                 .iter()
                 .any(|argument| argument == "DEVELOPMENT_TEAM=ABC123DEF4")
         );
+    }
+
+    #[test]
+    fn explicit_tools_reject_path_lookup_and_non_regular_paths() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned()).expect("UTF-8");
+        let trusted = root.join("trusted");
+        executable(&trusted);
+        let invalid = SigningService::from_tools(
+            super::super::SystemExecutor,
+            Utf8Path::new("cargo"),
+            &trusted,
+            &trusted,
+            &root,
+        );
+        assert!(matches!(invalid, Err(DeploymentError::ToolMissing { .. })));
+        let invalid = SigningService::from_tools(
+            super::super::SystemExecutor,
+            &root,
+            &trusted,
+            &trusted,
+            &root,
+        );
+        assert!(matches!(invalid, Err(DeploymentError::ToolMissing { .. })));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_tools_reject_symlink_executables() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned()).expect("UTF-8");
+        let trusted = root.join("trusted");
+        let linked = root.join("cargo");
+        executable(&trusted);
+        symlink(&trusted, &linked).expect("tool symlink");
+        let invalid = SigningService::from_tools(
+            super::super::SystemExecutor,
+            &linked,
+            &trusted,
+            &trusted,
+            &root,
+        );
+        assert!(matches!(invalid, Err(DeploymentError::ToolMissing { .. })));
     }
 
     #[test]

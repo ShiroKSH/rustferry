@@ -23,11 +23,16 @@ Commands work as a Cargo subcommand (`cargo ferry ...`) or direct binary (`cargo
 | `build android` | Build-only Android request; platform readiness and validation level are in [STATUS](STATUS.md) |
 | `build ios --simulator` | Build-only Simulator request; no automatic boot/install/launch |
 | `build ios --device --team <id>` | Implemented official arm64/Xcode development-signing build; provisioning updates remain explicit; no identity, Team, profile, or signed artifact was available for artifact validation, and no device was available for device validation |
+| `build iphone --remote github --unsigned` | Submit an exact source revision to the configured GitHub macOS worker, then rehash, inspect, and atomically publish the downloaded unsigned physical-device archive |
+| `build iphone --remote github --team <id>` | Request protected remote Apple Development signing; implemented and synthetically tested, but no real signed IPA acceptance has run |
+| `remote setup github` | Validate source/execution Git remote identities, generate the trusted workflow, and persist ignored provider metadata; signing requires a distinct private execution repository |
+| `remote doctor github` | Read-only provider, repository, workflow, and signed-readiness checks |
 | `devices [--platform all\|android\|ios]` | Typed ADB/simctl/devicectl inventory; `--watch --json-stream` emits the initial snapshot followed by polling deltas until cancelled |
 | `install android\|ios` | Build, independently validate, select an exact compatible device, then install |
 | `run android\|ios` | Build → validate → install → launch; `--logs` adds one bounded filtered snapshot where standalone logging is supported |
 | `logs android\|ios` | Finite application-filtered history by default; `--json-stream` runs the live protocol stream until cancellation or platform-tool exit |
 | `signing teams` | Read-only Apple Development identity/Team inventory |
+| `signing setup manual` | Validate one PKCS#12/application-profile pair outside Git, check protected GitHub Environment policy, and upload secrets only after dry-run review and confirmation |
 | `assets check\|generate` | Validate release sources; generate fingerprinted Android densities and an iOS asset catalog |
 | `clean [android\|ios\|generated]` | Remove only selected generated output below `target/ferry/` |
 | `clean --all` | Remove cargo-ferry output below `target/ferry/`, not application source/signing inputs |
