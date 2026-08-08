@@ -1,0 +1,86 @@
+From a6cc1ff867b03bc8fd66b8c6af7f1b0f7ca000c9 Mon Sep 17 00:00:00 2001
+From: ShiroKSH <kushidashiro@gmail.com>
+Date: Sun, 2 Aug 2026 06:19:11 +0300
+Subject: [PATCH 26/33] fix: keep worker checks portable
+
+---
+ crates/rustferry-worker-macos/src/keychain.rs | 9 ++++-----
+ crates/rustferry-worker-macos/src/main.rs     | 5 ++++-
+ crates/rustferry-worker-macos/src/sealed.rs   | 5 ++++-
+ 3 files changed, 12 insertions(+), 7 deletions(-)
+
+diff --git a/crates/rustferry-worker-macos/src/keychain.rs b/crates/rustferry-worker-macos/src/keychain.rs
+index 2d1c487..6b63f0a 100644
+--- a/crates/rustferry-worker-macos/src/keychain.rs
++++ b/crates/rustferry-worker-macos/src/keychain.rs
+@@ -771,7 +771,7 @@ fn validate_keychain_identity_listing(
+     Ok(())
+ }
+ 
+-#[cfg(any(target_os = "macos", test))]
++#[cfg(target_os = "macos")]
+ fn uppercase_hex(bytes: &[u8]) -> String {
+     const HEX: &[u8; 16] = b"0123456789ABCDEF";
+     let mut output = String::with_capacity(bytes.len() * 2);
+@@ -2446,14 +2446,13 @@ mod tests {
+         let input =
+             SigningKeychainInput::new(SecretBytes::new(vec![1_u8]), Secret::new(String::new()))
+                 .expect("valid input");
+-        let error = match EphemeralSigningKeychain::create(
++        let Err(error) = EphemeralSigningKeychain::create(
+             Path::new("/tmp/rustferry-signing"),
+             Path::new("/tmp/rustferry-signing/job"),
+             input,
+             KeychainOptions::default(),
+-        ) {
+-            Ok(_) => panic!("non-macOS keychain creation unexpectedly succeeded"),
+-            Err(error) => error,
++        ) else {
++            panic!("non-macOS keychain creation unexpectedly succeeded");
+         };
+         assert_eq!(error, KeychainError::UnsupportedPlatform);
+     }
+diff --git a/crates/rustferry-worker-macos/src/main.rs b/crates/rustferry-worker-macos/src/main.rs
+index 5e7c311..68d2a02 100644
+--- a/crates/rustferry-worker-macos/src/main.rs
++++ b/crates/rustferry-worker-macos/src/main.rs
+@@ -23,10 +23,11 @@ use rustferry_remote::{
+     SealedUnsignedArchive, SecretBytes, SecretReference, SecretReferenceKind, SigningMode,
+     SourceBundleRequest, SourceManifest, SourceMode, verify_source_manifest,
+ };
++#[cfg(target_os = "macos")]
++use rustferry_worker_macos::keychain::{KeychainOptions, garbage_collect_stale_keychains};
+ use rustferry_worker_macos::{
+     host::{WorkerHostOptions, doctor_worker_host, worker_host_capabilities},
+     job::{WorkerHookFailure, WorkerSecretResolver},
+-    keychain::{KeychainOptions, garbage_collect_stale_keychains},
+     pipeline::{
+         CompilePhaseRequest, PipelineError, PipelinePublicMetadata, PipelineToolchainSelection,
+         ProtectedSignPhaseRequest, compile_unsigned_phase, sign_protected_phase,
+@@ -940,6 +941,8 @@ fn remove_owned_job_root(
+     marker: &JobMarker,
+     identity: &Handle,
+ ) -> Result<(), CliFailure> {
++    #[cfg(not(target_os = "macos"))]
++    let _ = worker_root;
+     #[cfg(target_os = "macos")]
+     if marker.phase == JobPhase::Sign {
+         cleanup_stale_keychains_below(worker_root, job_root)?;
+diff --git a/crates/rustferry-worker-macos/src/sealed.rs b/crates/rustferry-worker-macos/src/sealed.rs
+index 416a7f4..e971c79 100644
+--- a/crates/rustferry-worker-macos/src/sealed.rs
++++ b/crates/rustferry-worker-macos/src/sealed.rs
+@@ -297,6 +297,9 @@ mod tests {
+         let limits = sealed_limits();
+         assert!(limits.max_archive_size <= 2 * 1024 * 1024 * 1024);
+         assert!(limits.source.max_file_count <= 50_000);
+-        assert!(Utf8Path::new("App.xcarchive").extension() == Some("xcarchive"));
++        assert_eq!(
++            Utf8Path::new("App.xcarchive").extension(),
++            Some("xcarchive")
++        );
+     }
+ }
+-- 
+2.55.0
+

@@ -1,0 +1,200 @@
+From 743f8c8956f0ac14253b63ea3611b781bcbaf2b2 Mon Sep 17 00:00:00 2001
+From: ShiroKSH <kushidashiro@gmail.com>
+Date: Sun, 2 Aug 2026 01:54:00 +0300
+Subject: [PATCH 09/33] ci: add Linux macless acceptance
+
+---
+ ...ustferry-goal3-linux-client-acceptance.yml | 156 ++++++++++++++++++
+ docs/GOAL3_COMMAND_AUDIT.jsonl                |  16 ++
+ 2 files changed, 172 insertions(+)
+ create mode 100644 .github/workflows/rustferry-goal3-linux-client-acceptance.yml
+
+diff --git a/.github/workflows/rustferry-goal3-linux-client-acceptance.yml b/.github/workflows/rustferry-goal3-linux-client-acceptance.yml
+new file mode 100644
+index 0000000..05e2103
+--- /dev/null
++++ b/.github/workflows/rustferry-goal3-linux-client-acceptance.yml
+@@ -0,0 +1,156 @@
++name: RustFerry Goal 3 Linux client acceptance
++
++on:
++  push:
++    branches:
++      - 'goal3/macless-iphone-builds'
++    paths:
++      - '.github/workflows/rustferry-goal3-linux-client-acceptance.yml'
++
++permissions: {}
++
++concurrency:
++  group: 'rustferry-goal3-linux-client-${{ github.repository_id }}'
++  cancel-in-progress: false
++
++jobs:
++  linux-client:
++    name: Linux client to remote unsigned iPhone archive
++    runs-on: ubuntu-24.04
++    timeout-minutes: 180
++    permissions:
++      actions: write
++      contents: read
++    env:
++      CARGO_INCREMENTAL: '0'
++      CARGO_PROFILE_DEV_DEBUG: '0'
++      CARGO_TERM_COLOR: 'never'
++      GITHUB_TOKEN: '${{ github.token }}'
++      RUST_BACKTRACE: '0'
++      RUSTUP_TOOLCHAIN: '1.92.0'
++      RUSTFERRY_WORKER_REVISION: '3332f8ed850a009e70465be1a7938db68c02cec4'
++    steps:
++      - name: Checkout exact acceptance source
++        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
++        with:
++          fetch-depth: 0
++          persist-credentials: false
++
++      - name: Prove Linux has no local Apple toolchain
++        shell: bash
++        run: |
++          set -euo pipefail
++          evidence="$RUNNER_TEMP/rustferry-goal3-linux-evidence"
++          install -d -m 0700 "$evidence"
++          uname -a > "$evidence/uname.txt"
++          test "$RUNNER_OS" = 'Linux'
++          test ! -d /Applications/Xcode.app
++          for tool in xcodebuild xcrun codesign; do
++            if command -v "$tool" >/dev/null 2>&1; then
++              echo "Unexpected Apple tool on Linux client: $tool" >&2
++              exit 1
++            fi
++          done
++          printf '%s\n' \
++            'client_os=Linux' \
++            'xcode=absent' \
++            'xcodebuild=absent' \
++            'codesign=absent' \
++            'iphoneos_sdk=absent' \
++            > "$evidence/client-toolchain.txt"
++          git rev-parse --verify 'HEAD^{commit}' > "$evidence/source-revision.txt"
++          git status --porcelain=v1 --untracked-files=all > "$evidence/prebuild-status.txt"
++          test ! -s "$evidence/prebuild-status.txt"
++
++      - name: Install exact Rust toolchain
++        shell: bash
++        run: |
++          set -euo pipefail
++          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
++          actual="$(rustup run "$RUSTUP_TOOLCHAIN" rustc --version)"
++          [[ "$actual" == 'rustc 1.92.0 '* ]]
++          printf '%s\n' "$actual" \
++            > "$RUNNER_TEMP/rustferry-goal3-linux-evidence/rustc-version.txt"
++
++      - name: Build Linux cargo-ferry client
++        shell: bash
++        run: |
++          set -euo pipefail
++          cargo build --locked --package cargo-ferry
++          target/debug/cargo-ferry --version \
++            > "$RUNNER_TEMP/rustferry-goal3-linux-evidence/cargo-ferry-version.txt"
++
++      - name: Run real GitHub provider and verify automatic download
++        shell: bash
++        env:
++          RUSTFERRY_ACCEPTANCE_SSH_PRIVATE_KEY: '${{ secrets.RUSTFERRY_GOAL3_ACCEPTANCE_SSH_PRIVATE_KEY }}'
++        run: |
++          set -euo pipefail
++          evidence="$RUNNER_TEMP/rustferry-goal3-linux-evidence"
++          test -n "$RUSTFERRY_ACCEPTANCE_SSH_PRIVATE_KEY"
++
++          install -d -m 0700 "$HOME/.ssh"
++          gh api meta --jq '.ssh_keys[]' \
++            | awk '{ print "github.com " $0 }' \
++            > "$HOME/.ssh/known_hosts"
++          test -s "$HOME/.ssh/known_hosts"
++          chmod 0600 "$HOME/.ssh/known_hosts"
++          eval "$(ssh-agent -s)" >/dev/null
++          trap 'ssh-agent -k >/dev/null 2>&1 || true' EXIT
++          printf '%s\n' "$RUSTFERRY_ACCEPTANCE_SSH_PRIVATE_KEY" \
++            | ssh-add - >/dev/null
++          unset RUSTFERRY_ACCEPTANCE_SSH_PRIVATE_KEY
++          git remote set-url --push origin 'git@github.com:ShiroKSH/rustferry.git'
++
++          target/debug/cargo-ferry --json remote setup github \
++            --project-dir examples/counter \
++            --repository ShiroKSH/rustferry \
++            --remote-name origin \
++            --trusted-ref refs/heads/goal3/macless-iphone-builds \
++            --worker-repository https://github.com/ShiroKSH/rustferry \
++            --worker-revision "$RUSTFERRY_WORKER_REVISION" \
++            --worker-version 0.1.0 \
++            | tee "$evidence/setup.json"
++          jq -e \
++            '.data.repository == "ShiroKSH/rustferry" and .data.installed == true and .data.signing_mode == "unsigned-smoke-only"' \
++            "$evidence/setup.json" >/dev/null
++
++          target/debug/cargo-ferry --json remote doctor github \
++            --project-dir examples/counter \
++            | tee "$evidence/doctor.json"
++          jq -e '.data.ready == true' "$evidence/doctor.json" >/dev/null
++
++          target/debug/cargo-ferry --json build iphone \
++            --project-dir examples/counter \
++            --remote github \
++            --unsigned \
++            | tee "$evidence/build.json"
++
++          archive="$GITHUB_WORKSPACE/examples/counter/target/ferry/ios/device/debug/Counter-unsigned.xcarchive.zip"
++          sanitized_log="$GITHUB_WORKSPACE/examples/counter/target/ferry/ios/device/debug/sanitized-build-log.txt"
++          test -s "$archive"
++          test -s "$sanitized_log"
++          unzip -t "$archive" > "$evidence/archive-zip-test.txt"
++          zipinfo -1 "$archive" > "$evidence/archive-entries.txt"
++          grep -qx 'Info.plist' "$evidence/archive-entries.txt"
++          grep -qx 'Products/Applications/Counter.app/Info.plist' \
++            "$evidence/archive-entries.txt"
++
++          actual_sha256="$(sha256sum "$archive" | awk '{print $1}')"
++          reported_sha256="$(jq -er '.data.artifact_sha256' "$evidence/build.json")"
++          test "$actual_sha256" = "$reported_sha256"
++          printf '%s  %s\n' "$actual_sha256" 'Counter-unsigned.xcarchive.zip' \
++            > "$evidence/SHA256SUMS"
++          stat --printf='%s\n' "$archive" > "$evidence/archive-size-bytes.txt"
++          cp --reflink=auto "$archive" "$evidence/Counter-unsigned.xcarchive.zip"
++          cp --reflink=auto "$sanitized_log" "$evidence/sanitized-build-log.txt"
++
++      - name: Upload Linux-client acceptance evidence
++        if: always()
++        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
++        with:
++          name: 'rustferry-goal3-linux-client-${{ github.run_id }}-${{ github.run_attempt }}'
++          path: '${{ runner.temp }}/rustferry-goal3-linux-evidence'
++          if-no-files-found: error
++          compression-level: 0
++          retention-days: 3
+diff --git a/docs/GOAL3_COMMAND_AUDIT.jsonl b/docs/GOAL3_COMMAND_AUDIT.jsonl
+index bd75628..99b0498 100644
+--- a/docs/GOAL3_COMMAND_AUDIT.jsonl
++++ b/docs/GOAL3_COMMAND_AUDIT.jsonl
+@@ -1206,3 +1206,19 @@
+ {"timestamp":"2026-08-01T22:36:27Z","operation_id":"goal3-20260801T223627Z-57893-487","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"workflow-lint","affected_path_category":"github-workflow-3332f8e","result":"started","exit_code":null}
+ {"timestamp":"2026-08-01T22:36:27Z","operation_id":"goal3-20260801T223627Z-57893-487","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"workflow-lint","affected_path_category":"github-workflow-3332f8e","result":"success","exit_code":0}
+ {"timestamp":"2026-08-01T22:36:44Z","operation_id":"goal3-20260801T223644Z-58204-31768","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"git-stage","affected_path_category":"github-workflow-3332f8e","result":"started","exit_code":null}
++{"timestamp":"2026-08-01T22:36:44Z","operation_id":"goal3-20260801T223644Z-58204-31768","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"git-stage","affected_path_category":"github-workflow-3332f8e","result":"success","exit_code":0}
++{"timestamp":"2026-08-01T22:36:58Z","operation_id":"goal3-20260801T223658Z-58386-6437","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"git-commit","affected_path_category":"github-workflow-3332f8e","result":"started","exit_code":null}
++{"timestamp":"2026-08-01T22:36:58Z","operation_id":"goal3-20260801T223658Z-58386-6437","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"git-commit","affected_path_category":"github-workflow-3332f8e","result":"success","exit_code":0}
++{"timestamp":"2026-08-01T22:37:08Z","operation_id":"goal3-20260801T223708Z-58798-27412","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"git-push","affected_path_category":"goal3-branch","result":"started","exit_code":null}
++{"timestamp":"2026-08-01T22:37:10Z","operation_id":"goal3-20260801T223708Z-58798-27412","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"git-push","affected_path_category":"goal3-branch","result":"success","exit_code":0}
++{"timestamp":"2026-08-01T22:37:35Z","operation_id":"goal3-20260801T223735Z-59243-5961","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"remote-doctor","affected_path_category":"github-public-unsigned","result":"started","exit_code":null}
++{"timestamp":"2026-08-01T22:37:37Z","operation_id":"goal3-20260801T223735Z-59243-5961","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"remote-doctor","affected_path_category":"github-public-unsigned","result":"success","exit_code":0}
++{"timestamp":"2026-08-01T22:38:02Z","operation_id":"goal3-20260801T223802Z-59678-18361","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"cargo-clean","affected_path_category":"isolated-target-final","result":"started","exit_code":null}
++{"timestamp":"2026-08-01T22:38:03Z","operation_id":"goal3-20260801T223802Z-59678-18361","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"cargo-clean","affected_path_category":"isolated-target-final","result":"success","exit_code":0}
++{"timestamp":"2026-08-01T22:50:09Z","operation_id":"goal3-20260801T225009Z-70215-2963","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"workflow-lint","affected_path_category":"linux-client-acceptance","result":"started","exit_code":null}
++{"timestamp":"2026-08-01T22:50:09Z","operation_id":"goal3-20260801T225009Z-70215-2963","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"workflow-lint","affected_path_category":"linux-client-acceptance","result":"success","exit_code":0}
++{"timestamp":"2026-08-01T22:53:02Z","operation_id":"goal3-20260801T225302Z-73092-26755","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"workflow-lint","affected_path_category":"linux-client-acceptance-security","result":"started","exit_code":null}
++{"timestamp":"2026-08-01T22:53:02Z","operation_id":"goal3-20260801T225302Z-73092-26755","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"workflow-lint","affected_path_category":"linux-client-acceptance-security","result":"success","exit_code":0}
++{"timestamp":"2026-08-01T22:53:41Z","operation_id":"goal3-20260801T225341Z-73668-5152","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"workflow-lint","affected_path_category":"linux-client-acceptance-final","result":"started","exit_code":null}
++{"timestamp":"2026-08-01T22:53:41Z","operation_id":"goal3-20260801T225341Z-73668-5152","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"workflow-lint","affected_path_category":"linux-client-acceptance-final","result":"success","exit_code":0}
++{"timestamp":"2026-08-01T22:53:48Z","operation_id":"goal3-20260801T225348Z-73783-20892","cwd":"/Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone","command_category":"git-stage","affected_path_category":"linux-client-acceptance","result":"started","exit_code":null}
+-- 
+2.55.0
+

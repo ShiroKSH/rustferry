@@ -1,0 +1,24 @@
+From 79a70d24ae9873e7290b2422b4d1769c9368ca31 Mon Sep 17 00:00:00 2001
+From: ShiroKSH <kushidashiro@gmail.com>
+Date: Sun, 2 Aug 2026 06:13:24 +0300
+Subject: [PATCH 25/33] ci: review BSD-3-Clause dependency
+
+---
+ scripts/check-licenses.py | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/scripts/check-licenses.py b/scripts/check-licenses.py
+index f44345a..d1a823c 100644
+--- a/scripts/check-licenses.py
++++ b/scripts/check-licenses.py
+@@ -29,6 +29,7 @@ REVIEWED_LICENSE_EXPRESSIONS = frozenset(
+         "Apache-2.0 OR MIT",
+         "Apache-2.0 WITH LLVM-exception",
+         "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
++        "BSD-3-Clause",
+         "BSD-3-Clause OR MIT OR Apache-2.0",
+         "MIT",
+         "MIT OR Apache-2.0",
+-- 
+2.55.0
+

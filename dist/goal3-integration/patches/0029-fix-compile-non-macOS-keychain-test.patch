@@ -1,0 +1,27 @@
+From 8e7f728bb628939cca0fdb21a2cac67f5fdd0a51 Mon Sep 17 00:00:00 2001
+From: ShiroKSH <kushidashiro@gmail.com>
+Date: Sun, 2 Aug 2026 06:33:22 +0300
+Subject: [PATCH 29/33] fix: compile non-macOS keychain test
+
+---
+ crates/rustferry-worker-macos/src/keychain.rs | 4 +---
+ 1 file changed, 1 insertion(+), 3 deletions(-)
+
+diff --git a/crates/rustferry-worker-macos/src/keychain.rs b/crates/rustferry-worker-macos/src/keychain.rs
+index 6b63f0a..1841013 100644
+--- a/crates/rustferry-worker-macos/src/keychain.rs
++++ b/crates/rustferry-worker-macos/src/keychain.rs
+@@ -2451,9 +2451,7 @@ mod tests {
+             Path::new("/tmp/rustferry-signing/job"),
+             input,
+             KeychainOptions::default(),
+-        ) else {
+-            panic!("non-macOS keychain creation unexpectedly succeeded");
+-        };
++        );
+         assert_eq!(error, KeychainError::UnsupportedPlatform);
+     }
+ }
+-- 
+2.55.0
+
