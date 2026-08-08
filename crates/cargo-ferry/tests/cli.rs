@@ -995,10 +995,10 @@ fn manual_signing_setup_help_has_exact_inputs_and_no_password_value_option() {
     let help = String::from_utf8(output.stdout).expect("UTF-8 help");
     let normalized_help = help.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(normalized_help.contains(
-        "signing setup manual [OPTIONS] --certificate <CERTIFICATE> --profile <PROFILE> --remote <REMOTE>"
+        "signing setup manual [OPTIONS] --certificate <CERTIFICATE> --profile <TARGET=PATH|PATH> --remote <REMOTE>"
     ));
     assert!(help.contains("--certificate <CERTIFICATE>"));
-    assert!(help.contains("--profile <PROFILE>"));
+    assert!(help.contains("--profile <TARGET=PATH|PATH>"));
     assert!(help.contains("--remote <REMOTE>"));
     assert!(help.contains("--password-stdin"));
     assert!(help.contains("--password-env <NAME>"));

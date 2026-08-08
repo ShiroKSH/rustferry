@@ -93,7 +93,7 @@ pub use signing::{
     ProvisioningProfile, ProvisioningProfileType, SigningCertificate, SigningIdentity, SigningMode,
     SigningPlan, SigningPrivateKeyReference, SigningReference, SigningStatus, SigningTarget,
     SigningTargetKind, SigningValidationError, SigningValidationErrors, SigningValidationReport,
-    ValidationComponent, ValidationStatus,
+    ValidationComponent, ValidationStatus, canonical_signing_target_graph_sha256,
 };
 pub use snapshot_session::{
     MAX_SNAPSHOT_SESSION_DESCRIPTOR_BYTES, SNAPSHOT_SESSION_SCHEMA_VERSION,

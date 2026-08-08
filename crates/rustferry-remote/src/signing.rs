@@ -16,6 +16,7 @@ const MAX_ENTITLEMENT_KEY_BYTES: usize = 255;
 const MAX_ENTITLEMENT_STRING_BYTES: usize = 16 * 1024;
 const MAX_ENTITLEMENT_COLLECTION_ITEMS: usize = 1_024;
 const MAX_ENTITLEMENT_DEPTH: usize = 16;
+const SIGNING_TARGET_GRAPH_SHA256_DOMAIN: &[u8] = b"rustferry.signing-target-graph.sha256.v1\0";
 
 /// Supported Apple signing mode.
 #[derive(
@@ -621,6 +622,63 @@ pub struct SigningTarget {
     pub bundle_identifier: BundleIdentifier,
     /// Code-object category determining inside-out order.
     pub kind: SigningTargetKind,
+}
+
+/// SHA-256 of a canonical, order-independent full signing-target graph.
+///
+/// The hash input starts with a versioned domain separator and record count.
+/// Every target is sorted by UTF-8 target name, bundle identifier, then kind;
+/// kind, name, and bundle identifier are encoded as ASCII-length-prefixed byte
+/// fields. The resulting lowercase digest binds every target kind without
+/// relying on serialization formats or enum discriminants.
+pub fn canonical_signing_target_graph_sha256(targets: &[SigningTarget]) -> String {
+    let mut targets = targets.iter().collect::<Vec<_>>();
+    targets.sort_unstable_by(|left, right| {
+        left.name
+            .as_bytes()
+            .cmp(right.name.as_bytes())
+            .then_with(|| {
+                left.bundle_identifier
+                    .as_str()
+                    .as_bytes()
+                    .cmp(right.bundle_identifier.as_str().as_bytes())
+            })
+            .then_with(|| {
+                signing_target_kind_name(left.kind).cmp(signing_target_kind_name(right.kind))
+            })
+    });
+
+    let mut digest = Sha256::new();
+    digest.update(SIGNING_TARGET_GRAPH_SHA256_DOMAIN);
+    update_canonical_length(&mut digest, targets.len());
+    for target in targets {
+        update_canonical_field(
+            &mut digest,
+            signing_target_kind_name(target.kind).as_bytes(),
+        );
+        update_canonical_field(&mut digest, target.name.as_bytes());
+        update_canonical_field(&mut digest, target.bundle_identifier.as_str().as_bytes());
+    }
+    hex::encode(digest.finalize())
+}
+
+fn update_canonical_field(digest: &mut Sha256, value: &[u8]) {
+    update_canonical_length(digest, value.len());
+    digest.update(value);
+}
+
+fn update_canonical_length(digest: &mut Sha256, length: usize) {
+    digest.update(length.to_string().as_bytes());
+    digest.update(b":");
+}
+
+const fn signing_target_kind_name(kind: SigningTargetKind) -> &'static str {
+    match kind {
+        SigningTargetKind::DynamicLibrary => "dynamic_library",
+        SigningTargetKind::Framework => "framework",
+        SigningTargetKind::Extension => "extension",
+        SigningTargetKind::Application => "application",
+    }
 }
 
 /// Per-target provisioning-profile selection.
@@ -1390,4 +1448,81 @@ fn is_profile_identifier(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
         && !value.starts_with('-')
         && !value.ends_with('-')
+}
+
+#[cfg(test)]
+mod target_graph_digest_tests {
+    use super::*;
+
+    fn target(name: &str, bundle_identifier: &str, kind: SigningTargetKind) -> SigningTarget {
+        SigningTarget {
+            name: name.to_owned(),
+            bundle_identifier: BundleIdentifier::new(bundle_identifier).expect("bundle identifier"),
+            kind,
+        }
+    }
+
+    #[test]
+    fn app_only_target_graph_digest_matches_golden() {
+        let targets = [target(
+            "App",
+            "com.example.app",
+            SigningTargetKind::Application,
+        )];
+
+        assert_eq!(
+            canonical_signing_target_graph_sha256(&targets),
+            "144f18f553557a96d6a39105b3aa0928c54bf075a5e32fef077a2eef59b37aff"
+        );
+    }
+
+    #[test]
+    fn full_target_graph_digest_is_deterministic_and_binds_every_identity() {
+        let targets = vec![
+            target(
+                "RuntimeBridge",
+                "com.example.weather.runtime-bridge",
+                SigningTargetKind::Framework,
+            ),
+            target(
+                "WeatherWidget",
+                "com.example.weather.widget",
+                SigningTargetKind::Extension,
+            ),
+            target(
+                "Weather",
+                "com.example.weather",
+                SigningTargetKind::Application,
+            ),
+        ];
+        let digest = canonical_signing_target_graph_sha256(&targets);
+        let reordered = targets.iter().rev().cloned().collect::<Vec<_>>();
+
+        assert_eq!(
+            digest,
+            "112e2935c240c978a4e356b5a0e7b3ffc0068ba249807666e8d1662bd366a691"
+        );
+        assert_eq!(canonical_signing_target_graph_sha256(&reordered), digest);
+
+        let mut app_drift = targets.clone();
+        app_drift
+            .iter_mut()
+            .find(|target| target.kind == SigningTargetKind::Application)
+            .expect("application target")
+            .bundle_identifier =
+            BundleIdentifier::new("com.example.weather.renamed").expect("app bundle drift");
+        assert_ne!(canonical_signing_target_graph_sha256(&app_drift), digest);
+
+        let mut framework_drift = targets;
+        framework_drift
+            .iter_mut()
+            .find(|target| target.kind == SigningTargetKind::Framework)
+            .expect("framework target")
+            .bundle_identifier =
+            BundleIdentifier::new("com.example.weather.changed").expect("framework bundle drift");
+        assert_ne!(
+            canonical_signing_target_graph_sha256(&framework_drift),
+            digest
+        );
+    }
 }

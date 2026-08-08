@@ -1,6 +1,14 @@
 //! Deterministic rendering of a two-phase GitHub-hosted macOS workflow.
 
-use std::{error::Error, fmt, fmt::Write as _};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+    fmt::Write as _,
+};
+
+use rustferry_remote::{SigningTarget, SigningTargetKind, canonical_signing_target_graph_sha256};
+use sha2::{Digest, Sha256};
 
 const CHECKOUT_ACTION_SHA: &str = "3d3c42e5aac5ba805825da76410c181273ba90b1";
 const CACHE_ACTION_SHA: &str = "caa296126883cff596d87d8935842f9db880ef25";
@@ -11,6 +19,14 @@ const DEFAULT_RUNNER: &str = "macos-15";
 const DEFAULT_WORKER_BUILD_TIMEOUT_MINUTES: u16 = 30;
 const REQUEST_MANIFEST_PATH: &str = ".rustferry/goal3/request.json";
 const RUST_TOOLCHAIN: &str = "1.92.0";
+const GOAL3_CERTIFICATE_P12_SECRET: &str = "RUSTFERRY_GOAL3_IOS_CERTIFICATE_P12";
+const GOAL3_CERTIFICATE_PASSWORD_SECRET: &str = "RUSTFERRY_GOAL3_IOS_CERTIFICATE_PASSWORD";
+const GOAL3_APPLICATION_PROFILE_SECRET: &str = "RUSTFERRY_GOAL3_IOS_PROVISIONING_PROFILE";
+const GOAL3_EXTENSION_PROFILE_SECRET_PREFIX: &str = "RUSTFERRY_GOAL3_IOS_PROFILE_";
+
+/// Maximum number of application and extension provisioning profiles exposed
+/// to one protected GitHub signing job.
+pub const MAX_SIGNING_PROFILES: usize = 3;
 
 /// A rejected workflow configuration field.
 ///
@@ -48,6 +64,13 @@ pub enum WorkflowConfigError {
     },
     /// Two signing roles referenced the same GitHub secret.
     DuplicateSecretName,
+    /// Signing targets could not form one unambiguous application/profile map.
+    InvalidSigningTargets,
+    /// More profile-bearing targets were configured than the protected worker accepts.
+    TooManySigningProfiles {
+        /// Maximum accepted application plus extension profile count.
+        maximum: usize,
+    },
     /// The temporary dispatch namespace overlaps the trusted source ref.
     RefNamespaceOverlap,
     /// A numeric policy value was outside its bounded range.
@@ -78,6 +101,15 @@ impl fmt::Display for WorkflowConfigError {
             Self::Reserved { field } => write!(formatter, "{field} uses a reserved value"),
             Self::DuplicateSecretName => {
                 formatter.write_str("signing secret names must be distinct")
+            }
+            Self::InvalidSigningTargets => formatter.write_str(
+                "signing targets must contain exactly one application and unique target identities",
+            ),
+            Self::TooManySigningProfiles { maximum } => {
+                write!(
+                    formatter,
+                    "signing target graph exceeds {maximum} provisioning profiles"
+                )
             }
             Self::RefNamespaceOverlap => formatter
                 .write_str("temporary dispatch namespace must not overlap the trusted source ref"),
@@ -200,12 +232,31 @@ impl SecretName {
     }
 }
 
-/// The three opaque GitHub secret references needed for manual development signing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SigningProfileSecretName {
+    target: Option<String>,
+    name: SecretName,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SigningTargetIdentity {
+    name: String,
+    bundle_identifier: String,
+    kind: SigningTargetKind,
+}
+
+/// Opaque GitHub secret references needed for manual development signing.
+///
+/// Legacy configurations retain one target-independent application profile.
+/// New configurations bind one deterministic static secret name to each
+/// application or extension target before the workflow is installed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SigningSecretNames {
     certificate_p12: SecretName,
     certificate_password: SecretName,
-    provisioning_profile: SecretName,
+    provisioning_profiles: Vec<SigningProfileSecretName>,
+    target_graph: Option<Vec<SigningTargetIdentity>>,
+    target_graph_sha256: Option<String>,
 }
 
 impl SigningSecretNames {
@@ -229,8 +280,71 @@ impl SigningSecretNames {
         Ok(Self {
             certificate_p12,
             certificate_password,
-            provisioning_profile,
+            provisioning_profiles: vec![SigningProfileSecretName {
+                target: None,
+                name: provisioning_profile,
+            }],
+            target_graph: None,
+            target_graph_sha256: None,
         })
+    }
+
+    /// Derive the exact static profile-secret map for one target graph.
+    ///
+    /// The application retains the legacy Goal 3 profile name. Extension
+    /// names contain the first 128 bits of SHA-256 over the target name, a NUL
+    /// separator, and its bundle identifier. Frameworks and dynamic libraries
+    /// do not receive provisioning profiles.
+    ///
+    /// # Errors
+    ///
+    /// Rejects target graphs without exactly one application, duplicate target
+    /// names or bundle identifiers, or more than [`MAX_SIGNING_PROFILES`]
+    /// application and extension targets.
+    ///
+    /// # Panics
+    ///
+    /// This cannot panic because the fixed certificate and password names
+    /// satisfy [`SecretName`] invariants.
+    pub fn for_targets(targets: &[SigningTarget]) -> Result<Self, WorkflowConfigError> {
+        let target_graph = canonical_signing_target_graph(targets)?;
+        let target_graph_sha256 = canonical_signing_target_graph_sha256(targets);
+        let mut profiles = BTreeMap::new();
+
+        for target in &target_graph {
+            let secret_name = match target.kind {
+                SigningTargetKind::Application => GOAL3_APPLICATION_PROFILE_SECRET.to_owned(),
+                SigningTargetKind::Extension => extension_profile_secret_name(target),
+                SigningTargetKind::DynamicLibrary | SigningTargetKind::Framework => continue,
+            };
+            profiles.insert(target.name.clone(), SecretName::new(secret_name)?);
+        }
+
+        if profiles.len() > MAX_SIGNING_PROFILES {
+            return Err(WorkflowConfigError::TooManySigningProfiles {
+                maximum: MAX_SIGNING_PROFILES,
+            });
+        }
+
+        let names = Self {
+            certificate_p12: SecretName::new(GOAL3_CERTIFICATE_P12_SECRET)
+                .expect("constant secret name is valid"),
+            certificate_password: SecretName::new(GOAL3_CERTIFICATE_PASSWORD_SECRET)
+                .expect("constant secret name is valid"),
+            provisioning_profiles: profiles
+                .into_iter()
+                .map(|(target, name)| SigningProfileSecretName {
+                    target: Some(target),
+                    name,
+                })
+                .collect(),
+            target_graph: Some(target_graph),
+            target_graph_sha256: Some(target_graph_sha256),
+        };
+        if names.all_names().collect::<BTreeSet<_>>().len() != names.all_names().count() {
+            return Err(WorkflowConfigError::DuplicateSecretName);
+        }
+        Ok(names)
     }
 
     /// Goal 3 development secret namespace from the project specification.
@@ -241,11 +355,10 @@ impl SigningSecretNames {
     /// constructor invariants and are distinct.
     pub fn goal3_defaults() -> Self {
         Self::new(
-            SecretName::new("RUSTFERRY_GOAL3_IOS_CERTIFICATE_P12")
+            SecretName::new(GOAL3_CERTIFICATE_P12_SECRET).expect("constant secret name is valid"),
+            SecretName::new(GOAL3_CERTIFICATE_PASSWORD_SECRET)
                 .expect("constant secret name is valid"),
-            SecretName::new("RUSTFERRY_GOAL3_IOS_CERTIFICATE_PASSWORD")
-                .expect("constant secret name is valid"),
-            SecretName::new("RUSTFERRY_GOAL3_IOS_PROVISIONING_PROFILE")
+            SecretName::new(GOAL3_APPLICATION_PROFILE_SECRET)
                 .expect("constant secret name is valid"),
         )
         .expect("constant secret names are distinct")
@@ -261,10 +374,131 @@ impl SigningSecretNames {
         &self.certificate_password
     }
 
-    /// GitHub secret containing the encoded development provisioning profile.
+    /// GitHub secret containing the encoded application provisioning profile.
+    ///
+    /// # Panics
+    ///
+    /// This cannot panic because every constructor retains at least one
+    /// application profile name.
     pub fn provisioning_profile(&self) -> &SecretName {
-        &self.provisioning_profile
+        let profile = self
+            .provisioning_profiles
+            .iter()
+            .find(|profile| profile.name.as_str() == GOAL3_APPLICATION_PROFILE_SECRET)
+            .unwrap_or_else(|| {
+                self.provisioning_profiles
+                    .first()
+                    .expect("signing secret names always contain an application profile")
+            });
+        &profile.name
     }
+
+    /// Static provisioning-profile secret bound to `target`.
+    ///
+    /// A legacy one-profile configuration returns its sole profile for any
+    /// target. The provider permits that fallback only for one-profile plans.
+    pub fn profile_for_target(&self, target: &str) -> Option<&SecretName> {
+        self.provisioning_profiles
+            .iter()
+            .find(|profile| {
+                profile
+                    .target
+                    .as_deref()
+                    .is_none_or(|configured| configured == target)
+            })
+            .map(|profile| &profile.name)
+    }
+
+    /// Deterministically ordered provisioning-profile secret names.
+    pub fn profile_names(&self) -> impl ExactSizeIterator<Item = &SecretName> {
+        self.provisioning_profiles
+            .iter()
+            .map(|profile| &profile.name)
+    }
+
+    /// Exact certificate, password, and provisioning-profile secret set.
+    pub fn all_names(&self) -> impl Iterator<Item = &SecretName> {
+        std::iter::once(&self.certificate_p12)
+            .chain(std::iter::once(&self.certificate_password))
+            .chain(self.profile_names())
+    }
+
+    /// Canonical full signing-target graph policy digest for modern workflows.
+    ///
+    /// Legacy target-independent configurations return `None`.
+    pub fn target_graph_sha256(&self) -> Option<&str> {
+        self.target_graph_sha256.as_deref()
+    }
+
+    /// Whether `targets` exactly matches the graph bound during workflow setup.
+    ///
+    /// Ordering is ignored. Target names, bundle identifiers, and kinds are
+    /// compared for every application, extension, framework, and dynamic library.
+    /// Legacy target-independent configurations never match a target graph.
+    pub fn matches_target_graph(&self, targets: &[SigningTarget]) -> bool {
+        self.target_graph.as_ref().is_some_and(|expected| {
+            canonical_signing_target_graph(targets).is_ok_and(|actual| actual == *expected)
+                && self.target_graph_sha256()
+                    == Some(canonical_signing_target_graph_sha256(targets).as_str())
+        })
+    }
+
+    pub(crate) fn uses_legacy_profile_binding(&self) -> bool {
+        self.provisioning_profiles.len() == 1 && self.provisioning_profiles[0].target.is_none()
+    }
+}
+
+fn canonical_signing_target_graph(
+    targets: &[SigningTarget],
+) -> Result<Vec<SigningTargetIdentity>, WorkflowConfigError> {
+    let mut target_names = BTreeSet::new();
+    let mut bundle_identifiers = BTreeSet::new();
+    let mut application_count = 0_usize;
+    let mut target_graph = Vec::with_capacity(targets.len());
+
+    for target in targets {
+        if !valid_signing_target_name(&target.name)
+            || !target_names.insert(target.name.as_str())
+            || !bundle_identifiers.insert(target.bundle_identifier.as_str())
+        {
+            return Err(WorkflowConfigError::InvalidSigningTargets);
+        }
+        if target.kind == SigningTargetKind::Application {
+            application_count += 1;
+        }
+        target_graph.push(SigningTargetIdentity {
+            name: target.name.clone(),
+            bundle_identifier: target.bundle_identifier.as_str().to_owned(),
+            kind: target.kind,
+        });
+    }
+
+    if application_count != 1 {
+        return Err(WorkflowConfigError::InvalidSigningTargets);
+    }
+    target_graph.sort_unstable();
+    Ok(target_graph)
+}
+
+fn extension_profile_secret_name(target: &SigningTargetIdentity) -> String {
+    let mut digest = Sha256::new();
+    digest.update(target.name.as_bytes());
+    digest.update([0]);
+    digest.update(target.bundle_identifier.as_bytes());
+    let digest = digest.finalize();
+    format!(
+        "{GOAL3_EXTENSION_PROFILE_SECRET_PREFIX}{}",
+        hex::encode_upper(&digest[..16])
+    )
+}
+
+fn valid_signing_target_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        && !value.contains("..")
 }
 
 /// Validated public GitHub repository containing the project source.
@@ -770,9 +1004,10 @@ impl GeneratedWorkflow {
 /// Generate a deterministic GitHub Actions workflow.
 ///
 /// The compile job has no environment and no `secrets` expressions. The sign
-/// job receives exactly three secrets at its worker invocation, after the
-/// sealed archive is downloaded and independently hash-checked. It never
-/// checks out or builds project source and always invokes worker cleanup.
+/// job receives the bounded exact configured signing-secret set at its worker
+/// invocation, after the sealed archive is downloaded and independently
+/// hash-checked. It never checks out or builds project source and always
+/// invokes worker cleanup.
 pub fn generate_workflow(config: &WorkflowConfig) -> GeneratedWorkflow {
     let mut yaml = String::with_capacity(12 * 1024);
     render_header(&mut yaml, config);
@@ -891,6 +1126,12 @@ fn render_header(yaml: &mut String, config: &WorkflowConfig) {
             config.temporary_branch_namespace.full_ref_prefix()
         ),
     );
+    if let Some(digest) = config.secret_names.target_graph_sha256() {
+        line(
+            yaml,
+            format_args!("  RUSTFERRY_SIGNING_TARGET_GRAPH_SHA256: '{digest}'"),
+        );
+    }
 }
 
 fn render_worker_build_job(yaml: &mut String, config: &WorkflowConfig) {
@@ -988,7 +1229,17 @@ fn render_compile_job(yaml: &mut String, config: &WorkflowConfig) {
     push(yaml, REQUEST_MANIFEST_PATH);
     push(
         yaml,
-        "\" \\\n            --trusted-source-ref \"$RUSTFERRY_TRUSTED_SOURCE_REF\" \\\n            --temporary-ref-prefix \"$RUSTFERRY_TEMPORARY_REF_PREFIX\" \\\n            --output-manifest \"$RUNNER_TEMP/rustferry-request.json\" \\\n            --github-output \"$GITHUB_OUTPUT\"\n      - name: Checkout exact requested source revision\n        uses: actions/checkout@",
+        "\" \\\n            --trusted-source-ref \"$RUSTFERRY_TRUSTED_SOURCE_REF\" \\\n            --temporary-ref-prefix \"$RUSTFERRY_TEMPORARY_REF_PREFIX\"",
+    );
+    if config.secret_names.target_graph_sha256().is_some() {
+        push(
+            yaml,
+            " \\\n            --expected-signing-target-graph-sha256 \"$RUSTFERRY_SIGNING_TARGET_GRAPH_SHA256\"",
+        );
+    }
+    push(
+        yaml,
+        " \\\n            --output-manifest \"$RUNNER_TEMP/rustferry-request.json\" \\\n            --github-output \"$GITHUB_OUTPUT\"\n      - name: Checkout exact requested source revision\n        uses: actions/checkout@",
     );
     push(yaml, CHECKOUT_ACTION_SHA);
     push(
@@ -1023,6 +1274,7 @@ fn render_compile_job(yaml: &mut String, config: &WorkflowConfig) {
     );
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_sign_job(yaml: &mut String, config: &WorkflowConfig) {
     push(
         yaml,
@@ -1076,16 +1328,42 @@ fn render_sign_job(yaml: &mut String, config: &WorkflowConfig) {
             config.secret_names.certificate_password.as_str()
         ),
     );
-    line(
-        yaml,
-        format_args!(
-            "          RUSTFERRY_SIGNING_PROVISIONING_PROFILE: '${{{{ secrets.{} }}}}'",
-            config.secret_names.provisioning_profile.as_str()
-        ),
-    );
+    let profile_names = config.secret_names.profile_names().collect::<Vec<_>>();
+    if profile_names.len() == 1 {
+        line(
+            yaml,
+            format_args!(
+                "          RUSTFERRY_SIGNING_PROVISIONING_PROFILE: '${{{{ secrets.{} }}}}'",
+                config.secret_names.provisioning_profile().as_str()
+            ),
+        );
+    } else {
+        for (index, profile) in profile_names.iter().enumerate() {
+            line(
+                yaml,
+                format_args!(
+                    "          RUSTFERRY_SIGNING_PROVISIONING_PROFILE_{}: '${{{{ secrets.{} }}}}'",
+                    index + 1,
+                    profile.as_str()
+                ),
+            );
+        }
+    }
     push(
         yaml,
-        "          RUSTFERRY_EXPECTED_SHA256: '${{ needs.compile.outputs.sealed_sha256 }}'\n          RUSTFERRY_OPERATION_ID: '${{ needs.compile.outputs.operation_id }}'\n          RUSTFERRY_SOURCE_REVISION: '${{ needs.compile.outputs.source_revision }}'\n        run: |\n          set -euo pipefail\n          printf '%s\\0%s\\0%s' \\\n            \"$RUSTFERRY_SIGNING_CERTIFICATE_P12\" \\\n            \"$RUSTFERRY_SIGNING_CERTIFICATE_PASSWORD\" \\\n            \"$RUSTFERRY_SIGNING_PROVISIONING_PROFILE\" |\n            /usr/bin/env -i \\\n              \"DEVELOPER_DIR=$DEVELOPER_DIR\" \\\n              \"HOME=$HOME\" \\\n              'LC_ALL=C' \\\n              \"PATH=$HOME/.cargo/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin\" \\\n              \"RUSTFERRY_WORKER_ROOT=$RUNNER_TEMP\" \\\n              \"RUSTUP_TOOLCHAIN=$RUSTUP_TOOLCHAIN\" \\\n              \"TMPDIR=$RUNNER_TEMP\" \\\n              \"$RUSTFERRY_WORKER_PATH\" run-job \\\n                --phase sign \\\n                --sealed-directory \"$RUNNER_TEMP/rustferry-handoff\" \\\n                --expected-sealed-sha256 \"$RUSTFERRY_EXPECTED_SHA256\" \\\n                --source-revision \"$RUSTFERRY_SOURCE_REVISION\" \\\n                --operation-id \"$RUSTFERRY_OPERATION_ID\" \\\n                --job-root \"$RUNNER_TEMP/rustferry-sign-job\" \\\n                --output-directory \"$RUNNER_TEMP/rustferry-signed\" \\\n",
+        "          RUSTFERRY_EXPECTED_SHA256: '${{ needs.compile.outputs.sealed_sha256 }}'\n          RUSTFERRY_OPERATION_ID: '${{ needs.compile.outputs.operation_id }}'\n          RUSTFERRY_SOURCE_REVISION: '${{ needs.compile.outputs.source_revision }}'\n",
+    );
+    if profile_names.len() == 1 {
+        push(
+            yaml,
+            "        run: |\n          set -euo pipefail\n          printf '%s\\0%s\\0%s' \\\n            \"$RUSTFERRY_SIGNING_CERTIFICATE_P12\" \\\n            \"$RUSTFERRY_SIGNING_CERTIFICATE_PASSWORD\" \\\n            \"$RUSTFERRY_SIGNING_PROVISIONING_PROFILE\" |\n",
+        );
+    } else {
+        render_v2_signing_frame(yaml, config, &profile_names);
+    }
+    push(
+        yaml,
+        "            /usr/bin/env -i \\\n              \"DEVELOPER_DIR=$DEVELOPER_DIR\" \\\n              \"HOME=$HOME\" \\\n              'LC_ALL=C' \\\n              \"PATH=$HOME/.cargo/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin\" \\\n              \"RUSTFERRY_WORKER_ROOT=$RUNNER_TEMP\" \\\n              \"RUSTUP_TOOLCHAIN=$RUSTUP_TOOLCHAIN\" \\\n              \"TMPDIR=$RUNNER_TEMP\" \\\n              \"$RUSTFERRY_WORKER_PATH\" run-job \\\n                --phase sign \\\n                --sealed-directory \"$RUNNER_TEMP/rustferry-handoff\" \\\n                --expected-sealed-sha256 \"$RUSTFERRY_EXPECTED_SHA256\" \\\n                --source-revision \"$RUSTFERRY_SOURCE_REVISION\" \\\n                --operation-id \"$RUSTFERRY_OPERATION_ID\" \\\n                --job-root \"$RUNNER_TEMP/rustferry-sign-job\" \\\n                --output-directory \"$RUNNER_TEMP/rustferry-signed\" \\\n",
     );
     line(
         yaml,
@@ -1101,13 +1379,21 @@ fn render_sign_job(yaml: &mut String, config: &WorkflowConfig) {
             config.secret_names.certificate_password.as_str()
         ),
     );
-    line(
-        yaml,
-        format_args!(
-            "                --provisioning-profile-reference '{}'",
-            config.secret_names.provisioning_profile.as_str()
-        ),
-    );
+    for (index, profile) in profile_names.iter().enumerate() {
+        let continuation = if index + 1 == profile_names.len() {
+            ""
+        } else {
+            " \\"
+        };
+        line(
+            yaml,
+            format_args!(
+                "                --provisioning-profile-reference '{}'{}",
+                profile.as_str(),
+                continuation
+            ),
+        );
+    }
     push(
         yaml,
         "      - name: Remove signing material and temporary keychain\n        if: '${{ always() }}'\n        shell: bash\n        run: |\n          set -euo pipefail\n          if [[ -x \"$RUSTFERRY_WORKER_PATH\" ]]; then\n            \"$RUSTFERRY_WORKER_PATH\" cleanup \\\n              --job-root \"$RUNNER_TEMP/rustferry-sign-job\" \\\n              --require-complete\n          elif [[ -d \"$RUNNER_TEMP/rustferry-sign-job\" ]]; then\n            echo 'Signing cleanup could not run because the trusted worker is unavailable.' >&2\n            exit 1\n          fi\n      - name: Upload validated development IPA\n        if: '${{ success() }}'\n        uses: actions/upload-artifact@",
@@ -1124,6 +1410,46 @@ fn render_sign_job(yaml: &mut String, config: &WorkflowConfig) {
             config.limits.retention_days()
         ),
     );
+}
+
+fn render_v2_signing_frame(
+    yaml: &mut String,
+    config: &WorkflowConfig,
+    profile_names: &[&SecretName],
+) {
+    push(
+        yaml,
+        "        run: |\n          set -euo pipefail\n          export LC_ALL=C\n          write_u16_be() {\n            local value=\"$1\"\n            printf '%b' \"$(printf '\\\\%03o\\\\%03o' \\\n              \"$(((value >> 8) & 255))\" \"$((value & 255))\")\"\n          }\n          write_u32_be() {\n            local value=\"$1\"\n            printf '%b' \"$(printf '\\\\%03o\\\\%03o\\\\%03o\\\\%03o' \\\n              \"$(((value >> 24) & 255))\" \"$(((value >> 16) & 255))\" \\\n              \"$(((value >> 8) & 255))\" \"$((value & 255))\")\"\n          }\n          write_record() {\n            local reference=\"$1\"\n            local secret_value=\"$2\"\n            write_u16_be \"${#reference}\"\n            write_u32_be \"${#secret_value}\"\n            printf '%s%s' \"$reference\" \"$secret_value\"\n          }\n          {\n            printf 'RFSIGNV2'\n",
+    );
+    line(
+        yaml,
+        format_args!("            write_u32_be '{}'", profile_names.len() + 2),
+    );
+    line(
+        yaml,
+        format_args!(
+            "            write_record '{}' \"$RUSTFERRY_SIGNING_CERTIFICATE_P12\"",
+            config.secret_names.certificate_p12.as_str()
+        ),
+    );
+    line(
+        yaml,
+        format_args!(
+            "            write_record '{}' \"$RUSTFERRY_SIGNING_CERTIFICATE_PASSWORD\"",
+            config.secret_names.certificate_password.as_str()
+        ),
+    );
+    for (index, profile) in profile_names.iter().enumerate() {
+        line(
+            yaml,
+            format_args!(
+                "            write_record '{}' \"$RUSTFERRY_SIGNING_PROVISIONING_PROFILE_{}\"",
+                profile.as_str(),
+                index + 1
+            ),
+        );
+    }
+    push(yaml, "          } |\n");
 }
 
 fn render_worker_install(yaml: &mut String, config: &WorkflowConfig, indentation: usize) {
@@ -1491,12 +1817,25 @@ fn validate_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustferry_remote::BundleIdentifier;
 
     const WORKER_REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
     const WORKER_SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     fn fixture_public_source() -> PublicSourceRepository {
         PublicSourceRepository::new("https://github.com/ShiroKSH/RustFerry.git/").unwrap()
+    }
+
+    fn signing_target(
+        name: &str,
+        bundle_identifier: &str,
+        kind: SigningTargetKind,
+    ) -> SigningTarget {
+        SigningTarget {
+            name: name.to_owned(),
+            bundle_identifier: BundleIdentifier::new(bundle_identifier).expect("bundle identifier"),
+            kind,
+        }
     }
 
     fn fixture_config() -> WorkflowConfig {
@@ -1515,6 +1854,40 @@ mod tests {
             TemporaryBranchNamespace::new("rustferry/goal3/builds").unwrap(),
         )
         .unwrap()
+    }
+
+    fn fixture_multi_profile_config() -> WorkflowConfig {
+        let mut config = fixture_config();
+        config.secret_names = SigningSecretNames::for_targets(&[
+            signing_target(
+                "RuntimeBridge",
+                "com.example.weather.runtime-bridge",
+                SigningTargetKind::Framework,
+            ),
+            signing_target(
+                "Weather",
+                "com.example.weather",
+                SigningTargetKind::Application,
+            ),
+            signing_target(
+                "WeatherWidget",
+                "com.example.weather.widget",
+                SigningTargetKind::Extension,
+            ),
+        ])
+        .expect("multi-profile secret names");
+        config
+    }
+
+    fn fixture_modern_app_only_config() -> WorkflowConfig {
+        let mut config = fixture_config();
+        config.secret_names = SigningSecretNames::for_targets(&[signing_target(
+            "App",
+            "com.example.app",
+            SigningTargetKind::Application,
+        )])
+        .expect("app-only target graph");
+        config
     }
 
     fn fixture_source_config() -> WorkflowConfig {
@@ -1855,6 +2228,60 @@ mod tests {
     }
 
     #[test]
+    fn modern_workflows_publish_only_the_exact_public_target_graph_digest() {
+        for (config, expected_digest) in [
+            (
+                fixture_modern_app_only_config(),
+                "144f18f553557a96d6a39105b3aa0928c54bf075a5e32fef077a2eef59b37aff",
+            ),
+            (
+                fixture_multi_profile_config(),
+                "112e2935c240c978a4e356b5a0e7b3ffc0068ba249807666e8d1662bd366a691",
+            ),
+        ] {
+            assert_eq!(
+                config.secret_names().target_graph_sha256(),
+                Some(expected_digest)
+            );
+            let workflow = generate_workflow(&config);
+            let (compile, _) = workflow.yaml().split_once("\n  sign:\n").unwrap();
+
+            assert!(workflow.yaml().contains(&format!(
+                "RUSTFERRY_SIGNING_TARGET_GRAPH_SHA256: '{expected_digest}'"
+            )));
+            assert_eq!(
+                workflow
+                    .yaml()
+                    .matches("--expected-signing-target-graph-sha256")
+                    .count(),
+                1
+            );
+            assert!(compile.contains(concat!(
+                "--expected-signing-target-graph-sha256 ",
+                "\"$RUSTFERRY_SIGNING_TARGET_GRAPH_SHA256\""
+            )));
+            assert!(!compile.contains("secrets."));
+            assert!(
+                !workflow
+                    .yaml()
+                    .contains("secrets.RUSTFERRY_SIGNING_TARGET_GRAPH_SHA256")
+            );
+        }
+
+        let legacy = generate_workflow(&fixture_config());
+        assert!(
+            !legacy
+                .yaml()
+                .contains("RUSTFERRY_SIGNING_TARGET_GRAPH_SHA256")
+        );
+        assert!(
+            !legacy
+                .yaml()
+                .contains("--expected-signing-target-graph-sha256")
+        );
+    }
+
+    #[test]
     fn compile_cleanup_fails_closed_when_the_worker_disappears() {
         let workflow = generate_workflow(&fixture_source_config());
         let compile = workflow
@@ -1931,6 +2358,59 @@ mod tests {
         assert!(!worker_environment.contains("RUSTFERRY_SIGNING_CERTIFICATE_P12="));
         assert!(!worker_environment.contains("RUSTFERRY_SIGNING_CERTIFICATE_PASSWORD="));
         assert!(!worker_environment.contains("RUSTFERRY_SIGNING_PROVISIONING_PROFILE="));
+    }
+
+    #[test]
+    fn multi_profile_workflow_uses_static_named_v2_records_only_in_signing_job() {
+        let config = fixture_multi_profile_config();
+        let workflow = generate_workflow(&config);
+        let (compile, sign) = workflow.yaml().split_once("\n  sign:\n").unwrap();
+        let profiles = config.secret_names().profile_names().collect::<Vec<_>>();
+
+        assert_eq!(profiles.len(), 2);
+        assert!(!compile.contains("secrets."));
+        assert!(!compile.contains("RUSTFERRY_GOAL3_IOS_"));
+        assert_eq!(sign.matches("${{ secrets.").count(), 4);
+        assert!(!sign.contains("secrets["));
+        assert!(sign.contains("printf 'RFSIGNV2'"));
+        assert!(sign.contains("write_u32_be '4'"));
+        assert!(!sign.contains("printf '%s\\0%s\\0%s'"));
+        assert_eq!(
+            sign.matches("--provisioning-profile-reference").count(),
+            profiles.len()
+        );
+
+        let certificate_record = sign
+            .find("write_record 'RUSTFERRY_GOAL3_IOS_CERTIFICATE_P12'")
+            .expect("certificate record");
+        let password_record = sign
+            .find("write_record 'RUSTFERRY_GOAL3_IOS_CERTIFICATE_PASSWORD'")
+            .expect("password record");
+        assert!(certificate_record < password_record);
+        let mut previous_record = password_record;
+        for (index, profile) in profiles.iter().enumerate() {
+            let secret_expression = format!("${{{{ secrets.{} }}}}", profile.as_str());
+            assert_eq!(sign.matches(&secret_expression).count(), 1);
+            assert!(sign.contains(&format!(
+                "RUSTFERRY_SIGNING_PROVISIONING_PROFILE_{}: '{}'",
+                index + 1,
+                secret_expression
+            )));
+            let record = sign
+                .find(&format!("write_record '{}'", profile.as_str()))
+                .expect("profile record");
+            assert!(record > previous_record);
+            previous_record = record;
+            assert!(sign.contains(&format!(
+                "--provisioning-profile-reference '{}'",
+                profile.as_str()
+            )));
+        }
+
+        let worker_environment = sign.split_once("/usr/bin/env -i").unwrap().1;
+        assert!(!worker_environment.contains("$RUSTFERRY_SIGNING_CERTIFICATE_P12"));
+        assert!(!worker_environment.contains("$RUSTFERRY_SIGNING_CERTIFICATE_PASSWORD"));
+        assert!(!worker_environment.contains("$RUSTFERRY_SIGNING_PROVISIONING_PROFILE_"));
     }
 
     #[test]
@@ -2079,6 +2559,139 @@ mod tests {
             TemporaryBranchNamespace::new("rustferry/goal3/builds").unwrap(),
         );
         assert!(sibling.is_ok());
+    }
+
+    #[test]
+    fn target_profile_secret_names_are_static_deterministic_and_exact() {
+        let targets = vec![
+            signing_target(
+                "RuntimeBridge",
+                "org.rustferry.runtime-bridge",
+                SigningTargetKind::Framework,
+            ),
+            signing_target(
+                "WeatherWidget",
+                "com.example.weather.widget",
+                SigningTargetKind::Extension,
+            ),
+            signing_target(
+                "Weather",
+                "com.example.weather",
+                SigningTargetKind::Application,
+            ),
+            signing_target(
+                "LiveActivity",
+                "com.example.weather.liveactivity",
+                SigningTargetKind::Extension,
+            ),
+        ];
+        let names = SigningSecretNames::for_targets(&targets).expect("profile names");
+        let reordered_targets = targets.iter().rev().cloned().collect::<Vec<_>>();
+        let reordered =
+            SigningSecretNames::for_targets(&reordered_targets).expect("reordered profile names");
+
+        assert_eq!(names, reordered);
+        assert!(names.matches_target_graph(&reordered_targets));
+        assert_eq!(names.profile_names().count(), MAX_SIGNING_PROFILES);
+        assert_eq!(
+            names.profile_for_target("Weather").map(SecretName::as_str),
+            Some(GOAL3_APPLICATION_PROFILE_SECRET)
+        );
+        assert_eq!(
+            names
+                .profile_for_target("WeatherWidget")
+                .map(SecretName::as_str),
+            Some("RUSTFERRY_GOAL3_IOS_PROFILE_3FAD627B2731B5773D3929E36B01CA69")
+        );
+        assert!(names.profile_for_target("RuntimeBridge").is_none());
+        assert_eq!(names.all_names().collect::<BTreeSet<_>>().len(), 5);
+
+        let mut app_bundle_drift = targets.clone();
+        app_bundle_drift
+            .iter_mut()
+            .find(|target| target.name == "Weather")
+            .expect("application target")
+            .bundle_identifier =
+            BundleIdentifier::new("com.example.weather.renamed").expect("drifted app bundle");
+        assert!(!names.matches_target_graph(&app_bundle_drift));
+
+        let mut extension_bundle_drift = targets.clone();
+        extension_bundle_drift
+            .iter_mut()
+            .find(|target| target.name == "WeatherWidget")
+            .expect("extension target")
+            .bundle_identifier = BundleIdentifier::new("com.example.weather.renamed-widget")
+            .expect("drifted extension bundle");
+        assert!(!names.matches_target_graph(&extension_bundle_drift));
+
+        let mut extension_name_drift = targets.clone();
+        extension_name_drift
+            .iter_mut()
+            .find(|target| target.name == "WeatherWidget")
+            .expect("extension target")
+            .name = "RenamedWidget".to_owned();
+        assert!(!names.matches_target_graph(&extension_name_drift));
+
+        let omitted_framework = targets
+            .iter()
+            .filter(|target| target.name != "RuntimeBridge")
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(!names.matches_target_graph(&omitted_framework));
+
+        let mut extra_framework = targets.clone();
+        extra_framework.push(signing_target(
+            "SupportKit",
+            "org.rustferry.support-kit",
+            SigningTargetKind::Framework,
+        ));
+        assert!(!names.matches_target_graph(&extra_framework));
+    }
+
+    #[test]
+    fn target_profile_secret_names_reject_ambiguous_or_oversized_graphs() {
+        let app = signing_target("App", "com.example.app", SigningTargetKind::Application);
+        let extension = signing_target(
+            "Widget",
+            "com.example.app.widget",
+            SigningTargetKind::Extension,
+        );
+        let duplicate_name = signing_target(
+            "Widget",
+            "com.example.app.liveactivity",
+            SigningTargetKind::Extension,
+        );
+        assert_eq!(
+            SigningSecretNames::for_targets(std::slice::from_ref(&extension)),
+            Err(WorkflowConfigError::InvalidSigningTargets)
+        );
+        assert_eq!(
+            SigningSecretNames::for_targets(&[app.clone(), app.clone()]),
+            Err(WorkflowConfigError::InvalidSigningTargets)
+        );
+        assert_eq!(
+            SigningSecretNames::for_targets(&[app.clone(), extension.clone(), duplicate_name]),
+            Err(WorkflowConfigError::InvalidSigningTargets)
+        );
+        assert_eq!(
+            SigningSecretNames::for_targets(&[
+                app,
+                extension,
+                signing_target(
+                    "LiveActivity",
+                    "com.example.app.liveactivity",
+                    SigningTargetKind::Extension,
+                ),
+                signing_target(
+                    "ShareExtension",
+                    "com.example.app.share",
+                    SigningTargetKind::Extension,
+                ),
+            ]),
+            Err(WorkflowConfigError::TooManySigningProfiles {
+                maximum: MAX_SIGNING_PROFILES,
+            })
+        );
     }
 
     #[test]

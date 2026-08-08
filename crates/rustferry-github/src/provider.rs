@@ -42,7 +42,10 @@ use crate::{
         RunConclusion, RunEvent, RunHandle, RunSnapshot, RunStatus, TemporaryGitRef,
         TransportError,
     },
-    workflow::{GeneratedWorkflow, TrustedSourceRef, WorkflowConfig, generate_workflow},
+    workflow::{
+        GeneratedWorkflow, MAX_SIGNING_PROFILES, TrustedSourceRef, WorkflowConfig,
+        generate_workflow,
+    },
 };
 
 /// Stable provider identifier exposed through the remote-build protocol.
@@ -2829,11 +2832,7 @@ fn append_signing_secret_check<R: GhRunner>(
 ) {
     let workflow = config.workflow();
     let secret_names = workflow.secret_names();
-    let expected_secrets = BTreeSet::from([
-        secret_names.certificate_p12().clone(),
-        secret_names.certificate_password().clone(),
-        secret_names.provisioning_profile().clone(),
-    ]);
+    let expected_secrets = secret_names.all_names().cloned().collect::<BTreeSet<_>>();
     match transport.list_environment_secrets(config.repository(), workflow.protected_environment())
     {
         Ok(secrets)
@@ -2879,11 +2878,11 @@ fn validate_submission(
     request: &IosDeviceBuildRequest,
 ) -> RemoteBuildResult<()> {
     if request.signing.mode == SigningMode::ManualDevelopment
-        && request.signing.provisioning.len() != 1
+        && !(1..=MAX_SIGNING_PROFILES).contains(&request.signing.provisioning.len())
     {
         return Err(provider_failure(
             "profile_mapping_unsupported",
-            "GitHub provider requires exactly one application provisioning profile",
+            "GitHub provider accepts one application profile and at most two extension profiles",
             false,
         ));
     }
@@ -2938,17 +2937,31 @@ fn validate_signing_secret_references(
     request: &IosDeviceBuildRequest,
 ) -> RemoteBuildResult<()> {
     let names = config.workflow.secret_names();
-    let references_match = request.signing.signing.as_ref().is_some_and(|signing| {
+    let identity_references_match = request.signing.signing.as_ref().is_some_and(|signing| {
         exact_github_secret(
             &signing.identity.private_key.reference,
             names.certificate_p12().as_str(),
         ) && signing.password.as_ref().is_some_and(|password| {
             exact_github_secret(password, names.certificate_password().as_str())
         })
-    }) && request.signing.provisioning.first().is_some_and(|profile| {
-        exact_github_secret(&profile.profile, names.provisioning_profile().as_str())
     });
-    if !references_match {
+    let profiles_match = if names.uses_legacy_profile_binding() {
+        request.signing.provisioning.len() == 1
+            && request.signing.provisioning.first().is_some_and(|profile| {
+                exact_github_secret(&profile.profile, names.provisioning_profile().as_str())
+            })
+    } else {
+        names.matches_target_graph(&request.signing.targets)
+            && request.signing.provisioning.len() == names.profile_names().count()
+            && request.signing.provisioning.iter().all(|profile| {
+                names
+                    .profile_for_target(&profile.target)
+                    .is_some_and(|expected| {
+                        exact_github_secret(&profile.profile, expected.as_str())
+                    })
+            })
+    };
+    if !identity_references_match || !profiles_match {
         return Err(provider_failure(
             "signing_secret_reference_mismatch",
             "signed GitHub builds require the exact configured GitHub Actions secret roles",
@@ -3601,7 +3614,7 @@ mod tests {
         EntitlementPlan, EntitlementSet, IosDeviceProductExpectation, ProvisioningPlan,
         ProvisioningProfileType, SigningCertificate, SigningIdentity, SigningPlan,
         SigningPrivateKeyReference, SigningReference, SigningTarget, SigningTargetKind,
-        SourceManifest,
+        SourceManifest, UnsignedNestedBundleExpectation, UnsignedNestedBundleKind,
     };
     use tempfile::tempdir;
 
@@ -3631,6 +3644,8 @@ mod tests {
         "UlVTVEZFUlJZX0dPQUwzX0lPU19DRVJUSUZJQ0FURV9QQVNTV09SRA==";
     const PROVISIONING_PROFILE_BASE64: &str =
         "UlVTVEZFUlJZX0dPQUwzX0lPU19QUk9WSVNJT05JTkdfUFJPRklMRQ==";
+    const WIDGET_PROFILE_BASE64: &str =
+        "UlVTVEZFUlJZX0dPQUwzX0lPU19QUk9GSUxFXzI2NEI4RkUyNjhCMDAwOEIzNkYwOUJCNUNEMDA4RUE0";
 
     #[derive(Clone, Debug)]
     struct FixedClock(u64);
@@ -3899,11 +3914,11 @@ mod tests {
         }
     }
 
-    fn workflow_config() -> WorkflowConfig {
+    fn workflow_config_with_secret_names(secret_names: SigningSecretNames) -> WorkflowConfig {
         WorkflowConfig::new(
             WorkflowFileName::new("rustferry-goal3-iphone.yml").expect("workflow name"),
             ProtectedEnvironment::new("rustferry-goal3-signing").expect("environment"),
-            SigningSecretNames::goal3_defaults(),
+            secret_names,
             WorkerDistribution::new(
                 "https://github.com/ShiroKSH/rust-and-iphone/releases/download/v0.1.0/ferry-worker-macos",
                 "0".repeat(64),
@@ -3917,6 +3932,10 @@ mod tests {
             TemporaryBranchNamespace::new("rustferry/goal3/builds").expect("namespace"),
         )
         .expect("workflow config")
+    }
+
+    fn workflow_config() -> WorkflowConfig {
+        workflow_config_with_secret_names(SigningSecretNames::goal3_defaults())
     }
 
     fn same_repository_provider_config(
@@ -3939,6 +3958,25 @@ mod tests {
 
     fn provider_config(authorization: GithubMutationAuthorization) -> GithubProviderConfig {
         let workflow = workflow_config();
+        let fingerprint = WorkflowFingerprint::for_workflow(&generate_workflow(&workflow));
+        GithubProviderConfig::new(
+            Repository::new("ShiroKSH", "rustferry-signing").expect("execution repository"),
+            "https://github.com/shiroksh/rust-and-iphone",
+            workflow,
+            fingerprint,
+            GithubPollingPolicy::new(3, Duration::from_millis(250)).expect("poll policy"),
+            authorization,
+            &Version::new(0, 1, 0),
+            8,
+        )
+        .expect("split provider config")
+    }
+
+    fn provider_config_with_secret_names(
+        authorization: GithubMutationAuthorization,
+        secret_names: SigningSecretNames,
+    ) -> GithubProviderConfig {
+        let workflow = workflow_config_with_secret_names(secret_names);
         let fingerprint = WorkflowFingerprint::for_workflow(&generate_workflow(&workflow));
         GithubProviderConfig::new(
             Repository::new("ShiroKSH", "rustferry-signing").expect("execution repository"),
@@ -4048,6 +4086,103 @@ mod tests {
         };
         request.validate().expect("valid Git request");
         request
+    }
+
+    fn multi_profile_request() -> (IosDeviceBuildRequest, SigningSecretNames) {
+        let mut request = valid_request();
+        let targets = vec![
+            request.signing.targets[0].clone(),
+            SigningTarget {
+                name: "Widget".to_owned(),
+                bundle_identifier: BundleIdentifier::new("com.example.app.widget")
+                    .expect("widget bundle"),
+                kind: SigningTargetKind::Extension,
+            },
+        ];
+        let names = SigningSecretNames::for_targets(&targets).expect("profile names");
+        let secret = |name: &str| {
+            SecretReference::new(SecretReferenceKind::GithubActions, name).expect("secret")
+        };
+        request.signing.targets = targets;
+        request.product.nested_bundles = vec![UnsignedNestedBundleExpectation {
+            relative_path: "PlugIns/Widget.appex".to_owned(),
+            bundle_identifier: "com.example.app.widget".to_owned(),
+            executable: "Widget".to_owned(),
+            kind: UnsignedNestedBundleKind::AppExtension,
+        }];
+        request.signing.provisioning = vec![
+            ProvisioningPlan {
+                target: "App".to_owned(),
+                profile: secret(
+                    names
+                        .profile_for_target("App")
+                        .expect("application profile")
+                        .as_str(),
+                ),
+                profile_type: ProvisioningProfileType::Development,
+            },
+            ProvisioningPlan {
+                target: "Widget".to_owned(),
+                profile: secret(
+                    names
+                        .profile_for_target("Widget")
+                        .expect("widget profile")
+                        .as_str(),
+                ),
+                profile_type: ProvisioningProfileType::Development,
+            },
+        ];
+        request.signing.entitlements.push(EntitlementPlan {
+            target: "Widget".to_owned(),
+            required: EntitlementSet::new(BTreeMap::new()).expect("widget entitlements"),
+        });
+        request.validate().expect("valid multi-profile request");
+        (request, names)
+    }
+
+    fn multi_profile_request_with_framework() -> (IosDeviceBuildRequest, SigningSecretNames) {
+        let (mut request, _) = multi_profile_request();
+        request.signing.targets.push(SigningTarget {
+            name: "RuntimeBridge".to_owned(),
+            bundle_identifier: BundleIdentifier::new("com.example.app.runtime-bridge")
+                .expect("framework bundle"),
+            kind: SigningTargetKind::Framework,
+        });
+        request
+            .product
+            .nested_bundles
+            .push(UnsignedNestedBundleExpectation {
+                relative_path: "Frameworks/RuntimeBridge.framework".to_owned(),
+                bundle_identifier: "com.example.app.runtime-bridge".to_owned(),
+                executable: "RuntimeBridge".to_owned(),
+                kind: UnsignedNestedBundleKind::Framework,
+            });
+        request
+            .product
+            .nested_bundles
+            .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        request
+            .validate()
+            .expect("valid multi-profile request with framework");
+        let names = SigningSecretNames::for_targets(&request.signing.targets)
+            .expect("framework-bound profile names");
+        (request, names)
+    }
+
+    fn assert_signing_reference_mismatch(
+        config: &GithubProviderConfig,
+        request: &IosDeviceBuildRequest,
+    ) {
+        let error = validate_submission(config, request)
+            .expect_err("configured signing target graph must remain exact");
+        assert!(matches!(
+            error,
+            RemoteBuildError::ProviderFailure {
+                code,
+                retryable: false,
+                ..
+            } if code == "signing_secret_reference_mismatch"
+        ));
     }
 
     fn unsigned_request() -> IosDeviceBuildRequest {
@@ -4515,6 +4650,35 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn multi_profile_secret_metadata_requires_the_exact_configured_set() {
+        let (_request, names) = multi_profile_request();
+        let config = provider_config_with_secret_names(all_authorized(), names);
+        let exact_rows = format!(
+            "{CERTIFICATE_P12_BASE64}\n{CERTIFICATE_PASSWORD_BASE64}\n{PROVISIONING_PROFILE_BASE64}\n{WIDGET_PROFILE_BASE64}\n"
+        )
+        .into_bytes();
+        let mut checks = Vec::new();
+        append_signing_secret_check(
+            &mut checks,
+            &mut transport(FakeGhRunner::with([Ok(exact_rows)])),
+            &config,
+        );
+        assert!(checks.iter().any(|check| {
+            check.code == "github.signing_secrets" && check.status == ProviderCheckStatus::Ready
+        }));
+
+        let mut checks = Vec::new();
+        append_signing_secret_check(
+            &mut checks,
+            &mut transport(FakeGhRunner::with([Ok(exact_signing_secret_rows())])),
+            &config,
+        );
+        assert!(checks.iter().any(|check| {
+            check.code == "github.signing_secrets" && check.status == ProviderCheckStatus::Error
+        }));
     }
 
     #[test]
@@ -5013,7 +5177,7 @@ mod tests {
     }
 
     #[test]
-    fn submission_requires_worker_supported_artifacts_and_one_profile() {
+    fn submission_requires_worker_supported_artifacts_and_bounded_profiles() {
         let config = provider_config(all_authorized());
         let provider = GithubBuildProvider::with_artifact_store_and_clock(
             config.clone(),
@@ -5050,18 +5214,163 @@ mod tests {
             ))
         );
 
-        let mut multiple_profiles = valid_request();
-        multiple_profiles
-            .signing
-            .provisioning
-            .push(multiple_profiles.signing.provisioning[0].clone());
-        let error = poll_ready(provider.submit(multiple_profiles, CancellationToken::new()))
-            .expect_err("multiple profile mapping is not implemented");
+        let mut too_many_profiles = valid_request();
+        for _ in 0..MAX_SIGNING_PROFILES {
+            too_many_profiles
+                .signing
+                .provisioning
+                .push(too_many_profiles.signing.provisioning[0].clone());
+        }
+        let error = poll_ready(provider.submit(too_many_profiles, CancellationToken::new()))
+            .expect_err("more than three profiles must fail closed");
         assert!(matches!(
             error,
             RemoteBuildError::ProviderFailure { code, .. }
                 if code == "profile_mapping_unsupported"
         ));
+    }
+
+    #[test]
+    fn submission_accepts_exact_static_multi_profile_map_and_rejects_role_swaps() {
+        let (request, names) = multi_profile_request();
+        let config = provider_config_with_secret_names(all_authorized(), names);
+        validate_submission(&config, &request).expect("exact multi-profile map");
+
+        let mut swapped = request.clone();
+        let first = swapped.signing.provisioning[0].profile.clone();
+        swapped.signing.provisioning[0].profile = swapped.signing.provisioning[1].profile.clone();
+        swapped.signing.provisioning[1].profile = first;
+        let error = validate_submission(&config, &swapped).expect_err("profile roles are bound");
+        assert!(matches!(
+            error,
+            RemoteBuildError::ProviderFailure { code, retryable: false, .. }
+                if code == "signing_secret_reference_mismatch"
+        ));
+
+        let legacy = provider_config(all_authorized());
+        let error = validate_submission(&legacy, &request)
+            .expect_err("legacy profile binding must remain single-profile only");
+        assert!(matches!(
+            error,
+            RemoteBuildError::ProviderFailure { code, retryable: false, .. }
+                if code == "signing_secret_reference_mismatch"
+        ));
+    }
+
+    #[test]
+    fn submission_rejects_application_and_extension_identity_drift() {
+        let (request, names) = multi_profile_request();
+        let config = provider_config_with_secret_names(all_authorized(), names);
+
+        let mut app_bundle_drift = request.clone();
+        app_bundle_drift.bundle_identifier = "com.example.renamed-app".to_owned();
+        app_bundle_drift
+            .signing
+            .targets
+            .iter_mut()
+            .find(|target| target.kind == SigningTargetKind::Application)
+            .expect("application target")
+            .bundle_identifier =
+            BundleIdentifier::new("com.example.renamed-app").expect("drifted app bundle");
+        app_bundle_drift
+            .validate()
+            .expect("internally valid app bundle drift");
+        assert_signing_reference_mismatch(&config, &app_bundle_drift);
+
+        let mut extension_bundle_drift = request.clone();
+        extension_bundle_drift
+            .signing
+            .targets
+            .iter_mut()
+            .find(|target| target.kind == SigningTargetKind::Extension)
+            .expect("extension target")
+            .bundle_identifier = BundleIdentifier::new("com.example.app.renamed-widget")
+            .expect("drifted extension bundle");
+        extension_bundle_drift
+            .product
+            .nested_bundles
+            .iter_mut()
+            .find(|bundle| bundle.kind == UnsignedNestedBundleKind::AppExtension)
+            .expect("extension bundle")
+            .bundle_identifier = "com.example.app.renamed-widget".to_owned();
+        extension_bundle_drift
+            .validate()
+            .expect("internally valid extension bundle drift");
+        assert_signing_reference_mismatch(&config, &extension_bundle_drift);
+
+        let mut extension_name_drift = request.clone();
+        extension_name_drift
+            .signing
+            .targets
+            .iter_mut()
+            .find(|target| target.kind == SigningTargetKind::Extension)
+            .expect("extension target")
+            .name = "RenamedWidget".to_owned();
+        extension_name_drift
+            .signing
+            .provisioning
+            .iter_mut()
+            .find(|profile| profile.target == "Widget")
+            .expect("extension profile")
+            .target = "RenamedWidget".to_owned();
+        extension_name_drift
+            .signing
+            .entitlements
+            .iter_mut()
+            .find(|entitlements| entitlements.target == "Widget")
+            .expect("extension entitlements")
+            .target = "RenamedWidget".to_owned();
+        extension_name_drift
+            .validate()
+            .expect("internally valid extension name drift");
+        assert_signing_reference_mismatch(&config, &extension_name_drift);
+    }
+
+    #[test]
+    fn submission_target_graph_match_is_order_insensitive_and_exact() {
+        let (request, names) = multi_profile_request_with_framework();
+        let config = provider_config_with_secret_names(all_authorized(), names);
+        validate_submission(&config, &request).expect("exact full target graph");
+
+        let mut reordered = request.clone();
+        reordered.signing.targets.reverse();
+        reordered.validate().expect("valid reordered target graph");
+        validate_submission(&config, &reordered).expect("target order is not identity");
+
+        let mut omitted = request.clone();
+        omitted
+            .signing
+            .targets
+            .retain(|target| target.name != "RuntimeBridge");
+        omitted
+            .product
+            .nested_bundles
+            .retain(|bundle| bundle.executable != "RuntimeBridge");
+        omitted.validate().expect("valid omitted framework graph");
+        assert_signing_reference_mismatch(&config, &omitted);
+
+        let mut extra = request.clone();
+        extra.signing.targets.push(SigningTarget {
+            name: "SupportKit".to_owned(),
+            bundle_identifier: BundleIdentifier::new("com.example.app.support-kit")
+                .expect("extra framework bundle"),
+            kind: SigningTargetKind::Framework,
+        });
+        extra
+            .product
+            .nested_bundles
+            .push(UnsignedNestedBundleExpectation {
+                relative_path: "Frameworks/SupportKit.framework".to_owned(),
+                bundle_identifier: "com.example.app.support-kit".to_owned(),
+                executable: "SupportKit".to_owned(),
+                kind: UnsignedNestedBundleKind::Framework,
+            });
+        extra
+            .product
+            .nested_bundles
+            .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        extra.validate().expect("valid extra framework graph");
+        assert_signing_reference_mismatch(&config, &extra);
     }
 
     #[test]

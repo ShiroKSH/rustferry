@@ -19,7 +19,7 @@ use rustferry_github::transport::{
 };
 use rustferry_github::workflow::PublicSourceRepository;
 use rustferry_github::{
-    GithubVerifiedArtifactStore, ProtectedEnvironment, SigningSecretNames,
+    GithubVerifiedArtifactStore, MAX_SIGNING_PROFILES, ProtectedEnvironment, SigningSecretNames,
     TemporaryBranchNamespace, TrustedSourceRef, WorkerDistribution, WorkflowConfig,
     WorkflowFileName, generate_workflow,
 };
@@ -53,7 +53,8 @@ use crate::project::{
     find_in_path, find_project_root, run_captured_bounded, run_captured_bounded_isolated,
 };
 
-const CONFIG_SCHEMA_VERSION: u32 = 2;
+const CONFIG_SCHEMA_VERSION: u32 = 3;
+const LEGACY_CONFIG_SCHEMA_VERSION: u32 = 2;
 const CONFIG_RELATIVE_PATH: &str = "target/ferry/github/provider.json";
 const CONFIG_LOCK_RELATIVE_PATH: &str = "target/ferry/github/.provider.lock";
 const CONFIG_BACKUP_PREFIX: &str = ".provider-backup-";
@@ -98,6 +99,9 @@ pub(super) struct StoredGithubConfig {
     worker_repository: String,
     worker_revision: String,
     worker_version: String,
+    /// Public target graph used to render static protected-secret expressions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    signing_targets: Vec<SigningTarget>,
     #[serde(skip_serializing_if = "Option::is_none")]
     signing: Option<SigningPlan>,
 }
@@ -255,21 +259,28 @@ pub(super) struct ManualGithubSigningPreview {
     certificate_common_name: String,
     certificate_sha256: String,
     certificate_expires_at_unix_seconds: u64,
-    profile_uuid: String,
-    profile_name: String,
-    profile_expires_at_unix_seconds: u64,
-    profile_type: &'static str,
-    profile_bundle_identifier_pattern: String,
+    profiles: Vec<ManualGithubProfilePreview>,
     device_udid_sha256: String,
     target_bundle_identifiers: Vec<String>,
     installed: bool,
     dry_run: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct ManualGithubProfilePreview {
+    target: String,
+    secret_name: String,
+    uuid: String,
+    name: String,
+    expires_at_unix_seconds: u64,
+    profile_type: &'static str,
+    bundle_identifier_pattern: String,
+}
+
 impl ManualGithubSigningPreview {
     pub(super) fn human_summary(&self) -> String {
         format!(
-            "Manual iPhone signing\n\nPublic source:\n  {}\n\nPrivate execution:\n  {}\n\nProtected Environment:\n  {}\n\nTeam:\n  {}\n\nCertificate:\n  {}\n  SHA-256: {}\n  Expires: {}\n\nProvisioning profile:\n  {}\n  UUID: {}\n  Type: {}\n  Bundle pattern: {}\n  Expires: {}\n\nDevice SHA-256:\n  {}\n\nTargets:\n  {}\n\nSecret roles:\n  {}",
+            "Manual iPhone signing\n\nPublic source:\n  {}\n\nPrivate execution:\n  {}\n\nProtected Environment:\n  {}\n\nTeam:\n  {}\n\nCertificate:\n  {}\n  SHA-256: {}\n  Expires: {}\n\nProvisioning profiles:\n  {}\n\nDevice SHA-256:\n  {}\n\nTargets:\n  {}\n\nSecret roles:\n  {}",
             self.source_repository,
             self.execution_repository,
             self.protected_environment,
@@ -277,11 +288,20 @@ impl ManualGithubSigningPreview {
             self.certificate_common_name,
             self.certificate_sha256,
             self.certificate_expires_at_unix_seconds,
-            self.profile_name,
-            self.profile_uuid,
-            self.profile_type,
-            self.profile_bundle_identifier_pattern,
-            self.profile_expires_at_unix_seconds,
+            self.profiles
+                .iter()
+                .map(|profile| format!(
+                    "{}: {}\n    Secret: {}\n    UUID: {}\n    Type: {}\n    Bundle pattern: {}\n    Expires: {}",
+                    profile.target,
+                    profile.name,
+                    profile.secret_name,
+                    profile.uuid,
+                    profile.profile_type,
+                    profile.bundle_identifier_pattern,
+                    profile.expires_at_unix_seconds,
+                ))
+                .collect::<Vec<_>>()
+                .join("\n  "),
             self.device_udid_sha256,
             self.target_bundle_identifiers.join("\n  "),
             self.required_secret_names.join("\n  "),
@@ -289,19 +309,62 @@ impl ManualGithubSigningPreview {
     }
 }
 
+#[derive(Clone)]
+pub(super) struct ManualGithubSigningAssets {
+    certificate: rustferry_remote::SigningCertificate,
+    profiles: BTreeMap<String, rustferry_remote::ProvisioningProfile>,
+}
+
+impl ManualGithubSigningAssets {
+    pub(super) fn new(
+        certificate: rustferry_remote::SigningCertificate,
+        profiles: BTreeMap<String, rustferry_remote::ProvisioningProfile>,
+    ) -> Result<Self, CliError> {
+        if profiles.is_empty()
+            || profiles.len() > MAX_SIGNING_PROFILES
+            || certificate.validate().is_err()
+        {
+            return Err(remote_error(
+                "invalid_validated_signing_assets",
+                "the validated signing asset set is empty or exceeds the supported target bound",
+                "Validate one application profile and at most the Widget and Live Activity profiles.",
+            ));
+        }
+        for profile in profiles.values() {
+            if profile.validate_metadata().is_err()
+                || profile.team.id() != certificate.team.id()
+                || !profile
+                    .certificate_fingerprints
+                    .contains(&certificate.sha256_fingerprint)
+            {
+                return Err(remote_error(
+                    "invalid_validated_signing_assets",
+                    "a validated profile does not match the retained signing identity",
+                    "Revalidate the exact certificate and target profiles together.",
+                ));
+            }
+        }
+        Ok(Self {
+            certificate,
+            profiles,
+        })
+    }
+}
+
 pub(super) struct ManualGithubSecretValues {
     certificate_p12: CanonicalBase64SigningBlob,
     certificate_password: RawSigningPassword,
-    provisioning_profile: CanonicalBase64SigningBlob,
+    profiles: BTreeMap<String, CanonicalBase64SigningBlob>,
 }
 
 impl ManualGithubSecretValues {
-    pub(super) fn from_validated_input(
-        expected: &rustferry_apple::ValidatedManualSigningAssets,
-        input: rustferry_apple::ManualSigningAssetsInput,
+    pub(super) fn from_validated_inputs(
+        expected: &ManualGithubSigningAssets,
+        identity: rustferry_apple::ManualSigningIdentityInput,
+        profiles: Vec<(String, SecretBytes)>,
     ) -> Result<Self, CliError> {
-        let (actual, input) =
-            rustferry_apple::validate_manual_signing_assets(input).map_err(|error| {
+        let (actual_certificate, identity) =
+            rustferry_apple::validate_manual_signing_identity(identity).map_err(|error| {
                 remote_error_with_details(
                     "manual_signing_asset_revalidation_failed",
                     "the retained signing assets failed validation immediately before upload",
@@ -309,24 +372,64 @@ impl ManualGithubSecretValues {
                     vec![error.to_string()],
                 )
             })?;
-        if &actual != expected {
+        if actual_certificate != expected.certificate {
             return Err(remote_error(
                 "manual_signing_asset_revalidation_mismatch",
                 "the retained signing assets no longer match the reviewed public metadata",
                 "Do not upload. Restart signing setup from the original stable asset files.",
             ));
         }
-        let (certificate_p12, certificate_password, provisioning_profile) = input.into_parts();
+        let mut retained_profiles = BTreeMap::new();
+        for (target, profile) in profiles {
+            if retained_profiles.contains_key(&target) {
+                return Err(remote_error(
+                    "manual_signing_asset_revalidation_mismatch",
+                    "a retained signing target has duplicate profile bytes",
+                    "Do not upload. Restart signing setup from the original stable asset files.",
+                ));
+            }
+            let (actual, profile) = rustferry_apple::validate_manual_signing_profile(
+                profile,
+                &actual_certificate,
+            )
+            .map_err(|error| {
+                remote_error_with_details(
+                    "manual_signing_asset_revalidation_failed",
+                    "a retained provisioning profile failed validation immediately before upload",
+                    "Do not upload. Revalidate the original target profile and retry.",
+                    vec![format!("target={target}"), error.to_string()],
+                )
+            })?;
+            if expected.profiles.get(&target) != Some(&actual) {
+                return Err(remote_error_with_details(
+                    "manual_signing_asset_revalidation_mismatch",
+                    "a retained profile no longer matches the reviewed public metadata",
+                    "Do not upload. Restart signing setup from the original stable asset files.",
+                    vec![format!("target={target}")],
+                ));
+            }
+            retained_profiles.insert(
+                target,
+                CanonicalBase64SigningBlob::from_raw(&profile, "provisioning_profile")?,
+            );
+        }
+        if retained_profiles.keys().collect::<BTreeSet<_>>()
+            != expected.profiles.keys().collect::<BTreeSet<_>>()
+        {
+            return Err(remote_error(
+                "manual_signing_asset_revalidation_mismatch",
+                "the retained target-profile set differs from the reviewed set",
+                "Do not upload. Restart signing setup from the original stable asset files.",
+            ));
+        }
+        let (certificate_p12, certificate_password) = identity.into_parts();
         Ok(Self {
             certificate_p12: CanonicalBase64SigningBlob::from_raw(
                 &certificate_p12,
                 "certificate_p12",
             )?,
             certificate_password: RawSigningPassword::new(certificate_password)?,
-            provisioning_profile: CanonicalBase64SigningBlob::from_raw(
-                &provisioning_profile,
-                "provisioning_profile",
-            )?,
+            profiles: retained_profiles,
         })
     }
 }
@@ -450,19 +553,33 @@ fn signing_secret_encoding_error(role: &'static str, reason: &'static str) -> Cl
 
 pub(super) struct ManualGithubSigningSession<R = GithubManualSigningRemote> {
     root: Utf8PathBuf,
+    expected_project_state: SigningProjectState,
     paths: GithubPaths,
     stored: StoredGithubConfig,
     original_config_identity: ArtifactFileIdentity,
     original_config_bytes: Vec<u8>,
     expected_workflow: Vec<u8>,
     plan: SigningPlan,
-    assets: rustferry_apple::ValidatedManualSigningAssets,
+    assets: ManualGithubSigningAssets,
     source_repository: Repository,
     execution_repository: Repository,
     environment: ProtectedEnvironment,
     secret_names: SigningSecretNames,
     remote: R,
     config_lock: Option<ProviderConfigLock>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SigningProjectState {
+    ferry_config: rustferry_core::FerryConfig,
+    binary_name: String,
+    targets: Vec<SigningTarget>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SigningSecretUpload {
+    role: String,
+    secret_name: String,
 }
 
 pub(super) trait ManualSigningRemote {
@@ -1584,13 +1701,64 @@ fn source_bundle_error(code: &'static str, error: &rustferry_remote::SourceError
     )
 }
 
+fn signing_project_state_changed() -> CliError {
+    remote_error(
+        "signing_project_state_changed",
+        "the project signing inputs changed during manual signing setup",
+        "Restore the reviewed ferry.toml, Cargo target, and generated signing target graph, then rerun setup. If upload already began, delete every reported secret name first.",
+    )
+}
+
+fn signing_project_state_from_inputs(
+    ferry_config: rustferry_core::FerryConfig,
+    binary_name: String,
+) -> Result<SigningProjectState, CliError> {
+    let targets = unsigned_signing_plan(&ferry_config, &binary_name)
+        .map_err(|_| signing_project_state_changed())?
+        .targets;
+    Ok(SigningProjectState {
+        ferry_config,
+        binary_name,
+        targets,
+    })
+}
+
+fn load_signing_project_state(root: &Utf8Path) -> Result<SigningProjectState, CliError> {
+    let ferry_config = rustferry_core::FerryConfig::load(&root.join("ferry.toml"))
+        .map_err(|_| signing_project_state_changed())?;
+    let cargo_targets = super::platform_build::read_cargo_targets(root)
+        .map_err(|_| signing_project_state_changed())?;
+    signing_project_state_from_inputs(ferry_config, cargo_targets.binary().to_owned())
+}
+
+fn ensure_signing_project_state_unchanged(
+    root: &Utf8Path,
+    expected: &SigningProjectState,
+) -> Result<(), CliError> {
+    if load_signing_project_state(root)? != *expected {
+        return Err(signing_project_state_changed());
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
 pub(super) fn prepare_manual_github_signing(
     root: &Utf8Path,
     plan: SigningPlan,
-    assets: rustferry_apple::ValidatedManualSigningAssets,
+    assets: ManualGithubSigningAssets,
+    expected_ferry_config: &rustferry_core::FerryConfig,
+    expected_binary_name: &str,
     mutating: bool,
 ) -> Result<ManualGithubSigningSession<GithubManualSigningRemote>, CliError> {
     validate_manual_assets_match_plan(&plan, &assets)?;
+    let expected_project_state = signing_project_state_from_inputs(
+        expected_ferry_config.clone(),
+        expected_binary_name.to_owned(),
+    )?;
+    if expected_project_state.targets != plan.targets {
+        return Err(signing_project_state_changed());
+    }
+    ensure_signing_project_state_unchanged(root, &expected_project_state)?;
     let config_lock_path = root.join(CONFIG_LOCK_RELATIVE_PATH);
     let config_lock = provider_config_lock_for_signing(root, &config_lock_path, mutating)?;
     let stored = load_config(root)?;
@@ -1599,6 +1767,32 @@ pub(super) fn prepare_manual_github_signing(
             "signing_already_configured",
             "manual-development signing is already configured",
             "Use the existing signing configuration. Secret rotation requires an explicit replacement workflow.",
+        ));
+    }
+    if stored.signing_targets.is_empty() {
+        if plan
+            .targets
+            .iter()
+            .filter(|target| {
+                matches!(
+                    target.kind,
+                    SigningTargetKind::Application | SigningTargetKind::Extension
+                )
+            })
+            .count()
+            != 1
+        {
+            return Err(remote_error(
+                "legacy_provider_target_map_unsupported",
+                "the legacy GitHub provider config supports only one application profile",
+                "After confirming the protected Environment is still empty, remove the generated unsigned provider config and workflow, then rerun GitHub remote setup and review the replacement before committing it.",
+            ));
+        }
+    } else if stored.signing_targets != plan.targets {
+        return Err(remote_error(
+            "signing_target_graph_changed",
+            "the current signing target graph differs from the installed workflow map",
+            "Rerun GitHub remote setup, review and commit the workflow, then rerun signing setup without changing targets.",
         ));
     }
     let git = git_context(
@@ -1644,7 +1838,18 @@ pub(super) fn prepare_manual_github_signing(
                 "Remove the generated provider config and rerun GitHub setup.",
             )
         })?;
-    let secret_names = SigningSecretNames::goal3_defaults();
+    let secret_names = if stored.signing_targets.is_empty() {
+        SigningSecretNames::goal3_defaults()
+    } else {
+        SigningSecretNames::for_targets(&plan.targets).map_err(|error| {
+            remote_error_with_details(
+                "invalid_signing_target_secret_map",
+                "the signing plan cannot reproduce the installed static secret map",
+                "Rerun GitHub setup and signing setup from one unchanged target graph.",
+                vec![error.to_string()],
+            )
+        })?
+    };
     let mut remote = GithubManualSigningRemote {
         transport: GithubTransport::new(make_gh_runner(root)?, TransportLimits::secure_defaults()),
     };
@@ -1669,6 +1874,7 @@ pub(super) fn prepare_manual_github_signing(
 
     let session = ManualGithubSigningSession {
         root: root.to_owned(),
+        expected_project_state,
         paths,
         stored,
         original_config_identity,
@@ -1689,7 +1895,7 @@ pub(super) fn prepare_manual_github_signing(
 
 fn validate_manual_assets_match_plan(
     plan: &SigningPlan,
-    assets: &rustferry_apple::ValidatedManualSigningAssets,
+    assets: &ManualGithubSigningAssets,
 ) -> Result<(), CliError> {
     validate_github_signing_plan(plan)?;
     let signing = plan
@@ -1700,14 +1906,26 @@ fn validate_manual_assets_match_plan(
         .device
         .as_ref()
         .expect("validated manual signing plan has a device");
+    let expected_targets = plan
+        .provisioning
+        .iter()
+        .map(|profile| profile.target.as_str())
+        .collect::<BTreeSet<_>>();
     if signing.identity.certificate != assets.certificate
-        || assets.profile.team != assets.certificate.team
-        || assets.profile.profile_type != rustferry_remote::ProvisioningProfileType::Development
-        || !assets
-            .profile
-            .device_udid_sha256s
-            .iter()
-            .any(|candidate| candidate == device.udid_sha256())
+        || assets
+            .profiles
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+            != expected_targets
+        || assets.profiles.values().any(|profile| {
+            profile.team.id() != assets.certificate.team.id()
+                || profile.profile_type != rustferry_remote::ProvisioningProfileType::Development
+                || !profile
+                    .device_udid_sha256s
+                    .iter()
+                    .any(|candidate| candidate == device.udid_sha256())
+        })
     {
         return Err(remote_error(
             "validated_signing_assets_mismatch",
@@ -1755,19 +1973,29 @@ impl<R: ManualSigningRemote> ManualGithubSigningSession<R> {
                 .identity
                 .certificate
                 .expires_at_unix_seconds,
-            profile_uuid: self.assets.profile.uuid.clone(),
-            profile_name: self.assets.profile.name.clone(),
-            profile_expires_at_unix_seconds: self.assets.profile.expires_at_unix_seconds,
-            profile_type: match self.assets.profile.profile_type {
-                rustferry_remote::ProvisioningProfileType::Development => "development",
-                rustferry_remote::ProvisioningProfileType::AdHoc => "ad-hoc",
-                rustferry_remote::ProvisioningProfileType::AppStore => "app-store",
-            },
-            profile_bundle_identifier_pattern: self
+            profiles: self
                 .assets
-                .profile
-                .bundle_identifier_pattern
-                .clone(),
+                .profiles
+                .iter()
+                .map(|(target, profile)| ManualGithubProfilePreview {
+                    target: target.clone(),
+                    secret_name: self
+                        .secret_names
+                        .profile_for_target(target)
+                        .expect("validated secret map covers every profile target")
+                        .as_str()
+                        .to_owned(),
+                    uuid: profile.uuid.clone(),
+                    name: profile.name.clone(),
+                    expires_at_unix_seconds: profile.expires_at_unix_seconds,
+                    profile_type: match profile.profile_type {
+                        rustferry_remote::ProvisioningProfileType::Development => "development",
+                        rustferry_remote::ProvisioningProfileType::AdHoc => "ad-hoc",
+                        rustferry_remote::ProvisioningProfileType::AppStore => "app-store",
+                    },
+                    bundle_identifier_pattern: profile.bundle_identifier_pattern.clone(),
+                })
+                .collect(),
             device_udid_sha256: device.udid_sha256().to_owned(),
             target_bundle_identifiers,
             installed,
@@ -1807,7 +2035,7 @@ impl<R: ManualSigningRemote> ManualGithubSigningSession<R> {
         }
         self.recheck_local_state()?;
 
-        let uploaded_roles = self.upload_signing_values(values)?;
+        let uploaded_secrets = self.upload_signing_values(values)?;
 
         let actual_names = self
             .remote
@@ -1818,12 +2046,9 @@ impl<R: ManualSigningRemote> ManualGithubSigningSession<R> {
                 &self.stored,
                 "after_upload",
             )
-            .map_err(|error| signing_post_upload_error(&error, &uploaded_roles))?;
+            .map_err(|error| signing_post_upload_error(&error, &uploaded_secrets))?;
         if actual_names != required_signing_secret_names(&self.secret_names) {
-            let mut details = uploaded_roles
-                .iter()
-                .map(|role| format!("uploaded_role={role}"))
-                .collect::<Vec<_>>();
+            let mut details = uploaded_signing_secret_details(&uploaded_secrets);
             details.extend(
                 actual_names
                     .into_iter()
@@ -1832,18 +2057,18 @@ impl<R: ManualSigningRemote> ManualGithubSigningSession<R> {
             return Err(remote_error_with_details(
                 "github_signing_secret_postcheck_failed",
                 "GitHub did not report the exact protected signing secret-name set after upload",
-                "The local provider config remains unsigned. Delete the uploaded signing roles, inspect only secret names in the protected Environment, and retry.",
+                "The local provider config remains unsigned. Delete every listed uploaded secret name, inspect only secret names in the protected Environment, and retry.",
                 details,
             ));
         }
         self.recheck_local_state()
-            .map_err(|error| signing_post_upload_error(&error, &uploaded_roles))?;
+            .map_err(|error| signing_post_upload_error(&error, &uploaded_secrets))?;
 
         self.stored.signing = Some(self.plan.clone());
         validate_stored_config(&self.stored)
-            .map_err(|error| signing_post_upload_error(&error, &uploaded_roles))?;
+            .map_err(|error| signing_post_upload_error(&error, &uploaded_secrets))?;
         let bytes = encode_stored_config(&self.stored)
-            .map_err(|error| signing_post_upload_error(&error, &uploaded_roles))?;
+            .map_err(|error| signing_post_upload_error(&error, &uploaded_secrets))?;
         let config_lock = self
             .config_lock
             .as_ref()
@@ -1859,12 +2084,12 @@ impl<R: ManualSigningRemote> ManualGithubSigningSession<R> {
         ) {
             Ok(()) => {}
             Err(ConfigCommitError::NotCommitted(error)) => {
-                return Err(signing_post_upload_error(error.as_ref(), &uploaded_roles));
+                return Err(signing_post_upload_error(error.as_ref(), &uploaded_secrets));
             }
             Err(ConfigCommitError::CommittedNeedsInspection(error)) => {
                 return Err(signing_config_commit_uncertain(
                     error.as_ref(),
-                    &uploaded_roles,
+                    &uploaded_secrets,
                 ));
             }
         }
@@ -1874,54 +2099,76 @@ impl<R: ManualSigningRemote> ManualGithubSigningSession<R> {
     fn upload_signing_values(
         &mut self,
         values: &ManualGithubSecretValues,
-    ) -> Result<Vec<&'static str>, CliError> {
-        let writes = [
-            (
-                "certificate_p12",
-                self.secret_names.certificate_p12().clone(),
-                values.certificate_p12.as_secret(),
-            ),
-            (
-                "provisioning_profile",
-                self.secret_names.provisioning_profile().clone(),
-                values.provisioning_profile.as_secret(),
-            ),
-            (
-                "certificate_password",
-                self.secret_names.certificate_password().clone(),
-                values.certificate_password.as_secret(),
-            ),
-        ];
-        let mut uploaded_roles = Vec::with_capacity(writes.len());
+    ) -> Result<Vec<SigningSecretUpload>, CliError> {
+        let mut writes = vec![(
+            "certificate_p12".to_owned(),
+            self.secret_names.certificate_p12().clone(),
+            values.certificate_p12.as_secret(),
+        )];
+        let mut provisioning = self.plan.provisioning.iter().collect::<Vec<_>>();
+        provisioning.sort_by(|left, right| left.target.cmp(&right.target));
+        for planned in provisioning {
+            let value = values.profiles.get(&planned.target).ok_or_else(|| {
+                remote_error_with_details(
+                    "signing_secret_value_mismatch",
+                    "a validated target profile has no retained upload value",
+                    "Do not upload. Restart signing setup from the original stable asset files.",
+                    vec![format!("target={}", planned.target)],
+                )
+            })?;
+            let name = rustferry_github::SecretName::new(planned.profile.name()).map_err(|_| {
+                remote_error(
+                    "invalid_github_signing_secret_name",
+                    "a target profile has an invalid protected secret name",
+                    "Regenerate the provider workflow and signing plan.",
+                )
+            })?;
+            writes.push((
+                format!("provisioning_profile:{}", planned.target),
+                name,
+                value.as_secret(),
+            ));
+        }
+        // Password last: an interrupted earlier write cannot leave a remotely usable identity.
+        writes.push((
+            "certificate_password".to_owned(),
+            self.secret_names.certificate_password().clone(),
+            values.certificate_password.as_secret(),
+        ));
+        let mut uploaded_secrets = Vec::with_capacity(writes.len());
         for (role, name, value) in writes {
+            let upload = SigningSecretUpload {
+                role,
+                secret_name: name.as_str().to_owned(),
+            };
             let request = EnvironmentSecretWriteRequest::new(
                 self.execution_repository.clone(),
                 self.environment.clone(),
                 name,
             );
             if let Err(error) = self.remote.set_secret(&request, value) {
-                let mut details = vec![format!("possibly_uploaded_role={role}")];
-                details.extend(
-                    uploaded_roles
-                        .iter()
-                        .map(|uploaded| format!("uploaded_role={uploaded}")),
-                );
+                let mut details = vec![
+                    format!("possibly_uploaded_role={}", upload.role),
+                    format!("possibly_uploaded_secret={}", upload.secret_name),
+                ];
+                details.extend(uploaded_signing_secret_details(&uploaded_secrets));
                 return Err(remote_error_with_details(
                     "github_signing_secret_upload_indeterminate",
                     "a GitHub signing-secret write did not return a reliable outcome",
-                    "The local provider config remains unsigned. Delete every listed uploaded and possibly-uploaded role from the protected Environment before retrying.",
+                    "The local provider config remains unsigned. Delete every listed uploaded and possibly-uploaded secret name from the protected Environment before retrying.",
                     {
                         details.push(format!("transport={error}"));
                         details
                     },
                 ));
             }
-            uploaded_roles.push(role);
+            uploaded_secrets.push(upload);
         }
-        Ok(uploaded_roles)
+        Ok(uploaded_secrets)
     }
 
     fn recheck_local_state(&self) -> Result<(), CliError> {
+        ensure_signing_project_state_unchanged(&self.root, &self.expected_project_state)?;
         let (identity, bytes) =
             capture_config_snapshot(&self.root, &self.paths.config, &self.stored)?;
         if identity != self.original_config_identity || bytes != self.original_config_bytes {
@@ -1943,11 +2190,10 @@ impl<R: ManualSigningRemote> ManualGithubSigningSession<R> {
 }
 
 fn required_signing_secret_names(names: &SigningSecretNames) -> BTreeSet<String> {
-    BTreeSet::from([
-        names.certificate_p12().as_str().to_owned(),
-        names.certificate_password().as_str().to_owned(),
-        names.provisioning_profile().as_str().to_owned(),
-    ])
+    names
+        .all_names()
+        .map(|name| name.as_str().to_owned())
+        .collect()
 }
 
 fn capture_config_snapshot(
@@ -2062,31 +2308,39 @@ fn signing_policy_transport_error(
     )
 }
 
-fn signing_post_upload_error(error: &CliError, uploaded_roles: &[&str]) -> CliError {
-    let mut details = uploaded_roles
+fn uploaded_signing_secret_details(uploaded: &[SigningSecretUpload]) -> Vec<String> {
+    uploaded
         .iter()
-        .map(|role| format!("uploaded_role={role}"))
-        .collect::<Vec<_>>();
+        .flat_map(|upload| {
+            [
+                format!("uploaded_role={}", upload.role),
+                format!("uploaded_secret={}", upload.secret_name),
+            ]
+        })
+        .collect()
+}
+
+fn signing_post_upload_error(error: &CliError, uploaded: &[SigningSecretUpload]) -> CliError {
+    let mut details = uploaded_signing_secret_details(uploaded);
+    details.push(format!("cause_code={}", error.code()));
     details.push(format!("cause={error}"));
     remote_error_with_details(
         "github_signing_post_upload_failed",
         "signing secrets changed remotely but setup could not be committed safely",
-        "The local provider config remains unsigned. Delete every listed uploaded role from the protected Environment, correct the failure, and retry.",
+        "The local provider config remains unsigned. Delete every listed uploaded secret name from the protected Environment, correct the failure, and retry.",
         details,
     )
 }
 
-fn signing_config_commit_uncertain(error: &CliError, uploaded_roles: &[&str]) -> CliError {
-    let mut details = uploaded_roles
-        .iter()
-        .map(|role| format!("uploaded_role={role}"))
-        .collect::<Vec<_>>();
+fn signing_config_commit_uncertain(error: &CliError, uploaded: &[SigningSecretUpload]) -> CliError {
+    let mut details = uploaded_signing_secret_details(uploaded);
     details.push("config_state=possibly_signed".to_owned());
+    details.push(format!("cause_code={}", error.code()));
     details.push(format!("cause={error}"));
     remote_error_with_details(
         "github_signing_config_commit_uncertain",
         "the signing config was replaced but durability or final verification failed",
-        "Do not retry or delete secrets yet. Inspect the private provider config and run GitHub status/doctor; reconcile the exact three secret roles only after confirming whether the signing plan is present.",
+        "Do not retry or delete secrets yet. Inspect the private provider config and run GitHub status/doctor; reconcile only the exact listed secret names after confirming whether the signing plan is present.",
         details,
     )
 }
@@ -2497,6 +2751,17 @@ fn setup(arguments: RemoteSetupArgs, dry_run: bool, reporter: &Reporter) -> Resu
                 "Pass `--worker-revision` with the trusted lowercase 40-hex commit containing the compatible ferry-worker-macos source.",
             )
         })?;
+    let ferry_config = rustferry_core::FerryConfig::load(&root.join("ferry.toml"))?;
+    let cargo_targets = super::platform_build::read_cargo_targets(&root)?;
+    let signing_targets = unsigned_signing_plan(&ferry_config, cargo_targets.binary())?.targets;
+    SigningSecretNames::for_targets(&signing_targets).map_err(|error| {
+        remote_error_with_details(
+            "invalid_signing_target_secret_map",
+            "the current iPhone target graph cannot form a static protected-secret map",
+            "Correct duplicate or unsupported application and extension targets before GitHub setup.",
+            vec![error.to_string()],
+        )
+    })?;
     let stored = StoredGithubConfig {
         schema_version: CONFIG_SCHEMA_VERSION,
         repository,
@@ -2510,6 +2775,7 @@ fn setup(arguments: RemoteSetupArgs, dry_run: bool, reporter: &Reporter) -> Resu
         worker_repository: worker_repository.clone(),
         worker_revision,
         worker_version: arguments.worker_version,
+        signing_targets,
         signing: None,
     };
     validate_stored_config(&stored)?;
@@ -2782,6 +3048,16 @@ fn select_signing_plan(
         )
     })?;
     validate_github_signing_plan(&plan)?;
+    let current_targets = unsigned_signing_plan(ferry_config, binary_name)?.targets;
+    if plan.targets != current_targets
+        || (!stored.signing_targets.is_empty() && stored.signing_targets != current_targets)
+    {
+        return Err(remote_error(
+            "signing_target_graph_changed",
+            "the current project target graph differs from the configured signing plan and workflow",
+            "Rerun GitHub remote setup and manual signing setup after reviewing the exact changed targets.",
+        ));
+    }
     if let Some(expected_team) = expected_team
         && plan.team.as_ref().map(|team| team.expected.id()) != Some(expected_team)
     {
@@ -2870,19 +3146,21 @@ fn validate_github_signing_plan(plan: &SigningPlan) -> Result<(), CliError> {
             "Use manual-development signing references, or omit the plan and pass `--unsigned` for smoke builds.",
         ));
     }
-    if plan.provisioning.len() != 1
-        || plan
-            .targets
-            .iter()
-            .any(|target| target.kind == SigningTargetKind::Extension)
-    {
+    if plan.provisioning.is_empty() || plan.provisioning.len() > MAX_SIGNING_PROFILES {
         return Err(remote_error(
             "unsupported_signing_target_graph",
-            "the GitHub manual-signing worker currently accepts one application profile and no extensions",
-            "Disable Widget and Live Activity targets for this one-profile flow, or wait for per-extension profile setup support.",
+            "the GitHub manual-signing worker accepts at most the app, Widget, and Live Activity profiles",
+            "Use the exact generated target graph with no more than three profile-bearing targets.",
         ));
     }
-    let names = SigningSecretNames::goal3_defaults();
+    let names = SigningSecretNames::for_targets(&plan.targets).map_err(|error| {
+        remote_error_with_details(
+            "unsupported_signing_target_graph",
+            "the signing target graph cannot form an exact protected-secret map",
+            "Regenerate the target graph and GitHub provider configuration.",
+            vec![error.to_string()],
+        )
+    })?;
     let Some(signing) = &plan.signing else {
         return Err(remote_error(
             "invalid_signing_plan",
@@ -2897,16 +3175,17 @@ fn validate_github_signing_plan(plan: &SigningPlan) -> Result<(), CliError> {
             reference.kind() == rustferry_remote::SecretReferenceKind::GithubActions
                 && reference.name() == names.certificate_password().as_str()
         })
-        && plan.provisioning.len() == 1
         && plan.provisioning.iter().all(|provisioning| {
             provisioning.profile.kind() == rustferry_remote::SecretReferenceKind::GithubActions
-                && provisioning.profile.name() == names.provisioning_profile().as_str()
+                && names
+                    .profile_for_target(&provisioning.target)
+                    .is_some_and(|name| provisioning.profile.name() == name.as_str())
         });
     if !references_match {
         return Err(remote_error(
             "signing_secret_reference_mismatch",
             "the signing plan does not use the configured protected GitHub secret names",
-            "Use RUSTFERRY_GOAL3_IOS_CERTIFICATE_P12, RUSTFERRY_GOAL3_IOS_CERTIFICATE_PASSWORD, and RUSTFERRY_GOAL3_IOS_PROVISIONING_PROFILE references.",
+            "Regenerate the exact certificate, password, and per-target profile references from the installed GitHub target map.",
         ));
     }
     Ok(())
@@ -4161,10 +4440,22 @@ fn workflow_from_stored(stored: &StoredGithubConfig) -> Result<WorkflowConfig, C
             "Remove the generated provider config and rerun GitHub setup with exact safe values.",
         ));
     };
+    let secret_names = if stored.signing_targets.is_empty() {
+        SigningSecretNames::goal3_defaults()
+    } else {
+        SigningSecretNames::for_targets(&stored.signing_targets).map_err(|error| {
+            remote_error_with_details(
+                "invalid_provider_config",
+                "the stored target graph cannot form a static signing-secret map",
+                "Rerun GitHub setup from the current validated target graph.",
+                vec![error.to_string()],
+            )
+        })?
+    };
     WorkflowConfig::new(
         filename,
         environment,
-        SigningSecretNames::goal3_defaults(),
+        secret_names,
         worker,
         public_source,
         trusted,
@@ -4181,8 +4472,10 @@ fn workflow_from_stored(stored: &StoredGithubConfig) -> Result<WorkflowConfig, C
 }
 
 fn validate_stored_config(stored: &StoredGithubConfig) -> Result<(), CliError> {
-    if stored.schema_version != CONFIG_SCHEMA_VERSION
-        || stored.workflow_file != WORKFLOW_FILE
+    if !matches!(
+        stored.schema_version,
+        LEGACY_CONFIG_SCHEMA_VERSION | CONFIG_SCHEMA_VERSION
+    ) || stored.workflow_file != WORKFLOW_FILE
         || stored.protected_environment != PROTECTED_ENVIRONMENT
         || stored.temporary_namespace != TEMPORARY_NAMESPACE
     {
@@ -4190,6 +4483,15 @@ fn validate_stored_config(stored: &StoredGithubConfig) -> Result<(), CliError> {
             "invalid_provider_config",
             "the stored GitHub provider config has an unsupported schema or fixed policy",
             "Remove the generated provider config and rerun GitHub setup.",
+        ));
+    }
+    if (stored.schema_version == LEGACY_CONFIG_SCHEMA_VERSION && !stored.signing_targets.is_empty())
+        || (stored.schema_version == CONFIG_SCHEMA_VERSION && stored.signing_targets.is_empty())
+    {
+        return Err(remote_error(
+            "invalid_provider_config",
+            "the stored GitHub provider target-map schema is inconsistent",
+            "Rerun GitHub setup from the current validated target graph.",
         ));
     }
     validate_git_remote_name(&stored.source_remote_name)?;
@@ -4218,6 +4520,13 @@ fn validate_stored_config(stored: &StoredGithubConfig) -> Result<(), CliError> {
     workflow_from_stored(stored)?;
     if let Some(signing) = &stored.signing {
         validate_github_signing_plan(signing)?;
+        if !stored.signing_targets.is_empty() && signing.targets != stored.signing_targets {
+            return Err(remote_error(
+                "signing_target_graph_mismatch",
+                "the stored signing plan differs from the workflow's static target-secret map",
+                "Rerun GitHub setup and signing setup from one unchanged target graph.",
+            ));
+        }
     }
     Ok(())
 }
@@ -5692,19 +6001,22 @@ mod tests {
     use super::{
         ArtifactDownloadRollback, CONFIG_SCHEMA_VERSION, CanonicalBase64SigningBlob,
         ConfigCommitError, ExistingFile, GithubPaths, ImmediateProviderResult,
-        MAX_ENVIRONMENT_SECRET_BYTES, ManualGithubSecretValues, ManualGithubSigningSession,
-        ManualSigningRemote, PROTECTED_ENVIRONMENT, RawSigningPassword, StoredGithubConfig,
-        TEMPORARY_NAMESPACE, WORKFLOW_FILE, acquire_provider_config_lock, downloaded_manifest,
-        encode_stored_config, ensure_config_snapshot_unchanged, ensure_doctor_ready,
-        ensure_provider_directories, ensure_workflow_directory, expected_artifact_downloads,
-        load_config, parse_repository_spec, preflight_file, prepare_artifact_destination,
-        provider_config_lock_for_signing, read_private_config_snapshot, remote_error,
-        replace_private_config, required_signing_secret_names, retry_artifact_listing,
+        MAX_ENVIRONMENT_SECRET_BYTES, ManualGithubSecretValues, ManualGithubSigningAssets,
+        ManualGithubSigningSession, ManualSigningRemote, PROTECTED_ENVIRONMENT, RawSigningPassword,
+        SigningSecretUpload, StoredGithubConfig, TEMPORARY_NAMESPACE, WORKFLOW_FILE,
+        acquire_provider_config_lock, downloaded_manifest, encode_stored_config,
+        ensure_config_snapshot_unchanged, ensure_doctor_ready, ensure_provider_directories,
+        ensure_workflow_directory, expected_artifact_downloads, generate_workflow, load_config,
+        load_signing_project_state, parse_repository_spec, preflight_file,
+        prepare_artifact_destination, provider_config_lock_for_signing,
+        read_private_config_snapshot, remote_error, replace_private_config,
+        required_signing_secret_names, retry_artifact_listing, signing_config_commit_uncertain,
         source_manifest_digest, unsigned_signing_plan, validate_git_remote_name,
-        validate_stored_config, write_create_only,
+        validate_manual_assets_match_plan, validate_stored_config, workflow_from_stored,
+        write_create_only,
     };
     use std::cell::RefCell;
-    use std::collections::{BTreeSet, VecDeque};
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::rc::Rc;
     use std::time::{Duration, Instant};
 
@@ -5740,6 +6052,11 @@ mod tests {
             worker_repository: "https://github.com/example/rustferry".to_owned(),
             worker_revision: "a".repeat(40),
             worker_version: "0.1.0".to_owned(),
+            signing_targets: vec![SigningTarget {
+                name: "App".to_owned(),
+                bundle_identifier: BundleIdentifier::new("com.example.app").expect("bundle ID"),
+                kind: SigningTargetKind::Application,
+            }],
             signing: None,
         }
     }
@@ -5753,6 +6070,19 @@ mod tests {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let root = camino::Utf8PathBuf::from_path_buf(temporary.path().to_owned())
             .expect("UTF-8 temp path");
+        let project_config = rustferry_core::FerryConfig::starter("App", "com.example.app");
+        std::fs::write(
+            root.join("ferry.toml"),
+            project_config
+                .to_pretty_toml()
+                .expect("project config TOML"),
+        )
+        .expect("project config");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"App\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("Cargo manifest");
         let paths = GithubPaths::new(&root, &root);
         ensure_provider_directories(&root, &paths).expect("private provider directories");
         let config = unsigned_stored_config();
@@ -5789,6 +6119,13 @@ mod tests {
         secret_results: VecDeque<Result<(), TransportError>>,
         state: Rc<RefCell<FakeManualSigningState>>,
         config_path: camino::Utf8PathBuf,
+        project_mutation: Option<FakeProjectMutation>,
+    }
+
+    struct FakeProjectMutation {
+        phase: &'static str,
+        path: camino::Utf8PathBuf,
+        bytes: Vec<u8>,
     }
 
     impl ManualSigningRemote for FakeManualSigningRemote {
@@ -5818,6 +6155,17 @@ mod tests {
                     environment: environment.as_str().to_owned(),
                     config_signed: stored_config_is_signed(&self.config_path),
                 });
+            if self
+                .project_mutation
+                .as_ref()
+                .is_some_and(|mutation| mutation.phase == phase)
+            {
+                let mutation = self
+                    .project_mutation
+                    .take()
+                    .expect("matched project mutation");
+                std::fs::write(mutation.path, mutation.bytes).expect("mutate project state");
+            }
             self.policy_results
                 .pop_front()
                 .expect("unexpected policy verification")
@@ -5935,6 +6283,41 @@ mod tests {
         )
     }
 
+    #[test]
+    fn manual_assets_bind_team_id_not_optional_display_name() {
+        let (mut plan, validated) = manual_plan_and_assets();
+        let certificate_team =
+            DevelopmentTeam::new(validated.certificate.team.id(), None).expect("certificate team");
+        let mut certificate = validated.certificate;
+        certificate.team = certificate_team.clone();
+        plan.signing
+            .as_mut()
+            .expect("signing identity")
+            .identity
+            .certificate = certificate.clone();
+        plan.team.as_mut().expect("team plan").expected = certificate_team;
+        plan.validate().expect("display-name-independent plan");
+
+        let assets = ManualGithubSigningAssets::new(
+            certificate.clone(),
+            BTreeMap::from([("App".to_owned(), validated.profile.clone())]),
+        )
+        .expect("same Team ID with different display names");
+        validate_manual_assets_match_plan(&plan, &assets)
+            .expect("plan comparison uses Team ID only");
+
+        let mut wrong_profile = validated.profile;
+        wrong_profile.team = DevelopmentTeam::new("OTHER12345", Some("Example Team".to_owned()))
+            .expect("different team");
+        assert!(
+            ManualGithubSigningAssets::new(
+                certificate,
+                BTreeMap::from([("App".to_owned(), wrong_profile)]),
+            )
+            .is_err()
+        );
+    }
+
     #[allow(clippy::type_complexity)]
     fn manual_signing_session(
         policy_results: Vec<Result<BTreeSet<String>, CliError>>,
@@ -5946,6 +6329,8 @@ mod tests {
         Rc<RefCell<FakeManualSigningState>>,
     ) {
         let (temporary, root, paths, stored) = provider_config_fixture();
+        let expected_project_state =
+            load_signing_project_state(&root).expect("project signing state");
         ensure_workflow_directory(&root).expect("workflow directory");
         let expected_workflow = b"trusted workflow\n".to_vec();
         write_create_only(&paths.workflow, &expected_workflow, false).expect("workflow fixture");
@@ -5961,6 +6346,7 @@ mod tests {
             secret_results: secret_results.into(),
             state: Rc::clone(&state),
             config_path: paths.config.clone(),
+            project_mutation: None,
         };
         let values = ManualGithubSecretValues {
             certificate_p12: CanonicalBase64SigningBlob::try_from_encoded(
@@ -5968,16 +6354,27 @@ mod tests {
                 "certificate_p12",
             )
             .expect("certificate base64"),
-            certificate_password: RawSigningPassword::new(SecretBytes::new(b"password".to_vec()))
-                .expect("password"),
-            provisioning_profile: CanonicalBase64SigningBlob::try_from_encoded(
-                SecretBytes::new(b"cHJvZmlsZQ==".to_vec()),
-                "provisioning_profile",
-            )
-            .expect("profile base64"),
+            certificate_password: RawSigningPassword::new(SecretBytes::new(
+                b"top-secret-canary".to_vec(),
+            ))
+            .expect("password"),
+            profiles: BTreeMap::from([(
+                "App".to_owned(),
+                CanonicalBase64SigningBlob::try_from_encoded(
+                    SecretBytes::new(b"cHJvZmlsZQ==".to_vec()),
+                    "provisioning_profile",
+                )
+                .expect("profile base64"),
+            )]),
         };
+        let assets = ManualGithubSigningAssets::new(
+            assets.certificate,
+            BTreeMap::from([("App".to_owned(), assets.profile)]),
+        )
+        .expect("manual signing assets");
         let session = ManualGithubSigningSession {
             root,
+            expected_project_state,
             paths,
             stored,
             original_config_identity,
@@ -5994,6 +6391,120 @@ mod tests {
             config_lock: Some(config_lock),
         };
         (temporary, session, values, state)
+    }
+
+    fn add_widget_profile_to_manual_signing_session(
+        session: &mut ManualGithubSigningSession<FakeManualSigningRemote>,
+        values: &mut ManualGithubSecretValues,
+    ) -> SigningSecretNames {
+        let mut project_config = session.expected_project_state.ferry_config.clone();
+        project_config.extensions.widget.enabled = true;
+        project_config.extensions.widget.app_group = Some("group.com.example.app".to_owned());
+        project_config.ios.min_version = "16.1".to_owned();
+        std::fs::write(
+            session.root.join("ferry.toml"),
+            project_config
+                .to_pretty_toml()
+                .expect("widget project config"),
+        )
+        .expect("replace project config fixture");
+        let project_state =
+            load_signing_project_state(&session.root).expect("widget signing project state");
+        let extension = project_state
+            .targets
+            .iter()
+            .find(|target| target.kind == SigningTargetKind::Extension)
+            .expect("widget extension target")
+            .clone();
+        session.plan.targets = project_state.targets.clone();
+        let names = SigningSecretNames::for_targets(&session.plan.targets).expect("secret map");
+        session.plan.provisioning.push(ProvisioningPlan {
+            target: extension.name.clone(),
+            profile: SecretReference::new(
+                SecretReferenceKind::GithubActions,
+                names
+                    .profile_for_target(&extension.name)
+                    .expect("extension secret")
+                    .as_str(),
+            )
+            .expect("profile reference"),
+            profile_type: ProvisioningProfileType::Development,
+        });
+        session.plan.entitlements.push(EntitlementPlan {
+            target: extension.name.clone(),
+            required: EntitlementSet::default(),
+        });
+        session.plan.validate().expect("multi-profile plan");
+        session.stored.signing_targets = session.plan.targets.clone();
+        session.expected_project_state = project_state;
+        session.secret_names = names.clone();
+
+        let mut extension_profile = session
+            .assets
+            .profiles
+            .get("App")
+            .expect("app profile")
+            .clone();
+        extension_profile.uuid = "87654321-4321-4321-4321-CBA987654321".to_owned();
+        extension_profile.name = "Widget Development Profile".to_owned();
+        extension_profile.application_identifier =
+            format!("ABCDE12345.{}", extension.bundle_identifier.as_str());
+        extension_profile.bundle_identifier_pattern =
+            extension.bundle_identifier.as_str().to_owned();
+        extension_profile
+            .validate_metadata()
+            .expect("extension profile metadata");
+        session
+            .assets
+            .profiles
+            .insert(extension.name.clone(), extension_profile);
+        values.profiles.insert(
+            extension.name,
+            CanonicalBase64SigningBlob::try_from_encoded(
+                SecretBytes::new(b"d2lkZ2V0".to_vec()),
+                "provisioning_profile",
+            )
+            .expect("extension profile base64"),
+        );
+
+        let stored_bytes = encode_stored_config(&session.stored).expect("multi stored config");
+        std::fs::write(&session.paths.config, stored_bytes).expect("replace config fixture");
+        let (identity, bytes) = read_private_config_snapshot(&session.root, &session.paths.config)
+            .expect("multi config snapshot");
+        session.original_config_identity = identity;
+        session.original_config_bytes = bytes;
+
+        let generated =
+            generate_workflow(&workflow_from_stored(&session.stored).expect("workflow"));
+        session.expected_workflow = generated.yaml().as_bytes().to_vec();
+        std::fs::write(&session.paths.workflow, &session.expected_workflow)
+            .expect("replace workflow fixture");
+        names
+    }
+
+    fn mutate_project_on_policy(
+        session: &mut ManualGithubSigningSession<FakeManualSigningRemote>,
+        phase: &'static str,
+    ) {
+        let mut changed = session.expected_project_state.ferry_config.clone();
+        changed.app.name.push_str(" changed");
+        session.remote.project_mutation = Some(FakeProjectMutation {
+            phase,
+            path: session.root.join("ferry.toml"),
+            bytes: changed
+                .to_pretty_toml()
+                .expect("changed project config")
+                .into_bytes(),
+        });
+    }
+
+    fn assert_no_fake_signing_values(details: &[String]) {
+        for value in ["Y2VydA==", "cHJvZmlsZQ==", "d2lkZ2V0", "top-secret-canary"] {
+            assert!(
+                details.iter().all(|detail| !detail.contains(value)),
+                "secret value leaked in error details"
+            );
+        }
     }
 
     #[test]
@@ -6028,6 +6539,53 @@ mod tests {
                 "accepted {invalid}"
             );
         }
+    }
+
+    #[test]
+    fn stored_target_map_renders_static_secrets_and_schema_two_remains_legacy_readable() {
+        let mut stored = unsigned_stored_config();
+        stored.signing_targets.push(SigningTarget {
+            name: "Widget".to_owned(),
+            bundle_identifier: BundleIdentifier::new("com.example.app.widget")
+                .expect("widget bundle ID"),
+            kind: SigningTargetKind::Extension,
+        });
+        validate_stored_config(&stored).expect("schema three target map");
+        let names = SigningSecretNames::for_targets(&stored.signing_targets).expect("secret map");
+        let generated = generate_workflow(&workflow_from_stored(&stored).expect("workflow"));
+        for name in names.all_names() {
+            assert!(
+                generated
+                    .yaml()
+                    .contains(&format!("secrets.{}", name.as_str())),
+                "workflow omits {}",
+                name.as_str()
+            );
+        }
+
+        let mut legacy = unsigned_stored_config();
+        legacy.schema_version = super::LEGACY_CONFIG_SCHEMA_VERSION;
+        legacy.signing_targets.clear();
+        let encoded = serde_json::to_vec(&legacy).expect("legacy config JSON");
+        let decoded = serde_json::from_slice::<StoredGithubConfig>(&encoded)
+            .expect("new client reads schema two config");
+        validate_stored_config(&decoded).expect("legacy single-profile config remains valid");
+        let legacy_workflow = generate_workflow(&workflow_from_stored(&decoded).expect("legacy"));
+        assert!(
+            legacy_workflow
+                .yaml()
+                .contains("secrets.RUSTFERRY_GOAL3_IOS_PROVISIONING_PROFILE")
+        );
+        assert!(!legacy_workflow.yaml().contains("RFSIGNV2"));
+
+        let mut malformed = unsigned_stored_config();
+        malformed.signing_targets.clear();
+        assert_eq!(
+            validate_stored_config(&malformed)
+                .expect_err("schema three requires exact targets")
+                .code(),
+            "invalid_provider_config"
+        );
     }
 
     #[test]
@@ -6319,6 +6877,11 @@ mod tests {
         let config_root = session.root.clone();
         let preview = session.install(&values).expect("signing install");
         assert!(preview.installed);
+        assert_eq!(preview.profiles.len(), 1);
+        assert_eq!(
+            preview.profiles[0].secret_name,
+            names.provisioning_profile().as_str()
+        );
         let state = state.borrow();
         assert_eq!(
             state.events,
@@ -6348,7 +6911,7 @@ mod tests {
                     execution_repository: "example/private-builds".to_owned(),
                     environment: PROTECTED_ENVIRONMENT.to_owned(),
                     name: names.certificate_password().as_str().to_owned(),
-                    value: b"password".to_vec(),
+                    value: b"top-secret-canary".to_vec(),
                     config_signed: false,
                 },
                 FakeManualSigningEvent::Policy {
@@ -6365,6 +6928,53 @@ mod tests {
                 .expect("installed config")
                 .signing
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn multi_profile_install_uses_canonical_exact_set_and_password_last() {
+        let (_temporary, mut session, mut values, state) =
+            manual_signing_session(Vec::new(), vec![Ok(()), Ok(()), Ok(()), Ok(())]);
+        let names = add_widget_profile_to_manual_signing_session(&mut session, &mut values);
+        session.remote.policy_results = VecDeque::from([
+            Ok(BTreeSet::new()),
+            Ok(required_signing_secret_names(&names)),
+        ]);
+
+        let preview = session.install(&values).expect("multi-profile install");
+        assert_eq!(preview.profiles.len(), 2);
+        for profile in &preview.profiles {
+            assert_eq!(
+                profile.secret_name,
+                names
+                    .profile_for_target(&profile.target)
+                    .expect("preview target secret")
+                    .as_str()
+            );
+        }
+        let state = state.borrow();
+        let secret_names = state
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                FakeManualSigningEvent::Secret { name, .. } => Some(name.as_str()),
+                FakeManualSigningEvent::Policy { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            secret_names,
+            vec![
+                names.certificate_p12().as_str(),
+                names
+                    .profile_for_target("App")
+                    .expect("app secret")
+                    .as_str(),
+                names
+                    .profile_for_target("FerryWidgetExtension")
+                    .expect("widget secret")
+                    .as_str(),
+                names.certificate_password().as_str(),
+            ]
         );
     }
 
@@ -6391,14 +7001,28 @@ mod tests {
     fn manual_signing_install_treats_each_failed_write_as_possibly_uploaded() {
         let logical_roles = [
             "certificate_p12",
-            "provisioning_profile",
+            "provisioning_profile:App",
+            "provisioning_profile:FerryWidgetExtension",
             "certificate_password",
         ];
         for (failure_index, logical_role) in logical_roles.iter().enumerate() {
             let mut results = vec![Ok(()); failure_index];
             results.push(Err(TransportError::Execution(GhExecutionError::TimedOut)));
-            let (_temporary, session, values, state) =
+            let (_temporary, mut session, mut values, state) =
                 manual_signing_session(vec![Ok(BTreeSet::new())], results);
+            let names = add_widget_profile_to_manual_signing_session(&mut session, &mut values);
+            let ordered_secret_names = [
+                names.certificate_p12().as_str(),
+                names
+                    .profile_for_target("App")
+                    .expect("app secret")
+                    .as_str(),
+                names
+                    .profile_for_target("FerryWidgetExtension")
+                    .expect("widget secret")
+                    .as_str(),
+                names.certificate_password().as_str(),
+            ];
             let config_root = session.root.clone();
             let error = session
                 .install(&values)
@@ -6409,6 +7033,20 @@ mod tests {
                 panic!("expected structured remote error");
             };
             assert!(details.contains(&expected_detail));
+            assert!(details.contains(&format!(
+                "possibly_uploaded_secret={}",
+                ordered_secret_names[failure_index]
+            )));
+            for uploaded_index in 0..failure_index {
+                assert!(
+                    details.contains(&format!("uploaded_role={}", logical_roles[uploaded_index]))
+                );
+                assert!(details.contains(&format!(
+                    "uploaded_secret={}",
+                    ordered_secret_names[uploaded_index]
+                )));
+            }
+            assert_no_fake_signing_values(&details);
             assert_eq!(recorded_secret_count(&state.borrow()), failure_index + 1);
             assert!(
                 load_config(&config_root)
@@ -6417,6 +7055,123 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    #[test]
+    fn manual_signing_install_binds_project_state_across_confirmation_and_preflight() {
+        let (_temporary, session, values, state) = manual_signing_session(Vec::new(), Vec::new());
+        let mut changed = session.expected_project_state.ferry_config.clone();
+        changed.app.name.push_str(" changed");
+        std::fs::write(
+            session.root.join("ferry.toml"),
+            changed.to_pretty_toml().expect("changed project config"),
+        )
+        .expect("mutate project during confirmation");
+        let error = session
+            .install(&values)
+            .expect_err("confirmation-time project drift must fail");
+        assert_eq!(error.code(), "signing_project_state_changed");
+        assert!(state.borrow().events.is_empty());
+
+        let (_temporary, mut session, values, state) =
+            manual_signing_session(vec![Ok(BTreeSet::new())], Vec::new());
+        mutate_project_on_policy(&mut session, "before_upload");
+        let error = session
+            .install(&values)
+            .expect_err("pre-upload project drift must fail");
+        assert_eq!(error.code(), "signing_project_state_changed");
+        assert_eq!(recorded_secret_count(&state.borrow()), 0);
+    }
+
+    #[test]
+    fn project_drift_after_upload_reports_exact_cleanup_secret_names() {
+        let names = SigningSecretNames::goal3_defaults();
+        let required = required_signing_secret_names(&names);
+        let (_temporary, mut session, values, state) = manual_signing_session(
+            vec![Ok(BTreeSet::new()), Ok(required)],
+            vec![Ok(()), Ok(()), Ok(())],
+        );
+        let config_root = session.root.clone();
+        mutate_project_on_policy(&mut session, "after_upload");
+        let error = session
+            .install(&values)
+            .expect_err("post-upload project drift must fail safely");
+        assert_eq!(error.code(), "github_signing_post_upload_failed");
+        let CliError::Remote { details, .. } = error else {
+            panic!("expected structured remote error");
+        };
+        assert!(details.contains(&"cause_code=signing_project_state_changed".to_owned()));
+        for name in names.all_names() {
+            assert!(details.contains(&format!("uploaded_secret={}", name.as_str())));
+        }
+        assert_no_fake_signing_values(&details);
+        assert_eq!(recorded_secret_count(&state.borrow()), 3);
+        assert!(
+            load_config(&config_root)
+                .expect("unsigned config")
+                .signing
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn uncertain_config_commit_reports_roles_and_exact_secret_names_only() {
+        let targets = vec![
+            SigningTarget {
+                name: "App".to_owned(),
+                bundle_identifier: BundleIdentifier::new("com.example.app").expect("app bundle ID"),
+                kind: SigningTargetKind::Application,
+            },
+            SigningTarget {
+                name: "FerryWidgetExtension".to_owned(),
+                bundle_identifier: BundleIdentifier::new("com.example.app.widget")
+                    .expect("widget bundle ID"),
+                kind: SigningTargetKind::Extension,
+            },
+        ];
+        let names = SigningSecretNames::for_targets(&targets).expect("secret names");
+        let uploads = vec![
+            SigningSecretUpload {
+                role: "certificate_p12".to_owned(),
+                secret_name: names.certificate_p12().as_str().to_owned(),
+            },
+            SigningSecretUpload {
+                role: "provisioning_profile:App".to_owned(),
+                secret_name: names
+                    .profile_for_target("App")
+                    .expect("app profile")
+                    .as_str()
+                    .to_owned(),
+            },
+            SigningSecretUpload {
+                role: "provisioning_profile:FerryWidgetExtension".to_owned(),
+                secret_name: names
+                    .profile_for_target("FerryWidgetExtension")
+                    .expect("widget profile")
+                    .as_str()
+                    .to_owned(),
+            },
+            SigningSecretUpload {
+                role: "certificate_password".to_owned(),
+                secret_name: names.certificate_password().as_str().to_owned(),
+            },
+        ];
+        let cause = remote_error(
+            "provider_config_commit_uncertain",
+            "provider config commit state is uncertain",
+            "Inspect the provider config.",
+        );
+        let error = signing_config_commit_uncertain(&cause, &uploads);
+        assert_eq!(error.code(), "github_signing_config_commit_uncertain");
+        let CliError::Remote { details, help, .. } = error else {
+            panic!("expected structured remote error");
+        };
+        for upload in uploads {
+            assert!(details.contains(&format!("uploaded_role={}", upload.role)));
+            assert!(details.contains(&format!("uploaded_secret={}", upload.secret_name)));
+        }
+        assert!(help.contains("secret names"));
+        assert_no_fake_signing_values(&details);
     }
 
     #[test]
@@ -6450,6 +7205,13 @@ mod tests {
             .install(&values)
             .expect_err("post-upload drift must fail");
         assert_eq!(error.code(), "github_signing_secret_postcheck_failed");
+        let CliError::Remote { details, .. } = error else {
+            panic!("expected structured remote error");
+        };
+        for name in names.all_names() {
+            assert!(details.contains(&format!("uploaded_secret={}", name.as_str())));
+        }
+        assert_no_fake_signing_values(&details);
         assert_eq!(recorded_secret_count(&state.borrow()), 3);
         assert!(
             load_config(&config_root)
@@ -6483,6 +7245,7 @@ mod tests {
                 .is_none()
         );
 
+        let names = SigningSecretNames::goal3_defaults();
         let (_temporary, session, values, state) = manual_signing_session(
             vec![Ok(BTreeSet::new()), Err(policy_error())],
             vec![Ok(()), Ok(()), Ok(())],
@@ -6497,11 +7260,15 @@ mod tests {
         };
         for role in [
             "certificate_p12",
-            "provisioning_profile",
+            "provisioning_profile:App",
             "certificate_password",
         ] {
             assert!(details.contains(&format!("uploaded_role={role}")));
         }
+        for name in names.all_names() {
+            assert!(details.contains(&format!("uploaded_secret={}", name.as_str())));
+        }
+        assert_no_fake_signing_values(&details);
         let state = state.borrow();
         assert_eq!(recorded_secret_count(&state), 3);
         assert!(matches!(

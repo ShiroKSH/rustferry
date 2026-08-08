@@ -22,7 +22,8 @@ use rustferry_remote::{
     ArtifactKind, ArtifactRecord, CompileHandoff, IosArtifactType, IosDeviceBuildRequest,
     SealedUnsignedArchive, SecretBytes, SecretReference, SecretReferenceKind, SigningMode,
     SourceBundleRequest, SourceManifest, SourceMode, WorkerStdioCodecError,
-    WorkerStdioRequestEnvelope, decode_worker_stdio_request, verify_source_manifest,
+    WorkerStdioRequestEnvelope, canonical_signing_target_graph_sha256, decode_worker_stdio_request,
+    verify_source_manifest,
 };
 #[cfg(target_os = "macos")]
 use rustferry_worker_macos::keychain::{KeychainOptions, garbage_collect_stale_keychains};
@@ -58,11 +59,18 @@ const MAX_PUBLIC_REPORT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CARGO_MANIFEST_BYTES: usize = 2 * 1024 * 1024;
 const MAX_GITHUB_OUTPUT_BYTES: u64 = 1024 * 1024;
 const MAX_GIT_OUTPUT_BYTES: usize = 64 * 1024;
-const MAX_ENCODED_SECRET_BYTES: usize = 24 * 1024 * 1024;
-const MAX_DECODED_SIGNING_BLOB_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ENCODED_SECRET_BYTES: usize = 48 * 1024;
+const MAX_DECODED_SIGNING_BLOB_BYTES: usize = (MAX_ENCODED_SECRET_BYTES / 4) * 3;
 const MAX_SIGNING_PASSWORD_BYTES: usize = 4 * 1024;
-const MAX_SIGNING_STDIN_BYTES: usize =
-    MAX_ENCODED_SECRET_BYTES * 2 + MAX_SIGNING_PASSWORD_BYTES + 2;
+// One app plus the currently generated Widget and Live Activity extensions.
+const MAX_SIGNING_PROFILES: usize = 3;
+const MAX_SIGNING_SECRET_RECORDS: usize = 2 + MAX_SIGNING_PROFILES;
+const MAX_SIGNING_REFERENCE_NAME_BYTES: usize = 128;
+const SIGNING_SECRET_FRAME_V2_MAGIC: &[u8; 8] = b"RFSIGNV2";
+const MAX_SIGNING_STDIN_BYTES: usize = SIGNING_SECRET_FRAME_V2_MAGIC.len()
+    + 4
+    + MAX_SIGNING_SECRET_RECORDS
+        * (2 + 4 + MAX_SIGNING_REFERENCE_NAME_BYTES + MAX_ENCODED_SECRET_BYTES);
 const GIT_TIMEOUT: Duration = Duration::from_secs(20);
 const JOB_MARKER_NAME: &str = ".rustferry-worker-job-v1.json";
 const COMPILE_REPORT_NAME: &str = "compile-report.json";
@@ -200,6 +208,9 @@ struct GithubRequestArgs {
     output_manifest: PathBuf,
     #[arg(long)]
     github_output: PathBuf,
+    /// Static workflow-bound digest of the complete signing target graph.
+    #[arg(long)]
+    expected_signing_target_graph_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -270,7 +281,7 @@ struct RunJobArgs {
     #[arg(long)]
     certificate_password_reference: Option<String>,
     #[arg(long)]
-    provisioning_profile_reference: Option<String>,
+    provisioning_profile_reference: Vec<String>,
     #[arg(
         long,
         default_value_t = 120,
@@ -594,6 +605,10 @@ fn run_github_request(arguments: GithubRequestArgs) -> Result<(), CliFailure> {
     let manifest = decode_github_dispatch_manifest(&manifest_bytes)?;
     let request = &manifest.request;
     validate_github_artifact_contract(request)?;
+    validate_expected_signing_target_graph(
+        arguments.expected_signing_target_graph_sha256.as_deref(),
+        request,
+    )?;
 
     let event_bytes = read_bounded_file(&event_path, MAX_EVENT_BYTES)?;
     let event = decode_unique_value(&event_bytes)?;
@@ -892,21 +907,24 @@ fn run_sign(arguments: RunJobArgs) -> Result<(), CliFailure> {
         arguments.certificate_password_reference,
         "certificate_password_reference",
     )?;
-    let profile_reference = required_string(
-        arguments.provisioning_profile_reference,
-        "provisioning_profile_reference",
-    )?;
-    for name in [
-        &certificate_reference,
-        &password_reference,
-        &profile_reference,
-    ] {
+    let profile_references = arguments.provisioning_profile_reference.clone();
+    if profile_references.is_empty() || profile_references.len() > MAX_SIGNING_PROFILES {
+        return Err(CliFailure::input(
+            "invalid_profile_reference_count",
+            "protected signing requires one bounded profile reference per app and extension",
+        ));
+    }
+    for name in std::iter::once(&certificate_reference)
+        .chain(std::iter::once(&password_reference))
+        .chain(profile_references.iter())
+    {
         validate_public_secret_reference_name(name)?;
     }
-    if certificate_reference == password_reference
-        || certificate_reference == profile_reference
-        || password_reference == profile_reference
-    {
+    let all_argument_references = std::iter::once(certificate_reference.as_str())
+        .chain(std::iter::once(password_reference.as_str()))
+        .chain(profile_references.iter().map(String::as_str))
+        .collect::<BTreeSet<_>>();
+    if all_argument_references.len() != profile_references.len() + 2 {
         return Err(CliFailure::input(
             "duplicate_secret_reference",
             "protected signing references must be distinct",
@@ -952,7 +970,7 @@ fn run_sign(arguments: RunJobArgs) -> Result<(), CliFailure> {
         &handoff.request,
         &certificate_reference,
         &password_reference,
-        &profile_reference,
+        &profile_references,
     )?;
 
     let worker_root = trusted_worker_root()?;
@@ -975,8 +993,7 @@ fn run_sign(arguments: RunJobArgs) -> Result<(), CliFailure> {
     let internal_artifacts = job_root.join("artifacts");
     let toolchain = toolchain_selection()?;
     let references = signing_secret_references(&handoff.request)?;
-    let input = read_signing_secret_stdin(&mut io::stdin().lock())?;
-    let mut resolver = StdinSecretResolver::new(references, input)?;
+    let mut resolver = read_signing_secret_stdin(&mut io::stdin().lock(), &references)?;
     let phase = ProtectedSignPhaseRequest {
         request: &handoff.request,
         compile: &handoff.compile,
@@ -1259,6 +1276,24 @@ fn validate_github_artifact_contract(request: &IosDeviceBuildRequest) -> Result<
     Ok(())
 }
 
+fn validate_expected_signing_target_graph(
+    expected_sha256: Option<&str>,
+    request: &IosDeviceBuildRequest,
+) -> Result<(), CliFailure> {
+    let Some(expected_sha256) = expected_sha256 else {
+        return Ok(());
+    };
+    validate_sha256(expected_sha256)?;
+    let actual_sha256 = canonical_signing_target_graph_sha256(&request.signing.targets);
+    if actual_sha256 != expected_sha256 {
+        return Err(CliFailure::input(
+            "signing_target_graph_mismatch",
+            "request signing targets differ from the static workflow target graph",
+        ));
+    }
+    Ok(())
+}
+
 fn signing_mode_name(mode: SigningMode) -> Result<&'static str, CliFailure> {
     match mode {
         SigningMode::UnsignedCompileOnly => Ok("unsigned_compile_only"),
@@ -1277,21 +1312,22 @@ fn validate_secret_role_bindings(
     request: &IosDeviceBuildRequest,
     certificate_reference: &str,
     password_reference: &str,
-    profile_reference: &str,
+    profile_references: &[String],
 ) -> Result<(), CliFailure> {
-    let signing = request.signing.signing.as_ref().ok_or_else(|| {
-        CliFailure::input("missing_signing_plan", "manual signing plan is incomplete")
-    })?;
-    let password = signing.password.as_ref().ok_or_else(|| {
-        CliFailure::input(
-            "missing_signing_password",
-            "manual signing password reference is missing",
-        )
-    })?;
-    if signing.identity.private_key.reference.name() != certificate_reference
-        || password.name() != password_reference
-        || request.signing.provisioning.len() != 1
-        || request.signing.provisioning[0].profile.name() != profile_reference
+    let expected = signing_secret_references(request)?;
+    let expected_profiles = expected
+        .profiles
+        .iter()
+        .map(SecretReference::name)
+        .collect::<BTreeSet<_>>();
+    let actual_profiles = profile_references
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if expected.certificate.name() != certificate_reference
+        || expected.password.name() != password_reference
+        || actual_profiles.len() != profile_references.len()
+        || actual_profiles != expected_profiles
     {
         return Err(CliFailure::input(
             "secret_role_mismatch",
@@ -1301,9 +1337,38 @@ fn validate_secret_role_bindings(
     Ok(())
 }
 
+#[derive(Clone, Debug)]
+struct SigningSecretReferences {
+    certificate: SecretReference,
+    password: SecretReference,
+    profiles: Vec<SecretReference>,
+}
+
+impl SigningSecretReferences {
+    fn ordered(&self) -> Vec<&SecretReference> {
+        std::iter::once(&self.certificate)
+            .chain(std::iter::once(&self.password))
+            .chain(self.profiles.iter())
+            .collect()
+    }
+
+    fn expected_names(&self) -> BTreeSet<&str> {
+        self.ordered()
+            .into_iter()
+            .map(SecretReference::name)
+            .collect()
+    }
+
+    fn reference_named(&self, name: &str) -> Option<&SecretReference> {
+        self.ordered()
+            .into_iter()
+            .find(|reference| reference.name() == name)
+    }
+}
+
 fn signing_secret_references(
     request: &IosDeviceBuildRequest,
-) -> Result<[SecretReference; 3], CliFailure> {
+) -> Result<SigningSecretReferences, CliFailure> {
     let signing = request.signing.signing.as_ref().ok_or_else(|| {
         CliFailure::input("missing_signing_plan", "manual signing plan is incomplete")
     })?;
@@ -1313,26 +1378,29 @@ fn signing_secret_references(
             "manual signing password reference is missing",
         )
     })?;
-    let profile = request
-        .signing
-        .provisioning
-        .first()
-        .filter(|_| request.signing.provisioning.len() == 1)
-        .ok_or_else(|| {
-            CliFailure::input(
-                "invalid_profile_reference",
-                "manual signing requires exactly one provisioning profile reference",
-            )
-        })?;
-    let references = [
-        signing.identity.private_key.reference.clone(),
-        password.clone(),
-        profile.profile.clone(),
-    ];
+    if request.signing.provisioning.is_empty()
+        || request.signing.provisioning.len() > MAX_SIGNING_PROFILES
+    {
+        return Err(CliFailure::input(
+            "invalid_profile_reference_count",
+            "manual signing profile reference count is unsupported",
+        ));
+    }
+    let references = SigningSecretReferences {
+        certificate: signing.identity.private_key.reference.clone(),
+        password: password.clone(),
+        profiles: request
+            .signing
+            .provisioning
+            .iter()
+            .map(|profile| profile.profile.clone())
+            .collect(),
+    };
     if references
-        .iter()
+        .ordered()
+        .into_iter()
         .any(|reference| reference.kind() != SecretReferenceKind::GithubActions)
-        || references.iter().collect::<BTreeSet<_>>().len() != references.len()
+        || references.expected_names().len() != references.ordered().len()
     {
         return Err(CliFailure::input(
             "invalid_secret_reference",
@@ -1342,40 +1410,13 @@ fn signing_secret_references(
     Ok(references)
 }
 
-struct SigningSecretInput {
-    certificate_p12: SecretBytes,
-    certificate_password: SecretBytes,
-    provisioning_profile: SecretBytes,
-}
-
 struct StdinSecretResolver {
     secrets: BTreeMap<SecretReference, SecretBytes>,
 }
 
 impl StdinSecretResolver {
-    fn new(
-        references: [SecretReference; 3],
-        input: SigningSecretInput,
-    ) -> Result<Self, CliFailure> {
-        let SigningSecretInput {
-            certificate_p12,
-            certificate_password,
-            provisioning_profile,
-        } = input;
-        let mut secrets = BTreeMap::new();
-        for (reference, value) in references.into_iter().zip([
-            certificate_p12,
-            certificate_password,
-            provisioning_profile,
-        ]) {
-            if secrets.insert(reference, value).is_some() {
-                return Err(CliFailure::input(
-                    "duplicate_secret_reference",
-                    "protected signing references must be distinct",
-                ));
-            }
-        }
-        Ok(Self { secrets })
+    fn new(secrets: BTreeMap<SecretReference, SecretBytes>) -> Self {
+        Self { secrets }
     }
 
     fn is_empty(&self) -> bool {
@@ -1396,68 +1437,237 @@ impl WorkerSecretResolver for StdinSecretResolver {
     }
 }
 
-fn read_signing_secret_stdin(reader: &mut impl Read) -> Result<SigningSecretInput, CliFailure> {
-    let mut frame = Vec::new();
-    let read = reader
-        .take(u64::try_from(MAX_SIGNING_STDIN_BYTES + 1).unwrap_or(u64::MAX))
-        .read_to_end(&mut frame);
-    if read.is_err() || frame.len() > MAX_SIGNING_STDIN_BYTES {
-        frame.fill(0);
-        return Err(invalid_signing_stdin());
-    }
-    parse_signing_secret_frame(
-        frame,
+fn read_signing_secret_stdin(
+    reader: &mut impl Read,
+    references: &SigningSecretReferences,
+) -> Result<StdinSecretResolver, CliFailure> {
+    let mut frame = read_bounded_signing_secret_stdin(reader)?;
+    parse_signing_secret_frame_in_place(
+        &mut frame,
+        references,
         MAX_ENCODED_SECRET_BYTES,
         MAX_SIGNING_PASSWORD_BYTES,
         MAX_DECODED_SIGNING_BLOB_BYTES,
     )
 }
 
-fn parse_signing_secret_frame(
-    mut frame: Vec<u8>,
+fn read_bounded_signing_secret_stdin(reader: &mut impl Read) -> Result<Vec<u8>, CliFailure> {
+    // Fixed initialized length: reads cannot grow the allocation and strand secret copies.
+    // The final byte is an oversize probe, so an exactly-maximal valid frame still reaches EOF.
+    let mut frame = vec![0; MAX_SIGNING_STDIN_BYTES + 1];
+    let mut length = 0;
+    loop {
+        if length == frame.len() {
+            frame.fill(0);
+            return Err(invalid_signing_stdin());
+        }
+        match reader.read(&mut frame[length..]) {
+            Ok(0) => break,
+            Ok(read) if read <= frame.len() - length => length += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Ok(_) | Err(_) => {
+                frame.fill(0);
+                return Err(invalid_signing_stdin());
+            }
+        }
+    }
+    frame.truncate(length);
+    Ok(frame)
+}
+
+fn parse_signing_secret_frame_in_place(
+    frame: &mut [u8],
+    references: &SigningSecretReferences,
     maximum_encoded_blob_bytes: usize,
     maximum_password_bytes: usize,
     maximum_decoded_blob_bytes: usize,
-) -> Result<SigningSecretInput, CliFailure> {
-    let result = (|| {
-        let separators = frame
-            .iter()
-            .enumerate()
-            .filter_map(|(index, byte)| (*byte == 0).then_some(index))
-            .take(3)
-            .collect::<Vec<_>>();
-        let [certificate_end, password_end] = separators.as_slice() else {
-            return Err(invalid_signing_stdin());
-        };
-        let certificate = &frame[..*certificate_end];
-        let password = &frame[*certificate_end + 1..*password_end];
-        let profile = &frame[*password_end + 1..];
-        if certificate.len() > maximum_encoded_blob_bytes
-            || password.len() > maximum_password_bytes
-            || profile.len() > maximum_encoded_blob_bytes
+) -> Result<StdinSecretResolver, CliFailure> {
+    let result = if frame.starts_with(b"RFSIGN") {
+        parse_signing_secret_frame_v2(
+            frame,
+            references,
+            maximum_encoded_blob_bytes,
+            maximum_password_bytes,
+            maximum_decoded_blob_bytes,
+        )
+    } else if references.profiles.len() == 1 {
+        parse_legacy_signing_secret_frame(
+            frame,
+            references,
+            maximum_encoded_blob_bytes,
+            maximum_password_bytes,
+            maximum_decoded_blob_bytes,
+        )
+    } else {
+        Err(CliFailure::input(
+            "legacy_signing_frame_requires_single_profile",
+            "legacy protected signing stdin is valid only for a single-profile plan",
+        ))
+    };
+    frame.fill(0);
+    result
+}
+
+fn parse_legacy_signing_secret_frame(
+    frame: &[u8],
+    references: &SigningSecretReferences,
+    maximum_encoded_blob_bytes: usize,
+    maximum_password_bytes: usize,
+    maximum_decoded_blob_bytes: usize,
+) -> Result<StdinSecretResolver, CliFailure> {
+    let separators = frame
+        .iter()
+        .enumerate()
+        .filter_map(|(index, byte)| (*byte == 0).then_some(index))
+        .take(3)
+        .collect::<Vec<_>>();
+    let [certificate_end, password_end] = separators.as_slice() else {
+        return Err(invalid_signing_stdin());
+    };
+    let certificate = &frame[..*certificate_end];
+    let password = &frame[*certificate_end + 1..*password_end];
+    let profile = &frame[*password_end + 1..];
+    if certificate.len() > maximum_encoded_blob_bytes
+        || password.len() > maximum_password_bytes
+        || profile.len() > maximum_encoded_blob_bytes
+    {
+        return Err(invalid_signing_stdin());
+    }
+    let certificate_p12 = decode_base64(certificate, maximum_decoded_blob_bytes)
+        .map(SecretBytes::new)
+        .ok_or_else(invalid_signing_stdin)?;
+    let provisioning_profile = decode_base64(profile, maximum_decoded_blob_bytes)
+        .map(SecretBytes::new)
+        .ok_or_else(invalid_signing_stdin)?;
+    validate_signing_password(password, maximum_password_bytes)?;
+    let mut secrets = BTreeMap::new();
+    secrets.insert(references.certificate.clone(), certificate_p12);
+    secrets.insert(
+        references.password.clone(),
+        SecretBytes::new(password.to_vec()),
+    );
+    secrets.insert(references.profiles[0].clone(), provisioning_profile);
+    Ok(StdinSecretResolver::new(secrets))
+}
+
+fn parse_signing_secret_frame_v2(
+    frame: &[u8],
+    references: &SigningSecretReferences,
+    maximum_encoded_blob_bytes: usize,
+    maximum_password_bytes: usize,
+    maximum_decoded_blob_bytes: usize,
+) -> Result<StdinSecretResolver, CliFailure> {
+    if !frame.starts_with(SIGNING_SECRET_FRAME_V2_MAGIC) {
+        return Err(CliFailure::input(
+            "unsupported_signing_secret_frame_version",
+            "protected signing stdin frame version is unsupported",
+        ));
+    }
+    let mut offset = SIGNING_SECRET_FRAME_V2_MAGIC.len();
+    let count = read_frame_u32(frame, &mut offset).ok_or_else(invalid_signing_stdin)?;
+    let expected_count = references.ordered().len();
+    if count != expected_count || count > MAX_SIGNING_SECRET_RECORDS {
+        return Err(CliFailure::input(
+            "signing_secret_count_mismatch",
+            "protected signing stdin has an unexpected record count",
+        ));
+    }
+
+    let expected_names = references.expected_names();
+    let mut seen = BTreeSet::new();
+    let mut secrets = BTreeMap::new();
+    for _ in 0..count {
+        let name_length = read_frame_u16(frame, &mut offset).ok_or_else(invalid_signing_stdin)?;
+        let value_length = read_frame_u32(frame, &mut offset).ok_or_else(invalid_signing_stdin)?;
+        if name_length == 0
+            || name_length > MAX_SIGNING_REFERENCE_NAME_BYTES
+            || value_length > maximum_encoded_blob_bytes.max(maximum_password_bytes)
         {
             return Err(invalid_signing_stdin());
         }
-        let certificate_p12 = decode_base64(certificate, maximum_decoded_blob_bytes)
-            .map(SecretBytes::new)
-            .ok_or_else(invalid_signing_stdin)?;
-        let provisioning_profile = decode_base64(profile, maximum_decoded_blob_bytes)
-            .map(SecretBytes::new)
-            .ok_or_else(invalid_signing_stdin)?;
-        Ok(SigningSecretInput {
-            certificate_p12,
-            certificate_password: SecretBytes::new(password.to_vec()),
-            provisioning_profile,
-        })
-    })();
-    frame.fill(0);
-    result
+        let name_bytes =
+            take_frame_bytes(frame, &mut offset, name_length).ok_or_else(invalid_signing_stdin)?;
+        let name = std::str::from_utf8(name_bytes).map_err(|_| invalid_signing_stdin())?;
+        validate_public_secret_reference_name(name)?;
+        if !expected_names.contains(name) {
+            return Err(CliFailure::input(
+                "unknown_signing_secret_record",
+                "protected signing stdin contains an unknown secret reference",
+            ));
+        }
+        if !seen.insert(name) {
+            return Err(CliFailure::input(
+                "duplicate_signing_secret_record",
+                "protected signing stdin repeats a secret reference",
+            ));
+        }
+        let value =
+            take_frame_bytes(frame, &mut offset, value_length).ok_or_else(invalid_signing_stdin)?;
+        let reference = references
+            .reference_named(name)
+            .expect("expected reference name was checked");
+        let decoded = if reference == &references.password {
+            validate_signing_password(value, maximum_password_bytes)?;
+            SecretBytes::new(value.to_vec())
+        } else {
+            if value.len() > maximum_encoded_blob_bytes {
+                return Err(invalid_signing_stdin());
+            }
+            decode_base64(value, maximum_decoded_blob_bytes)
+                .map(SecretBytes::new)
+                .ok_or_else(invalid_signing_stdin)?
+        };
+        secrets.insert(reference.clone(), decoded);
+    }
+    if offset != frame.len() {
+        return Err(CliFailure::input(
+            "trailing_signing_secret_frame_bytes",
+            "protected signing stdin contains trailing bytes",
+        ));
+    }
+    if seen != expected_names {
+        return Err(CliFailure::input(
+            "missing_signing_secret_record",
+            "protected signing stdin omits a required secret reference",
+        ));
+    }
+    Ok(StdinSecretResolver::new(secrets))
+}
+
+fn read_frame_u16(frame: &[u8], offset: &mut usize) -> Option<usize> {
+    let bytes = take_frame_bytes(frame, offset, 2)?;
+    Some(usize::from(u16::from_be_bytes([bytes[0], bytes[1]])))
+}
+
+fn read_frame_u32(frame: &[u8], offset: &mut usize) -> Option<usize> {
+    let bytes = take_frame_bytes(frame, offset, 4)?;
+    usize::try_from(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])).ok()
+}
+
+fn take_frame_bytes<'a>(frame: &'a [u8], offset: &mut usize, length: usize) -> Option<&'a [u8]> {
+    let end = offset.checked_add(length)?;
+    let bytes = frame.get(*offset..end)?;
+    *offset = end;
+    Some(bytes)
+}
+
+fn validate_signing_password(value: &[u8], maximum: usize) -> Result<(), CliFailure> {
+    if value.len() > maximum
+        || std::str::from_utf8(value).is_err()
+        || value.iter().any(|byte| matches!(byte, 0 | b'\r' | b'\n'))
+    {
+        return Err(CliFailure::input(
+            "invalid_signing_password",
+            "protected signing password is not bounded safe UTF-8",
+        ));
+    }
+    Ok(())
 }
 
 const fn invalid_signing_stdin() -> CliFailure {
     CliFailure::input(
         "invalid_signing_stdin",
-        "protected signing stdin must contain exactly three bounded canonical fields",
+        "protected signing stdin is malformed, truncated, oversized, or noncanonical",
     )
 }
 
@@ -1828,7 +2038,7 @@ fn reject_sign_arguments_for_compile(arguments: &RunJobArgs) -> Result<(), CliFa
         || arguments.operation_id.is_some()
         || arguments.certificate_p12_reference.is_some()
         || arguments.certificate_password_reference.is_some()
-        || arguments.provisioning_profile_reference.is_some()
+        || !arguments.provisioning_profile_reference.is_empty()
     {
         return Err(CliFailure::input(
             "phase_argument_mismatch",
@@ -3755,6 +3965,64 @@ unsafe_code = "deny"
     }
 
     #[test]
+    fn static_target_graph_digest_rejects_every_crafted_graph_drift() {
+        let mut request = valid_github_request();
+        request
+            .product
+            .nested_bundles
+            .push(rustferry_remote::UnsignedNestedBundleExpectation {
+                relative_path: "Frameworks/RuntimeBridge.framework".to_owned(),
+                bundle_identifier: "com.example.app.runtime-bridge".to_owned(),
+                executable: "RuntimeBridge".to_owned(),
+                kind: rustferry_remote::UnsignedNestedBundleKind::Framework,
+            });
+        request.signing.targets.push(SigningTarget {
+            name: "RuntimeBridge".to_owned(),
+            bundle_identifier: BundleIdentifier::new("com.example.app.runtime-bridge")
+                .expect("framework bundle"),
+            kind: SigningTargetKind::Framework,
+        });
+        request.validate().expect("valid app and framework graph");
+        let expected = canonical_signing_target_graph_sha256(&request.signing.targets);
+        validate_expected_signing_target_graph(Some(&expected), &request)
+            .expect("exact static graph");
+        validate_expected_signing_target_graph(None, &request)
+            .expect("legacy workflow omits the graph digest");
+        assert_eq!(
+            validate_expected_signing_target_graph(Some(&expected.to_uppercase()), &request)
+                .expect_err("uppercase digest must fail")
+                .code,
+            "invalid_sha256"
+        );
+
+        let mut app_bundle_drift = request.clone();
+        app_bundle_drift.signing.targets[0].bundle_identifier =
+            BundleIdentifier::new("com.example.other").expect("forged app bundle");
+        let mut framework_bundle_drift = request.clone();
+        framework_bundle_drift.signing.targets[1].bundle_identifier =
+            BundleIdentifier::new("com.example.app.other-framework")
+                .expect("forged framework bundle");
+        let mut name_drift = request.clone();
+        name_drift.signing.targets[1].name = "OtherFramework".to_owned();
+        let mut omitted_target = request.clone();
+        omitted_target.signing.targets.pop();
+
+        for drifted in [
+            app_bundle_drift,
+            framework_bundle_drift,
+            name_drift,
+            omitted_target,
+        ] {
+            assert_eq!(
+                validate_expected_signing_target_graph(Some(&expected), &drifted)
+                    .expect_err("crafted target graph must fail")
+                    .code,
+                "signing_target_graph_mismatch"
+            );
+        }
+    }
+
+    #[test]
     fn github_dispatch_preserves_same_repository_compatibility() {
         let mut manifest = valid_dispatch_manifest();
         manifest.execution_repository = TEST_SOURCE_REPOSITORY.to_owned();
@@ -4002,13 +4270,91 @@ unsafe_code = "deny"
         assert!(validate_public_secret_reference_name("CERT=value").is_err());
     }
 
+    fn test_signing_references(profile_names: &[&str]) -> SigningSecretReferences {
+        let reference = |name| {
+            SecretReference::new(SecretReferenceKind::GithubActions, name)
+                .expect("GitHub secret reference")
+        };
+        SigningSecretReferences {
+            certificate: reference("RUSTFERRY_GOAL3_IOS_CERTIFICATE_P12"),
+            password: reference("RUSTFERRY_GOAL3_IOS_CERTIFICATE_PASSWORD"),
+            profiles: profile_names.iter().map(|name| reference(name)).collect(),
+        }
+    }
+
+    fn signing_frame_v2(records: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut frame = SIGNING_SECRET_FRAME_V2_MAGIC.to_vec();
+        frame.extend_from_slice(
+            &u32::try_from(records.len())
+                .expect("record count")
+                .to_be_bytes(),
+        );
+        for (name, value) in records {
+            frame.extend_from_slice(
+                &u16::try_from(name.len())
+                    .expect("reference length")
+                    .to_be_bytes(),
+            );
+            frame.extend_from_slice(
+                &u32::try_from(value.len())
+                    .expect("value length")
+                    .to_be_bytes(),
+            );
+            frame.extend_from_slice(name.as_bytes());
+            frame.extend_from_slice(value);
+        }
+        frame
+    }
+
+    fn assert_signing_frame_error(
+        mut frame: Vec<u8>,
+        references: &SigningSecretReferences,
+        maximum_blob: usize,
+        maximum_password: usize,
+        maximum_decoded: usize,
+        code: &str,
+    ) {
+        let error = parse_signing_secret_frame_in_place(
+            &mut frame,
+            references,
+            maximum_blob,
+            maximum_password,
+            maximum_decoded,
+        )
+        .err()
+        .expect("secret frame must fail");
+        assert_eq!(error.code, code);
+        assert!(frame.iter().all(|byte| *byte == 0));
+    }
+
     #[test]
-    fn signing_stdin_requires_exact_bounded_canonical_fields() {
-        let input = parse_signing_secret_frame(b"AQI=\0\0AwQ=".to_vec(), 8, 8, 8)
-            .expect("canonical secret frame");
-        assert_eq!(input.certificate_p12.expose_secret_bytes(), &[1, 2]);
-        assert!(input.certificate_password.is_empty());
-        assert_eq!(input.provisioning_profile.expose_secret_bytes(), &[3, 4]);
+    fn signing_stdin_preserves_legacy_single_profile_and_wipes_input() {
+        let references = test_signing_references(&["RUSTFERRY_GOAL3_IOS_PROVISIONING_PROFILE"]);
+        let mut frame = b"AQI=\0\0AwQ=".to_vec();
+        let mut resolver = parse_signing_secret_frame_in_place(&mut frame, &references, 8, 8, 8)
+            .expect("canonical legacy secret frame");
+        assert!(frame.iter().all(|byte| *byte == 0));
+        assert_eq!(
+            resolver
+                .resolve(&references.certificate)
+                .expect("certificate")
+                .expose_secret_bytes(),
+            &[1, 2]
+        );
+        assert!(
+            resolver
+                .resolve(&references.password)
+                .expect("password")
+                .is_empty()
+        );
+        assert_eq!(
+            resolver
+                .resolve(&references.profiles[0])
+                .expect("profile")
+                .expose_secret_bytes(),
+            &[3, 4]
+        );
+        assert!(resolver.is_empty());
 
         for malformed in [
             b"AQI=\0password".as_slice(),
@@ -4016,53 +4362,308 @@ unsafe_code = "deny"
             b"AQI=\n\0password\0AwQ=".as_slice(),
             b"\0password\0AwQ=".as_slice(),
         ] {
-            assert!(parse_signing_secret_frame(malformed.to_vec(), 16, 16, 16).is_err());
+            let mut frame = malformed.to_vec();
+            assert!(
+                parse_signing_secret_frame_in_place(&mut frame, &references, 16, 16, 16,).is_err()
+            );
+            assert!(frame.iter().all(|byte| *byte == 0));
         }
-        assert!(parse_signing_secret_frame(b"AQID\0password\0AwQ=".to_vec(), 3, 16, 16).is_err());
-        assert!(parse_signing_secret_frame(b"AQI=\0password\0AwQ=".to_vec(), 16, 4, 16).is_err());
-        assert!(parse_signing_secret_frame(b"AQI=\0password\0AwQ=".to_vec(), 16, 16, 1).is_err());
+        let multi = test_signing_references(&[
+            "RUSTFERRY_GOAL3_IOS_PROVISIONING_PROFILE",
+            "RUSTFERRY_GOAL3_IOS_PROFILE_00112233445566778899AABBCCDDEEFF",
+        ]);
+        let mut legacy = b"AQI=\0password\0AwQ=".to_vec();
+        assert_eq!(
+            parse_signing_secret_frame_in_place(&mut legacy, &multi, 16, 16, 16)
+                .err()
+                .expect("legacy multi-profile frame must fail")
+                .code,
+            "legacy_signing_frame_requires_single_profile"
+        );
+        assert!(legacy.iter().all(|byte| *byte == 0));
     }
 
     #[test]
-    fn stdin_resolver_binds_roles_to_exact_request_references_once() {
-        let reference = |name| {
-            SecretReference::new(SecretReferenceKind::GithubActions, name)
-                .expect("GitHub secret reference")
-        };
-        let certificate = reference("RUSTFERRY_GOAL3_IOS_CERTIFICATE_P12");
-        let password = reference("RUSTFERRY_GOAL3_IOS_CERTIFICATE_PASSWORD");
-        let profile = reference("RUSTFERRY_GOAL3_IOS_PROVISIONING_PROFILE");
-        let input = parse_signing_secret_frame(b"AQI=\0password\0AwQ=".to_vec(), 16, 16, 16)
-            .expect("canonical secret frame");
-        let mut resolver = StdinSecretResolver::new(
-            [certificate.clone(), password.clone(), profile.clone()],
-            input,
-        )
-        .expect("stdin resolver");
+    fn v2_stdin_is_named_exact_bounded_and_one_shot() {
+        let references = test_signing_references(&[
+            "RUSTFERRY_GOAL3_IOS_PROVISIONING_PROFILE",
+            "RUSTFERRY_GOAL3_IOS_PROFILE_00112233445566778899AABBCCDDEEFF",
+        ]);
+        let records = [
+            (references.profiles[1].name(), b"BQY=".as_slice()),
+            (references.password.name(), b"password".as_slice()),
+            (references.certificate.name(), b"AQI=".as_slice()),
+            (references.profiles[0].name(), b"AwQ=".as_slice()),
+        ];
+        let mut frame = signing_frame_v2(&records);
+        let mut resolver = parse_signing_secret_frame_in_place(&mut frame, &references, 16, 16, 16)
+            .expect("canonical v2 secret frame");
+        assert!(frame.iter().all(|byte| *byte == 0));
 
         assert_eq!(
             resolver
-                .resolve(&profile)
-                .expect("profile")
+                .resolve(&references.profiles[1])
+                .expect("extension profile")
                 .expose_secret_bytes(),
-            &[3, 4]
+            &[5, 6]
         );
         assert_eq!(
             resolver
-                .resolve(&certificate)
+                .resolve(&references.certificate)
                 .expect("certificate")
                 .expose_secret_bytes(),
             &[1, 2]
         );
         assert_eq!(
             resolver
-                .resolve(&password)
+                .resolve(&references.password)
                 .expect("password")
                 .expose_secret_bytes(),
             b"password"
         );
-        assert!(resolver.resolve(&password).is_err());
+        assert!(resolver.resolve(&references.password).is_err());
+        assert_eq!(resolver.secrets.len(), 1);
+        resolver
+            .resolve(&references.profiles[0])
+            .expect("application profile");
         assert!(resolver.is_empty());
+    }
+
+    #[test]
+    fn signing_stdin_reader_keeps_one_fixed_allocation_and_rejects_probe_byte() {
+        struct ChunkedReader {
+            bytes: Vec<u8>,
+            position: usize,
+            chunk_size: usize,
+        }
+
+        impl Read for ChunkedReader {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                let available = self.bytes.len().saturating_sub(self.position);
+                let length = available.min(output.len()).min(self.chunk_size);
+                output[..length]
+                    .copy_from_slice(&self.bytes[self.position..self.position + length]);
+                self.position += length;
+                Ok(length)
+            }
+        }
+
+        let mut exact = ChunkedReader {
+            bytes: vec![0x5a; MAX_SIGNING_STDIN_BYTES],
+            position: 0,
+            chunk_size: 7_919,
+        };
+        let frame = read_bounded_signing_secret_stdin(&mut exact).expect("maximum bounded frame");
+        assert_eq!(frame.len(), MAX_SIGNING_STDIN_BYTES);
+        assert!(frame.capacity() > MAX_SIGNING_STDIN_BYTES);
+        assert_eq!(exact.position, MAX_SIGNING_STDIN_BYTES);
+
+        let mut oversized = ChunkedReader {
+            bytes: vec![0x5a; MAX_SIGNING_STDIN_BYTES + 1],
+            position: 0,
+            chunk_size: 4_093,
+        };
+        let error = read_bounded_signing_secret_stdin(&mut oversized)
+            .expect_err("probe byte must reject the frame");
+        assert_eq!(error.code, "invalid_signing_stdin");
+        assert_eq!(oversized.position, MAX_SIGNING_STDIN_BYTES + 1);
+    }
+
+    #[test]
+    fn v2_stdin_rejects_duplicate_unknown_missing_truncated_and_trailing_records() {
+        let references = test_signing_references(&[
+            "RUSTFERRY_GOAL3_IOS_PROVISIONING_PROFILE",
+            "RUSTFERRY_GOAL3_IOS_PROFILE_00112233445566778899AABBCCDDEEFF",
+        ]);
+        let valid = [
+            (references.certificate.name(), b"AQI=".as_slice()),
+            (references.password.name(), b"password".as_slice()),
+            (references.profiles[0].name(), b"AwQ=".as_slice()),
+            (references.profiles[1].name(), b"BQY=".as_slice()),
+        ];
+
+        let mut duplicate = signing_frame_v2(&[valid[0], valid[1], valid[2], valid[2]]);
+        assert_eq!(
+            parse_signing_secret_frame_in_place(&mut duplicate, &references, 16, 16, 16)
+                .err()
+                .expect("duplicate")
+                .code,
+            "duplicate_signing_secret_record"
+        );
+        assert!(duplicate.iter().all(|byte| *byte == 0));
+
+        let mut unknown = signing_frame_v2(&[
+            valid[0],
+            valid[1],
+            valid[2],
+            ("RUSTFERRY_GOAL3_IOS_PROFILE_UNKNOWN", b"BQY="),
+        ]);
+        assert_eq!(
+            parse_signing_secret_frame_in_place(&mut unknown, &references, 64, 16, 16)
+                .err()
+                .expect("unknown")
+                .code,
+            "unknown_signing_secret_record"
+        );
+        assert!(unknown.iter().all(|byte| *byte == 0));
+
+        let mut missing = signing_frame_v2(&valid[..3]);
+        assert_eq!(
+            parse_signing_secret_frame_in_place(&mut missing, &references, 16, 16, 16)
+                .err()
+                .expect("missing")
+                .code,
+            "signing_secret_count_mismatch"
+        );
+        assert!(missing.iter().all(|byte| *byte == 0));
+
+        let mut truncated = signing_frame_v2(&valid);
+        truncated.pop();
+        assert_eq!(
+            parse_signing_secret_frame_in_place(&mut truncated, &references, 16, 16, 16)
+                .err()
+                .expect("truncated")
+                .code,
+            "invalid_signing_stdin"
+        );
+        assert!(truncated.iter().all(|byte| *byte == 0));
+
+        let mut trailing = signing_frame_v2(&valid);
+        trailing.push(0);
+        assert_eq!(
+            parse_signing_secret_frame_in_place(&mut trailing, &references, 16, 16, 16)
+                .err()
+                .expect("trailing")
+                .code,
+            "trailing_signing_secret_frame_bytes"
+        );
+        assert!(trailing.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn v2_stdin_rejects_versions_noncanonical_values_and_every_boundary() {
+        let references = test_signing_references(&["RUSTFERRY_GOAL3_IOS_PROVISIONING_PROFILE"]);
+        let valid = [
+            (references.certificate.name(), b"AQI=".as_slice()),
+            (references.password.name(), b"password".as_slice()),
+            (references.profiles[0].name(), b"AwQ=".as_slice()),
+        ];
+
+        let mut wrong_version = signing_frame_v2(&valid);
+        wrong_version[..8].copy_from_slice(b"RFSIGNV3");
+        assert_signing_frame_error(
+            wrong_version,
+            &references,
+            16,
+            16,
+            16,
+            "unsupported_signing_secret_frame_version",
+        );
+
+        for invalid_blob in [b"AB==".as_slice(), b"AQI=\n".as_slice(), b"raw".as_slice()] {
+            assert_signing_frame_error(
+                signing_frame_v2(&[
+                    (references.certificate.name(), invalid_blob),
+                    valid[1],
+                    valid[2],
+                ]),
+                &references,
+                16,
+                16,
+                16,
+                "invalid_signing_stdin",
+            );
+        }
+
+        for invalid_password in [b"secret\0".as_slice(), b"secret\n".as_slice(), &[0xff]] {
+            assert_signing_frame_error(
+                signing_frame_v2(&[
+                    valid[0],
+                    (references.password.name(), invalid_password),
+                    valid[2],
+                ]),
+                &references,
+                16,
+                16,
+                16,
+                "invalid_signing_password",
+            );
+        }
+
+        assert_signing_frame_error(
+            signing_frame_v2(&[
+                (references.certificate.name(), b"AQIDBA=="),
+                valid[1],
+                valid[2],
+            ]),
+            &references,
+            4,
+            16,
+            16,
+            "invalid_signing_stdin",
+        );
+        assert_signing_frame_error(
+            signing_frame_v2(&[valid[0], (references.password.name(), b"12345"), valid[2]]),
+            &references,
+            16,
+            4,
+            16,
+            "invalid_signing_password",
+        );
+
+        let mut excessive_count = SIGNING_SECRET_FRAME_V2_MAGIC.to_vec();
+        excessive_count.extend_from_slice(
+            &u32::try_from(MAX_SIGNING_SECRET_RECORDS + 1)
+                .expect("count")
+                .to_be_bytes(),
+        );
+        assert_signing_frame_error(
+            excessive_count,
+            &references,
+            16,
+            16,
+            16,
+            "signing_secret_count_mismatch",
+        );
+
+        let mut name_overflow = SIGNING_SECRET_FRAME_V2_MAGIC.to_vec();
+        name_overflow.extend_from_slice(&3_u32.to_be_bytes());
+        name_overflow.extend_from_slice(&129_u16.to_be_bytes());
+        name_overflow.extend_from_slice(&1_u32.to_be_bytes());
+        assert_signing_frame_error(
+            name_overflow,
+            &references,
+            16,
+            16,
+            16,
+            "invalid_signing_stdin",
+        );
+
+        let mut value_overflow = SIGNING_SECRET_FRAME_V2_MAGIC.to_vec();
+        value_overflow.extend_from_slice(&3_u32.to_be_bytes());
+        value_overflow.extend_from_slice(&1_u16.to_be_bytes());
+        value_overflow.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert_signing_frame_error(
+            value_overflow,
+            &references,
+            16,
+            16,
+            16,
+            "invalid_signing_stdin",
+        );
+
+        let mut truncated_header = SIGNING_SECRET_FRAME_V2_MAGIC.to_vec();
+        truncated_header.extend_from_slice(&3_u32.to_be_bytes());
+        truncated_header.push(0);
+        assert_signing_frame_error(
+            truncated_header,
+            &references,
+            16,
+            16,
+            16,
+            "invalid_signing_stdin",
+        );
     }
 
     #[test]

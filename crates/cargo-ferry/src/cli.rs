@@ -908,9 +908,9 @@ pub struct ManualSigningSetupArgs {
     /// PKCS#12 Apple Development certificate and private-key archive.
     #[arg(long)]
     pub certificate: Utf8PathBuf,
-    /// Development provisioning-profile file.
-    #[arg(long)]
-    pub profile: Utf8PathBuf,
+    /// Development profile as PATH, or TARGET=PATH for every app/extension target.
+    #[arg(long, required = true, value_name = "TARGET=PATH|PATH")]
+    pub profile: Vec<String>,
     /// Remote provider that will receive the validated signing assets.
     #[arg(long, value_enum)]
     pub remote: RemoteProviderChoice,
@@ -1326,10 +1326,7 @@ mod tests {
         };
         let SigningSetupMode::Manual(arguments) = setup.mode;
         assert_eq!(arguments.certificate, Utf8PathBuf::from("development.p12"));
-        assert_eq!(
-            arguments.profile,
-            Utf8PathBuf::from("Weather.mobileprovision")
-        );
+        assert_eq!(arguments.profile, vec!["Weather.mobileprovision"]);
         assert_eq!(arguments.remote, RemoteProviderChoice::Github);
         assert!(!arguments.password_stdin);
         assert!(arguments.password_env.is_none());
