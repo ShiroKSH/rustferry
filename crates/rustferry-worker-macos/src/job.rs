@@ -72,7 +72,11 @@ impl WorkerRelativePath {
         job_root: &Utf8Path,
         absolute: &Utf8Path,
     ) -> Result<Self, WorkerJobError> {
-        if !job_root.is_absolute() || !absolute.is_absolute() {
+        if !job_root.is_absolute()
+            || !absolute.is_absolute()
+            || contains_lexical_dot_component(job_root.as_str())
+            || contains_lexical_dot_component(absolute.as_str())
+        {
             return Err(WorkerJobError::InvalidWorkerPath);
         }
         let relative = absolute
@@ -107,6 +111,11 @@ impl WorkerRelativePath {
             .strip_prefix(parent.as_str())
             .is_some_and(|suffix| suffix.starts_with('/') && suffix.len() > 1)
     }
+}
+
+fn contains_lexical_dot_component(path: &str) -> bool {
+    path.split(['/', '\\'])
+        .any(|component| matches!(component, "." | ".."))
 }
 
 impl<'de> Deserialize<'de> for WorkerRelativePath {
