@@ -17,7 +17,7 @@ env:
   RUST_BACKTRACE: '0'
   RUSTUP_TOOLCHAIN: '1.92.0'
   RUSTFERRY_WORKER_REPOSITORY: 'https://github.com/shiroksh/rustferry'
-  RUSTFERRY_WORKER_REVISION: 'c08e793b0dcf584ec45e015d023a57b91cf094ba'
+  RUSTFERRY_WORKER_REVISION: '1c06dc9177d9134b7adf2ddd0720ae0fa9e11bd8'
   RUSTFERRY_WORKER_VERSION: '0.1.0'
   RUSTFERRY_SOURCE_REPOSITORY: 'https://github.com/shiroksh/rustferry'
   RUSTFERRY_TRUSTED_SOURCE_REF: 'refs/heads/goal3/integrate-goal2'
@@ -40,7 +40,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: 'shiroksh/rustferry'
-          ref: 'c08e793b0dcf584ec45e015d023a57b91cf094ba'
+          ref: '1c06dc9177d9134b7adf2ddd0720ae0fa9e11bd8'
           fetch-depth: 1
           persist-credentials: false
           path: .rustferry-worker-source
