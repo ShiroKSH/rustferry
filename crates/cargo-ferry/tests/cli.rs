@@ -122,7 +122,8 @@ fn manual_signing_setup_help_has_exact_inputs_and_no_password_value_option() {
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
     let help = String::from_utf8(output.stdout).expect("UTF-8 help");
-    assert!(help.contains(
+    let normalized_help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(normalized_help.contains(
         "Usage: cargo-ferry signing setup manual [OPTIONS] --certificate <CERTIFICATE> --profile <PROFILE> --remote <REMOTE>"
     ));
     assert!(help.contains("--certificate <CERTIFICATE>"));
