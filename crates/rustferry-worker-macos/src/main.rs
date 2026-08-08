@@ -2376,6 +2376,7 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+#[cfg(unix)]
 fn sync_directory(path: &Utf8Path) -> Result<(), CliFailure> {
     File::open(path)
         .and_then(|directory| directory.sync_all())
@@ -2385,6 +2386,11 @@ fn sync_directory(path: &Utf8Path) -> Result<(), CliFailure> {
                 "output directory could not be synchronized",
             )
         })
+}
+
+#[cfg(not(unix))]
+const fn sync_directory(_path: &Utf8Path) -> Result<(), CliFailure> {
+    Ok(())
 }
 
 fn set_executable(path: &Utf8Path, executable: bool) -> Result<(), CliFailure> {
