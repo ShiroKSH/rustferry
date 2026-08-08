@@ -763,11 +763,18 @@ fn extract_inspected_ipa(
     {
         return Err(SignedIpaValidationError::IpaChangedDuringValidation);
     }
-    let mut file = File::open(ipa_path).map_err(|source| io_error("open IPA", source))?;
+    let initial_identity = FileIdentityHandle::from_path(ipa_path)
+        .map_err(|source| io_error("identify IPA", source))?;
+    let mut file = initial_identity
+        .as_file()
+        .try_clone()
+        .map_err(|source| io_error("clone open IPA", source))?;
     let opened_metadata = file
         .metadata()
         .map_err(|source| io_error("inspect open IPA", source))?;
-    if !same_file_metadata(&path_metadata, &opened_metadata) {
+    if !file_binding_unchanged(ipa_path, &path_metadata, &initial_identity, &file)
+        .map_err(|source| io_error("rebind open IPA", source))?
+    {
         return Err(SignedIpaValidationError::IpaChangedDuringValidation);
     }
     let (size, sha256) = describe_open_file(&mut file)?;
@@ -787,7 +794,7 @@ fn extract_inspected_ipa(
     if final_size != size || final_sha256 != sha256 {
         return Err(SignedIpaValidationError::IpaChangedDuringValidation);
     }
-    ensure_ipa_path_stable(ipa_path, &opened_metadata, &file)?;
+    ensure_ipa_path_stable(ipa_path, &opened_metadata, &initial_identity, &file)?;
     Ok(())
 }
 
@@ -1025,13 +1032,25 @@ fn describe_open_file(file: &mut File) -> Result<(u64, String), SignedIpaValidat
 fn ensure_ipa_path_stable(
     path: &Utf8Path,
     initial: &Metadata,
+    initial_identity: &FileIdentityHandle,
     file: &File,
 ) -> Result<(), SignedIpaValidationError> {
-    let open_final = file
-        .metadata()
-        .map_err(|source| io_error("reinspect open IPA", source))?;
-    let path_final =
-        fs::symlink_metadata(path).map_err(|source| io_error("reinspect IPA path", source))?;
+    if !file_binding_unchanged(path, initial, initial_identity, file)
+        .map_err(|source| io_error("reinspect IPA binding", source))?
+    {
+        return Err(SignedIpaValidationError::IpaChangedDuringValidation);
+    }
+    Ok(())
+}
+
+fn file_binding_unchanged(
+    path: &Utf8Path,
+    initial: &Metadata,
+    initial_identity: &FileIdentityHandle,
+    file: &File,
+) -> io::Result<bool> {
+    let open_final = file.metadata()?;
+    let path_final = fs::symlink_metadata(path)?;
     if path_final.file_type().is_symlink()
         || !path_final.is_file()
         || !metadata_has_single_link(&open_final)
@@ -1043,9 +1062,11 @@ fn ensure_ipa_path_stable(
         || open_final.modified().ok() != initial.modified().ok()
         || path_final.modified().ok() != initial.modified().ok()
     {
-        return Err(SignedIpaValidationError::IpaChangedDuringValidation);
+        return Ok(false);
     }
-    Ok(())
+    let open_identity = FileIdentityHandle::from_file(file.try_clone()?)?;
+    let path_identity = FileIdentityHandle::from_path(path)?;
+    Ok(&open_identity == initial_identity && &path_identity == initial_identity)
 }
 
 fn metadata_has_single_link(metadata: &Metadata) -> bool {
@@ -1067,13 +1088,7 @@ fn same_file_metadata(left: &Metadata, right: &Metadata) -> bool {
         use std::os::unix::fs::MetadataExt as _;
         left.dev() == right.dev() && left.ino() == right.ino()
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt as _;
-        left.volume_serial_number() == right.volume_serial_number()
-            && left.file_index() == right.file_index()
-    }
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(unix))]
     {
         left.len() == right.len() && left.modified().ok() == right.modified().ok()
     }
@@ -1576,11 +1591,15 @@ fn file_has_macho_magic(path: &Utf8Path) -> Result<bool, SignedIpaValidationErro
     if initial.file_type().is_symlink() || !initial.is_file() {
         return Err(SignedIpaValidationError::UnsafeIpaArchive);
     }
-    let mut file = File::open(path).map_err(|source| io_error("open potential Mach-O", source))?;
-    let opened = file
-        .metadata()
+    let identity = FileIdentityHandle::from_path(path)
         .map_err(|source| io_error("identify potential Mach-O", source))?;
-    if !same_file_metadata(&initial, &opened) {
+    let mut file = identity
+        .as_file()
+        .try_clone()
+        .map_err(|source| io_error("clone potential Mach-O", source))?;
+    if !file_binding_unchanged(path, &initial, &identity, &file)
+        .map_err(|source| io_error("rebind potential Mach-O", source))?
+    {
         return Err(SignedIpaValidationError::UnsafeIpaArchive);
     }
     let mut magic = [0_u8; 4];
@@ -2010,11 +2029,15 @@ fn read_bounded_file(path: &Utf8Path, maximum: u64) -> Result<Vec<u8>, SignedIpa
     if metadata.len() > maximum {
         return Err(SignedIpaValidationError::BundleLayoutMismatch);
     }
-    let mut file = File::open(path).map_err(|source| io_error("open validation file", source))?;
-    let opened = file
-        .metadata()
-        .map_err(|source| io_error("inspect open validation file", source))?;
-    if !same_file_metadata(&metadata, &opened) {
+    let identity = FileIdentityHandle::from_path(path)
+        .map_err(|source| io_error("identify validation file", source))?;
+    let mut file = identity
+        .as_file()
+        .try_clone()
+        .map_err(|source| io_error("clone validation file", source))?;
+    if !file_binding_unchanged(path, &metadata, &identity, &file)
+        .map_err(|source| io_error("rebind validation file", source))?
+    {
         return Err(SignedIpaValidationError::UnsafeIpaArchive);
     }
     let capacity = usize::try_from(metadata.len())
@@ -2027,6 +2050,11 @@ fn read_bounded_file(path: &Utf8Path, maximum: u64) -> Result<Vec<u8>, SignedIpa
     let actual_size =
         u64::try_from(bytes.len()).map_err(|_| SignedIpaValidationError::BundleLayoutMismatch)?;
     if actual_size != metadata.len() || actual_size > maximum {
+        return Err(SignedIpaValidationError::UnsafeIpaArchive);
+    }
+    if !file_binding_unchanged(path, &metadata, &identity, &file)
+        .map_err(|source| io_error("reinspect validation file binding", source))?
+    {
         return Err(SignedIpaValidationError::UnsafeIpaArchive);
     }
     Ok(bytes)
@@ -2043,13 +2071,17 @@ fn ensure_real_regular_file(
     Ok(())
 }
 
+#[cfg(unix)]
 fn secure_private_directory(path: &Utf8Path) -> Result<(), SignedIpaValidationError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .map_err(|source| io_error("secure certificate evidence directory", source))?;
-    }
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|source| io_error("secure certificate evidence directory", source))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn secure_private_directory(_path: &Utf8Path) -> Result<(), SignedIpaValidationError> {
     Ok(())
 }
 
@@ -2317,6 +2349,52 @@ mod tests {
 
     use super::*;
     use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
+
+    #[test]
+    fn file_binding_requires_the_same_open_file() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let first = Utf8PathBuf::from_path_buf(temporary.path().join("first.bin"))
+            .expect("UTF-8 first path");
+        let second = Utf8PathBuf::from_path_buf(temporary.path().join("second.bin"))
+            .expect("UTF-8 second path");
+        fs::write(&first, b"same-size").expect("first file");
+        fs::write(&second, b"different").expect("second file");
+
+        let fixed_modified = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        for path in [&first, &second] {
+            OpenOptions::new()
+                .write(true)
+                .open(path)
+                .expect("open fixture for timestamp")
+                .set_times(std::fs::FileTimes::new().set_modified(fixed_modified))
+                .expect("set fixture timestamp");
+        }
+
+        let metadata = fs::symlink_metadata(&first).expect("first metadata");
+        let second_metadata = fs::symlink_metadata(&second).expect("second metadata");
+        assert_eq!(metadata.len(), second_metadata.len());
+        assert_eq!(metadata.modified().ok(), second_metadata.modified().ok());
+        let identity = FileIdentityHandle::from_path(&first).expect("first identity");
+        assert_ne!(
+            identity,
+            FileIdentityHandle::from_path(&second).expect("second identity")
+        );
+        let file = identity.as_file().try_clone().expect("clone first file");
+        assert!(
+            file_binding_unchanged(&first, &metadata, &identity, &file)
+                .expect("stable first binding")
+        );
+        assert!(
+            !file_binding_unchanged(&second, &metadata, &identity, &file)
+                .expect("distinct second binding")
+        );
+
+        fs::write(&first, b"mutated-in-place").expect("mutate first file in place");
+        assert!(
+            !file_binding_unchanged(&first, &metadata, &identity, &file)
+                .expect("same-inode mutation check")
+        );
+    }
 
     #[test]
     fn apple_commands_are_fixed_absolute_argument_arrays() {

@@ -10,6 +10,7 @@ use rustferry_remote::{
     SigningIdentity, SigningMode, SigningPlan, SigningPrivateKeyReference, SigningReference,
     SigningTargetKind, validate_profile_for_target,
 };
+use same_file::Handle as FileIdentityHandle;
 
 use crate::cli::{
     ManualSigningSetupArgs, RemoteProviderChoice, SigningArgs, SigningCommand, SigningSetupArgs,
@@ -564,12 +565,7 @@ fn read_signing_asset(
         path: resolved.clone(),
         source,
     })?;
-    let opened = FileSnapshot::capture(&file.metadata().map_err(|source| CliError::Io {
-        action: "inspect open manual signing asset",
-        path: resolved.clone(),
-        source,
-    })?)
-    .map_err(|source| CliError::Io {
+    let opened = FileSnapshot::capture_file(&file).map_err(|source| CliError::Io {
         action: "identify open manual signing asset",
         path: resolved.clone(),
         source,
@@ -589,7 +585,7 @@ fn read_signing_asset(
             path: resolved.clone(),
             source,
         })?;
-    verify_final_asset_state(&resolved, &reader, &bytes.0, initial, maximum, role)?;
+    verify_final_asset_state(&resolved, &reader, &bytes.0, &initial, maximum, role)?;
     Ok(bytes.into_secret())
 }
 
@@ -620,6 +616,11 @@ fn resolve_signing_asset(
             vec![format!("role={role}"), format!("maximum_raw={maximum}")],
         ));
     }
+    let source_snapshot = FileSnapshot::capture_path(path).map_err(|source| CliError::Io {
+        action: "identify manual signing asset",
+        path: path.to_owned(),
+        source,
+    })?;
     let resolved = path.canonicalize_utf8().map_err(|source| CliError::Io {
         action: "resolve manual signing asset",
         path: path.to_owned(),
@@ -633,29 +634,28 @@ fn resolve_signing_asset(
             vec![format!("role={role}")],
         ));
     }
-    let snapshot = FileSnapshot::capture(&initial_metadata).map_err(|source| CliError::Io {
-        action: "identify manual signing asset",
-        path: resolved.clone(),
-        source,
-    })?;
-    Ok((resolved, snapshot))
+    let resolved_snapshot =
+        FileSnapshot::capture_path(&resolved).map_err(|source| CliError::Io {
+            action: "identify resolved manual signing asset",
+            path: resolved.clone(),
+            source,
+        })?;
+    if source_snapshot != resolved_snapshot {
+        return Err(asset_changed(role));
+    }
+    Ok((resolved, resolved_snapshot))
 }
 
 fn verify_final_asset_state(
     resolved: &Utf8Path,
     reader: &io::Take<fs::File>,
     bytes: &[u8],
-    initial: FileSnapshot,
+    initial: &FileSnapshot,
     maximum: u64,
     role: &'static str,
 ) -> Result<(), CliError> {
     let open_final =
-        FileSnapshot::capture(&reader.get_ref().metadata().map_err(|source| CliError::Io {
-            action: "reinspect open manual signing asset",
-            path: resolved.to_owned(),
-            source,
-        })?)
-        .map_err(|source| CliError::Io {
+        FileSnapshot::capture_file(reader.get_ref()).map_err(|source| CliError::Io {
             action: "reidentify open manual signing asset",
             path: resolved.to_owned(),
             source,
@@ -668,16 +668,15 @@ fn verify_final_asset_state(
     if path_final_metadata.file_type().is_symlink() {
         return Err(asset_changed(role));
     }
-    let path_final =
-        FileSnapshot::capture(&path_final_metadata).map_err(|source| CliError::Io {
-            action: "reidentify manual signing asset",
-            path: resolved.to_owned(),
-            source,
-        })?;
+    let path_final = FileSnapshot::capture_path(resolved).map_err(|source| CliError::Io {
+        action: "reidentify manual signing asset",
+        path: resolved.to_owned(),
+        source,
+    })?;
     if bytes.len() as u64 > maximum
         || bytes.len() as u64 != initial.length
-        || open_final != initial
-        || path_final != initial
+        || &open_final != initial
+        || &path_final != initial
     {
         return Err(asset_changed(role));
     }
@@ -707,15 +706,48 @@ fn asset_changed(role: &'static str) -> CliError {
     )
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 struct FileSnapshot {
-    identity: FileIdentity,
+    identity: FileIdentityHandle,
     length: u64,
     modified: Option<SystemTime>,
 }
 
 impl FileSnapshot {
-    fn capture(metadata: &Metadata) -> io::Result<Self> {
+    fn capture_path(path: &Utf8Path) -> io::Result<Self> {
+        let before = fs::symlink_metadata(path)?;
+        Self::validate_metadata(&before)?;
+        let identity = FileIdentityHandle::from_path(path)?;
+        let snapshot = Self::from_identity(identity)?;
+        let after = fs::symlink_metadata(path)?;
+        Self::validate_metadata(&after)?;
+        if !snapshot.matches_metadata(&before)
+            || !snapshot.matches_metadata(&after)
+            || FileIdentityHandle::from_path(path)? != snapshot.identity
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "signing asset changed while its identity was captured",
+            ));
+        }
+        Ok(snapshot)
+    }
+
+    fn capture_file(file: &fs::File) -> io::Result<Self> {
+        Self::from_identity(FileIdentityHandle::from_file(file.try_clone()?)?)
+    }
+
+    fn from_identity(identity: FileIdentityHandle) -> io::Result<Self> {
+        let metadata = identity.as_file().metadata()?;
+        Self::validate_metadata(&metadata)?;
+        Ok(Self {
+            identity,
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+
+    fn validate_metadata(metadata: &Metadata) -> io::Result<()> {
         if !metadata.is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -732,63 +764,13 @@ impl FileSnapshot {
                 ));
             }
         }
-        #[cfg(windows)]
-        let identity = FileIdentity::capture(metadata)?;
-        #[cfg(not(windows))]
-        let identity = FileIdentity::capture(metadata);
-        Ok(Self {
-            identity,
-            length: metadata.len(),
-            modified: metadata.modified().ok(),
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FileIdentity {
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(windows)]
-    volume_serial_number: u32,
-    #[cfg(windows)]
-    file_index: u64,
-    #[cfg(not(any(unix, windows)))]
-    created: Option<SystemTime>,
-}
-
-impl FileIdentity {
-    #[cfg(unix)]
-    fn capture(metadata: &Metadata) -> Self {
-        use std::os::unix::fs::MetadataExt as _;
-        Self {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        }
+        Ok(())
     }
 
-    #[cfg(windows)]
-    fn capture(metadata: &Metadata) -> io::Result<Self> {
-        use std::os::windows::fs::MetadataExt as _;
-        Ok(Self {
-            volume_serial_number: metadata.volume_serial_number().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "file volume identity is unavailable",
-                )
-            })?,
-            file_index: metadata.file_index().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::Unsupported, "file identity is unavailable")
-            })?,
-        })
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    fn capture(metadata: &Metadata) -> Self {
-        Self {
-            created: metadata.created().ok(),
-        }
+    fn matches_metadata(&self, metadata: &Metadata) -> bool {
+        metadata.is_file()
+            && metadata.len() == self.length
+            && metadata.modified().ok() == self.modified
     }
 }
 
@@ -836,14 +818,69 @@ fn manual_error_with_details(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::read_signing_asset;
     use super::{
-        WipingBuffer, password_environment_reference, read_password_from, read_signing_asset,
+        WipingBuffer, password_environment_reference, read_password_from,
         reject_unsupported_extensions, remote, select_device, validate_password,
     };
     use rustferry_remote::SecretBytes;
 
     const DEVICE_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const DEVICE_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn signing_asset_reader_binds_a_stable_file_outside_git() {
+        let project = tempfile::tempdir().expect("project tempdir");
+        std::fs::create_dir(project.path().join(".git")).expect("git marker");
+        let repository_root = camino::Utf8PathBuf::from_path_buf(
+            project.path().canonicalize().expect("canonical project"),
+        )
+        .expect("UTF-8 project");
+        #[cfg(unix)]
+        let outside = tempfile::tempdir_in("/tmp").expect("outside tempdir");
+        #[cfg(not(unix))]
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let asset = camino::Utf8PathBuf::from_path_buf(outside.path().join("development.p12"))
+            .expect("UTF-8 asset");
+        std::fs::write(&asset, b"opaque-asset").expect("asset bytes");
+
+        assert_eq!(
+            super::read_signing_asset(&asset, &repository_root, 32, "certificate_p12")
+                .expect("outside regular asset")
+                .expose_secret_bytes(),
+            b"opaque-asset"
+        );
+    }
+
+    #[test]
+    fn signing_asset_snapshot_rejects_same_metadata_replacement() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let asset = camino::Utf8PathBuf::from_path_buf(temporary.path().join("development.p12"))
+            .expect("UTF-8 asset");
+        let replacement = asset.with_extension("replacement");
+        std::fs::write(&asset, b"first-asset").expect("original asset");
+        std::fs::write(&replacement, b"other-asset").expect("replacement asset");
+        let fixed_modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        for path in [&asset, &replacement] {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .expect("open fixture for timestamp")
+                .set_times(std::fs::FileTimes::new().set_modified(fixed_modified))
+                .expect("set fixture timestamp");
+        }
+
+        let original = super::FileSnapshot::capture_path(&asset).expect("original snapshot");
+        let displaced = asset.with_extension("displaced");
+        std::fs::rename(&asset, &displaced).expect("displace original asset");
+        std::fs::rename(&replacement, &asset).expect("install replacement asset");
+        let current = super::FileSnapshot::capture_path(&asset).expect("replacement snapshot");
+
+        assert_eq!(original.length, current.length);
+        assert_eq!(original.modified, current.modified);
+        assert_ne!(original, current);
+    }
 
     #[test]
     fn stdin_password_strips_one_line_ending_and_allows_empty_passwords() {

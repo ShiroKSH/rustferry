@@ -14,7 +14,10 @@ use std::{
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
-    sync::Arc,
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, RecvTimeoutError},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -33,6 +36,7 @@ const API_ACCEPT: &str = "Accept: application/vnd.github+json";
 const API_VERSION: &str = "X-GitHub-Api-Version: 2022-11-28";
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const MAX_SECRET_SET_OUTPUT_BYTES: usize = 4 * 1024;
+const PROCESS_CLEANUP_GRACE: Duration = Duration::from_secs(1);
 const MAX_API_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_PAGES: u16 = 100;
@@ -2437,26 +2441,28 @@ fn run_process_inner(
 ) -> Result<Vec<u8>, GhExecutionError> {
     let mut child = command.spawn().map_err(|_| GhExecutionError::SpawnFailed)?;
     let mut process_tree = ProcessTreeGuard::attach(&child).inspect_err(|_| {
-        let _ = child.kill();
-        let _ = child.wait();
+        terminate_child(&mut child, process_cleanup_deadline());
     })?;
     let Some(stdout) = child.stdout.take() else {
-        terminate_process_tree(&mut child, &mut process_tree);
+        let cleanup_deadline = process_cleanup_deadline();
+        terminate_process_tree(&mut child, &mut process_tree, cleanup_deadline);
         return Err(GhExecutionError::ProcessIo);
     };
     let Some(stderr) = child.stderr.take() else {
-        terminate_process_tree(&mut child, &mut process_tree);
+        let cleanup_deadline = process_cleanup_deadline();
+        terminate_process_tree(&mut child, &mut process_tree, cleanup_deadline);
         return Err(GhExecutionError::ProcessIo);
     };
     let stdin_writer = if let Some(input) = input {
         let Some(mut stdin) = child.stdin.take() else {
-            terminate_process_tree(&mut child, &mut process_tree);
+            let cleanup_deadline = process_cleanup_deadline();
+            terminate_process_tree(&mut child, &mut process_tree, cleanup_deadline);
             return Err(GhExecutionError::ProcessIo);
         };
         // A bounded zeroizing copy lets timeout handling kill `gh` even if its
         // stdin reader stalls while the writer thread is active.
         let input = SecretBytes::new(input.expose_secret_bytes().to_vec());
-        Some(thread::spawn(move || {
+        Some(spawn_process_worker(move || {
             stdin
                 .write_all(input.expose_secret_bytes())
                 .map_err(|_| GhExecutionError::ProcessIo)
@@ -2464,15 +2470,18 @@ fn run_process_inner(
     } else {
         None
     };
-    let stdout_reader = thread::spawn(move || read_capped(stdout, stdout_limit, retain_stdout));
-    let stderr_reader = thread::spawn(move || read_capped(stderr, MAX_STDERR_BYTES, false));
+    let stdout_reader =
+        spawn_process_worker(move || read_capped(stdout, stdout_limit, retain_stdout));
+    let stderr_reader = spawn_process_worker(move || read_capped(stderr, MAX_STDERR_BYTES, false));
     let Some(deadline) = Instant::now().checked_add(timeout) else {
-        terminate_process_tree(&mut child, &mut process_tree);
-        if let Some(writer) = stdin_writer {
-            let _ = writer.join();
-        }
-        let _ = stdout_reader.join();
-        let _ = stderr_reader.join();
+        let cleanup_deadline = process_cleanup_deadline();
+        terminate_process_tree(&mut child, &mut process_tree, cleanup_deadline);
+        let _ = collect_process_workers(
+            stdin_writer.as_ref(),
+            &stdout_reader,
+            &stderr_reader,
+            cleanup_deadline,
+        );
         return Err(GhExecutionError::TimedOut);
     };
 
@@ -2483,45 +2492,93 @@ fn run_process_inner(
                 thread::sleep(Duration::from_millis(20));
             }
             Ok(None) => {
-                terminate_process_tree(&mut child, &mut process_tree);
-                if let Some(writer) = stdin_writer {
-                    let _ = writer.join();
-                }
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
+                let cleanup_deadline = process_cleanup_deadline();
+                terminate_process_tree(&mut child, &mut process_tree, cleanup_deadline);
+                let _ = collect_process_workers(
+                    stdin_writer.as_ref(),
+                    &stdout_reader,
+                    &stderr_reader,
+                    cleanup_deadline,
+                );
                 return Err(GhExecutionError::TimedOut);
             }
             Err(_) => {
-                terminate_process_tree(&mut child, &mut process_tree);
-                if let Some(writer) = stdin_writer {
-                    let _ = writer.join();
-                }
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
+                let cleanup_deadline = process_cleanup_deadline();
+                terminate_process_tree(&mut child, &mut process_tree, cleanup_deadline);
+                let _ = collect_process_workers(
+                    stdin_writer.as_ref(),
+                    &stdout_reader,
+                    &stderr_reader,
+                    cleanup_deadline,
+                );
                 return Err(GhExecutionError::ProcessIo);
             }
         }
     };
     // `gh` has exited, but a descendant may still hold one of its inherited
-    // pipes open. End the complete supervised tree before joining readers.
+    // pipes open. End the complete supervised tree before collecting output.
     process_tree.terminate_descendants();
-    let stdin_result = stdin_writer
-        .map(|writer| writer.join().map_err(|_| GhExecutionError::ProcessIo)?)
-        .transpose();
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| GhExecutionError::ProcessIo)??;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| GhExecutionError::ProcessIo)??;
+    let (stdout, stderr) = collect_process_workers(
+        stdin_writer.as_ref(),
+        &stdout_reader,
+        &stderr_reader,
+        process_cleanup_deadline(),
+    )?;
     if !status.success() {
         return Err(command_failed(status));
     }
-    stdin_result.map(drop)?;
     if stdout.truncated || stderr.truncated {
         return Err(GhExecutionError::OutputLimitExceeded);
     }
     Ok(stdout.bytes)
+}
+
+fn spawn_process_worker<T>(
+    worker: impl FnOnce() -> Result<T, GhExecutionError> + Send + 'static,
+) -> Receiver<Result<T, GhExecutionError>>
+where
+    T: Send + 'static,
+{
+    let (sender, receiver) = mpsc::sync_channel(1);
+    // Completion is observed through the bounded receiver; the detached handle
+    // must never turn a process timeout into an unbounded thread join.
+    drop(thread::spawn(move || {
+        let _ = sender.send(worker());
+    }));
+    receiver
+}
+
+fn collect_process_workers(
+    stdin_writer: Option<&Receiver<Result<(), GhExecutionError>>>,
+    stdout_reader: &Receiver<Result<CapturedOutput, GhExecutionError>>,
+    stderr_reader: &Receiver<Result<CapturedOutput, GhExecutionError>>,
+    deadline: Instant,
+) -> Result<(CapturedOutput, CapturedOutput), GhExecutionError> {
+    if let Some(stdin_writer) = stdin_writer {
+        receive_process_worker(stdin_writer, deadline)?;
+    }
+    let stdout = receive_process_worker(stdout_reader, deadline)?;
+    let stderr = receive_process_worker(stderr_reader, deadline)?;
+    Ok((stdout, stderr))
+}
+
+fn receive_process_worker<T>(
+    receiver: &Receiver<Result<T, GhExecutionError>>,
+    deadline: Instant,
+) -> Result<T, GhExecutionError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match receiver.recv_timeout(remaining) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+            Err(GhExecutionError::ProcessIo)
+        }
+    }
+}
+
+fn process_cleanup_deadline() -> Instant {
+    Instant::now()
+        .checked_add(PROCESS_CLEANUP_GRACE)
+        .unwrap_or_else(Instant::now)
 }
 
 #[cfg(unix)]
@@ -2574,10 +2631,29 @@ impl Drop for ProcessTreeGuard {
     }
 }
 
-fn terminate_process_tree(child: &mut Child, process_tree: &mut ProcessTreeGuard) {
+fn terminate_process_tree(
+    child: &mut Child,
+    process_tree: &mut ProcessTreeGuard,
+    deadline: Instant,
+) {
     process_tree.terminate_descendants();
+    terminate_child(child, deadline);
+}
+
+fn terminate_child(child: &mut Child, deadline: Instant) {
     let _ = child.kill();
-    let _ = child.wait();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return;
+                }
+                thread::sleep(remaining.min(Duration::from_millis(20)));
+            }
+        }
+    }
 }
 
 fn command_failed(status: ExitStatus) -> GhExecutionError {
@@ -3270,6 +3346,29 @@ mod tests {
         assert!(rendered.contains("status 23"));
     }
 
+    #[test]
+    fn process_worker_drain_stops_at_cleanup_deadline() {
+        let (_stdout_sender, stdout_reader) =
+            mpsc::sync_channel::<Result<CapturedOutput, GhExecutionError>>(1);
+        let (_stderr_sender, stderr_reader) =
+            mpsc::sync_channel::<Result<CapturedOutput, GhExecutionError>>(1);
+        let started = Instant::now();
+        let deadline = started
+            .checked_add(Duration::from_millis(50))
+            .expect("short cleanup deadline");
+
+        let Err(error) = collect_process_workers(None, &stdout_reader, &stderr_reader, deadline)
+        else {
+            panic!("open output pipe must stop at the cleanup deadline");
+        };
+
+        assert_eq!(error, GhExecutionError::ProcessIo);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "bounded output drain exceeded its grace"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn gh_process_runner_timeout_kills_descendants_holding_output_pipes() {
@@ -3280,7 +3379,7 @@ mod tests {
         let executable = executable_directory.path().join("gh");
         fs::write(
             &executable,
-            b"#!/bin/sh\nset -eu\n/bin/cat >/dev/null\n/bin/sleep 30 &\nprintf '%s\\n' \"$!\" > descendant-pid\n/bin/sleep 30\n",
+            b"#!/bin/sh\nset -eu\n/bin/sleep 5 &\nprintf '%s\\n' \"$!\" > descendant-pid\n/bin/cat >/dev/null\n/bin/sleep 5\n",
         )
         .expect("fake gh executable");
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))

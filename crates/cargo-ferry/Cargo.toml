@@ -31,6 +31,7 @@ rustferry-core = { version = "0.1.0", path = "../rustferry-core" }
 rustferry-github = { version = "0.1.0", path = "../rustferry-github" }
 rustferry-remote = { version = "0.1.0", path = "../rustferry-remote" }
 rpassword.workspace = true
+same-file.workspace = true
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true

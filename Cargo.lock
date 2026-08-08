@@ -418,6 +418,7 @@ dependencies = [
  "rustferry-core",
  "rustferry-github",
  "rustferry-remote",
+ "same-file",
  "semver",
  "serde",
  "serde_json",

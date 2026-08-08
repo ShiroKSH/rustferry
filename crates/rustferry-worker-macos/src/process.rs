@@ -1,8 +1,10 @@
 //! Bounded subprocess execution for the worker's fixed Apple tools.
 
+#[cfg(unix)]
+use std::ffi::OsStr;
 use std::{
     collections::BTreeMap,
-    ffi::{OsStr, OsString},
+    ffi::OsString,
     io::Read,
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},

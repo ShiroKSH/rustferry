@@ -33,6 +33,7 @@ use rustferry_remote::{
     SourceLimits, SourceManifest, SourceManifestEntry, SourceMode, UnsignedNestedBundleKind,
     ValidationLevel, plan_source_bundle, validate_source_manifest,
 };
+use same_file::Handle as FileIdentityHandle;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -51,6 +52,7 @@ use crate::project::{
 const CONFIG_SCHEMA_VERSION: u32 = 2;
 const CONFIG_RELATIVE_PATH: &str = "target/ferry/github/provider.json";
 const CONFIG_LOCK_RELATIVE_PATH: &str = "target/ferry/github/.provider.lock";
+const CONFIG_BACKUP_PREFIX: &str = ".provider-backup-";
 const CACHE_RELATIVE_PATH: &str = "target/ferry/github/cache";
 const GIT_ISOLATION_RELATIVE_PATH: &str = "target/ferry/github/git-isolation";
 const WORKFLOW_FILE: &str = "rustferry-goal3-iphone.yml";
@@ -456,6 +458,7 @@ struct ProviderConfigLock {
     _file: File,
 }
 
+#[derive(Debug)]
 enum ConfigCommitError {
     NotCommitted(Box<CliError>),
     CommittedNeedsInspection(Box<CliError>),
@@ -486,74 +489,39 @@ struct ExpectedDownload {
     path: Utf8PathBuf,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ArtifactFileIdentity {
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(windows)]
-    volume_serial_number: u32,
-    #[cfg(windows)]
-    file_index: u64,
-    #[cfg(not(any(unix, windows)))]
-    length: u64,
-    #[cfg(not(any(unix, windows)))]
-    created: std::time::SystemTime,
-    #[cfg(not(any(unix, windows)))]
-    modified: std::time::SystemTime,
-}
+#[derive(Debug, Eq, PartialEq)]
+struct ArtifactFileIdentity(FileIdentityHandle);
 
 impl ArtifactFileIdentity {
     fn capture(path: &Utf8Path) -> std::io::Result<Self> {
         let metadata = fs::symlink_metadata(path)?;
-        Self::from_metadata(&metadata)
-    }
-
-    fn from_metadata(metadata: &fs::Metadata) -> std::io::Result<Self> {
-        if !metadata.file_type().is_file() {
+        Self::validate_metadata(&metadata)?;
+        let identity = FileIdentityHandle::from_path(path)?;
+        Self::validate_metadata(&identity.as_file().metadata()?)?;
+        let final_metadata = fs::symlink_metadata(path)?;
+        Self::validate_metadata(&final_metadata)?;
+        if FileIdentityHandle::from_path(path)? != identity {
             return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "downloaded artifact is not a regular file",
+                std::io::ErrorKind::WouldBlock,
+                "file identity changed while it was captured",
             ));
         }
+        Ok(Self(identity))
+    }
 
-        #[cfg(unix)]
-        let identity = {
-            use std::os::unix::fs::MetadataExt as _;
+    fn from_file(file: &File) -> std::io::Result<Self> {
+        Self::validate_metadata(&file.metadata()?)?;
+        Ok(Self(FileIdentityHandle::from_file(file.try_clone()?)?))
+    }
 
-            Self {
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            }
-        };
-        #[cfg(windows)]
-        let identity = {
-            use std::os::windows::fs::MetadataExt as _;
-
-            Self {
-                volume_serial_number: metadata.volume_serial_number().ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Unsupported,
-                        "artifact volume identity is unavailable",
-                    )
-                })?,
-                file_index: metadata.file_index().ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Unsupported,
-                        "artifact file identity is unavailable",
-                    )
-                })?,
-            }
-        };
-        #[cfg(not(any(unix, windows)))]
-        let identity = Self {
-            length: metadata.len(),
-            created: metadata.created()?,
-            modified: metadata.modified()?,
-        };
-
-        Ok(identity)
+    fn validate_metadata(metadata: &fs::Metadata) -> std::io::Result<()> {
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "file identity target is not a regular file",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -586,11 +554,63 @@ impl ArtifactDownloadRollback {
 impl Drop for ArtifactDownloadRollback {
     fn drop(&mut self) {
         if !self.committed {
-            for artifact in self.created.iter().rev() {
-                if ArtifactFileIdentity::capture(&artifact.path).ok() == Some(artifact.identity) {
-                    let _ = fs::remove_file(&artifact.path);
-                }
+            while let Some(artifact) = self.created.pop() {
+                rollback_created_artifact(artifact);
             }
+        }
+    }
+}
+
+fn rollback_created_artifact(artifact: CreatedArtifact) {
+    rollback_created_artifact_with(artifact, |_| {});
+}
+
+fn rollback_created_artifact_with(
+    artifact: CreatedArtifact,
+    after_quarantine: impl FnOnce(&Utf8Path),
+) {
+    let Some(parent) = artifact.path.parent() else {
+        return;
+    };
+    let Ok(quarantine) = tempfile::Builder::new()
+        .prefix(".rustferry-rollback-")
+        .tempdir_in(parent)
+    else {
+        return;
+    };
+    let Ok(quarantine_root) = Utf8PathBuf::from_path_buf(quarantine.path().to_path_buf()) else {
+        return;
+    };
+    let quarantined = quarantine_root.join("artifact");
+    if fs::rename(&artifact.path, &quarantined).is_err() {
+        return;
+    }
+    after_quarantine(&quarantined);
+
+    let current = ArtifactFileIdentity::capture(&quarantined);
+    let unchanged = current
+        .as_ref()
+        .is_ok_and(|current| current == &artifact.identity);
+    drop(current);
+    drop(artifact.identity);
+    let Ok(temporary_path) = tempfile::TempPath::try_from_path(quarantined.to_path_buf()) else {
+        let _ = quarantine.keep();
+        return;
+    };
+    if unchanged {
+        let _ = temporary_path.close();
+        let _ = quarantine.close();
+        return;
+    }
+
+    match temporary_path.persist_noclobber(&artifact.path) {
+        Ok(()) => {
+            let _ = quarantine.close();
+        }
+        Err(mut error) => {
+            error.path.disable_cleanup(true);
+            drop(error);
+            let _ = quarantine.keep();
         }
     }
 }
@@ -871,7 +891,7 @@ impl<R: ManualSigningRemote> ManualGithubSigningSession<R> {
             &self.root,
             &self.paths.config,
             &bytes,
-            self.original_config_identity,
+            &self.original_config_identity,
             &self.original_config_bytes,
             &self.stored,
             config_lock,
@@ -1124,7 +1144,7 @@ pub fn build_iphone(
     reporter: &Reporter,
 ) -> Result<(), CliError> {
     let RemoteProviderChoice::Github = provider;
-    let stored = load_config(root)?;
+    let (stored, _config_lock) = load_config_for_build(root)?;
     let signing = select_signing_plan(&stored, ferry_config, binary_name, expected_team, unsigned)?;
     let git = git_context(root, &stored.source_remote_name, reporter)?;
     let execution = git_remote_context(&git.root, &stored.execution_remote_name, reporter)?;
@@ -3258,6 +3278,14 @@ fn acquire_provider_config_lock(
     root: &Utf8Path,
     path: &Utf8Path,
 ) -> Result<ProviderConfigLock, CliError> {
+    acquire_provider_config_lock_with_interlock(root, path, || {})
+}
+
+fn acquire_provider_config_lock_with_interlock(
+    root: &Utf8Path,
+    path: &Utf8Path,
+    after_recovery_preflight: impl FnOnce(),
+) -> Result<ProviderConfigLock, CliError> {
     if path != root.join(CONFIG_LOCK_RELATIVE_PATH) {
         return Err(remote_error(
             "unsafe_provider_config_lock",
@@ -3274,6 +3302,8 @@ fn acquire_provider_config_lock(
         )
     })?;
     require_private_directory(parent, "GitHub provider config lock")?;
+    reject_config_recovery_entries(parent)?;
+    after_recovery_preflight();
     if let Ok(metadata) = fs::symlink_metadata(path)
         && (!metadata.is_file() || metadata.file_type().is_symlink())
     {
@@ -3303,7 +3333,7 @@ fn acquire_provider_config_lock(
     })?;
     require_single_link(&metadata, "provider-config lock")?;
     require_private_mode(path, &metadata)?;
-    let opened = ArtifactFileIdentity::from_metadata(&metadata).map_err(|source| CliError::Io {
+    let opened = ArtifactFileIdentity::from_file(&file).map_err(|source| CliError::Io {
         action: "identify open provider-config lock",
         path: path.to_owned(),
         source,
@@ -3339,6 +3369,7 @@ fn acquire_provider_config_lock(
             "Stop concurrent filesystem changes and retry.",
         ));
     }
+    reject_config_recovery_entries(parent)?;
     Ok(ProviderConfigLock { _file: file })
 }
 
@@ -3358,9 +3389,33 @@ fn require_single_link(metadata: &fs::Metadata, label: &'static str) -> Result<(
     Ok(())
 }
 
+fn reject_config_recovery_entries(parent: &Utf8Path) -> Result<(), CliError> {
+    let entries = fs::read_dir(parent).map_err(|source| CliError::Io {
+        action: "inspect provider-config recovery entries",
+        path: parent.to_owned(),
+        source,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| CliError::Io {
+            action: "inspect provider-config recovery entry",
+            path: parent.to_owned(),
+            source,
+        })?;
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with(CONFIG_BACKUP_PREFIX) {
+            return Err(remote_error_with_details(
+                "provider_config_recovery_required",
+                "a preserved provider-config transaction requires inspection",
+                "Restore or remove the preserved transaction only after comparing it with the current provider config.",
+                vec![format!("recovery={}", entry.path().display())],
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ConfigFileState {
-    identity: ArtifactFileIdentity,
     length: u64,
     modified: Option<std::time::SystemTime>,
 }
@@ -3378,18 +3433,34 @@ impl ConfigFileState {
             ));
         }
         require_single_link(metadata, "provider_config")?;
-        let identity =
-            ArtifactFileIdentity::from_metadata(metadata).map_err(|source| CliError::Io {
-                action: "identify GitHub provider config",
-                path: Utf8PathBuf::from(CONFIG_RELATIVE_PATH),
-                source,
-            })?;
         Ok(Self {
-            identity,
             length: metadata.len(),
             modified: metadata.modified().ok(),
         })
     }
+}
+
+fn identify_config_file(
+    file: &File,
+    path: &Utf8Path,
+    action: &'static str,
+) -> Result<ArtifactFileIdentity, CliError> {
+    ArtifactFileIdentity::from_file(file).map_err(|source| CliError::Io {
+        action,
+        path: path.to_owned(),
+        source,
+    })
+}
+
+fn identify_config_path(
+    path: &Utf8Path,
+    action: &'static str,
+) -> Result<ArtifactFileIdentity, CliError> {
+    ArtifactFileIdentity::capture(path).map_err(|source| CliError::Io {
+        action,
+        path: path.to_owned(),
+        source,
+    })
 }
 
 fn read_private_config_snapshot(
@@ -3404,20 +3475,31 @@ fn read_private_config_snapshot(
         ));
     }
     reject_linked_components(root, Utf8Path::new(CONFIG_RELATIVE_PATH), true)?;
-    let initial_metadata = fs::symlink_metadata(path).map_err(|source| {
-        if source.kind() == std::io::ErrorKind::NotFound {
-            remote_error(
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Err(remote_error(
                 "remote_not_configured",
                 "the GitHub remote provider is not configured for this project",
                 "Run `cargo ferry remote setup github --worker-revision <exact-commit>` first.",
-            )
-        } else {
-            CliError::Io {
+            ));
+        }
+        Err(source) => {
+            return Err(CliError::Io {
                 action: "inspect GitHub provider config",
                 path: path.to_owned(),
                 source,
-            }
+            });
         }
+    }
+    read_private_config_file(path)
+}
+
+fn read_private_config_file(path: &Utf8Path) -> Result<(ArtifactFileIdentity, Vec<u8>), CliError> {
+    let initial_metadata = fs::symlink_metadata(path).map_err(|source| CliError::Io {
+        action: "inspect private provider file",
+        path: path.to_owned(),
+        source,
     })?;
     require_private_mode(path, &initial_metadata)?;
     let initial = ConfigFileState::capture(&initial_metadata)?;
@@ -3441,7 +3523,10 @@ fn read_private_config_snapshot(
     })?;
     require_private_mode(path, &opened_metadata)?;
     let opened = ConfigFileState::capture(&opened_metadata)?;
-    if opened != initial {
+    let opened_identity =
+        identify_config_file(&file, path, "identify open GitHub provider config")?;
+    let linked_identity = identify_config_path(path, "identify GitHub provider config path")?;
+    if opened != initial || linked_identity != opened_identity {
         return Err(provider_config_changed());
     }
 
@@ -3456,23 +3541,31 @@ fn read_private_config_snapshot(
             path: path.to_owned(),
             source,
         })?;
-    let final_handle =
+    let final_handle_state =
         ConfigFileState::capture(&file.metadata().map_err(|source| CliError::Io {
             action: "reinspect open GitHub provider config",
             path: path.to_owned(),
             source,
         })?)?;
+    let final_handle_identity =
+        identify_config_file(&file, path, "reidentify open GitHub provider config")?;
     let final_path_metadata = fs::symlink_metadata(path).map_err(|source| CliError::Io {
         action: "reinspect GitHub provider config path",
         path: path.to_owned(),
         source,
     })?;
     require_private_mode(path, &final_path_metadata)?;
-    let final_path = ConfigFileState::capture(&final_path_metadata)?;
-    if bytes.len() as u64 != initial.length || final_handle != initial || final_path != initial {
+    let final_path_state = ConfigFileState::capture(&final_path_metadata)?;
+    let final_path_identity = identify_config_path(path, "reidentify GitHub provider config path")?;
+    if bytes.len() as u64 != initial.length
+        || final_handle_state != initial
+        || final_path_state != initial
+        || final_handle_identity != opened_identity
+        || final_path_identity != opened_identity
+    {
         return Err(provider_config_changed());
     }
-    Ok((initial.identity, bytes))
+    Ok((opened_identity, bytes))
 }
 
 fn provider_config_changed() -> CliError {
@@ -3495,6 +3588,16 @@ fn load_config(root: &Utf8Path) -> Result<StoredGithubConfig, CliError> {
     })?;
     validate_stored_config(&stored)?;
     Ok(stored)
+}
+
+fn load_config_for_build(
+    root: &Utf8Path,
+) -> Result<(StoredGithubConfig, ProviderConfigLock), CliError> {
+    let _ = load_config(root)?;
+    let lock_path = root.join(CONFIG_LOCK_RELATIVE_PATH);
+    let lock = acquire_provider_config_lock(root, &lock_path)?;
+    let stored = load_config(root)?;
+    Ok((stored, lock))
 }
 
 fn encode_stored_config(stored: &StoredGithubConfig) -> Result<Vec<u8>, CliError> {
@@ -3521,10 +3624,33 @@ fn replace_private_config(
     root: &Utf8Path,
     path: &Utf8Path,
     bytes: &[u8],
-    expected_original_identity: ArtifactFileIdentity,
+    expected_original_identity: &ArtifactFileIdentity,
     expected_original_bytes: &[u8],
     expected_installed: &StoredGithubConfig,
     _config_lock: &ProviderConfigLock,
+) -> Result<(), ConfigCommitError> {
+    replace_private_config_with(
+        root,
+        path,
+        bytes,
+        expected_original_identity,
+        expected_original_bytes,
+        expected_installed,
+        || {},
+        |_| {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replace_private_config_with(
+    root: &Utf8Path,
+    path: &Utf8Path,
+    bytes: &[u8],
+    expected_original_identity: &ArtifactFileIdentity,
+    expected_original_bytes: &[u8],
+    expected_installed: &StoredGithubConfig,
+    before_quarantine: impl FnOnce(),
+    after_quarantine: impl FnOnce(&Utf8Path),
 ) -> Result<(), ConfigCommitError> {
     let StagedPrivateConfig { temporary, parent } = stage_private_config(
         root,
@@ -3534,14 +3660,61 @@ fn replace_private_config(
         expected_original_bytes,
     )
     .map_err(|error| ConfigCommitError::NotCommitted(Box::new(error)))?;
-    temporary.persist(path).map_err(|error| {
-        ConfigCommitError::NotCommitted(Box::new(CliError::Io {
-            action: "atomically replace GitHub provider config",
-            path: path.to_owned(),
-            source: error.error,
+    before_quarantine();
+    let quarantine = ConfigQuarantine::capture(&parent, path)
+        .map_err(|error| ConfigCommitError::NotCommitted(Box::new(error)))?;
+    let quarantined_snapshot = read_private_config_file(&quarantine.path);
+    let quarantine_matches = quarantined_snapshot
+        .as_ref()
+        .is_ok_and(|(identity, current)| {
+            identity == expected_original_identity && current == expected_original_bytes
+        });
+    if !quarantine_matches {
+        let cause = quarantined_snapshot
+            .err()
+            .unwrap_or_else(provider_config_changed);
+        return Err(restore_config_or_preserve(quarantine, path, cause));
+    }
+    drop(quarantined_snapshot);
+    if let Err(error) = sync_private_config_directory(&parent) {
+        return Err(restore_config_or_preserve(quarantine, path, error));
+    }
+    after_quarantine(&quarantine.path);
+
+    let installed = match temporary.persist_noclobber(path) {
+        Ok(file) => file,
+        Err(error) => {
+            let recovery = quarantine.keep();
+            return Err(ConfigCommitError::CommittedNeedsInspection(Box::new(
+                remote_error_with_details(
+                    "provider_config_commit_uncertain",
+                    "the provider config could not be installed without overwriting a concurrent path",
+                    "Inspect the current provider config and the preserved original before retrying.",
+                    vec![format!("recovery={recovery}"), error.error.to_string()],
+                ),
+            )));
+        }
+    };
+    drop(installed);
+    if let Err(error) = finish_private_config_commit(root, &parent, expected_installed) {
+        let recovery = quarantine.keep();
+        return Err(ConfigCommitError::CommittedNeedsInspection(Box::new(
+            remote_error_with_details(
+                "provider_config_commit_uncertain",
+                "the updated provider config could not be verified after installation",
+                "Inspect the installed provider config and the preserved original before building.",
+                vec![format!("recovery={recovery}"), error.to_string()],
+            ),
+        )));
+    }
+    quarantine.delete().map_err(|(recovery, source)| {
+        ConfigCommitError::CommittedNeedsInspection(Box::new(CliError::Io {
+            action: "remove verified provider-config backup",
+            path: recovery,
+            source,
         }))
     })?;
-    finish_private_config_commit(root, &parent, expected_installed)
+    sync_private_config_directory(&parent)
         .map_err(|error| ConfigCommitError::CommittedNeedsInspection(Box::new(error)))
 }
 
@@ -3550,11 +3723,120 @@ struct StagedPrivateConfig {
     parent: Utf8PathBuf,
 }
 
+struct ConfigQuarantine {
+    directory: tempfile::TempDir,
+    path: Utf8PathBuf,
+}
+
+impl ConfigQuarantine {
+    fn capture(parent: &Utf8Path, path: &Utf8Path) -> Result<Self, CliError> {
+        let directory = tempfile::Builder::new()
+            .prefix(CONFIG_BACKUP_PREFIX)
+            .tempdir_in(parent)
+            .map_err(|source| CliError::Io {
+                action: "create provider-config backup directory",
+                path: parent.to_owned(),
+                source,
+            })?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_path_buf())
+            .map_err(CliError::NonUtf8Path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).map_err(|source| {
+                CliError::Io {
+                    action: "secure provider-config backup directory",
+                    path: root.clone(),
+                    source,
+                }
+            })?;
+        }
+        require_private_directory(&root, "provider-config backup")?;
+        let quarantined = root.join("provider.json");
+        fs::rename(path, &quarantined).map_err(|source| CliError::Io {
+            action: "quarantine original provider config",
+            path: path.to_owned(),
+            source,
+        })?;
+        Ok(Self {
+            directory,
+            path: quarantined,
+        })
+    }
+
+    fn keep(self) -> Utf8PathBuf {
+        let path = self.path.clone();
+        let _ = self.directory.keep();
+        path
+    }
+
+    fn restore_noclobber(
+        self,
+        destination: &Utf8Path,
+    ) -> Result<(), (Utf8PathBuf, std::io::Error)> {
+        let recovery = self.path.clone();
+        let temporary = match tempfile::TempPath::try_from_path(self.path.to_path_buf()) {
+            Ok(temporary) => temporary,
+            Err(source) => {
+                let _ = self.directory.keep();
+                return Err((recovery, source));
+            }
+        };
+        match temporary.persist_noclobber(destination) {
+            Ok(()) => {
+                let _ = self.directory.close();
+                Ok(())
+            }
+            Err(mut error) => {
+                error.path.disable_cleanup(true);
+                let source = error.error;
+                drop(error.path);
+                let _ = self.directory.keep();
+                Err((recovery, source))
+            }
+        }
+    }
+
+    fn delete(self) -> Result<(), (Utf8PathBuf, std::io::Error)> {
+        let recovery = self.path.clone();
+        if let Err(source) = fs::remove_file(&self.path) {
+            let _ = self.directory.keep();
+            return Err((recovery, source));
+        }
+        match self.directory.close() {
+            Ok(()) => Ok(()),
+            Err(source) => Err((recovery, source)),
+        }
+    }
+}
+
+fn restore_config_or_preserve(
+    quarantine: ConfigQuarantine,
+    destination: &Utf8Path,
+    cause: CliError,
+) -> ConfigCommitError {
+    match quarantine.restore_noclobber(destination) {
+        Ok(()) => ConfigCommitError::NotCommitted(Box::new(cause)),
+        Err((recovery, source)) => {
+            ConfigCommitError::CommittedNeedsInspection(Box::new(remote_error_with_details(
+                "provider_config_recovery_required",
+                "the changed provider config could not be restored without overwriting another path",
+                "Inspect the current provider config and preserved file before retrying.",
+                vec![
+                    format!("recovery={recovery}"),
+                    source.to_string(),
+                    cause.to_string(),
+                ],
+            )))
+        }
+    }
+}
+
 fn stage_private_config(
     root: &Utf8Path,
     path: &Utf8Path,
     bytes: &[u8],
-    expected_original_identity: ArtifactFileIdentity,
+    expected_original_identity: &ArtifactFileIdentity,
     expected_original_bytes: &[u8],
 ) -> Result<StagedPrivateConfig, CliError> {
     reject_linked_components(root, Utf8Path::new(CONFIG_RELATIVE_PATH), true)?;
@@ -3617,14 +3899,7 @@ fn finish_private_config_commit(
     parent: &Utf8Path,
     expected_installed: &StoredGithubConfig,
 ) -> Result<(), CliError> {
-    #[cfg(unix)]
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|source| CliError::Io {
-            action: "synchronize GitHub provider config directory",
-            path: parent.to_owned(),
-            source,
-        })?;
+    sync_private_config_directory(parent)?;
     let installed = load_config(root)?;
     if &installed != expected_installed {
         return Err(remote_error(
@@ -3636,14 +3911,26 @@ fn finish_private_config_commit(
     Ok(())
 }
 
+fn sync_private_config_directory(parent: &Utf8Path) -> Result<(), CliError> {
+    #[cfg(unix)]
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| CliError::Io {
+            action: "synchronize GitHub provider config directory",
+            path: parent.to_owned(),
+            source,
+        })?;
+    Ok(())
+}
+
 fn ensure_config_snapshot_unchanged(
     root: &Utf8Path,
     path: &Utf8Path,
-    expected_identity: ArtifactFileIdentity,
+    expected_identity: &ArtifactFileIdentity,
     expected_bytes: &[u8],
 ) -> Result<(), CliError> {
     let (identity, current_bytes) = read_private_config_snapshot(root, path)?;
-    if identity != expected_identity || current_bytes != expected_bytes {
+    if &identity != expected_identity || current_bytes != expected_bytes {
         return Err(provider_config_changed());
     }
     Ok(())
@@ -4444,18 +4731,20 @@ mod tests {
         ManualSigningRemote, PROTECTED_ENVIRONMENT, RawSigningPassword, StoredGithubConfig,
         TEMPORARY_NAMESPACE, WORKFLOW_FILE, acquire_provider_config_lock, downloaded_manifest,
         encode_stored_config, ensure_config_snapshot_unchanged, ensure_doctor_ready,
-        ensure_provider_directories, ensure_workflow_directory, executable_entrypoint,
-        expected_artifact_downloads, load_config, parse_repository_spec, preflight_file,
-        prepare_artifact_destination, provider_config_lock_for_signing,
-        read_private_config_snapshot, remote_error, replace_private_config,
-        required_signing_secret_names, retry_artifact_listing, source_manifest_digest,
-        unsigned_signing_plan, validate_git_remote_name, validate_stored_config, write_create_only,
+        ensure_provider_directories, ensure_workflow_directory, expected_artifact_downloads,
+        load_config, parse_repository_spec, preflight_file, prepare_artifact_destination,
+        provider_config_lock_for_signing, read_private_config_snapshot, remote_error,
+        replace_private_config, required_signing_secret_names, retry_artifact_listing,
+        source_manifest_digest, unsigned_signing_plan, validate_git_remote_name,
+        validate_stored_config, write_create_only,
     };
     use std::cell::RefCell;
     use std::collections::{BTreeSet, VecDeque};
     use std::rc::Rc;
     use std::time::{Duration, Instant};
 
+    #[cfg(unix)]
+    use super::executable_entrypoint;
     use crate::error::CliError;
     use crate::output::Reporter;
     use rustferry_github::transport::{
@@ -4867,7 +5156,7 @@ mod tests {
         same_length_mutation[0] ^= 1;
         std::fs::write(&paths.config, &same_length_mutation).expect("same-length mutation");
         assert_eq!(
-            ensure_config_snapshot_unchanged(&root, &paths.config, identity, &original)
+            ensure_config_snapshot_unchanged(&root, &paths.config, &identity, &original)
                 .expect_err("content mutation must fail")
                 .code(),
             "provider_config_changed"
@@ -4882,11 +5171,48 @@ mod tests {
         std::fs::rename(&paths.config, &displaced).expect("displace original config");
         std::fs::rename(&replacement, &paths.config).expect("replace config path");
         assert_eq!(
-            ensure_config_snapshot_unchanged(&root, &paths.config, identity, &original)
+            ensure_config_snapshot_unchanged(&root, &paths.config, &identity, &original)
                 .expect_err("identity replacement must fail")
                 .code(),
             "provider_config_changed"
         );
+    }
+
+    #[test]
+    fn build_config_rejects_an_unresolved_recovery_backup() {
+        let (_temporary, root, paths, expected) = provider_config_fixture();
+        let recovery = paths
+            .config
+            .parent()
+            .expect("provider parent")
+            .join(format!("{}fixture", super::CONFIG_BACKUP_PREFIX));
+        std::fs::create_dir(&recovery).expect("recovery directory");
+
+        assert_eq!(load_config(&root).expect("inspectable config"), expected);
+        let Err(error) = super::load_config_for_build(&root) else {
+            panic!("build must stop for unresolved recovery");
+        };
+        assert_eq!(error.code(), "provider_config_recovery_required");
+    }
+
+    #[test]
+    fn config_lock_rechecks_recovery_after_the_preflight_window() {
+        let (_temporary, root, paths, _config) = provider_config_fixture();
+        let recovery = paths
+            .config
+            .parent()
+            .expect("provider parent")
+            .join(format!("{}interleaved", super::CONFIG_BACKUP_PREFIX));
+
+        let Err(error) =
+            super::acquire_provider_config_lock_with_interlock(&root, &paths.config_lock, || {
+                std::fs::create_dir(&recovery).expect("interleaved recovery directory");
+            })
+        else {
+            panic!("post-lock recovery recheck must fail");
+        };
+
+        assert_eq!(error.code(), "provider_config_recovery_required");
     }
 
     #[test]
@@ -4906,17 +5232,115 @@ mod tests {
             &root,
             &paths.config,
             &installed_bytes,
-            identity,
+            &identity,
             &original_bytes,
             &wrong_expectation,
             &config_lock,
         )
         .expect_err("post-commit mismatch must be typed");
-        assert!(matches!(
-            error,
-            ConfigCommitError::CommittedNeedsInspection(_)
-        ));
+        assert!(
+            matches!(error, ConfigCommitError::CommittedNeedsInspection(_)),
+            "unexpected commit state: {error:?}"
+        );
         assert_eq!(load_config(&root).expect("committed config"), installed);
+    }
+
+    #[test]
+    fn provider_config_commit_does_not_overwrite_a_late_replacement() {
+        let (_temporary, root, paths, original_config) = provider_config_fixture();
+        let config_lock =
+            acquire_provider_config_lock(&root, &paths.config_lock).expect("config lock");
+        let (identity, original_bytes) =
+            read_private_config_snapshot(&root, &paths.config).expect("original snapshot");
+        let mut installed = original_config.clone();
+        installed.worker_version = "0.1.1".to_owned();
+        let installed_bytes = encode_stored_config(&installed).expect("installed bytes");
+        let late = paths.config.with_extension("late");
+
+        let error = super::replace_private_config_with(
+            &root,
+            &paths.config,
+            &installed_bytes,
+            &identity,
+            &original_bytes,
+            &installed,
+            || {
+                write_create_only(&late, &original_bytes, true).expect("late replacement");
+                std::fs::remove_file(&paths.config).expect("remove original path");
+                std::fs::rename(&late, &paths.config).expect("install late replacement");
+            },
+            |_| {},
+        )
+        .expect_err("late replacement must abort commit");
+
+        assert!(matches!(error, ConfigCommitError::NotCommitted(_)));
+        assert_eq!(
+            std::fs::read(&paths.config).expect("preserved late replacement"),
+            original_bytes
+        );
+        assert_eq!(
+            load_config(&root).expect("restored config"),
+            original_config
+        );
+        drop(config_lock);
+    }
+
+    #[test]
+    fn provider_config_commit_preserves_an_occupied_path_and_backup() {
+        let (_temporary, root, paths, original_config) = provider_config_fixture();
+        let config_lock =
+            acquire_provider_config_lock(&root, &paths.config_lock).expect("config lock");
+        let (identity, original_bytes) =
+            read_private_config_snapshot(&root, &paths.config).expect("original snapshot");
+        let mut installed = original_config.clone();
+        installed.worker_version = "0.1.1".to_owned();
+        let installed_bytes = encode_stored_config(&installed).expect("installed bytes");
+        let occupied = b"concurrent provider config";
+
+        let error = super::replace_private_config_with(
+            &root,
+            &paths.config,
+            &installed_bytes,
+            &identity,
+            &original_bytes,
+            &installed,
+            || {},
+            |_| {
+                std::fs::write(&paths.config, occupied).expect("occupy provider config path");
+            },
+        )
+        .expect_err("occupied path must make commit uncertain");
+
+        assert!(
+            matches!(error, ConfigCommitError::CommittedNeedsInspection(_)),
+            "unexpected commit state: {error:?}"
+        );
+        assert_eq!(
+            std::fs::read(&paths.config).expect("preserved occupied path"),
+            occupied
+        );
+        let parent = paths.config.parent().expect("provider parent");
+        let recovery = std::fs::read_dir(parent)
+            .expect("provider directory")
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(super::CONFIG_BACKUP_PREFIX)
+            })
+            .expect("preserved backup");
+        assert_eq!(
+            std::fs::read(recovery.path().join("provider.json")).expect("backup bytes"),
+            original_bytes
+        );
+        assert_eq!(
+            super::reject_config_recovery_entries(parent)
+                .expect_err("recovery entry must block another mutation")
+                .code(),
+            "provider_config_recovery_required"
+        );
+        drop(config_lock);
     }
 
     #[test]
@@ -5386,6 +5810,29 @@ mod tests {
             b"user replacement"
         );
         assert!(!supporting.exists());
+    }
+
+    #[test]
+    fn partial_download_rollback_never_unlinks_a_new_path_occupant() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let root = camino::Utf8Path::from_path(temporary.path()).expect("UTF-8 temp path");
+        let primary = root.join("new.ipa");
+        std::fs::write(&primary, b"downloaded primary").expect("primary download");
+        let artifact = super::CreatedArtifact {
+            identity: super::ArtifactFileIdentity::capture(&primary)
+                .expect("record primary identity"),
+            path: primary.clone(),
+        };
+
+        super::rollback_created_artifact_with(artifact, |_| {
+            std::fs::write(&primary, b"concurrent replacement")
+                .expect("install concurrent replacement");
+        });
+
+        assert_eq!(
+            std::fs::read(&primary).expect("preserved concurrent replacement"),
+            b"concurrent replacement"
+        );
     }
 
     #[test]
