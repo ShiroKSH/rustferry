@@ -3353,7 +3353,11 @@ mod tests {
             "workspace/source/target/Weather.xcarchive"
         );
 
-        let traversal = root.path.join("workspace").join("..").join("outside");
+        let separator = std::path::MAIN_SEPARATOR;
+        let traversal = Utf8PathBuf::from(format!(
+            "{}{separator}workspace{separator}..{separator}outside",
+            root.path
+        ));
         assert_eq!(
             WorkerRelativePath::from_absolute_under(&root.path, &traversal),
             Err(WorkerJobError::InvalidWorkerPath)
