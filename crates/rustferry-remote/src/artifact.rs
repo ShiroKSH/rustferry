@@ -1341,7 +1341,7 @@ fn inspect_unsigned_app_bundle_from_capability(
         ExpectedMachOKind::Executable,
     );
     for (relative, expected) in &expected_nested {
-        let nested_info_path = Utf8Path::new(relative).join("Info.plist");
+        let nested_info_path = Utf8PathBuf::from(format!("{relative}/Info.plist"));
         let nested_info = read_filesystem_plist(filesystem, &nested_info_path)?;
         validate_plist_string(
             path,
