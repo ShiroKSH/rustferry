@@ -2305,11 +2305,12 @@ mod tests {
         );
         let service = explicit_service(&project);
         let plan = service.plan(&request).expect("plan");
+        let canonical_project = project.canonicalize_utf8().expect("canonical project");
         assert!(plan.cargo_command.program.is_absolute());
         assert!(plan.xcodebuild_command.program.is_absolute());
         assert_eq!(
             plan.xcodebuild_command.environment.get("DEVELOPER_DIR"),
-            Some(&OsString::from(project.as_str()))
+            Some(&OsString::from(canonical_project.as_str()))
         );
         assert!(
             !plan
