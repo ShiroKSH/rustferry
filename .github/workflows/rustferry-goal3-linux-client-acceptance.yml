@@ -3,7 +3,7 @@ name: RustFerry Goal 3 Linux client acceptance
 on:
   push:
     branches:
-      - 'goal3/integrate-goal2'
+      - 'master'
     paths:
       - '.github/workflows/rustferry-goal3-linux-client-acceptance.yml'
       - '.github/workflows/rustferry-goal3-iphone.yml'
@@ -26,6 +26,7 @@ concurrency:
 jobs:
   linux-client:
     name: Linux client to remote unsigned iPhone archive
+    if: vars.RUSTFERRY_GOAL3_ACCEPTANCE_ENABLED == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     permissions:
@@ -37,7 +38,7 @@ jobs:
       CARGO_TERM_COLOR: 'never'
       RUST_BACKTRACE: '0'
       RUSTUP_TOOLCHAIN: '1.92.0'
-      RUSTFERRY_WORKER_REVISION: '6658643e9646c97efa7977923ba770e002f7b8a4'
+      RUSTFERRY_WORKER_REVISION: '088dedfd1462875f69584db738f5626680b02c91'
     steps:
       - name: Checkout exact acceptance source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -117,7 +118,7 @@ jobs:
             --execution-repository ShiroKSH/rustferry \
             --source-remote-name origin \
             --execution-remote-name origin \
-            --trusted-ref refs/heads/goal3/integrate-goal2 \
+            --trusted-ref refs/heads/master \
             --worker-repository https://github.com/ShiroKSH/rustferry \
             --worker-revision "$RUSTFERRY_WORKER_REVISION" \
             --worker-version 0.1.0 \
