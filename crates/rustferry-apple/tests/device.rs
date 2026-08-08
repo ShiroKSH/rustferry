@@ -7,7 +7,8 @@ use std::process::Command;
 use camino::Utf8Path;
 #[cfg(target_os = "macos")]
 use rustferry_apple::{
-    AppleDiscoveryOptions, build_ios_device_unsigned, discover_apple, write_ios_project,
+    AppleDiscoveryOptions, IosAssetPackaging, build_ios_device_unsigned, discover_apple,
+    write_ios_project,
 };
 use rustferry_apple::{
     IOS_DEVICE_TARGET, IosDeviceArchiveRequest, IosDeviceArtifactDisposition, IosDeviceSdk,
@@ -320,7 +321,8 @@ fn xcode_archives_real_unsigned_device_products_for_structural_validation() {
         let assets = ProjectAssets::load(root).unwrap();
         let generated = generate_ios_project_for_platform(
             &IosProjectSpec::new(request.config.clone(), request.binary_name.clone())
-                .with_assets(assets),
+                .with_assets(assets)
+                .with_asset_packaging(IosAssetPackaging::SdkOnlyResources),
             IosProjectPlatform::DeviceUnsigned,
         )
         .unwrap();

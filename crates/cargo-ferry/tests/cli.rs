@@ -70,6 +70,786 @@ fn accepts_cargo_injected_subcommand_and_emits_stable_json() {
 }
 
 #[test]
+fn ide_handshake_is_a_direct_deterministic_protocol_document() {
+    let first = cargo_bin_cmd!("cargo-ferry")
+        .env_remove("CARGO_FERRY_RUNTIME_PATH")
+        .args(["ide", "handshake", "--json"])
+        .output()
+        .expect("run IDE handshake");
+    let second = cargo_bin_cmd!("cargo-ferry")
+        .env_remove("CARGO_FERRY_RUNTIME_PATH")
+        .args(["ide", "handshake", "--json"])
+        .output()
+        .expect("run IDE handshake again");
+
+    assert!(first.status.success());
+    assert!(first.stderr.is_empty());
+    assert!(!first.stdout.contains(&0x1b));
+    assert_eq!(first.stdout, second.stdout);
+    assert_eq!(first.stdout.split(|byte| *byte == b'\n').count(), 2);
+    let document: Value = serde_json::from_slice(&first.stdout).expect("valid handshake JSON");
+    assert_eq!(document["protocol_version"], 1);
+    assert_eq!(document["tool"]["name"], "cargo-ferry");
+    assert_eq!(
+        document["supported_protocol_versions"],
+        serde_json::json!([1])
+    );
+    assert!(
+        document["supported_commands"]
+            .as_array()
+            .expect("supported command list")
+            .iter()
+            .any(|command| command == "check")
+    );
+    assert_eq!(document["runtime_dependency"]["source"], "registry");
+    assert_eq!(document["runtime_dependency"]["usable"], false);
+    assert!(document.get("schema_version").is_none());
+}
+
+#[test]
+fn ide_handshake_accepts_an_explicit_runtime_path_override() {
+    let runtime = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../rustferry");
+    let output = cargo_bin_cmd!("cargo-ferry")
+        .env("CARGO_FERRY_RUNTIME_PATH", runtime)
+        .args(["ide", "handshake", "--json"])
+        .output()
+        .expect("run IDE handshake with a runtime path override");
+
+    assert!(output.status.success());
+    let document: Value = serde_json::from_slice(&output.stdout).expect("valid handshake JSON");
+    assert_eq!(document["runtime_dependency"]["source"], "path");
+    assert_eq!(document["runtime_dependency"]["usable"], true);
+}
+
+#[test]
+fn ide_validate_returns_zero_based_diagnostics_for_unicode_workspace() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let project = generate_project(temporary.path(), "Приложение Ferry");
+    let path = project.join("ferry.toml");
+    let source = fs::read_to_string(&path)
+        .expect("generated configuration")
+        .lines()
+        .map(|line| {
+            if line.starts_with("identifier = ") {
+                "identifier = \"not-an-identifier\""
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&path, source).expect("write invalid identifier");
+
+    let output = cargo_bin_cmd!("cargo-ferry")
+        .args(["ide", "validate", "--workspace"])
+        .arg(&project)
+        .arg("--json")
+        .output()
+        .expect("run IDE validation");
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let document: Value = serde_json::from_slice(&output.stdout).expect("valid validation JSON");
+    assert_eq!(document["protocol_version"], 1);
+    assert_eq!(document["valid"], false);
+    let diagnostic = &document["diagnostics"][0];
+    assert_eq!(
+        diagnostic["file"],
+        path.canonicalize()
+            .expect("canonical configuration")
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert_eq!(diagnostic["range"]["start"]["character"], 0);
+}
+
+#[test]
+fn ide_validate_uses_unsaved_manifest_stdin_without_writing_it_to_disk() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let project = generate_project(temporary.path(), "stdin-validation");
+    let path = project.join("ferry.toml");
+    let saved = fs::read_to_string(&path).expect("generated configuration");
+    let unsaved = saved
+        .lines()
+        .map(|line| {
+            if line.starts_with("identifier = ") {
+                "identifier = \"not-an-identifier\""
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let output = cargo_bin_cmd!("cargo-ferry")
+        .args(["ide", "validate", "--workspace"])
+        .arg(&project)
+        .args(["--manifest-stdin", "--json"])
+        .write_stdin(unsaved)
+        .output()
+        .expect("validate unsaved IDE source");
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let document: Value = serde_json::from_slice(&output.stdout).expect("validation response");
+    assert_eq!(document["valid"], false);
+    assert_eq!(
+        document["diagnostics"][0]["file"],
+        path.canonicalize()
+            .expect("canonical configuration")
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert_eq!(document["diagnostics"][0]["range"]["start"]["character"], 0);
+    assert_eq!(
+        fs::read_to_string(path).expect("saved configuration after validation"),
+        saved
+    );
+}
+
+#[test]
+fn ide_validate_rejects_oversized_or_non_utf8_manifest_stdin() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let project = generate_project(temporary.path(), "bounded-stdin-validation");
+
+    let oversized = cargo_bin_cmd!("cargo-ferry")
+        .args(["ide", "validate", "--workspace"])
+        .arg(&project)
+        .args(["--manifest-stdin", "--json"])
+        .write_stdin(vec![b' '; 1024 * 1024 + 1])
+        .output()
+        .expect("reject oversized IDE source");
+    assert_eq!(oversized.status.code(), Some(2));
+    assert!(oversized.stderr.is_empty());
+    let oversized: Value = serde_json::from_slice(&oversized.stdout).expect("bounded error");
+    assert_eq!(oversized["error"]["code"], "ide_manifest_input_too_large");
+    assert_eq!(oversized["error"]["details"][0], "limit_bytes=1048576");
+
+    let invalid_utf8 = cargo_bin_cmd!("cargo-ferry")
+        .args(["ide", "validate", "--workspace"])
+        .arg(&project)
+        .args(["--manifest-stdin", "--json"])
+        .write_stdin(vec![0xff, 0xfe])
+        .output()
+        .expect("reject non-UTF-8 IDE source");
+    assert_eq!(invalid_utf8.status.code(), Some(2));
+    assert!(invalid_utf8.stderr.is_empty());
+    let invalid_utf8: Value = serde_json::from_slice(&invalid_utf8.stdout).expect("UTF-8 error");
+    assert_eq!(
+        invalid_utf8["error"]["code"],
+        "ide_manifest_input_invalid_utf8"
+    );
+}
+
+#[test]
+fn ide_stream_closes_failed_operation_without_partial_json() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let missing = temporary.path().join("Missing Ferry Project");
+    fs::create_dir(&missing).expect("missing project directory");
+    let output = cargo_bin_cmd!("cargo-ferry")
+        .args(["ide", "build", "--workspace"])
+        .arg(&missing)
+        .args([
+            "--platform",
+            "android",
+            "--operation-id",
+            "test:missing-project",
+            "--json-stream",
+        ])
+        .output()
+        .expect("run failed IDE build");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stderr.is_empty());
+    assert!(output.stdout.ends_with(b"\n"));
+    let events = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<Value>(line).expect("complete event object"))
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0]["event"], "operation_started");
+    assert_eq!(events[1]["event"], "diagnostic");
+    assert_eq!(events[2]["event"], "operation_finished");
+    assert_eq!(events[2]["success"], false);
+    assert!(
+        events
+            .iter()
+            .all(|event| event["operation_id"] == "test:missing-project")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn ide_logs_stream_incrementally_until_ctrl_c_then_emits_only_cancellation_terminal() {
+    use std::io::{BufRead as _, BufReader, Read as _};
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::time::{Duration, Instant};
+
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let project = generate_project(temporary.path(), "streaming_logs");
+    let tools = temporary.path().join("tools");
+    fs::create_dir(&tools).expect("fake tool directory");
+    let fake_adb = tools.join("adb");
+    fs::write(
+        &fake_adb,
+        include_bytes!("fixtures/deployment/fake-log-tool.sh"),
+    )
+    .expect("write fake adb");
+    let mut permissions = fs::metadata(&fake_adb)
+        .expect("fake adb metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_adb, permissions).expect("make fake adb executable");
+    let path = std::env::join_paths(std::iter::once(tools).chain(std::env::split_paths(
+        &std::env::var_os("PATH").expect("test PATH"),
+    )))
+    .expect("combined PATH");
+    let descendant_pid_file = temporary.path().join("log-descendant.pid");
+
+    let mut cli = Command::new(env!("CARGO_BIN_EXE_cargo-ferry"))
+        .args(["ide", "logs", "--workspace"])
+        .arg(&project)
+        .args([
+            "--platform",
+            "android",
+            "--device",
+            "serial",
+            "--operation-id",
+            "test:streaming-logs",
+            "--json-stream",
+        ])
+        .env("PATH", path)
+        .env("RUSTFERRY_FAKE_HOLD", "1")
+        .env("RUSTFERRY_FAKE_DESCENDANT_PID", &descendant_pid_file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start streaming IDE logs");
+    let stdout = cli.stdout.take().expect("streaming stdout");
+    let (line_sender, line_receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if line_sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut events = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "IDE log event was not emitted incrementally"
+        );
+        let line = line_receiver
+            .recv_timeout(remaining)
+            .expect("streamed IDE protocol line")
+            .expect("UTF-8 streamed IDE protocol line");
+        let event: Value = serde_json::from_str(&line).expect("complete streamed event");
+        let is_application_log = event["event"] == "log" && event["message"] == "android ready";
+        events.push(event);
+        if is_application_log {
+            break;
+        }
+    }
+    assert!(
+        cli.try_wait()
+            .expect("probe active IDE log stream")
+            .is_none(),
+        "IDE log command exited after a finite snapshot"
+    );
+
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-INT", &cli.id().to_string()])
+            .status()
+            .expect("signal IDE log command")
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = cli.try_wait().expect("wait for IDE log cancellation") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "IDE log command did not exit after Ctrl+C"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(130));
+
+    loop {
+        match line_receiver.recv_timeout(Duration::from_secs(1)) {
+            Ok(Ok(line)) => events.push(serde_json::from_str(&line).expect("terminal event")),
+            Ok(Err(error)) => panic!("streaming stdout was not UTF-8: {error}"),
+            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => panic!("streaming stdout remained open"),
+        }
+    }
+    let mut stderr = String::new();
+    cli.stderr
+        .take()
+        .expect("streaming stderr")
+        .read_to_string(&mut stderr)
+        .expect("read streaming stderr");
+    assert!(stderr.is_empty());
+    assert_eq!(
+        events.last().expect("terminal event")["event"],
+        "operation_cancelled"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["event"] == "operation_finished"),
+        "cancelled stream emitted a second terminal event"
+    );
+
+    let descendant_pid = fs::read_to_string(descendant_pid_file)
+        .expect("fake adb descendant PID")
+        .trim()
+        .to_owned();
+    assert!(
+        !Command::new("/bin/kill")
+            .args(["-0", &descendant_pid])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("probe fake adb descendant")
+            .success(),
+        "fake adb descendant survived IDE log cancellation"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ide_check_stream_emits_real_rustc_diagnostics_without_platform_build() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let project = generate_project(temporary.path(), "rust-check-diagnostic");
+    let tools = temporary.path().join("tools");
+    fs::create_dir(&tools).expect("fake tool directory");
+    let fake_cargo = tools.join("cargo");
+    fs::write(
+        &fake_cargo,
+        r#"#!/bin/sh
+printf '%s\n' '{"reason":"compiler-message","message":{"message":"mismatched types","code":{"code":"E0308","explanation":null},"level":"error","spans":[{"file_name":"src/app.rs","line_start":7,"line_end":7,"column_start":5,"column_end":8,"is_primary":true,"text":[{"text":"    bad","highlight_start":5,"highlight_end":8}]}],"children":[{"message":"use the expected type","level":"help"}],"rendered":"error[E0308]: mismatched types\n --> src/app.rs:7:5\n"}}'
+exit 101
+"#,
+    )
+    .expect("fake Cargo executable");
+    let mut permissions = fs::metadata(&fake_cargo)
+        .expect("fake Cargo metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_cargo, permissions).expect("make fake Cargo executable");
+    let path = std::env::join_paths(std::iter::once(tools).chain(std::env::split_paths(
+        &std::env::var_os("PATH").expect("test PATH"),
+    )))
+    .expect("combined PATH");
+
+    let output = cargo_bin_cmd!("cargo-ferry")
+        .env("PATH", path)
+        .args(["ide", "check", "--workspace"])
+        .arg(&project)
+        .args([
+            "--operation-id",
+            "test:rust-check-diagnostic",
+            "--json-stream",
+        ])
+        .output()
+        .expect("run IDE Rust check with compiler failure");
+
+    assert_eq!(output.status.code(), Some(4));
+    assert!(output.stderr.is_empty());
+    let events = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<Value>(line).expect("complete event object"))
+        .collect::<Vec<_>>();
+    assert_eq!(events[0]["event"], "operation_started");
+    assert_eq!(events[0]["command"], "check");
+    assert_eq!(events[1]["event"], "phase_started");
+    assert_eq!(events[1]["phase"], "rust_check");
+    assert_eq!(events[2]["event"], "command_started");
+    assert_eq!(events[2]["tool"], "cargo");
+    let diagnostic = events
+        .iter()
+        .find(|event| {
+            event["event"] == "diagnostic" && event["diagnostic"]["code"] == "rustc.E0308"
+        })
+        .expect("structured rustc diagnostic");
+    assert_eq!(
+        diagnostic["diagnostic"]["file"],
+        project
+            .canonicalize()
+            .expect("canonical project")
+            .join("src/app.rs")
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert_eq!(diagnostic["diagnostic"]["range"]["start"]["line"], 6);
+    assert_eq!(diagnostic["diagnostic"]["range"]["start"]["character"], 4);
+    assert_eq!(events[events.len() - 2]["event"], "phase_finished");
+    assert_eq!(events[events.len() - 2]["success"], false);
+    assert_eq!(
+        events.last().expect("terminal event")["event"],
+        "operation_finished"
+    );
+    assert_eq!(events.last().expect("terminal event")["success"], false);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "diagnostic")
+            .count(),
+        1,
+        "a Rust source error must not create a second ferry.toml diagnostic"
+    );
+    assert!(!events.iter().any(|event| event["event"] == "artifact"));
+}
+
+#[cfg(unix)]
+#[test]
+fn ide_check_ctrl_c_emits_one_cancellation_terminal() {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let project = generate_project(temporary.path(), "interruptible-ide-check");
+    let tools = temporary.path().join("tools");
+    fs::create_dir(&tools).expect("fake tool directory");
+    let cargo_pid_path = temporary.path().join("cargo.pid");
+    let fake_cargo = tools.join("cargo");
+    fs::write(
+        &fake_cargo,
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$FERRY_TEST_CARGO_PID_FILE\"\nwhile :; do sleep 10; done\n",
+    )
+    .expect("fake cargo executable");
+    let mut permissions = fs::metadata(&fake_cargo)
+        .expect("fake Cargo metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_cargo, permissions).expect("make fake Cargo executable");
+    let path = std::env::join_paths(std::iter::once(tools).chain(std::env::split_paths(
+        &std::env::var_os("PATH").expect("test PATH"),
+    )))
+    .expect("combined PATH");
+    let mut cli = Command::new(env!("CARGO_BIN_EXE_cargo-ferry"))
+        .args(["ide", "check", "--workspace"])
+        .arg(&project)
+        .args([
+            "--operation-id",
+            "test:interruptible-check",
+            "--json-stream",
+        ])
+        .env("PATH", path)
+        .env("FERRY_TEST_CARGO_PID_FILE", &cargo_pid_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start IDE check");
+    let cargo_pid = {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(pid) = fs::read_to_string(&cargo_pid_path)
+                && let Ok(pid) = pid.trim().parse::<u32>()
+            {
+                break pid;
+            }
+            if Instant::now() >= deadline {
+                let _ = cli.kill();
+                let _ = cli.wait();
+                panic!("fake cargo did not start");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-INT", &cli.id().to_string()])
+            .status()
+            .expect("signal cargo-ferry")
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = cli.try_wait().expect("wait for cargo-ferry") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = cli.kill();
+            let _ = cli.wait();
+            panic!("IDE check did not stop after Ctrl+C");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(130));
+    let stdout = read_stdout_after_exit(cli.stdout.take().expect("cargo-ferry stdout"), cargo_pid);
+    let events = stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<Value>(line).expect("complete event object"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        events.last().expect("terminal event")["event"],
+        "operation_cancelled"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                event["event"] == "operation_cancelled" || event["event"] == "operation_finished"
+            })
+            .count(),
+        1
+    );
+    assert_process_exits(cargo_pid);
+}
+
+#[cfg(unix)]
+#[test]
+fn ide_build_stream_emits_real_rustc_file_ranges_before_platform_build() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let project = generate_project(temporary.path(), "rust-diagnostic");
+    let tools = temporary.path().join("tools");
+    fs::create_dir(&tools).expect("fake tool directory");
+    let fake_cargo = tools.join("cargo");
+    fs::write(
+        &fake_cargo,
+        r#"#!/bin/sh
+printf '%s\n' '{"reason":"compiler-message","message":{"message":"mismatched types","code":{"code":"E0308","explanation":null},"level":"error","spans":[{"file_name":"src/app.rs","line_start":7,"line_end":7,"column_start":5,"column_end":8,"is_primary":true,"text":[{"text":"    bad","highlight_start":5,"highlight_end":8}]}],"children":[{"message":"use the expected type","level":"help"}],"rendered":"error[E0308]: mismatched types\n --> src/app.rs:7:5\n"}}'
+exit 101
+"#,
+    )
+    .expect("fake Cargo executable");
+    let mut permissions = fs::metadata(&fake_cargo)
+        .expect("fake Cargo metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_cargo, permissions).expect("make fake Cargo executable");
+    let path = std::env::join_paths(std::iter::once(tools).chain(std::env::split_paths(
+        &std::env::var_os("PATH").expect("test PATH"),
+    )))
+    .expect("combined PATH");
+
+    let output = cargo_bin_cmd!("cargo-ferry")
+        .env("PATH", path)
+        .args(["ide", "build", "--workspace"])
+        .arg(&project)
+        .args([
+            "--platform",
+            "android",
+            "--operation-id",
+            "test:rust-diagnostic",
+            "--json-stream",
+        ])
+        .output()
+        .expect("run IDE build with compiler failure");
+
+    assert_eq!(output.status.code(), Some(4));
+    assert!(output.stderr.is_empty());
+    let events = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<Value>(line).expect("complete event object"))
+        .collect::<Vec<_>>();
+    let diagnostic = events
+        .iter()
+        .find(|event| {
+            event["event"] == "diagnostic" && event["diagnostic"]["code"] == "rustc.E0308"
+        })
+        .expect("structured rustc diagnostic");
+    assert_eq!(
+        diagnostic["diagnostic"]["file"],
+        project
+            .canonicalize()
+            .expect("canonical project")
+            .join("src/app.rs")
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert_eq!(diagnostic["diagnostic"]["range"]["start"]["line"], 6);
+    assert_eq!(diagnostic["diagnostic"]["range"]["start"]["character"], 4);
+    assert_eq!(
+        events.last().expect("terminal event")["event"],
+        "operation_finished"
+    );
+    assert_eq!(events.last().expect("terminal event")["success"], false);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "diagnostic")
+            .count(),
+        1,
+        "a Rust source error must not create a second ferry.toml diagnostic"
+    );
+    assert!(!events.iter().any(|event| {
+        event["event"] == "diagnostic"
+            && event["diagnostic"]["code"] == "ferry.external_command_failed"
+    }));
+    let log = fs::read_to_string(project.join("target/ferry/logs/cargo-check.log"))
+        .expect("human-readable cargo check log");
+    assert!(log.contains("error[E0308]: mismatched types"));
+    assert!(!log.contains("{\"reason\""));
+}
+
+#[test]
+fn devices_json_stream_emits_protocol_v1_ndjson() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let output = cargo_bin_cmd!("cargo-ferry")
+        .args(["devices", "--platform", "all", "--project-dir"])
+        .arg(temporary.path())
+        .arg("--json-stream")
+        .output()
+        .expect("run device discovery");
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    assert!(output.stdout.ends_with(b"\n"));
+    let lines = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<Value>(line).expect("complete device event"))
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 1);
+    assert!(lines.iter().all(|event| event["protocol_version"] == 1));
+    assert!(lines[0]["devices"].is_array());
+    assert!(lines[0]["warnings"].is_array());
+}
+
+#[test]
+fn json_stream_is_rejected_for_non_protocol_commands() {
+    let output = cargo_bin_cmd!("cargo-ferry")
+        .args(["examples", "--json-stream"])
+        .output()
+        .expect("run invalid stream request");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stderr.is_empty());
+    let document: Value = serde_json::from_slice(&output.stdout).expect("structured error");
+    assert_eq!(document["status"], "error");
+    assert_eq!(document["error"]["code"], "invalid_arguments");
+    assert!(
+        document["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("supported only"))
+    );
+}
+
+#[test]
+fn ide_physical_install_requires_an_explicit_team_without_fake_success() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let project = generate_project(temporary.path(), "physical_ide_install");
+    let output = cargo_bin_cmd!("cargo-ferry")
+        .args(["ide", "install", "--workspace"])
+        .arg(&project)
+        .args([
+            "--platform",
+            "ios-device",
+            "--device",
+            "test-device",
+            "--operation-id",
+            "test:physical-install",
+            "--json-stream",
+        ])
+        .output()
+        .expect("run physical IDE install");
+
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stderr.is_empty());
+    assert!(output.stdout.ends_with(b"\n"));
+    let events = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<Value>(line).expect("complete event object"))
+        .collect::<Vec<_>>();
+    assert_eq!(events[0]["event"], "operation_started");
+    assert_eq!(
+        events.last().expect("terminal event")["event"],
+        "operation_finished"
+    );
+    assert_eq!(
+        events.last().expect("terminal event")["error"]["code"],
+        "physical_ios_team_required"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event["operation_id"] == "test:physical-install")
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| { event["event"] == "operation_finished" && event["success"] == true })
+    );
+}
+
+#[test]
+fn ide_physical_build_dry_run_uses_the_official_signing_plan() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let project = generate_project(temporary.path(), "physical_ide_build_plan");
+    let output = cargo_bin_cmd!("cargo-ferry")
+        .args(["--dry-run", "ide", "build", "--workspace"])
+        .arg(&project)
+        .args([
+            "--platform",
+            "ios-device",
+            "--team",
+            "ABCDE12345",
+            "--operation-id",
+            "test:physical-build",
+            "--json-stream",
+        ])
+        .output()
+        .expect("run physical IDE build plan");
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let events = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<Value>(line).expect("complete event object"))
+        .collect::<Vec<_>>();
+    assert_eq!(events[0]["event"], "operation_started");
+    assert_eq!(
+        events.last().expect("terminal event")["event"],
+        "operation_finished"
+    );
+    assert_eq!(events.last().expect("terminal event")["success"], true);
+    assert!(events.iter().any(|event| {
+        event["event"] == "command_started"
+            && event["arguments"]
+                .as_array()
+                .is_some_and(|arguments| arguments.iter().any(|value| value == "ios-device"))
+    }));
+    assert!(!project.join("target/ferry/ios-device/generated").exists());
+}
+
+#[test]
 fn help_and_version_are_successful_control_flow() {
     cargo_bin_cmd!("cargo-ferry")
         .arg("--help")
@@ -124,7 +904,7 @@ fn manual_signing_setup_help_has_exact_inputs_and_no_password_value_option() {
     let help = String::from_utf8(output.stdout).expect("UTF-8 help");
     let normalized_help = help.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(normalized_help.contains(
-        "Usage: cargo-ferry signing setup manual [OPTIONS] --certificate <CERTIFICATE> --profile <PROFILE> --remote <REMOTE>"
+        "signing setup manual [OPTIONS] --certificate <CERTIFICATE> --profile <PROFILE> --remote <REMOTE>"
     ));
     assert!(help.contains("--certificate <CERTIFICATE>"));
     assert!(help.contains("--profile <PROFILE>"));
@@ -274,6 +1054,125 @@ fn runtime_path_is_canonicalized_in_the_generated_manifest() {
         .as_str()
         .expect("runtime dependency path");
     assert_eq!(std::path::Path::new(dependency_path), canonical);
+}
+
+#[test]
+fn explicit_display_name_and_registry_runtime_are_generated_without_dev_paths() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    cargo_bin_cmd!("cargo-ferry")
+        .env_remove("CARGO_FERRY_RUNTIME_PATH")
+        .args([
+            "new",
+            "weather-client",
+            "--display-name",
+            "Weather · Europe",
+            "--runtime-source",
+            "registry",
+            "--runtime-version",
+            "0.1.0",
+            "--no-git",
+            "--no-check",
+            "--parent",
+        ])
+        .arg(temporary.path())
+        .assert()
+        .success();
+
+    let project = temporary.path().join("weather-client");
+    let config = fs::read_to_string(project.join("ferry.toml")).expect("configuration");
+    assert!(config.contains("name = \"Weather · Europe\""));
+    let manifest_source = fs::read_to_string(project.join("Cargo.toml")).expect("manifest");
+    assert!(manifest_source.contains("[workspace]"));
+    assert!(!manifest_source.contains(env!("CARGO_MANIFEST_DIR")));
+    let manifest = manifest_source
+        .parse::<toml_edit::DocumentMut>()
+        .expect("parsed manifest");
+    assert_eq!(
+        manifest["dependencies"]["rustferry"]["version"].as_str(),
+        Some("=0.1.0")
+    );
+    assert!(
+        manifest["dependencies"]["rustferry"]
+            .as_inline_table()
+            .is_some_and(|dependency| !dependency.contains_key("path"))
+    );
+}
+
+#[test]
+fn workspace_runtime_is_explicit_and_does_not_create_nested_workspace() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    cargo_bin_cmd!("cargo-ferry")
+        .env_remove("CARGO_FERRY_RUNTIME_PATH")
+        .args([
+            "new",
+            "workspace-runtime",
+            "--runtime-source",
+            "workspace",
+            "--no-git",
+            "--no-check",
+            "--parent",
+        ])
+        .arg(temporary.path())
+        .assert()
+        .success();
+    let manifest = fs::read_to_string(temporary.path().join("workspace-runtime/Cargo.toml"))
+        .expect("manifest");
+    assert!(manifest.contains("workspace = true"));
+    assert!(!manifest.contains("[workspace]"));
+}
+
+#[test]
+fn physical_ios_dry_run_uses_official_signing_plan_without_mutating_provisioning() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let project = generate_project(temporary.path(), "device-build-plan");
+    let output = cargo_bin_cmd!("cargo-ferry")
+        .args([
+            "--json",
+            "--dry-run",
+            "build",
+            "ios",
+            "--device",
+            "--team",
+            "ABCDE12345",
+            "--project-dir",
+        ])
+        .arg(&project)
+        .output()
+        .expect("physical iOS plan");
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("plan JSON");
+    assert_eq!(document["data"]["platform"], "ios-device");
+    assert_eq!(document["data"]["plan"]["rust_target"], "aarch64-apple-ios");
+    assert_eq!(
+        document["data"]["plan"]["allow_provisioning_updates"],
+        false
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("-allowProvisioningUpdates"));
+    assert!(!project.join("target/ferry/ios-device/generated").exists());
+}
+
+#[test]
+fn assets_check_accepts_generated_release_sources() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let project = generate_project(temporary.path(), "asset-check");
+    let output = cargo_bin_cmd!("cargo-ferry")
+        .args(["--json", "assets", "check", "--project-dir"])
+        .arg(&project)
+        .output()
+        .expect("check generated assets");
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let document: Value = serde_json::from_slice(&output.stdout).expect("asset check JSON");
+    assert_eq!(document["status"], "ok");
+    assert_eq!(document["data"]["release_ready"], true);
+    assert_eq!(document["data"]["icon"]["width"], 1_024);
+    assert_eq!(document["data"]["splash"]["height"], 1_024);
 }
 
 #[test]
@@ -754,12 +1653,20 @@ fn clean_generated_removes_profile_sources_but_preserves_artifacts() {
         "target/ferry/android/debug/generated",
         "target/ferry/android/release/generated",
         "target/ferry/ios/generated",
+        "target/ferry/ios-device/generated",
+        "target/ferry/ios-device/xcode/Debug/Intermediates",
     ] {
         fs::create_dir_all(project.join(generated)).expect("generated directory");
         fs::write(project.join(generated).join("marker"), "generated").expect("generated marker");
     }
     let artifact = project.join("target/ferry/android/debug/clean_generated.apk");
     fs::write(&artifact, "artifact").expect("artifact marker");
+    let physical_artifact = project.join("target/ferry/ios-device/debug/clean_generated.app");
+    fs::create_dir_all(&physical_artifact).expect("physical artifact");
+    let physical_cargo = project.join("target/ferry/ios-device/cargo/cache-marker");
+    fs::create_dir_all(physical_cargo.parent().expect("physical Cargo parent"))
+        .expect("physical Cargo cache");
+    fs::write(&physical_cargo, "cache").expect("physical Cargo marker");
 
     cargo_bin_cmd!("cargo-ferry")
         .args(["clean", "generated", "--project-dir"])
@@ -778,6 +1685,10 @@ fn clean_generated_removes_profile_sources_but_preserves_artifacts() {
             .exists()
     );
     assert!(!project.join("target/ferry/ios/generated").exists());
+    assert!(!project.join("target/ferry/ios-device/generated").exists());
+    assert!(!project.join("target/ferry/ios-device/xcode").exists());
+    assert!(physical_artifact.exists());
+    assert!(physical_cargo.exists());
     assert_eq!(
         fs::read_to_string(artifact).expect("preserved artifact"),
         "artifact"

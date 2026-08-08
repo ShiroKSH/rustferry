@@ -1298,7 +1298,7 @@ pub trait VerifiedArtifactStore: Send {
     fn remove_artifacts(&mut self, context: &GithubArtifactContext) -> RemoteBuildResult<()>;
 }
 
-/// Honest placeholder used until artifact ingestion is injected.
+/// Artifact store used when verified ingestion is not configured.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NoVerifiedArtifactStore;
 
@@ -4074,7 +4074,7 @@ mod tests {
             project_path: ".".to_owned(),
             entries: Vec::new(),
             total_size: 0,
-            sha256: format!("{:x}", digest.finalize()),
+            sha256: hex::encode(digest.finalize()),
         }
     }
 

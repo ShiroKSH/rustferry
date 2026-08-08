@@ -1,12 +1,12 @@
 use std::ffi::OsString;
 
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use rustferry_codegen::{
     PlatformSelection, ProjectGenerator, ProjectRequest, RuntimeDependency, TemplateKind,
 };
 use serde::Serialize;
 
-use crate::cli::{NewArgs, PlatformChoice, TemplateChoice};
+use crate::cli::{NewArgs, PlatformChoice, RuntimeSourceChoice, TemplateChoice};
 use crate::commands::check::check_project;
 use crate::error::CliError;
 use crate::output::Reporter;
@@ -37,12 +37,18 @@ pub fn run(arguments: NewArgs, dry_run: bool, reporter: &Reporter) -> Result<(),
         }
     };
     let template = template_kind(arguments.template);
+    let runtime_dependency = runtime_dependency(
+        arguments.runtime_source,
+        arguments.runtime_version,
+        arguments.runtime_path,
+    )?;
     let request = ProjectRequest {
         name: arguments.name,
+        display_name: arguments.display_name,
         identifier: arguments.id,
         template,
         platforms: platform_selection(arguments.platform),
-        runtime_dependency: runtime_dependency()?,
+        runtime_dependency,
     };
     let generator = ProjectGenerator::new(parent, request);
 
@@ -157,25 +163,79 @@ fn initialize_git(root: &camino::Utf8Path, reporter: &Reporter) -> Result<(), Cl
     }
 }
 
-fn runtime_dependency() -> Result<RuntimeDependency, CliError> {
-    let Some(value) = std::env::var_os("CARGO_FERRY_RUNTIME_PATH") else {
-        return Ok(RuntimeDependency::Version(
-            env!("CARGO_PKG_VERSION").to_owned(),
-        ));
-    };
-    let path =
-        Utf8PathBuf::from_path_buf(value.into()).map_err(|_| CliError::InvalidRuntimePath {
-            message: "the value must be valid UTF-8".to_owned(),
-        })?;
+fn runtime_dependency(
+    source: Option<RuntimeSourceChoice>,
+    version: Option<String>,
+    path: Option<Utf8PathBuf>,
+) -> Result<RuntimeDependency, CliError> {
+    match source {
+        Some(RuntimeSourceChoice::Registry) => {
+            if path.is_some() {
+                return Err(CliError::InvalidRuntimeDependency {
+                    message: "--runtime-path is valid only with `--runtime-source path`".to_owned(),
+                });
+            }
+            let version = version.unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned());
+            semver::Version::parse(&version).map_err(|source| {
+                CliError::InvalidRuntimeDependency {
+                    message: format!("registry version `{version}` is not semantic: {source}"),
+                }
+            })?;
+            Ok(RuntimeDependency::Registry(version))
+        }
+        Some(RuntimeSourceChoice::Workspace) => {
+            if version.is_some() || path.is_some() {
+                return Err(CliError::InvalidRuntimeDependency {
+                    message:
+                        "workspace runtime resolution does not accept --runtime-version or --runtime-path"
+                            .to_owned(),
+                });
+            }
+            Ok(RuntimeDependency::Workspace)
+        }
+        Some(RuntimeSourceChoice::Path) => {
+            if version.is_some() {
+                return Err(CliError::InvalidRuntimeDependency {
+                    message: "--runtime-version is valid only with `--runtime-source registry`"
+                        .to_owned(),
+                });
+            }
+            let path = path.ok_or_else(|| CliError::InvalidRuntimeDependency {
+                message: "--runtime-source path requires --runtime-path".to_owned(),
+            })?;
+            canonical_runtime_path(&path)
+        }
+        None => {
+            if version.is_some() || path.is_some() {
+                return Err(CliError::InvalidRuntimeDependency {
+                    message: "runtime version/path options require an explicit --runtime-source"
+                        .to_owned(),
+                });
+            }
+            let Some(value) = std::env::var_os("CARGO_FERRY_RUNTIME_PATH") else {
+                return Ok(RuntimeDependency::Registry(
+                    env!("CARGO_PKG_VERSION").to_owned(),
+                ));
+            };
+            let path = Utf8PathBuf::from_path_buf(value.into()).map_err(|_| {
+                CliError::InvalidRuntimePath {
+                    message: "the value must be valid UTF-8".to_owned(),
+                }
+            })?;
+            canonical_runtime_path(&path)
+        }
+    }
+}
+
+fn canonical_runtime_path(path: &Utf8Path) -> Result<RuntimeDependency, CliError> {
     if !path.is_absolute() {
         return Err(CliError::InvalidRuntimePath {
             message: "the value must be an absolute path".to_owned(),
         });
     }
-    let canonical =
-        std::fs::canonicalize(&path).map_err(|source| CliError::InvalidRuntimePath {
-            message: format!("the path could not be canonicalized: {source}"),
-        })?;
+    let canonical = std::fs::canonicalize(path).map_err(|source| CliError::InvalidRuntimePath {
+        message: format!("the path could not be canonicalized: {source}"),
+    })?;
     let canonical =
         Utf8PathBuf::from_path_buf(canonical).map_err(|_| CliError::InvalidRuntimePath {
             message: "the canonical path must be valid UTF-8".to_owned(),

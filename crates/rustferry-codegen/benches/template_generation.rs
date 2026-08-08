@@ -16,10 +16,11 @@ fn main() {
     for index in 0..iterations {
         let request = ProjectRequest {
             name: format!("benchmark-{index}"),
+            display_name: None,
             identifier: Some(format!("com.example.benchmark{index}")),
             template: TemplateKind::Starter,
             platforms: PlatformSelection::Both,
-            runtime_dependency: RuntimeDependency::Version("0.1.0".to_owned()),
+            runtime_dependency: RuntimeDependency::Registry("0.1.0".to_owned()),
         };
         let generated = ProjectGenerator::new(parent, request)
             .generate()

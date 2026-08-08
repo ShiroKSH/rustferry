@@ -1,10 +1,13 @@
 use std::fs;
 
 use camino::{Utf8Path, Utf8PathBuf};
-use rustferry_core::ProjectAssets;
+use rustferry_core::{ArtifactDigest, ArtifactDigestKind, ProjectAssets, digest_artifact};
 use serde::{Deserialize, Serialize};
 
-use crate::{AppleError, AppleToolchain, CommandSpec, ExtensionKind, error::io_error, run_command};
+use crate::{
+    AppleError, AppleToolchain, CommandSpec, ExtensionKind, IosAssetPackaging, error::io_error,
+    run_command,
+};
 
 const ACTIVITY_MODEL_BUNDLE_IDENTIFIER: &str = "org.rustferry.activity-model";
 const ACTIVITY_MODEL_INSTALL_NAME: &str = "@rpath/FerryActivityModel.framework/FerryActivityModel";
@@ -46,8 +49,34 @@ pub struct IosArtifactExpectation {
     pub app_group: Option<String>,
     /// Optional destination for redacted validation logs.
     pub log_dir: Option<Utf8PathBuf>,
-    /// Exact project icon and splash bytes expected in the sealed bundle.
+    /// Validated source snapshot requiring a compiled app-icon and launch-image catalog.
     pub project_assets: Option<ProjectAssets>,
+    /// Expected asset representation, absent only when no project assets are required.
+    pub asset_packaging: Option<IosAssetPackaging>,
+}
+
+/// Evidence that the app consumes the generated asset catalog.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IosAssetCatalogValidation {
+    /// Compiled catalog sealed into the application bundle.
+    pub compiled_catalog: Utf8PathBuf,
+    /// App-icon set selected by processed bundle metadata.
+    pub app_icon_name: String,
+    /// Launch-screen image set selected by processed bundle metadata.
+    pub launch_image_name: String,
+}
+
+/// Evidence for the runtime-free, SDK-only image resource fallback.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IosSdkOnlyAssetValidation {
+    /// Exact validated icon resource sealed into the application bundle.
+    pub icon: Utf8PathBuf,
+    /// Exact validated splash resource sealed into the application bundle.
+    pub splash: Utf8PathBuf,
+    /// Legacy plist icon resource selected by the SDK-only host.
+    pub icon_file: String,
+    /// Launch-screen image resource selected by the SDK-only host.
+    pub launch_image_name: String,
 }
 
 /// Validated ad-hoc code-signature metadata.
@@ -117,6 +146,8 @@ pub struct IosRuntimeBridgeValidation {
 pub struct IosArtifactValidation {
     /// Stable validation schema version.
     pub schema_version: u32,
+    /// SHA-256 identity of the exact application tree inspected by the platform validator.
+    pub artifact_digest: ArtifactDigest,
     /// Validated application path.
     pub app_path: Utf8PathBuf,
     /// Validated bundle identifier.
@@ -129,6 +160,10 @@ pub struct IosArtifactValidation {
     pub rust_binary_embedded: bool,
     /// Required resources found in the app.
     pub resources: Vec<Utf8PathBuf>,
+    /// Compiled asset-catalog and processed metadata evidence.
+    pub asset_catalog: Option<IosAssetCatalogValidation>,
+    /// Validated raw-resource fallback used when no Simulator runtime is installed.
+    pub sdk_only_assets: Option<IosSdkOnlyAssetValidation>,
     /// Inspected embedded frameworks and dynamic libraries.
     pub embedded_frameworks: Vec<Utf8PathBuf>,
     /// Generated native runtime framework evidence.
@@ -156,6 +191,7 @@ pub fn validate_ios_app(
     toolchain: &AppleToolchain,
 ) -> Result<IosArtifactValidation, AppleError> {
     validate_real_directory(&expected.app_path, "application bundle")?;
+    let validated_digest = ios_artifact_digest(&expected.app_path)?;
     let info_plist = expected.app_path.join("Info.plist");
     validate_regular_file(&info_plist, "application Info.plist")?;
     lint_plist(&info_plist, toolchain, expected.log_dir.as_deref(), 1)?;
@@ -257,11 +293,16 @@ pub fn validate_ios_app(
         false
     };
 
-    let resources = ["FerryResources.json", "FerryIcon.png", "FerrySplash.png"]
-        .into_iter()
-        .map(|name| expected.app_path.join(name))
-        .filter(|path| path.is_file())
-        .collect::<Vec<_>>();
+    let resources = [
+        "FerryResources.json",
+        "Assets.car",
+        "FerryIcon.png",
+        "FerrySplash.png",
+    ]
+    .into_iter()
+    .map(|name| expected.app_path.join(name))
+    .filter(|path| path.is_file())
+    .collect::<Vec<_>>();
     if !resources
         .iter()
         .any(|path| path.file_name() == Some("FerryResources.json"))
@@ -272,23 +313,140 @@ pub fn validate_ios_app(
                 .to_owned(),
         );
     }
-    if let Some(assets) = &expected.project_assets {
-        for (name, expected_bytes) in [
-            ("FerryIcon.png", assets.icon()),
-            ("FerrySplash.png", assets.splash()),
-        ] {
-            let path = expected.app_path.join(name);
-            validate_regular_file(&path, "project image resource")?;
-            let actual = fs::read(&path)
-                .map_err(|source| io_error("read embedded project image", &path, source))?;
-            if actual != expected_bytes {
+    let (asset_catalog, sdk_only_assets) = match (
+        expected.project_assets.as_ref(),
+        expected.asset_packaging,
+    ) {
+        (None, None) => (None, None),
+        (Some(_), Some(IosAssetPackaging::CompiledCatalog)) => {
+            for name in ["FerryIcon.png", "FerrySplash.png"] {
+                let path = expected.app_path.join(name);
+                if path.exists() {
+                    return invalid(
+                        &path,
+                        "SDK-only image resource is present in a compiled-catalog bundle"
+                            .to_owned(),
+                    );
+                }
+            }
+            let compiled_catalog = expected.app_path.join("Assets.car");
+            validate_regular_file(&compiled_catalog, "compiled asset catalog")?;
+            let app_icon_name = plist_value(
+                &info_plist,
+                "CFBundleIconName",
+                toolchain,
+                expected.log_dir.as_deref(),
+                102,
+            )?;
+            if app_icon_name != "AppIcon" {
                 return invalid(
-                    &path,
-                    "embedded image bytes differ from the validated project asset".to_owned(),
+                    &info_plist,
+                    format!("CFBundleIconName is `{app_icon_name}`, expected `AppIcon`"),
                 );
             }
+            let launch_image_name = plist_value(
+                &info_plist,
+                "UILaunchScreen.UIImageName",
+                toolchain,
+                expected.log_dir.as_deref(),
+                103,
+            )?;
+            if launch_image_name != "FerryLaunch" {
+                return invalid(
+                    &info_plist,
+                    format!(
+                        "UILaunchScreen UIImageName is `{launch_image_name}`, expected `FerryLaunch`"
+                    ),
+                );
+            }
+            (
+                Some(IosAssetCatalogValidation {
+                    compiled_catalog,
+                    app_icon_name,
+                    launch_image_name,
+                }),
+                None,
+            )
         }
-    }
+        (Some(assets), Some(IosAssetPackaging::SdkOnlyResources)) => {
+            let compiled_catalog = expected.app_path.join("Assets.car");
+            if compiled_catalog.exists() {
+                return invalid(
+                    &compiled_catalog,
+                    "compiled asset catalog is present in an SDK-only resource bundle".to_owned(),
+                );
+            }
+            let icon = expected.app_path.join("FerryIcon.png");
+            let splash = expected.app_path.join("FerrySplash.png");
+            for (path, source_bytes) in [(&icon, assets.icon()), (&splash, assets.splash())] {
+                validate_regular_file(path, "SDK-only project image resource")?;
+                let actual = fs::read(path)
+                    .map_err(|source| io_error("read SDK-only project image", path, source))?;
+                if actual != source_bytes {
+                    return invalid(
+                        path,
+                        "embedded image bytes differ from the validated project asset".to_owned(),
+                    );
+                }
+            }
+            let icon_file = plist_value(
+                &info_plist,
+                "CFBundleIconFile",
+                toolchain,
+                expected.log_dir.as_deref(),
+                104,
+            )?;
+            if icon_file != "FerryIcon" {
+                return invalid(
+                    &info_plist,
+                    format!("CFBundleIconFile is `{icon_file}`, expected `FerryIcon`"),
+                );
+            }
+            let legacy_launch_image = plist_value(
+                &info_plist,
+                "UILaunchImageFile",
+                toolchain,
+                expected.log_dir.as_deref(),
+                105,
+            )?;
+            if legacy_launch_image != "FerrySplash" {
+                return invalid(
+                    &info_plist,
+                    format!("UILaunchImageFile is `{legacy_launch_image}`, expected `FerrySplash`"),
+                );
+            }
+            let launch_image_name = plist_value(
+                &info_plist,
+                "UILaunchScreen.UIImageName",
+                toolchain,
+                expected.log_dir.as_deref(),
+                106,
+            )?;
+            if launch_image_name != "FerrySplash" {
+                return invalid(
+                    &info_plist,
+                    format!(
+                        "UILaunchScreen UIImageName is `{launch_image_name}`, expected `FerrySplash`"
+                    ),
+                );
+            }
+            (
+                None,
+                Some(IosSdkOnlyAssetValidation {
+                    icon,
+                    splash,
+                    icon_file,
+                    launch_image_name,
+                }),
+            )
+        }
+        _ => {
+            return Err(AppleError::InvalidRequest(
+                "iOS artifact assets and packaging expectation must either both be present or both be absent"
+                    .to_owned(),
+            ));
+        }
+    };
 
     let embedded_frameworks = inspect_frameworks(&expected.app_path)?;
     let runtime_bridge = validate_runtime_bridge(
@@ -364,20 +522,40 @@ pub fn validate_ios_app(
         110,
     )?;
 
+    let current_digest = ios_artifact_digest(&expected.app_path)?;
+    if current_digest != validated_digest {
+        return invalid(
+            &expected.app_path,
+            "application bundle changed while platform validation was running".to_owned(),
+        );
+    }
+
     Ok(IosArtifactValidation {
-        schema_version: 6,
+        schema_version: 9,
+        artifact_digest: validated_digest,
         app_path: expected.app_path.clone(),
         bundle_identifier,
         executable,
         architectures,
         rust_binary_embedded,
         resources,
+        asset_catalog,
+        sdk_only_assets,
         embedded_frameworks,
         runtime_bridge,
         extensions,
         deep_link_schemes: expected.deep_link_schemes.clone(),
         application_delegate,
         code_signature,
+    })
+}
+
+fn ios_artifact_digest(path: &Utf8Path) -> Result<ArtifactDigest, AppleError> {
+    digest_artifact(path, ArtifactDigestKind::IosSimulatorApp).map_err(|error| {
+        AppleError::InvalidArtifact {
+            path: path.to_owned(),
+            reason: format!("could not bind validation to exact application contents: {error}"),
+        }
     })
 }
 

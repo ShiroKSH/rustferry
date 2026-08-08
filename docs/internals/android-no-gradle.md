@@ -26,6 +26,8 @@ Debug signing material belongs in cargo-ferry's machine configuration directory,
 
 ## Build versus deployment
 
-`build` needs no ADB, emulator, USB connection, or phone. Installation and launch are separate future composition commands. Artifact status and device status remain independent in [Support matrix](../support-matrix.md).
+`build` needs no ADB, emulator, USB connection, or phone and never installs or launches. The explicit `install android` and `run android` commands now compose a fresh, independently validated APK with typed ADB operations for one exact device ID, or for the sole compatible device when selection is unambiguous. `logs android` collects a bounded application-filtered snapshot by default; `--json-stream` selects the live protocol stream.
+
+Those deployment paths are implemented and host-tested, but no emulator or physical Android device was available for runtime validation. Artifact status and device status remain independent in the [Support matrix](../support-matrix.md).
 
 See [ADR-002](../ADR-002-android-build.md), [Android build](../android/build.md), and the official [AAPT2](https://developer.android.com/tools/aapt2), [zipalign](https://developer.android.com/tools/zipalign), [apksigner](https://developer.android.com/tools/apksigner), and [NDK custom build-system](https://developer.android.com/ndk/guides/other_build_systems) documentation.

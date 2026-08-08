@@ -1547,7 +1547,7 @@ fn portable_name_key(name: &str) -> String {
 fn sha256_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -1964,7 +1964,7 @@ mod tests {
             project_path: ".".to_owned(),
             entries,
             total_size: 0,
-            sha256: format!("{:x}", digest.finalize()),
+            sha256: hex::encode(digest.finalize()),
         }
     }
 

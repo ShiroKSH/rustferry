@@ -7,6 +7,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
+publish = false
 description = "Hardened macOS build and signing worker for RustFerry"
 
 [[bin]]
@@ -18,10 +19,11 @@ camino.workspace = true
 cap-std.workspace = true
 clap.workspace = true
 fs2.workspace = true
+hex.workspace = true
 plist.workspace = true
-rustferry-apple = { version = "0.1.0", path = "../rustferry-apple" }
-rustferry-core = { version = "0.1.0", path = "../rustferry-core" }
-rustferry-remote = { version = "0.1.0", path = "../rustferry-remote" }
+rustferry-apple = { version = "=0.1.0", path = "../rustferry-apple" }
+rustferry-core = { version = "=0.1.0", path = "../rustferry-core" }
+rustferry-remote = { version = "=0.1.0", path = "../rustferry-remote" }
 same-file.workspace = true
 serde.workspace = true
 serde_json.workspace = true

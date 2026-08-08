@@ -29,6 +29,7 @@ fn every_template_passes_cargo_check() {
             parent,
             ProjectRequest {
                 name: name.to_owned(),
+                display_name: None,
                 identifier: None,
                 template,
                 platforms: PlatformSelection::Both,

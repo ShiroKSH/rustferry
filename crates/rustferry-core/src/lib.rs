@@ -1,5 +1,6 @@
 //! Shared configuration, validation, paths, and diagnostics for cargo-ferry.
 
+mod artifact;
 mod assets;
 mod config;
 mod naming;
@@ -7,7 +8,8 @@ mod naming;
 #[doc(hidden)]
 pub mod process_control;
 
-pub use assets::{AssetError, ProjectAssets};
+pub use artifact::{ArtifactDigest, ArtifactDigestError, ArtifactDigestKind, digest_artifact};
+pub use assets::{AssetError, PngMetadata, ProjectAssets};
 pub use config::{
     AndroidAbi, AndroidConfig, AndroidLiveActivityFallback, AppConfig, AppWindowConfig,
     BoolCapability, CapabilitiesConfig, ConfigError, DeepLinksCapability, ExtensionsConfig,

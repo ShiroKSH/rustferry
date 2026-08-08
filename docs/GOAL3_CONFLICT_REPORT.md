@@ -1,5 +1,16 @@
 # Goal 3 conflict report
 
+## Integration update — 2026-08-08
+
+Goal 2 advanced to `1f4f9a06daaa90e0fe82adf4e5667a1a97d35b61` while Goal 3 advanced from the
+isolation base. Integration now preserves the Goal 2 package/release, IDE, deployment, assets, and
+local physical-signing surfaces while adding the Goal 3 remote protocol, GitHub provider, trusted
+worker, and unsigned/signed artifact contracts. The combined release surface is eight publishable
+crates plus the non-publishable macOS worker. A regenerated lockfile, fresh license inventory,
+workspace/package matrix, and exact integrated-revision remote acceptance are still required.
+
+The remainder of this file is the historical isolation report that guided the merge.
+
 - Goal 3 base: `d6887eba95b8116799801118c5026210628397f9`
 - Latest observed Goal 2/source commit: `d6887eba95b8116799801118c5026210628397f9`
 - Latest observation: `2026-08-01T16:15:06Z`
@@ -10,4 +21,4 @@
 - Goal 3 files changed through Milestone 1: isolated-environment files; root Cargo manifests; additive `crates/rustferry-remote/`; remote protocol schema/docs; additive Apple device pipeline/tests/templates; narrow Apple artifact/discovery/library/project/Xcode-smoke changes; Goal 3 status and ownership docs
 - Current textual intersections: root `Cargo.toml` and `Cargo.lock`; `crates/rustferry-apple/Cargo.toml`, `src/artifact.rs`, `src/discovery.rs`, `src/lib.rs`, `src/project.rs`, and `tests/xcode_smoke.rs`; `docs/STATUS.md` once this checkpoint records its new validation level. Goal 3's `device.rs`, device tests, and activity-model templates are additive.
 
-Semantic conflicts remain visible: Goal 2 is adding JSON streaming, IDE events, diagnostics, artifacts, device/deployment models, signing, and physical-build types. Goal 3 isolated these concerns in an additive neutral remote-contract crate and has not edited Goal 2 IDE/device surfaces. Resolution order: shared core models; workspace dependencies; CLI dispatch; provider workflows; generated IDE adapters; docs/status. This report is a point-in-time observation and will be regenerated at integration. Stable Goal 2 integration has not occurred and no merged test matrix has run.
+At that observation, semantic conflicts remained visible: Goal 2 was adding JSON streaming, IDE events, diagnostics, artifacts, device/deployment models, signing, and physical-build types. Goal 3 isolated these concerns in an additive neutral remote-contract crate and had not edited Goal 2 IDE/device surfaces. The historical resolution order was shared core models, workspace dependencies, CLI dispatch, provider workflows, generated IDE adapters, then docs/status.

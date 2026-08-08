@@ -592,7 +592,7 @@ fn is_lowercase_sha256(value: &str) -> bool {
 }
 
 fn sha256_lowercase(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 /// Kind of code object in the required inside-out signing order.

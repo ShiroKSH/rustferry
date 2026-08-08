@@ -15,8 +15,9 @@ mod project;
 mod signing_assets;
 
 pub use artifact::{
-    IosArtifactExpectation, IosArtifactValidation, IosCodeSignatureValidation,
-    IosExtensionExpectation, IosExtensionValidation, IosRuntimeBridgeValidation, validate_ios_app,
+    IosArtifactExpectation, IosArtifactValidation, IosAssetCatalogValidation,
+    IosCodeSignatureValidation, IosExtensionExpectation, IosExtensionValidation,
+    IosRuntimeBridgeValidation, IosSdkOnlyAssetValidation, validate_ios_app,
     validate_ios_extension,
 };
 pub use build::{
@@ -38,8 +39,8 @@ pub use doctor::{
 };
 pub use error::AppleError;
 pub use project::{
-    GeneratedAppleProject, IosProjectPlatform, IosProjectSpec, generate_ios_project,
-    generate_ios_project_for_platform, write_ios_project,
+    GeneratedAppleProject, IosAssetPackaging, IosProjectPlatform, IosProjectSpec,
+    generate_ios_project, generate_ios_project_for_platform, write_ios_project,
 };
 pub use signing_assets::{
     APPLE_ROOT_CA_G2_SHA256, APPLE_ROOT_CA_G3_SHA256, APPLE_ROOT_CA_SHA256,

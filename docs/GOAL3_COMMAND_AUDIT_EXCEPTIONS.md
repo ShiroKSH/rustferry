@@ -36,3 +36,13 @@ One nested cross-platform review also ran these unwrapped commands in the same c
 - `python3 scripts/check-licenses.py` — its internal `cargo metadata --locked --format-version 1 --all-features` passed; the script rejected then-unreviewed `tinyvec`, `tinyvec_macros`, and `winx` licenses.
 
 The unwrapped reviews created an accidental Goal 3-only root `target/`. No Cargo process remained; `scripts/goal3-run cleanup goal3-accidental-root-target -- cargo clean --target-dir /Users/kushida/Documents/rust-and-iphone-goal3-macless-iphone/target` removed 6.0 GiB. No command targeted the Goal 2 source checkout. All subsequent mutating/test commands must use `scripts/goal3-run`.
+
+## 2026-08-02 recovery
+
+One read-only local instruction check ran outside the Goal 3 wrapper:
+
+- The security-hardening instruction file was read successfully; no project file changed. Its host-only path is intentionally excluded from the repository record. The check was immediately repeated through `scripts/goal3-run`.
+
+One wrapped recovery command has only a completion record because disk exhaustion prevented its initial record:
+
+- `./scripts/goal3-run cleanup goal3-target-cache -- zsh -lc 'export CARGO_TARGET_DIR="$PWD/.goal3/target"; cargo clean; df -h .'` — the wrapper's initial audit append failed with `ENOSPC`. The wrapper continued, and Cargo removed 4,665 files (1010.2 MiB) from the wrapper-scoped `.goal3/target` only. Operation `goal3-20260802T033119Z-48415-13727` subsequently appended its success record after space was recovered. The Goal 2 source checkout was not targeted.

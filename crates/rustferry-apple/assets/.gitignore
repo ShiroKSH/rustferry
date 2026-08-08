@@ -1,4 +1,4 @@
 # Public Apple trust anchors, not signing material.
-!apple-root-ca.pem
-!apple-root-ca-g2.pem
-!apple-root-ca-g3.pem
+!apple-root-ca.crt
+!apple-root-ca-g2.crt
+!apple-root-ca-g3.crt

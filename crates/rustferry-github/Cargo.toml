@@ -7,12 +7,22 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
+documentation = "https://docs.rs/rustferry-github"
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Secure GitHub Actions workflow generation for RustFerry iPhone builds"
+include = [
+    "src/**",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+]
 
 [dependencies]
 camino.workspace = true
-rustferry-core = { version = "0.1.0", path = "../rustferry-core" }
-rustferry-remote = { version = "0.1.0", path = "../rustferry-remote" }
+hex.workspace = true
+rustferry-core = { version = "=0.1.0", path = "../rustferry-core" }
+rustferry-remote = { version = "=0.1.0", path = "../rustferry-remote" }
 same-file.workspace = true
 semver.workspace = true
 serde.workspace = true

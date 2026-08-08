@@ -8,7 +8,20 @@ requires exact signature identifiers, sealed plists/resources, strict verificati
 bundle, and recursive strict verification for the application. No Apple Account, team, certificate,
 or provisioning profile is needed.
 
-## Physical iPhone
+## Local physical-device signing
+
+The local path uses the official Xcode development pipeline with an explicit user-selected Team.
+Provisioning updates are disabled unless requested, and manual signing can name a profile. After
+Xcode builds, RustFerry checks the expected executable and Cargo provenance, arm64 architecture,
+signatures, signing certificate, embedded profiles, expiration, Team and bundle identifiers,
+entitlement authorization, and embedded extensions before returning a validated artifact.
+
+The implementation and deterministic tests do not establish a real signing or device result. The
+local environment had no Apple Development identity, Team, provisioning profile, signed physical
+artifact, or attached device. Widget application groups and other entitlements can require
+additional profile capabilities.
+
+## Remote manual-development signing
 
 Manual-development signing is implemented for the GitHub remote provider. The source repository
 must be public. Signing runs in a distinct private execution repository through protected Environment
@@ -43,7 +56,8 @@ exact required secret names remotely before persisting the private local signing
 [GitHub macOS provider security](../remote/github-security.md) for the full preflight, failure, and
 cleanup contract.
 
-The signing engine and setup flow have synthetic cryptographic and policy validation. A real Apple
-Development certificate/profile upload and signed IPA acceptance run remain pending. No signing
-identity, private key, password, or profile is stored in `ferry.toml`, public workflow files, or
-generated logs.
+The remote signing engine and setup flow have synthetic cryptographic and policy validation. A real
+Apple Development certificate/profile upload and signed IPA acceptance run remain pending. No
+signing identity, private key, password, profile contents, or account token is stored in
+`ferry.toml`, public workflow files, or generated logs. See [Physical iPhone development](physical-device.md)
+and [STATUS](../STATUS.md) for the current evidence level.

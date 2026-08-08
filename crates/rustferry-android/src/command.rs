@@ -1,19 +1,22 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::Read,
     process::{Child, Command, ExitStatus, Stdio},
-    sync::mpsc::{self, Receiver, RecvTimeoutError},
     thread,
     time::{Duration, Instant},
 };
 
 use camino::{Utf8Path, Utf8PathBuf};
+use rustferry_core::process_control::{
+    BoundedOutputCapture, DEFAULT_PROCESS_OUTPUT_LIMIT, OutputCaptureStatus,
+};
 
 use crate::{AndroidError, error::io_error};
 
 /// Default deadline for one external build-tool invocation.
 pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_mins(30);
+const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(1);
 
 /// One safely tokenized external command.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -96,6 +99,15 @@ fn run_command_inner(
     spec: &CommandSpec,
     log_path: Option<&Utf8Path>,
 ) -> Result<CommandOutput, AndroidError> {
+    run_command_with_output_limit(spec, log_path, DEFAULT_PROCESS_OUTPUT_LIMIT)
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_command_with_output_limit(
+    spec: &CommandSpec,
+    log_path: Option<&Utf8Path>,
+    output_limit: usize,
+) -> Result<CommandOutput, AndroidError> {
     if rustferry_core::process_control::interrupt_requested() {
         return Err(AndroidError::CommandInterrupted {
             stage: spec.stage.clone(),
@@ -136,128 +148,91 @@ fn run_command_inner(
             });
         }
     };
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| AndroidError::CommandSpawn {
-            stage: spec.stage.clone(),
-            program: spec.program.clone(),
-            source: std::io::Error::other("spawned process did not expose piped stdout"),
-        })?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| AndroidError::CommandSpawn {
-            stage: spec.stage.clone(),
-            program: spec.program.clone(),
-            source: std::io::Error::other("spawned process did not expose piped stderr"),
-        })?;
-    let (stdout_sender, stdout_reader) = mpsc::sync_channel(1);
-    thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let result = stdout.read_to_end(&mut bytes).map(|_| bytes);
-        let _ = stdout_sender.send(result);
-    });
-    let (stderr_sender, stderr_reader) = mpsc::sync_channel(1);
-    thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let result = stderr.read_to_end(&mut bytes).map(|_| bytes);
-        let _ = stderr_sender.send(result);
-    });
+    let mut capture = match capture_output(&mut child, spec, output_limit) {
+        Ok(capture) => capture,
+        Err(error) => {
+            terminate_process_tree(&mut child, process_group);
+            return Err(error);
+        }
+    };
 
     let started = Instant::now();
-    let status = loop {
+    let mut status = None;
+    loop {
         if rustferry_core::process_control::interrupt_requested() {
             terminate_process_tree(&mut child, process_group);
+            drain_after_termination(&mut capture);
             return Err(AndroidError::CommandInterrupted {
                 stage: spec.stage.clone(),
                 program: spec.program.clone(),
             });
         }
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if started.elapsed() < spec.timeout => {
-                thread::sleep(Duration::from_millis(25));
-            }
-            Ok(None) => {
-                terminate_process_tree(&mut child, process_group);
-                break None;
-            }
+        let capture_status = match capture.poll() {
+            Ok(capture_status) => capture_status,
             Err(source) => {
                 terminate_process_tree(&mut child, process_group);
-                return Err(AndroidError::CommandSpawn {
-                    stage: spec.stage.clone(),
-                    program: spec.program.clone(),
-                    source,
-                });
+                return Err(output_read_error(spec, log_path, source));
             }
-        }
-    };
-
-    let mut stdout = None;
-    let mut stderr = None;
-    let mut timed_out = status.is_none();
-    if !timed_out {
-        stdout = receive_reader(&stdout_reader, started, spec.timeout).map_err(|source| {
-            if source.kind() == std::io::ErrorKind::Interrupted {
-                terminate_process_tree(&mut child, process_group);
-                return AndroidError::CommandInterrupted {
-                    stage: spec.stage.clone(),
-                    program: spec.program.clone(),
-                };
-            }
-            io_error(
-                "read command stdout",
-                log_path.unwrap_or(&spec.program),
-                source,
-            )
-        })?;
-        stderr = receive_reader(&stderr_reader, started, spec.timeout).map_err(|source| {
-            if source.kind() == std::io::ErrorKind::Interrupted {
-                terminate_process_tree(&mut child, process_group);
-                return AndroidError::CommandInterrupted {
-                    stage: spec.stage.clone(),
-                    program: spec.program.clone(),
-                };
-            }
-            io_error(
-                "read command stderr",
-                log_path.unwrap_or(&spec.program),
-                source,
-            )
-        })?;
-        if stdout.is_none() || stderr.is_none() {
-            timed_out = true;
+        };
+        if let OutputCaptureStatus::LimitExceeded(stream) = capture_status {
             terminate_process_tree(&mut child, process_group);
+            drain_after_termination(&mut capture);
+            let output = capture.into_partial_output();
+            if let Some(path) = log_path {
+                write_log(spec, path, &output.stdout, &output.stderr)?;
+            }
+            return Err(AndroidError::ProcessOutputTooLarge {
+                stage: spec.stage.clone(),
+                program: spec.program.clone(),
+                stream: stream.to_string(),
+                limit_bytes: output_limit,
+                log: log_path.map(Utf8Path::to_owned),
+            });
         }
-    }
-    if timed_out {
-        let grace_started = Instant::now();
-        let grace = Duration::from_secs(1);
-        if stdout.is_none() {
-            stdout = receive_reader(&stdout_reader, grace_started, grace)
-                .ok()
-                .flatten();
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(exit_status)) => status = Some(exit_status),
+                Ok(None) => {}
+                Err(source) => {
+                    terminate_process_tree(&mut child, process_group);
+                    return Err(AndroidError::CommandSpawn {
+                        stage: spec.stage.clone(),
+                        program: spec.program.clone(),
+                        source,
+                    });
+                }
+            }
         }
-        if stderr.is_none() {
-            stderr = receive_reader(&stderr_reader, grace_started, grace)
-                .ok()
-                .flatten();
+        if status.is_some() && capture.is_complete() {
+            break;
         }
-    }
-    let stdout = stdout.unwrap_or_default();
-    let stderr = stderr.unwrap_or_default();
-    if let Some(log_path) = log_path {
-        write_log(spec, log_path, &stdout, &stderr)?;
+        let remaining = spec.timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            terminate_process_tree(&mut child, process_group);
+            drain_after_termination(&mut capture);
+            let output = capture.into_partial_output();
+            if let Some(path) = log_path {
+                write_log(spec, path, &output.stdout, &output.stderr)?;
+            }
+            return Err(AndroidError::CommandTimedOut {
+                stage: spec.stage.clone(),
+                program: spec.program.clone(),
+                log: log_path.map(Utf8Path::to_owned),
+            });
+        }
+        if capture.is_complete() {
+            thread::sleep(remaining.min(OUTPUT_POLL_INTERVAL));
+        } else if let Err(source) = capture.wait_timeout(remaining.min(OUTPUT_POLL_INTERVAL)) {
+            terminate_process_tree(&mut child, process_group);
+            return Err(output_read_error(spec, log_path, source));
+        }
     }
 
-    let Some(status) = status.filter(|_| !timed_out) else {
-        return Err(AndroidError::CommandTimedOut {
-            stage: spec.stage.clone(),
-            program: spec.program.clone(),
-            log: log_path.map(Utf8Path::to_owned),
-        });
-    };
+    let output = capture.into_partial_output();
+    if let Some(log_path) = log_path {
+        write_log(spec, log_path, &output.stdout, &output.stderr)?;
+    }
+    let status = status.expect("completed capture requires a reaped child");
     if !status.success() {
         return Err(AndroidError::CommandFailed {
             stage: spec.stage.clone(),
@@ -266,39 +241,69 @@ fn run_command_inner(
                 || "terminated by signal".to_owned(),
                 |code| code.to_string(),
             ),
-            summary: command_summary(&stdout, &stderr),
+            summary: command_summary(&output.stdout, &output.stderr),
             log: log_path.map(Utf8Path::to_owned),
         });
     }
     Ok(CommandOutput {
-        stdout,
-        stderr,
+        stdout: output.stdout,
+        stderr: output.stderr,
         status,
     })
 }
 
-fn receive_reader(
-    reader: &Receiver<std::io::Result<Vec<u8>>>,
-    started: Instant,
-    timeout: Duration,
-) -> std::io::Result<Option<Vec<u8>>> {
-    loop {
-        if rustferry_core::process_control::interrupt_requested() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "command output drain interrupted",
-            ));
+fn capture_output(
+    child: &mut Child,
+    spec: &CommandSpec,
+    output_limit: usize,
+) -> Result<BoundedOutputCapture, AndroidError> {
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AndroidError::CommandSpawn {
+            stage: spec.stage.clone(),
+            program: spec.program.clone(),
+            source: std::io::Error::other("spawned process did not expose piped stdout"),
+        })?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| AndroidError::CommandSpawn {
+            stage: spec.stage.clone(),
+            program: spec.program.clone(),
+            source: std::io::Error::other("spawned process did not expose piped stderr"),
+        })?;
+    BoundedOutputCapture::spawn(stdout, stderr, output_limit).map_err(|source| {
+        AndroidError::CommandSpawn {
+            stage: spec.stage.clone(),
+            program: spec.program.clone(),
+            source,
         }
-        let remaining = timeout.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
-            return Ok(None);
-        }
-        match reader.recv_timeout(remaining.min(Duration::from_millis(25))) {
-            Ok(result) => return result.map(Some),
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {
-                return Err(std::io::Error::other("command output reader disconnected"));
-            }
+    })
+}
+
+fn output_read_error(
+    spec: &CommandSpec,
+    log_path: Option<&Utf8Path>,
+    source: std::io::Error,
+) -> AndroidError {
+    io_error(
+        "read command output",
+        log_path.unwrap_or(&spec.program),
+        source,
+    )
+}
+
+fn drain_after_termination(capture: &mut BoundedOutputCapture) {
+    let started = Instant::now();
+    while !capture.is_complete() {
+        let remaining = OUTPUT_DRAIN_GRACE.saturating_sub(started.elapsed());
+        if remaining.is_zero()
+            || capture
+                .wait_timeout(remaining.min(OUTPUT_POLL_INTERVAL))
+                .is_err()
+        {
+            break;
         }
     }
 }
@@ -383,6 +388,9 @@ fn command_summary(stdout: &[u8], stderr: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    const TEST_OUTPUT_LIMIT: usize = 64 * 1024;
+
     #[test]
     fn rendered_command_redacts_selected_arguments() {
         let mut command = CommandSpec::new("sign", "/tools/apksigner", "/project");
@@ -406,5 +414,29 @@ mod tests {
         let error = run_command(&command, &root.join("command.log")).unwrap_err();
         assert!(matches!(error, AndroidError::CommandTimedOut { .. }));
         assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_stdout_is_typed_and_log_is_bounded() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temporary.path().to_owned()).unwrap();
+        let log_path = root.join("command.log");
+        let mut command = CommandSpec::new("oversized stdout", "/usr/bin/yes", &root);
+        command.args = vec!["overflow".into()];
+        command.timeout = Duration::from_secs(5);
+        let started = Instant::now();
+        let error = run_command_with_output_limit(&command, Some(&log_path), TEST_OUTPUT_LIMIT)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AndroidError::ProcessOutputTooLarge {
+                ref stream,
+                limit_bytes: TEST_OUTPUT_LIMIT,
+                ..
+            } if stream == "stdout"
+        ));
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(fs::metadata(log_path).unwrap().len() <= (TEST_OUTPUT_LIMIT + 4096) as u64);
     }
 }

@@ -1646,11 +1646,11 @@ fn sha256_file(path: &Utf8Path) -> Result<String, PipelineError> {
     {
         return Err(PipelineError::ArtifactPublicationFailed);
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(hex::encode(digest.finalize()))
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn normalize_public_tool_output(output: &[u8]) -> Result<String, PipelineError> {
@@ -1932,7 +1932,7 @@ mod tests {
                 project_path: ".".to_owned(),
                 entries: Vec::new(),
                 total_size: 0,
-                sha256: format!("{:x}", source_digest.finalize()),
+                sha256: hex::encode(source_digest.finalize()),
             },
             signing,
             requested_artifacts: BTreeSet::from([IosArtifactType::Ipa]),

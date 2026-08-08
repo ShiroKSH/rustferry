@@ -22,6 +22,7 @@ fn generated_minimal_project_produces_verified_apk() {
         parent,
         ProjectRequest {
             name: "android-probe".to_owned(),
+            display_name: None,
             identifier: Some("com.example.androidprobe".to_owned()),
             template: TemplateKind::Minimal,
             platforms: PlatformSelection::Android,
@@ -65,23 +66,23 @@ fn generated_minimal_project_produces_verified_apk() {
     let AndroidBuildOutcome::Built(artifact) = outcome else {
         panic!("non-dry build returned a dry-run plan");
     };
-    assert!(artifact.apk.is_file());
-    assert_eq!(artifact.validation.package_name, "com.example.androidprobe");
+    let validation = artifact.validation();
+    assert!(artifact.apk().is_file());
+    assert_eq!(validation.package_name, "com.example.androidprobe");
     assert_eq!(
-        artifact.validation.launcher_activity,
+        validation.launcher_activity,
         rustferry_android::ACTIVITY_CLASS
     );
-    assert_eq!(artifact.validation.native_abis, ["arm64-v8a"]);
-    assert!(artifact.validation.dex_files >= 1);
+    assert_eq!(validation.native_abis, ["arm64-v8a"]);
+    assert!(validation.dex_files >= 1);
     assert!(
-        artifact
-            .validation
+        validation
             .manifest
             .permissions
             .contains(&"android.permission.CAMERA".to_owned())
     );
     assert_eq!(
-        artifact.validation.manifest.deep_link_filters,
+        validation.manifest.deep_link_filters,
         ["scheme=probe;host=open.example;pathPrefix=/details"]
     );
     for component in [
@@ -93,10 +94,10 @@ fn generated_minimal_project_produces_verified_apk() {
         ),
         format!("receiver:{}", rustferry_android::WIDGET_PROVIDER_CLASS),
     ] {
-        assert!(artifact.validation.manifest.components.contains(&component));
+        assert!(validation.manifest.components.contains(&component));
     }
-    eprintln!("verified APK: {}", artifact.apk);
-    eprintln!("validation: {:?}", artifact.validation);
+    eprintln!("verified APK: {}", artifact.apk());
+    eprintln!("validation: {validation:?}");
 
     let repeated = build_android(&request).unwrap();
     let AndroidBuildOutcome::Built(repeated) = repeated else {
@@ -104,7 +105,7 @@ fn generated_minimal_project_produces_verified_apk() {
     };
     for stage in ["aapt2-compile", "aapt2-link", "d8"] {
         assert!(
-            repeated.cache_hits.iter().any(|hit| hit == stage),
+            repeated.cache_hits().iter().any(|hit| hit == stage),
             "repeated build did not reuse {stage}"
         );
     }

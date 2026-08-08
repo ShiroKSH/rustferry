@@ -1,35 +1,77 @@
-# Physical iPhone status
+# Physical iPhone development
 
-Remote physical-device compilation is implemented. The GitHub-hosted macOS worker has produced a
-real unsigned `aarch64-apple-ios` archive, and a Linux client automatically downloaded and
-independently validated it. This proves the no-Mac compile and artifact path, not installability or
-runtime behavior.
+RustFerry has two physical-device build paths. A local Mac can use the official Xcode development
+pipeline. A machine without Xcode can submit an exact source revision to a trusted GitHub-hosted
+macOS worker and download the result only after remote and local validation.
 
-After [GitHub remote setup](../remote/github-security.md#repository-setup), an unsigned diagnostic
-build is:
+## Local Mac development build
+
+The local path cross-compiles the Rust executable for `aarch64-apple-ios`, generates the hidden
+Xcode host below `target/ferry/ios-device/`, asks Xcode to development-sign it for an explicit Team,
+then checks the app, embedded extensions, signatures, profiles, entitlements, Team ID, bundle IDs,
+and arm64 architecture.
+
+List usable identities:
+
+```text
+cargo ferry signing teams
+```
+
+Build without changing provisioning assets:
+
+```text
+cargo ferry build ios --device --team ABCDE12345
+```
+
+Permit Xcode account/profile updates only when intended:
+
+```text
+cargo ferry build ios --device --team ABCDE12345 --allow-provisioning-updates
+```
+
+Manual signing accepts `--provisioning-profile NAME_OR_UUID`. No password, private key, profile contents, or account token belongs in `ferry.toml` or CLI output.
+
+Install and run use an exact CoreDevice identifier from `cargo ferry devices --platform ios`:
+
+```text
+cargo ferry install ios --device DEVICE_ID --team ABCDE12345
+cargo ferry run ios --device DEVICE_ID --team ABCDE12345
+```
+
+An unsigned or ad-hoc Simulator bundle is never accepted for a physical device. Provisioning mutation is off by default, no device is needed for build, and no signing bypass exists.
+
+Implementation and deterministic signing-plan tests are complete, but the local environment has not
+produced, installed, or launched a physical-device artifact: no Apple Development identity, Team,
+profile, or attached device was available.
+
+## Remote build without Xcode
+
+After [GitHub remote setup](../remote/github-security.md#repository-setup), request an unsigned
+diagnostic build:
 
 ```console
 cargo ferry build iphone --remote github --unsigned
 ```
 
-The client downloads
-`target/ferry/ios/device/<profile>/<product>-unsigned.xcarchive.zip` only after remote and local
-validation.
+The client publishes only an operation-scoped request, waits for the trusted macOS worker, downloads
+the result, rehashes and independently inspects it, then atomically writes
+`target/ferry/ios/device/<profile>/<product>-unsigned.xcarchive.zip`. A Linux acceptance run produced
+a real unsigned physical-iPhone archive and validated the automatic download end to end. This is
+compile and unsigned-artifact evidence, not installability or device-runtime evidence.
 
-Manual Apple Development signing setup is implemented for one application profile. Configure it as
-described in [iOS signing](signing.md), then request a signed build:
+Manual Apple Development signing setup supports one application profile. Configure it as described
+in [iOS signing](signing.md), then request a signed build:
 
 ```console
 cargo ferry build iphone --remote github --team <TEAMID>
 ```
 
-A successful signed request is designed to download the development IPA, artifact manifest,
-validation report, and sanitized log below `target/ferry/ios/device/<profile>/`. The worker uses full
-Xcode, normal Apple signing, a temporary keychain, matching development provisioning, and strict
-signature/profile/team/device/entitlement checks.
+The signed path is designed to return a development IPA, artifact manifest, validation report, and
+sanitized log below `target/ferry/ios/device/<profile>/`. Real certificate/profile upload, signed IPA
+export, and independent signed-artifact acceptance have not run because the required Apple assets
+and distinct private execution repository are not configured. Widget and Live Activity projects
+remain unsupported by this setup flow until separate extension profiles exist.
 
-Real certificate/profile upload, signed IPA export, and independent signed-artifact acceptance have
-not yet run because the required external Apple assets and distinct private execution repository are
-not configured. Widget and Live Activity projects are rejected by manual setup until separate
-extension profiles are supported. Install, launch, and physical-device runtime remain unimplemented
-and unvalidated.
+Local devicectl install/launch services are implemented. Installing or launching a downloaded remote
+artifact has not been accepted, and no physical-device runtime behavior has been observed. See
+[STATUS](../STATUS.md) for the exact evidence level.

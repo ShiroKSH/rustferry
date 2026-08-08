@@ -1392,7 +1392,7 @@ fn verify_regular_file(
         .map_err(|error| io_store_error(error.kind()))?;
     if size != expected_size
         || final_metadata.len() != expected_size
-        || format!("{:x}", hasher.finalize()) != expected_sha256
+        || hex::encode(hasher.finalize()) != expected_sha256
     {
         return Err(GithubArtifactStoreError::InvalidSealedArchive);
     }
@@ -1476,7 +1476,7 @@ fn atomic_verified_copy_with_unlink(
             .flush()
             .and_then(|()| output.sync_all())
             .map_err(|error| io_store_error(error.kind()))?;
-        let actual_sha256 = format!("{:x}", hasher.finalize());
+        let actual_sha256 = hex::encode(hasher.finalize());
         if copied != record.size || actual_sha256 != record.sha256 {
             return Err(GithubArtifactStoreError::InvalidSealedArchive);
         }
@@ -1652,7 +1652,7 @@ fn is_safe_public_text(value: &str) -> bool {
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn rfc3339_from_unix(seconds: u64) -> Option<String> {
@@ -2487,7 +2487,7 @@ mod tests {
             project_path: ".".to_owned(),
             entries,
             total_size,
-            sha256: format!("{:x}", digest.finalize()),
+            sha256: hex::encode(digest.finalize()),
         }
     }
 

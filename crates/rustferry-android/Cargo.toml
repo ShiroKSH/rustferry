@@ -7,24 +7,33 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
+documentation = "https://docs.rs/rustferry-android"
 readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Direct no-Gradle Android packaging backend for RustFerry"
+include = [
+    "src/**",
+    "java/**",
+    "tests/golden/**",
+    "tests/fixtures/**",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+]
 
 [dependencies]
 camino.workspace = true
 directories.workspace = true
 fs2.workspace = true
 hex.workspace = true
-rustferry-codegen = { version = "0.1.0", path = "../rustferry-codegen" }
-rustferry-core = { version = "0.1.0", path = "../rustferry-core" }
+rustferry-codegen = { version = "=0.1.0", path = "../rustferry-codegen" }
+rustferry-core = { version = "=0.1.0", path = "../rustferry-core" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
-zip = { version = "6.0.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [dev-dependencies]
 tempfile.workspace = true

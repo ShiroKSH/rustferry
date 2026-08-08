@@ -5,7 +5,10 @@ use std::{
 };
 
 use camino::{Utf8Path, Utf8PathBuf};
-use rustferry_core::{AndroidAbi, AndroidLiveActivityFallback, FerryConfig};
+use rustferry_core::{
+    AndroidAbi, AndroidLiveActivityFallback, ArtifactDigest, ArtifactDigestKind, FerryConfig,
+    digest_artifact,
+};
 use serde::{Deserialize, Serialize};
 use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
@@ -36,6 +39,8 @@ pub struct ApkExpectation {
 /// Evidence returned by independent APK inspection.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ApkValidation {
+    /// SHA-256 identity of the exact APK bytes inspected by the platform validator.
+    pub artifact_digest: ArtifactDigest,
     /// Package ID parsed from `aapt2 dump badging`.
     pub package_name: String,
     /// Launcher activity parsed from AAPT2.
@@ -293,14 +298,17 @@ pub fn validate_apk_archive(
             });
         }
     }
-    if !seen
-        .iter()
-        .any(|name| name.starts_with("res/drawable") && name.contains("ferry_icon"))
-    {
-        return Err(AndroidError::InvalidArtifact {
-            path: apk.to_owned(),
-            reason: "compiled launcher icon resource is missing".to_owned(),
-        });
+    for density in ["mdpi", "hdpi", "xhdpi", "xxhdpi", "xxxhdpi"] {
+        let prefix = format!("res/mipmap-{density}");
+        if !seen
+            .iter()
+            .any(|name| name.starts_with(&prefix) && name.contains("ferry_icon"))
+        {
+            return Err(AndroidError::InvalidArtifact {
+                path: apk.to_owned(),
+                reason: format!("compiled {density} launcher icon resource is missing"),
+            });
+        }
     }
     if !seen
         .iter()
@@ -338,12 +346,22 @@ pub fn validate_apk_archive(
     }
     entries.sort();
     Ok(ApkValidation {
+        artifact_digest: apk_artifact_digest(apk)?,
         package_name: String::new(),
         launcher_activity: String::new(),
         entries,
         native_abis,
         dex_files: dex_names.len(),
         manifest: Box::default(),
+    })
+}
+
+pub(crate) fn apk_artifact_digest(apk: &Utf8Path) -> Result<ArtifactDigest, AndroidError> {
+    digest_artifact(apk, ArtifactDigestKind::AndroidApk).map_err(|error| {
+        AndroidError::InvalidArtifact {
+            path: apk.to_owned(),
+            reason: format!("could not bind validation to exact APK bytes: {error}"),
+        }
     })
 }
 
@@ -1064,7 +1082,11 @@ mod tests {
         for (name, contents) in [
             ("AndroidManifest.xml", b"manifest".as_slice()),
             ("resources.arsc", b"resources".as_slice()),
-            ("res/drawable/ferry_icon.xml", b"icon".as_slice()),
+            ("res/mipmap-mdpi-v4/ferry_icon.png", b"icon".as_slice()),
+            ("res/mipmap-hdpi-v4/ferry_icon.png", b"icon".as_slice()),
+            ("res/mipmap-xhdpi-v4/ferry_icon.png", b"icon".as_slice()),
+            ("res/mipmap-xxhdpi-v4/ferry_icon.png", b"icon".as_slice()),
+            ("res/mipmap-xxxhdpi-v4/ferry_icon.png", b"icon".as_slice()),
             ("res/drawable/ferry_splash.xml", b"splash".as_slice()),
         ] {
             zip.start_file(name, options).unwrap();
@@ -1116,6 +1138,11 @@ mod tests {
             dex_required: false,
         };
         let mut validation = ApkValidation {
+            artifact_digest: ArtifactDigest {
+                sha256: String::new(),
+                entries: 0,
+                bytes: 0,
+            },
             package_name: String::new(),
             launcher_activity: String::new(),
             entries: vec![],
@@ -1208,6 +1235,11 @@ mod tests {
             A: http://schemas.android.com/apk/res/android:grantUriPermissions=true
 "#;
         let mut validation = ApkValidation {
+            artifact_digest: ArtifactDigest {
+                sha256: String::new(),
+                entries: 0,
+                bytes: 0,
+            },
             package_name: String::new(),
             launcher_activity: String::new(),
             entries: vec![],

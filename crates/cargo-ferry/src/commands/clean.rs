@@ -69,16 +69,19 @@ fn clean_targets(root: &Utf8Path, scope: Option<CleanScope>, all: bool) -> Vec<U
     }
     match scope {
         Some(CleanScope::Android) => vec![root.join("android")],
-        Some(CleanScope::Ios) => vec![root.join("ios")],
+        Some(CleanScope::Ios) => vec![root.join("ios"), root.join("ios-device")],
         Some(CleanScope::Generated) => vec![
             root.join("android/debug/generated"),
             root.join("android/release/generated"),
             root.join("ios/generated"),
+            root.join("ios-device/generated"),
+            root.join("ios-device/xcode"),
             root.join("generated"),
         ],
         None => vec![
             root.join("android"),
             root.join("ios"),
+            root.join("ios-device"),
             root.join("generated"),
         ],
     }

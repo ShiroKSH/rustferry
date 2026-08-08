@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AppleBuildProfile, AppleError, CommandSpec, IOS_DEVICE_TARGET, IosDeviceToolchain,
-    IosProjectPlatform, IosProjectSpec, PlannedCopy, error::io_error,
+    AppleBuildProfile, AppleError, CommandSpec, IOS_DEVICE_TARGET, IosAssetPackaging,
+    IosDeviceToolchain, IosProjectPlatform, IosProjectSpec, PlannedCopy, error::io_error,
     generate_ios_project_for_platform, run_command, write_ios_project,
 };
 
@@ -236,7 +236,8 @@ fn plan_with_assets(
     }
     let generated = generate_ios_project_for_platform(
         &IosProjectSpec::new(request.config.clone(), request.binary_name.clone())
-            .with_assets(assets.clone()),
+            .with_assets(assets.clone())
+            .with_asset_packaging(IosAssetPackaging::SdkOnlyResources),
         IosProjectPlatform::DeviceUnsigned,
     )?;
     let device_root = request
@@ -321,7 +322,7 @@ fn archive_expectation(
                     "generated physical-iOS project omitted required resource `{relative}`"
                 ))
             })?;
-        required_resources.insert(relative.to_owned(), format!("{:x}", Sha256::digest(bytes)));
+        required_resources.insert(relative.to_owned(), hex::encode(Sha256::digest(bytes)));
     }
     Ok(UnsignedXcarchiveExpectation {
         app_directory_name: product.app_directory_name,
@@ -612,7 +613,8 @@ fn write_trusted_generated_project(
 ) -> Result<(), AppleError> {
     let generated = generate_ios_project_for_platform(
         &IosProjectSpec::new(request.config.clone(), request.binary_name.clone())
-            .with_assets(assets.clone()),
+            .with_assets(assets.clone())
+            .with_asset_packaging(IosAssetPackaging::SdkOnlyResources),
         IosProjectPlatform::DeviceUnsigned,
     )?;
     write_ios_project(&generated, generated_root)

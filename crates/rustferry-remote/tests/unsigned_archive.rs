@@ -653,5 +653,5 @@ const fn version(major: u32, minor: u32, patch: u32) -> u32 {
 }
 
 fn sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }

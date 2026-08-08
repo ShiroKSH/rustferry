@@ -1971,7 +1971,7 @@ impl<R: GhRunner> GithubTransport<R> {
             return Err(TransportError::ArtifactSizeMismatch);
         }
         if let Some(expected) = artifact.digest.as_deref() {
-            let actual = format!("sha256:{:x}", Sha256::digest(&bytes));
+            let actual = format!("sha256:{}", hex::encode(Sha256::digest(&bytes)));
             if actual != expected {
                 return Err(TransportError::ArtifactDigestMismatch);
             }
@@ -2977,7 +2977,7 @@ mod tests {
             self.secret_writes.push(RecordedSecretWrite {
                 request: request.clone(),
                 stdin_bytes: value.len(),
-                stdin_sha256: format!("{:x}", Sha256::digest(value.expose_secret_bytes())),
+                stdin_sha256: hex::encode(Sha256::digest(value.expose_secret_bytes())),
             });
             self.secret_responses
                 .pop_front()
@@ -3203,7 +3203,7 @@ mod tests {
         assert_eq!(write.stdin_bytes, SENTINEL.len());
         assert_eq!(
             write.stdin_sha256,
-            format!("{:x}", Sha256::digest(SENTINEL.as_bytes()))
+            hex::encode(Sha256::digest(SENTINEL.as_bytes()))
         );
         assert_eq!(
             write.request.arguments(),
@@ -3379,7 +3379,7 @@ mod tests {
         let executable = executable_directory.path().join("gh");
         fs::write(
             &executable,
-            b"#!/bin/sh\nset -eu\n/bin/sleep 5 &\nprintf '%s\\n' \"$!\" > descendant-pid\n/bin/cat >/dev/null\n/bin/sleep 5\n",
+            b"#!/bin/sh\nset -eu\n/bin/sleep 30 &\nprintf '%s\\n' \"$!\" > descendant-pid\n/bin/cat >/dev/null\n/bin/sleep 30\n",
         )
         .expect("fake gh executable");
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
@@ -3397,10 +3397,10 @@ mod tests {
             1,
             4 * 1024,
             4 * 1024 * 1024,
-            Duration::from_secs(1),
-            Duration::from_secs(1),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
         )
-        .expect("one-second limits");
+        .expect("five-second limits");
         let request = environment_secret_write_request();
         let value = SecretBytes::new(SENTINEL.as_bytes().to_vec());
         let mut transport = GithubTransport::new(runner, limits);
@@ -3413,7 +3413,7 @@ mod tests {
 
         assert_eq!(error, TransportError::Execution(GhExecutionError::TimedOut));
         assert!(
-            elapsed < Duration::from_secs(4),
+            elapsed < Duration::from_secs(8),
             "process-tree timeout took {elapsed:?}"
         );
         assert!(!format!("{error:?}\n{error}").contains(SENTINEL));

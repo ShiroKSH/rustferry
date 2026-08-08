@@ -1,5 +1,226 @@
 //! Child-process-tree tracking used by the command-line interrupt handler.
 
+use std::{
+    fmt,
+    io::{self, Read},
+    sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError},
+    thread,
+    time::Duration,
+};
+
+/// Maximum bytes retained from each child-process output stream.
+pub const DEFAULT_PROCESS_OUTPUT_LIMIT: usize = 32 * 1024 * 1024;
+
+const OUTPUT_READ_CHUNK_SIZE: usize = 16 * 1024;
+
+/// One of the two captured child-process output streams.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessOutputStream {
+    /// Standard output.
+    Stdout,
+    /// Standard error.
+    Stderr,
+}
+
+impl fmt::Display for ProcessOutputStream {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stdout => formatter.write_str("stdout"),
+            Self::Stderr => formatter.write_str("stderr"),
+        }
+    }
+}
+
+/// Current state of a bounded concurrent output capture.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutputCaptureStatus {
+    /// At least one stream is still open.
+    Pending,
+    /// Both streams reached EOF within their limits.
+    Complete,
+    /// A stream produced more bytes than the configured per-stream limit.
+    LimitExceeded(ProcessOutputStream),
+}
+
+/// Captured prefixes from both child-process output streams.
+#[derive(Debug, Default)]
+pub struct CapturedProcessOutput {
+    /// Standard output, capped at the configured limit.
+    pub stdout: Vec<u8>,
+    /// Standard error, capped at the configured limit.
+    pub stderr: Vec<u8>,
+}
+
+enum OutputDrainEvent {
+    LimitExceeded(ProcessOutputStream),
+    Finished {
+        stream: ProcessOutputStream,
+        result: io::Result<Vec<u8>>,
+    },
+}
+
+/// Concurrently drains stdout and stderr while retaining at most a fixed number of bytes each.
+pub struct BoundedOutputCapture {
+    receiver: Receiver<OutputDrainEvent>,
+    stdout: Option<Vec<u8>>,
+    stderr: Option<Vec<u8>>,
+    limit_exceeded: Option<ProcessOutputStream>,
+}
+
+impl BoundedOutputCapture {
+    /// Start one drain thread per stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an operating-system error when either reader thread cannot be started.
+    pub fn spawn<Stdout, Stderr>(stdout: Stdout, stderr: Stderr, limit: usize) -> io::Result<Self>
+    where
+        Stdout: Read + Send + 'static,
+        Stderr: Read + Send + 'static,
+    {
+        let (sender, receiver) = mpsc::channel();
+        spawn_bounded_drain(stdout, ProcessOutputStream::Stdout, limit, sender.clone())?;
+        spawn_bounded_drain(stderr, ProcessOutputStream::Stderr, limit, sender)?;
+        Ok(Self {
+            receiver,
+            stdout: None,
+            stderr: None,
+            limit_exceeded: None,
+        })
+    }
+
+    /// Consume all currently queued reader events without blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when a pipe read fails or both readers disconnect before EOF.
+    pub fn poll(&mut self) -> io::Result<OutputCaptureStatus> {
+        loop {
+            match self.receiver.try_recv() {
+                Ok(event) => self.accept(event)?,
+                Err(TryRecvError::Empty) => return Ok(self.status()),
+                Err(TryRecvError::Disconnected) if self.is_complete() => {
+                    return Ok(self.status());
+                }
+                Err(TryRecvError::Disconnected) => {
+                    return Err(io::Error::other(
+                        "child output readers disconnected before both streams reached EOF",
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Wait for reader activity, then consume every queued event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when a pipe read fails or both readers disconnect before EOF.
+    pub fn wait_timeout(&mut self, timeout: Duration) -> io::Result<OutputCaptureStatus> {
+        if self.is_complete() {
+            return Ok(self.status());
+        }
+        match self.receiver.recv_timeout(timeout) {
+            Ok(event) => self.accept(event)?,
+            Err(RecvTimeoutError::Timeout) => return self.poll(),
+            Err(RecvTimeoutError::Disconnected) if self.is_complete() => {
+                return Ok(self.status());
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::other(
+                    "child output readers disconnected before both streams reached EOF",
+                ));
+            }
+        }
+        self.poll()
+    }
+
+    /// Report whether both drain threads reached EOF.
+    pub const fn is_complete(&self) -> bool {
+        self.stdout.is_some() && self.stderr.is_some()
+    }
+
+    /// Return completed stream prefixes, substituting an empty vector for a reader still blocked.
+    pub fn into_partial_output(self) -> CapturedProcessOutput {
+        CapturedProcessOutput {
+            stdout: self.stdout.unwrap_or_default(),
+            stderr: self.stderr.unwrap_or_default(),
+        }
+    }
+
+    fn accept(&mut self, event: OutputDrainEvent) -> io::Result<()> {
+        match event {
+            OutputDrainEvent::LimitExceeded(stream) => {
+                self.limit_exceeded.get_or_insert(stream);
+                Ok(())
+            }
+            OutputDrainEvent::Finished { stream, result } => {
+                let bytes = result.map_err(|source| {
+                    io::Error::new(source.kind(), format!("read child {stream}: {source}"))
+                })?;
+                match stream {
+                    ProcessOutputStream::Stdout => self.stdout = Some(bytes),
+                    ProcessOutputStream::Stderr => self.stderr = Some(bytes),
+                }
+                Ok(())
+            }
+        }
+    }
+
+    const fn status(&self) -> OutputCaptureStatus {
+        if let Some(stream) = self.limit_exceeded {
+            OutputCaptureStatus::LimitExceeded(stream)
+        } else if self.is_complete() {
+            OutputCaptureStatus::Complete
+        } else {
+            OutputCaptureStatus::Pending
+        }
+    }
+}
+
+fn spawn_bounded_drain(
+    mut reader: impl Read + Send + 'static,
+    stream: ProcessOutputStream,
+    limit: usize,
+    sender: mpsc::Sender<OutputDrainEvent>,
+) -> io::Result<()> {
+    thread::Builder::new()
+        .name(format!("rustferry-{stream}-drain"))
+        .spawn(move || {
+            let mut retained = Vec::new();
+            let mut chunk = [0_u8; OUTPUT_READ_CHUNK_SIZE];
+            let mut exceeded = false;
+            let result = loop {
+                match reader.read(&mut chunk) {
+                    Ok(0) => break Ok(retained),
+                    Ok(read) => {
+                        let remaining = limit.saturating_sub(retained.len());
+                        let append = read.min(remaining);
+                        if let Err(error) = retained.try_reserve_exact(append) {
+                            break Err(io::Error::other(format!(
+                                "could not reserve bounded {stream} buffer: {error}"
+                            )));
+                        }
+                        retained.extend_from_slice(&chunk[..append]);
+                        if read > remaining && !exceeded {
+                            exceeded = true;
+                            if sender
+                                .send(OutputDrainEvent::LimitExceeded(stream))
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                    Err(source) if source.kind() == io::ErrorKind::Interrupted => {}
+                    Err(source) => break Err(source),
+                }
+            };
+            let _ = sender.send(OutputDrainEvent::Finished { stream, result });
+        })
+        .map(drop)
+}
+
 #[cfg(unix)]
 mod platform {
     #![allow(unsafe_code)]
@@ -291,4 +512,47 @@ pub fn track_child(child: &std::process::Child) -> std::io::Result<ProcessGroupG
     #[cfg(not(windows))]
     let guard = platform::ProcessGroupGuard::new(child);
     Ok(ProcessGroupGuard { _guard: guard })
+}
+
+#[cfg(test)]
+mod output_tests {
+    use std::io::Cursor;
+
+    use super::*;
+
+    #[test]
+    fn bounded_capture_retains_only_the_configured_prefix() {
+        let limit = 64;
+        let mut capture = BoundedOutputCapture::spawn(
+            Cursor::new(vec![b'o'; limit + 1]),
+            Cursor::new(b"diagnostic".to_vec()),
+            limit,
+        )
+        .unwrap();
+        while !capture.is_complete() {
+            capture.wait_timeout(Duration::from_secs(1)).unwrap();
+        }
+        assert_eq!(
+            capture.poll().unwrap(),
+            OutputCaptureStatus::LimitExceeded(ProcessOutputStream::Stdout)
+        );
+        let output = capture.into_partial_output();
+        assert_eq!(output.stdout, vec![b'o'; limit]);
+        assert_eq!(output.stderr, b"diagnostic");
+    }
+
+    #[test]
+    fn output_equal_to_the_limit_is_complete() {
+        let limit = 64;
+        let mut capture = BoundedOutputCapture::spawn(
+            Cursor::new(vec![b'o'; limit]),
+            Cursor::new(Vec::new()),
+            limit,
+        )
+        .unwrap();
+        while !capture.is_complete() {
+            capture.wait_timeout(Duration::from_secs(1)).unwrap();
+        }
+        assert_eq!(capture.poll().unwrap(), OutputCaptureStatus::Complete);
+    }
 }

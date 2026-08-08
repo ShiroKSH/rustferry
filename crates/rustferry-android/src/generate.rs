@@ -1,6 +1,10 @@
 use std::{fmt::Write as _, fs};
 
 use camino::{Utf8Path, Utf8PathBuf};
+use rustferry_codegen::{
+    GeneratedAssetPlatform, GeneratedAssetSet, read_generated_platform_assets,
+    render_platform_assets_for,
+};
 use rustferry_core::{
     AndroidLiveActivityFallback, FerryConfig, NetworkMode, Orientation, ProjectAssets, Theme,
 };
@@ -194,8 +198,13 @@ fn generate_android_content_inner(
     } else {
         String::new()
     };
+    let icon_resource = if assets.is_some() {
+        "@mipmap/ferry_icon"
+    } else {
+        "@drawable/ferry_icon"
+    };
     let manifest = format!(
-        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\" package=\"{application_id}\">\n{permission_xml}    <uses-sdk android:minSdkVersion=\"{}\" android:targetSdkVersion=\"{target_sdk}\" />\n    <application\n        android:allowBackup=\"false\"\n        android:debuggable=\"{}\"\n        android:extractNativeLibs=\"false\"\n        android:hasCode=\"true\"\n        android:icon=\"@drawable/ferry_icon\"\n        android:label=\"@string/app_name\"\n        android:supportsRtl=\"true\"\n        android:theme=\"@style/FerryTheme\">\n        <activity\n            android:name=\"{ACTIVITY_CLASS}\"\n            android:configChanges=\"orientation|screenSize|keyboardHidden|uiMode|density\"\n            android:exported=\"true\"\n            android:launchMode=\"singleTop\"{orientation}>\n            <meta-data android:name=\"android.app.lib_name\" android:value=\"{native_library_name}\" />\n            <intent-filter>\n                <action android:name=\"android.intent.action.MAIN\" />\n                <category android:name=\"android.intent.category.LAUNCHER\" />\n            </intent-filter>\n{deep_links}        </activity>\n{notification_component}{widget_component}{file_provider_component}    </application>\n</manifest>\n",
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\" package=\"{application_id}\">\n{permission_xml}    <uses-sdk android:minSdkVersion=\"{}\" android:targetSdkVersion=\"{target_sdk}\" />\n    <application\n        android:allowBackup=\"false\"\n        android:debuggable=\"{}\"\n        android:extractNativeLibs=\"false\"\n        android:hasCode=\"true\"\n        android:icon=\"{icon_resource}\"\n        android:label=\"@string/app_name\"\n        android:supportsRtl=\"true\"\n        android:theme=\"@style/FerryTheme\">\n        <activity\n            android:name=\"{ACTIVITY_CLASS}\"\n            android:configChanges=\"orientation|screenSize|keyboardHidden|uiMode|density\"\n            android:exported=\"true\"\n            android:launchMode=\"singleTop\"{orientation}>\n            <meta-data android:name=\"android.app.lib_name\" android:value=\"{native_library_name}\" />\n            <intent-filter>\n                <action android:name=\"android.intent.action.MAIN\" />\n                <category android:name=\"android.intent.category.LAUNCHER\" />\n            </intent-filter>\n{deep_links}        </activity>\n{notification_component}{widget_component}{file_provider_component}    </application>\n</manifest>\n",
         config.android.min_sdk,
         if debuggable { "true" } else { "false" },
     );
@@ -254,16 +263,17 @@ fn generate_android_content_inner(
                     | "res/drawable-night/ferry_splash.xml"
             )
         });
-        binary_resources.extend([
-            (
-                Utf8PathBuf::from("res/drawable-nodpi/ferry_icon.png"),
-                assets.icon().to_vec(),
-            ),
-            (
-                Utf8PathBuf::from("res/drawable-nodpi/ferry_splash.png"),
-                assets.splash().to_vec(),
-            ),
-        ]);
+        binary_resources = android_resource_paths(
+            render_platform_assets_for(assets, GeneratedAssetPlatform::Android)?
+                .files
+                .into_iter()
+                .filter_map(|(path, bytes)| {
+                    path.strip_prefix("android")
+                        .ok()
+                        .map(|relative| (relative.to_owned(), bytes))
+                })
+                .collect(),
+        )?;
     }
     resources.sort_by(|left, right| left.0.cmp(&right.0));
     binary_resources.sort_by(|left, right| left.0.cmp(&right.0));
@@ -301,6 +311,46 @@ fn generate_android_content_inner(
         java_sources,
         fingerprint,
     })
+}
+
+pub(crate) fn content_from_generated_asset_set(
+    planned: &GeneratedAndroidContent,
+    generated: &GeneratedAssetSet,
+) -> Result<GeneratedAndroidContent, AndroidError> {
+    let cached = android_resource_paths(read_generated_platform_assets(
+        generated,
+        GeneratedAssetPlatform::Android,
+    )?)?;
+    if cached != planned.binary_resources {
+        return Err(AndroidError::InvalidRequest(format!(
+            "generated Android asset cache {} differs from the planned source snapshot",
+            generated.root
+        )));
+    }
+    let mut content = planned.clone();
+    content.binary_resources = cached;
+    Ok(content)
+}
+
+fn android_resource_paths(
+    files: Vec<(Utf8PathBuf, Vec<u8>)>,
+) -> Result<Vec<(Utf8PathBuf, Vec<u8>)>, AndroidError> {
+    let mut resources = Vec::with_capacity(files.len());
+    for (relative, bytes) in files {
+        if relative.is_absolute()
+            || relative.as_str().is_empty()
+            || relative
+                .components()
+                .any(|component| !matches!(component, camino::Utf8Component::Normal(_)))
+        {
+            return Err(AndroidError::InvalidRequest(format!(
+                "generated Android asset path is unsafe: {relative}"
+            )));
+        }
+        resources.push((Utf8PathBuf::from("res").join(relative), bytes));
+    }
+    resources.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(resources)
 }
 
 pub(crate) fn android_manifest_permissions(
@@ -482,6 +532,15 @@ mod tests {
 
     use super::*;
 
+    mod png_fixture {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/opaque_png.rs"
+        ));
+    }
+
+    use png_fixture::OPAQUE_1024_PNG as PNG;
+
     #[test]
     fn default_manifest_matches_golden() {
         let config = FerryConfig::starter("RustFerry Counter", "com.example.counter");
@@ -500,6 +559,69 @@ mod tests {
         assert!(content.resources.iter().any(|(path, source)| path
             == "res/drawable-night/ferry_splash.xml"
             && source.contains("#FF101216")));
+    }
+
+    #[test]
+    fn project_assets_use_density_icons_and_cached_packaging_bytes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = Utf8Path::from_path(temporary.path()).unwrap();
+        fs::create_dir(root.join("assets")).unwrap();
+        fs::write(root.join("assets/icon.png"), PNG).unwrap();
+        fs::write(root.join("assets/splash.png"), PNG).unwrap();
+        let assets = ProjectAssets::load(root).unwrap();
+        let planned = generate_android_content_with_assets(
+            &FerryConfig::starter("Assets", "com.example.assets"),
+            "assets",
+            35,
+            true,
+            true,
+            &assets,
+        )
+        .unwrap();
+
+        assert!(
+            planned
+                .manifest
+                .contains("android:icon=\"@mipmap/ferry_icon\"")
+        );
+        assert_eq!(planned.binary_resources.len(), 6);
+        for (density, size) in [
+            ("mdpi", 48),
+            ("hdpi", 72),
+            ("xhdpi", 96),
+            ("xxhdpi", 144),
+            ("xxxhdpi", 192),
+        ] {
+            let path = Utf8PathBuf::from(format!("res/mipmap-{density}/ferry_icon.png"));
+            let bytes = planned
+                .binary_resources
+                .iter()
+                .find_map(|(candidate, bytes)| (candidate == &path).then_some(bytes))
+                .unwrap();
+            assert_eq!(png_dimensions(bytes), (size, size));
+        }
+        assert!(planned.binary_resources.iter().any(|(path, bytes)| path
+            == "res/drawable-nodpi/ferry_splash.png"
+            && png_dimensions(bytes) == (1_024, 1_024)));
+
+        let generated = rustferry_codegen::generate_platform_assets(root, None).unwrap();
+        let packaged = content_from_generated_asset_set(&planned, &generated).unwrap();
+        assert_eq!(packaged.binary_resources, planned.binary_resources);
+
+        fs::write(
+            generated.root.join("android/mipmap-mdpi/ferry_icon.png"),
+            b"tampered",
+        )
+        .unwrap();
+        assert!(content_from_generated_asset_set(&planned, &generated).is_err());
+    }
+
+    fn png_dimensions(bytes: &[u8]) -> (u32, u32) {
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        (
+            u32::from_be_bytes(bytes[16..20].try_into().unwrap()),
+            u32::from_be_bytes(bytes[20..24].try_into().unwrap()),
+        )
     }
 
     #[test]

@@ -477,10 +477,9 @@ pub fn canonical_request_bytes(request: &IosDeviceBuildRequest) -> RemoteBuildRe
 ///
 /// Returns the same validation or serialization failure as [`canonical_request_bytes`].
 pub fn canonical_request_sha256(request: &IosDeviceBuildRequest) -> RemoteBuildResult<String> {
-    Ok(format!(
-        "{:x}",
-        Sha256::digest(canonical_request_bytes(request)?)
-    ))
+    Ok(hex::encode(Sha256::digest(canonical_request_bytes(
+        request,
+    )?)))
 }
 
 /// Provider result after a physical-iPhone build reaches a build-terminal state.

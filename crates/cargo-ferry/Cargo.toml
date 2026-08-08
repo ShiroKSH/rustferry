@@ -11,6 +11,15 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Build Rust applications for Android and iOS without user-maintained platform projects"
+documentation = "https://docs.rs/cargo-ferry"
+include = [
+    "build.rs",
+    "src/**",
+    "embedded-docs/**",
+    "tests/fixtures/**",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+]
 
 [[bin]]
 name = "cargo-ferry"
@@ -24,21 +33,23 @@ clap_complete = "4.5.55"
 fs2.workspace = true
 keyring.workspace = true
 libc.workspace = true
-rustferry-android = { version = "0.1.0", path = "../rustferry-android" }
-rustferry-apple = { version = "0.1.0", path = "../rustferry-apple" }
-rustferry-codegen = { version = "0.1.0", path = "../rustferry-codegen" }
-rustferry-core = { version = "0.1.0", path = "../rustferry-core" }
-rustferry-github = { version = "0.1.0", path = "../rustferry-github" }
-rustferry-remote = { version = "0.1.0", path = "../rustferry-remote" }
+rustferry-android = { version = "=0.1.0", path = "../rustferry-android" }
+rustferry-apple = { version = "=0.1.0", path = "../rustferry-apple" }
+rustferry-codegen = { version = "=0.1.0", path = "../rustferry-codegen" }
+rustferry-core = { version = "=0.1.0", path = "../rustferry-core" }
+rustferry-github = { version = "=0.1.0", path = "../rustferry-github" }
+rustferry-remote = { version = "=0.1.0", path = "../rustferry-remote" }
+rustferry-runtime-contract = { package = "rustferry", version = "=0.1.0", path = "../rustferry", default-features = false }
 rpassword.workspace = true
 same-file.workspace = true
+schemars.workspace = true
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
-toml_edit = "0.23.7"
+toml_edit = "0.25.13"
 uuid.workspace = true
 
 [dev-dependencies]

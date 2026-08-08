@@ -28,7 +28,47 @@ const MAX_REMOTE_BINARY_INPUT_BYTES: u64 = ((MAX_ENVIRONMENT_SECRET_BYTES / 4) *
 pub fn run(arguments: SigningArgs, dry_run: bool, reporter: &Reporter) -> Result<(), CliError> {
     match arguments.command {
         SigningCommand::Setup(arguments) => setup(arguments, dry_run, reporter),
+        SigningCommand::Teams(arguments) => teams(arguments.project_dir, reporter),
     }
+}
+
+fn teams(project_dir: Option<Utf8PathBuf>, reporter: &Reporter) -> Result<(), CliError> {
+    let current_directory = match project_dir {
+        Some(path) => find_project_root(Some(&path))?,
+        None => {
+            Utf8PathBuf::from_path_buf(std::env::current_dir().map_err(|source| CliError::Io {
+                action: "read current directory",
+                path: Utf8PathBuf::from("."),
+                source,
+            })?)
+            .map_err(CliError::NonUtf8Path)?
+        }
+    };
+    let teams = cargo_ferry::deployment::SigningService::for_team_discovery(
+        cargo_ferry::deployment::SystemExecutor,
+    )?
+    .teams(&current_directory)?;
+    reporter.success(
+        "signing teams",
+        &teams,
+        || {
+            if teams.is_empty() {
+                return "No usable Apple Development identities found.\n\nInstall an Apple Development certificate in Keychain, then rerun `cargo ferry signing teams`.".to_owned();
+            }
+            teams
+                .iter()
+                .map(|team| {
+                    format!(
+                        "{}\t{}\t{}",
+                        team.team_id, team.identity, team.certificate_fingerprint
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        },
+        &[],
+    );
+    Ok(())
 }
 
 fn setup(arguments: SigningSetupArgs, dry_run: bool, reporter: &Reporter) -> Result<(), CliError> {

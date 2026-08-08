@@ -3,6 +3,7 @@
 mod cli;
 mod commands;
 mod error;
+mod ide;
 mod output;
 mod project;
 
@@ -19,7 +20,10 @@ fn main() -> ExitCode {
     if arguments.get(1).is_some_and(|value| value == "ferry") {
         arguments.remove(1);
     }
-    let wants_json = arguments.iter().any(|argument| argument == "--json");
+    let wants_json = arguments
+        .iter()
+        .any(|argument| argument == "--json" || argument == "--json-stream");
+    let wants_ide = arguments.iter().any(|argument| argument == "ide");
     let cli = match Cli::try_parse_from(arguments) {
         Ok(cli) => cli,
         Err(error) => {
@@ -30,7 +34,9 @@ fn main() -> ExitCode {
                 let _ = error.print();
                 return ExitCode::SUCCESS;
             }
-            if wants_json {
+            if wants_ide {
+                let _ = crate::commands::ide::write_argument_error(&error.to_string());
+            } else if wants_json {
                 Reporter::new(true, false, false).argument_error(&error.to_string());
             } else {
                 let _ = error.print();
@@ -38,15 +44,36 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let wants_json = cli.json;
+    if cli.json_stream
+        && !matches!(
+            &cli.command,
+            crate::cli::Command::Ide(_)
+                | crate::cli::Command::Devices(_)
+                | crate::cli::Command::Logs(_)
+        )
+    {
+        Reporter::new(true, false, false).argument_error(
+            "--json-stream is supported only by `ide` operations, `devices`, and `logs`; use --json for this command",
+        );
+        return ExitCode::from(2);
+    }
+    let wants_json = cli.json || cli.json_stream;
+    let is_json_stream = cli.json_stream;
+    let is_ide = matches!(&cli.command, crate::cli::Command::Ide(_));
     let reporter = Reporter::new(cli.json, cli.quiet, cli.verbose);
     if let Err(source) = rustferry_core::process_control::install_interrupt_handler() {
-        reporter.error(&crate::error::CliError::InterruptHandler { source });
+        let error = crate::error::CliError::InterruptHandler { source };
+        if is_ide {
+            let _ =
+                crate::ide::protocol::write_compact(&crate::ide::service::error_response(&error));
+        } else {
+            reporter.error(&error);
+        }
         return ExitCode::from(5);
     }
-    let result = commands::run(cli.command, cli.dry_run, &reporter);
+    let result = commands::run(cli.command, cli.dry_run, cli.json_stream, &reporter);
     if rustferry_core::process_control::interrupt_requested() {
-        if wants_json {
+        if wants_json && !is_ide && !is_json_stream {
             reporter.error(&crate::error::CliError::CommandInterrupted {
                 tool: "active child process".to_owned(),
                 stage: "command execution",
@@ -56,6 +83,7 @@ fn main() -> ExitCode {
     }
     match result {
         Ok(()) => ExitCode::SUCCESS,
+        Err(error) if error.is_already_reported() => ExitCode::from(error.exit_code()),
         Err(error) => {
             reporter.error(&error);
             ExitCode::from(error.exit_code())

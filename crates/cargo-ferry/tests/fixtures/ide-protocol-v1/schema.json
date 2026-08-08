@@ -1,0 +1,1485 @@
+{
+  "$defs": {
+    "Artifact": {
+      "description": "Validated artifact metadata consumed by the Artifacts view.",
+      "properties": {
+        "architectures": {
+          "description": "Included native architectures.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "kind": {
+          "description": "Artifact kind such as `apk` or `app`.",
+          "type": "string"
+        },
+        "package_identifier": {
+          "description": "Package or bundle identifier.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Absolute artifact path.",
+          "type": "string"
+        },
+        "platform": {
+          "description": "Platform identifier.",
+          "type": "string"
+        },
+        "profile": {
+          "description": "`debug` or `release`.",
+          "type": "string"
+        },
+        "validation": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Deterministically ordered validation statuses.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "platform",
+        "kind",
+        "path",
+        "package_identifier",
+        "architectures",
+        "profile",
+        "validation"
+      ],
+      "type": "object"
+    },
+    "BuildMetadata": {
+      "description": "Static information about this executable build.",
+      "properties": {
+        "development": {
+          "description": "True for non-release builds.",
+          "type": "boolean"
+        },
+        "git_commit": {
+          "description": "Optional commit injected by release automation.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "profile": {
+          "description": "Cargo profile used for this executable.",
+          "type": "string"
+        },
+        "target": {
+          "description": "Host target expressed as `os-arch`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "profile",
+        "target",
+        "development"
+      ],
+      "type": "object"
+    },
+    "Device": {
+      "description": "Stable device record used by snapshots and stream events.",
+      "properties": {
+        "architecture": {
+          "description": "Architecture or ABI.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "capabilities": {
+          "$ref": "#/$defs/DeviceCapabilities",
+          "description": "State-aware operation support."
+        },
+        "details": {
+          "additionalProperties": true,
+          "description": "Bounded extra structured details.",
+          "type": "object"
+        },
+        "id": {
+          "description": "ADB serial, Simulator UDID, or `CoreDevice` identifier.",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/DeviceKind",
+          "description": "Device family."
+        },
+        "name": {
+          "description": "Display name, never used for selection.",
+          "type": "string"
+        },
+        "os_version": {
+          "description": "Operating-system version.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "paired": {
+          "description": "Official Apple pairing status.",
+          "type": "boolean"
+        },
+        "platform": {
+          "$ref": "#/$defs/DevicePlatform",
+          "description": "Mobile platform."
+        },
+        "state": {
+          "$ref": "#/$defs/DeviceState",
+          "description": "Current state."
+        },
+        "transport": {
+          "description": "USB, network, emulator, or `CoreSimulator` transport.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "trusted": {
+          "description": "Host/device trust status.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "platform",
+        "kind",
+        "state",
+        "paired",
+        "trusted",
+        "capabilities"
+      ],
+      "type": "object"
+    },
+    "DeviceCapabilities": {
+      "description": "Operations available for one device.",
+      "properties": {
+        "build": {
+          "description": "Builds may target this family.",
+          "type": "boolean"
+        },
+        "install": {
+          "description": "Installation is available.",
+          "type": "boolean"
+        },
+        "launch": {
+          "description": "Launch is available.",
+          "type": "boolean"
+        },
+        "logs": {
+          "description": "Application logs are available.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "build",
+        "install",
+        "launch",
+        "logs"
+      ],
+      "type": "object"
+    },
+    "DeviceDiscoveryWarning": {
+      "description": "Non-fatal device discovery failure.",
+      "properties": {
+        "code": {
+          "description": "Stable code.",
+          "type": "string"
+        },
+        "message": {
+          "description": "Bounded actionable summary.",
+          "type": "string"
+        },
+        "source": {
+          "description": "ADB, `CoreSimulator`, or `CoreDevice` source.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "source",
+        "message"
+      ],
+      "type": "object"
+    },
+    "DeviceKind": {
+      "description": "Concrete mobile device family.",
+      "oneOf": [
+        {
+          "const": "android_physical",
+          "description": "USB or wireless Android hardware.",
+          "type": "string"
+        },
+        {
+          "const": "android_emulator",
+          "description": "Android Emulator instance.",
+          "type": "string"
+        },
+        {
+          "const": "ios_simulator",
+          "description": "`CoreSimulator` virtual device.",
+          "type": "string"
+        },
+        {
+          "const": "ios_physical",
+          "description": "Paired physical Apple device.",
+          "type": "string"
+        }
+      ]
+    },
+    "DevicePlatform": {
+      "description": "Mobile operating-system family.",
+      "oneOf": [
+        {
+          "const": "android",
+          "description": "Android device or emulator.",
+          "type": "string"
+        },
+        {
+          "const": "ios",
+          "description": "Apple iOS device or Simulator.",
+          "type": "string"
+        }
+      ]
+    },
+    "DeviceSnapshotResponse": {
+      "description": "Unary device discovery result.",
+      "properties": {
+        "devicectl": {
+          "$ref": "#/$defs/DevicectlCapabilities",
+          "description": "Detected physical-iOS tool capabilities."
+        },
+        "devices": {
+          "description": "Stable, sorted device records.",
+          "items": {
+            "$ref": "#/$defs/Device"
+          },
+          "type": "array"
+        },
+        "protocol_version": {
+          "description": "Protocol version.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "warnings": {
+          "description": "Independent platform discovery failures.",
+          "items": {
+            "$ref": "#/$defs/DeviceDiscoveryWarning"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "devices",
+        "warnings",
+        "devicectl"
+      ],
+      "type": "object"
+    },
+    "DeviceState": {
+      "description": "Normalized connection and runtime state.",
+      "oneOf": [
+        {
+          "const": "online",
+          "description": "Connected and available.",
+          "type": "string"
+        },
+        {
+          "const": "booted",
+          "description": "Simulator is booted.",
+          "type": "string"
+        },
+        {
+          "const": "shutdown",
+          "description": "Simulator is shut down.",
+          "type": "string"
+        },
+        {
+          "const": "offline",
+          "description": "Transport is offline.",
+          "type": "string"
+        },
+        {
+          "const": "unauthorized",
+          "description": "Host has not been authorized.",
+          "type": "string"
+        },
+        {
+          "const": "unavailable",
+          "description": "Known but currently unusable.",
+          "type": "string"
+        },
+        {
+          "const": "disconnected",
+          "description": "Paired device is disconnected.",
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "description": "Tool returned an unrecognized state.",
+          "type": "string"
+        }
+      ]
+    },
+    "DevicectlCapabilities": {
+      "description": "Physical Apple tooling detected from installed Xcode.",
+      "properties": {
+        "available": {
+          "description": "`xcrun devicectl` exists.",
+          "type": "boolean"
+        },
+        "install": {
+          "description": "Physical install is supported.",
+          "type": "boolean"
+        },
+        "json_output": {
+          "description": "Structured JSON output is supported.",
+          "type": "boolean"
+        },
+        "launch": {
+          "description": "Physical launch is supported.",
+          "type": "boolean"
+        },
+        "logs": {
+          "description": "Physical application logs are supported.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "available",
+        "json_output",
+        "install",
+        "launch",
+        "logs"
+      ],
+      "type": "object"
+    },
+    "Diagnostic": {
+      "description": "File diagnostic produced by Rust validation or a platform build.",
+      "properties": {
+        "code": {
+          "description": "Stable namespaced code.",
+          "type": "string"
+        },
+        "documentation": {
+          "description": "Documentation URL when one exists.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "file": {
+          "description": "Absolute UTF-8 file path.",
+          "type": "string"
+        },
+        "fixes": {
+          "description": "Safe edits or commands explicitly supplied by Rust.",
+          "items": {
+            "$ref": "#/$defs/StructuredFix"
+          },
+          "type": "array"
+        },
+        "help": {
+          "description": "Concrete remediation.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "description": "User-facing summary without ANSI escapes.",
+          "type": "string"
+        },
+        "range": {
+          "$ref": "#/$defs/SourceRange",
+          "description": "Zero-based half-open range."
+        },
+        "severity": {
+          "$ref": "#/$defs/DiagnosticSeverity",
+          "description": "Severity."
+        }
+      },
+      "required": [
+        "severity",
+        "code",
+        "message",
+        "file",
+        "range"
+      ],
+      "type": "object"
+    },
+    "DiagnosticSeverity": {
+      "description": "Diagnostic severity understood by VS Code.",
+      "oneOf": [
+        {
+          "const": "error",
+          "description": "Build or configuration failure.",
+          "type": "string"
+        },
+        {
+          "const": "warning",
+          "description": "Actionable warning.",
+          "type": "string"
+        },
+        {
+          "const": "information",
+          "description": "Informational note.",
+          "type": "string"
+        },
+        {
+          "const": "hint",
+          "description": "Low-priority hint.",
+          "type": "string"
+        }
+      ]
+    },
+    "DoctorResponse": {
+      "description": "Host toolchain report returned by the shared doctor service.",
+      "properties": {
+        "protocol_version": {
+          "description": "Protocol version.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "report": {
+          "description": "Existing typed doctor result serialized without parsing human output."
+        }
+      },
+      "required": [
+        "protocol_version",
+        "report"
+      ],
+      "type": "object"
+    },
+    "FeatureFlags": {
+      "description": "IDE-visible feature switches.",
+      "properties": {
+        "android_build": {
+          "description": "Android artifact builds are implemented.",
+          "type": "boolean"
+        },
+        "cancellation": {
+          "description": "Process-tree cancellation is implemented.",
+          "type": "boolean"
+        },
+        "devices": {
+          "description": "Structured device discovery is implemented.",
+          "type": "boolean"
+        },
+        "install": {
+          "description": "Structured installation is implemented.",
+          "type": "boolean"
+        },
+        "ios_simulator_build": {
+          "description": "iOS Simulator artifact builds are implemented.",
+          "type": "boolean"
+        },
+        "logs": {
+          "description": "Application-specific log streaming is implemented.",
+          "type": "boolean"
+        },
+        "physical_ios": {
+          "description": "Official physical-iOS build and deployment is implemented.",
+          "type": "boolean"
+        },
+        "run": {
+          "description": "Structured launch is implemented.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "android_build",
+        "ios_simulator_build",
+        "devices",
+        "install",
+        "run",
+        "logs",
+        "physical_ios",
+        "cancellation"
+      ],
+      "type": "object"
+    },
+    "FixKind": {
+      "description": "Kind of safe fix returned by Rust.",
+      "oneOf": [
+        {
+          "const": "text_edit",
+          "description": "Apply one exact text replacement.",
+          "type": "string"
+        },
+        {
+          "const": "command",
+          "description": "Invoke a registered editor command.",
+          "type": "string"
+        },
+        {
+          "const": "documentation",
+          "description": "Open documentation.",
+          "type": "string"
+        }
+      ]
+    },
+    "HandshakeResponse": {
+      "description": "Version negotiation result.",
+      "properties": {
+        "build": {
+          "$ref": "#/$defs/BuildMetadata",
+          "description": "Reproducible executable metadata."
+        },
+        "features": {
+          "$ref": "#/$defs/FeatureFlags",
+          "description": "Feature availability, never inferred by the client from the host OS."
+        },
+        "host": {
+          "$ref": "#/$defs/HostInfo",
+          "description": "Extension-host environment."
+        },
+        "protocol_version": {
+          "description": "Negotiated protocol version.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "runtime_dependency": {
+          "$ref": "#/$defs/RuntimeDependencyStatus",
+          "description": "Runtime crate resolution status for project generation."
+        },
+        "supported_commands": {
+          "description": "Available IDE subcommands.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "supported_event_types": {
+          "description": "Event names a v1 client can consume.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "supported_platforms": {
+          "description": "Platform identifiers accepted by build operations.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "supported_protocol_versions": {
+          "description": "Versions accepted by this executable.",
+          "items": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "templates": {
+          "description": "Project templates provided by the Rust generator.",
+          "items": {
+            "$ref": "#/$defs/TemplateMetadata"
+          },
+          "type": "array"
+        },
+        "tool": {
+          "$ref": "#/$defs/ToolInfo",
+          "description": "Executable identity."
+        }
+      },
+      "required": [
+        "protocol_version",
+        "tool",
+        "host",
+        "supported_protocol_versions",
+        "supported_platforms",
+        "supported_commands",
+        "supported_event_types",
+        "features",
+        "build",
+        "runtime_dependency",
+        "templates"
+      ],
+      "type": "object"
+    },
+    "HostInfo": {
+      "description": "Operating system and architecture of the extension host.",
+      "properties": {
+        "arch": {
+          "description": "Rust target architecture identifier.",
+          "type": "string"
+        },
+        "os": {
+          "description": "Rust target OS identifier.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "os",
+        "arch"
+      ],
+      "type": "object"
+    },
+    "Position": {
+      "description": "A source position using zero-based line and UTF-16 character offsets.",
+      "properties": {
+        "character": {
+          "description": "Zero-based UTF-16 code-unit offset.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "line": {
+          "description": "Zero-based line.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "line",
+        "character"
+      ],
+      "type": "object"
+    },
+    "ProjectModel": {
+      "description": "IDE-safe project metadata.",
+      "properties": {
+        "android": {
+          "description": "Resolved Android configuration."
+        },
+        "capabilities": {
+          "description": "Enabled runtime and extension capabilities.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "config_path": {
+          "description": "Absolute configuration path.",
+          "type": "string"
+        },
+        "crate_name": {
+          "description": "Cargo package name.",
+          "type": "string"
+        },
+        "display_name": {
+          "description": "Human-facing application name.",
+          "type": "string"
+        },
+        "display_version": {
+          "description": "Platform-facing display version.",
+          "type": "string"
+        },
+        "identifier": {
+          "description": "Android package and Apple bundle identifier.",
+          "type": "string"
+        },
+        "ios": {
+          "description": "Resolved Apple configuration."
+        },
+        "platforms": {
+          "description": "Enabled target platforms.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "root": {
+          "description": "Canonical absolute project root.",
+          "type": "string"
+        },
+        "target_directory": {
+          "description": "Absolute generated-output boundary.",
+          "type": "string"
+        },
+        "version": {
+          "description": "Semantic application version.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "root",
+        "config_path",
+        "target_directory",
+        "display_name",
+        "crate_name",
+        "identifier",
+        "version",
+        "display_version",
+        "platforms",
+        "capabilities",
+        "android",
+        "ios"
+      ],
+      "type": "object"
+    },
+    "ProjectResponse": {
+      "description": "Resolved project response.",
+      "properties": {
+        "project": {
+          "$ref": "#/$defs/ProjectModel",
+          "description": "Resolved project metadata."
+        },
+        "protocol_version": {
+          "description": "Protocol version.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "templates": {
+          "description": "Generator-owned templates for new-project UI.",
+          "items": {
+            "$ref": "#/$defs/TemplateMetadata"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "project",
+        "templates"
+      ],
+      "type": "object"
+    },
+    "ProtocolError": {
+      "description": "Typed, redacted protocol failure.",
+      "properties": {
+        "code": {
+          "description": "Stable snake-case code.",
+          "type": "string"
+        },
+        "details": {
+          "description": "Additional redacted details.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "help": {
+          "description": "Concrete remediation.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "description": "Safe summary.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "type": "object"
+    },
+    "ProtocolErrorResponse": {
+      "description": "Unary machine failure.",
+      "properties": {
+        "error": {
+          "$ref": "#/$defs/ProtocolError",
+          "description": "Typed failure."
+        },
+        "protocol_version": {
+          "description": "Protocol version.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "error"
+      ],
+      "type": "object"
+    },
+    "RuntimeDependencyStatus": {
+      "description": "Project-generator runtime dependency state.",
+      "properties": {
+        "source": {
+          "description": "`registry` for release mode or `path` for explicit monorepo mode.",
+          "type": "string"
+        },
+        "usable": {
+          "description": "Whether the configured resolver is usable.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "usable",
+        "source"
+      ],
+      "type": "object"
+    },
+    "SigningTeam": {
+      "description": "Non-secret Apple Development identity metadata.",
+      "properties": {
+        "certificate_fingerprint": {
+          "description": "Public certificate fingerprint.",
+          "type": "string"
+        },
+        "identity": {
+          "description": "Human-readable Keychain identity label.",
+          "type": "string"
+        },
+        "team_id": {
+          "description": "Apple Development Team identifier.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "team_id",
+        "identity",
+        "certificate_fingerprint"
+      ],
+      "type": "object"
+    },
+    "SigningTeamsResponse": {
+      "description": "Apple Development identities available to editor signing UI.",
+      "properties": {
+        "protocol_version": {
+          "description": "Protocol version.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "teams": {
+          "description": "Installed usable identities grouped by Team ID.",
+          "items": {
+            "$ref": "#/$defs/SigningTeam"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "teams"
+      ],
+      "type": "object"
+    },
+    "SourceRange": {
+      "description": "Half-open source range.",
+      "properties": {
+        "end": {
+          "$ref": "#/$defs/Position",
+          "description": "Exclusive end."
+        },
+        "start": {
+          "$ref": "#/$defs/Position",
+          "description": "Inclusive start."
+        }
+      },
+      "required": [
+        "start",
+        "end"
+      ],
+      "type": "object"
+    },
+    "StreamEvent": {
+      "description": "One complete newline-delimited event.",
+      "oneOf": [
+        {
+          "description": "Operation boundary opened.",
+          "properties": {
+            "command": {
+              "description": "Stable command name.",
+              "type": "string"
+            },
+            "event": {
+              "const": "operation_started",
+              "type": "string"
+            },
+            "workspace": {
+              "description": "Canonical workspace, absent for host-only operations.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "event",
+            "command"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Named phase opened.",
+          "properties": {
+            "event": {
+              "const": "phase_started",
+              "type": "string"
+            },
+            "message": {
+              "description": "Optional UI text.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "phase": {
+              "description": "Stable phase identifier.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "event",
+            "phase"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Bounded progress update.",
+          "properties": {
+            "current": {
+              "description": "Completed unit count.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "event": {
+              "const": "progress",
+              "type": "string"
+            },
+            "message": {
+              "description": "Human-readable progress summary.",
+              "type": "string"
+            },
+            "phase": {
+              "description": "Stable phase identifier.",
+              "type": "string"
+            },
+            "total": {
+              "description": "Total unit count, when known.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "event",
+            "phase",
+            "message"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Sanitized external command boundary.",
+          "properties": {
+            "arguments": {
+              "description": "Redacted argument array.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "event": {
+              "const": "command_started",
+              "type": "string"
+            },
+            "tool": {
+              "description": "Executable name, not a shell string.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "event",
+            "tool",
+            "arguments"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "File-bound diagnostic.",
+          "properties": {
+            "diagnostic": {
+              "$ref": "#/$defs/Diagnostic",
+              "description": "Diagnostic payload."
+            },
+            "event": {
+              "const": "diagnostic",
+              "type": "string"
+            }
+          },
+          "required": [
+            "event",
+            "diagnostic"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Added or changed device.",
+          "properties": {
+            "device": {
+              "$ref": "#/$defs/Device",
+              "description": "Deployment service model."
+            },
+            "event": {
+              "const": "device",
+              "type": "string"
+            }
+          },
+          "required": [
+            "event",
+            "device"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Validated build artifact.",
+          "properties": {
+            "artifact": {
+              "$ref": "#/$defs/Artifact",
+              "description": "Artifact payload."
+            },
+            "event": {
+              "const": "artifact",
+              "type": "string"
+            }
+          },
+          "required": [
+            "event",
+            "artifact"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Application launch confirmation.",
+          "properties": {
+            "device_id": {
+              "description": "Stable target device ID.",
+              "type": "string"
+            },
+            "event": {
+              "const": "application_started",
+              "type": "string"
+            },
+            "identifier": {
+              "description": "Package or bundle identifier.",
+              "type": "string"
+            },
+            "platform": {
+              "description": "Platform identifier.",
+              "type": "string"
+            },
+            "process_id": {
+              "description": "Process identifier when the platform reports one.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "event",
+            "platform",
+            "device_id",
+            "identifier"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "One bounded application log record.",
+          "properties": {
+            "event": {
+              "const": "log",
+              "type": "string"
+            },
+            "level": {
+              "description": "Normalized severity.",
+              "type": "string"
+            },
+            "message": {
+              "description": "Sanitized UTF-8 message.",
+              "type": "string"
+            },
+            "source_timestamp": {
+              "description": "Platform-provided timestamp, when available.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "target": {
+              "description": "Process, package, or subsystem.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "event",
+            "level",
+            "target",
+            "message"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Non-fatal warning.",
+          "properties": {
+            "code": {
+              "description": "Stable namespaced code.",
+              "type": "string"
+            },
+            "event": {
+              "const": "warning",
+              "type": "string"
+            },
+            "help": {
+              "description": "Concrete remediation.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "message": {
+              "description": "Safe summary.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "event",
+            "code",
+            "message"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Standalone safe fix.",
+          "properties": {
+            "event": {
+              "const": "fix",
+              "type": "string"
+            },
+            "fix": {
+              "$ref": "#/$defs/StructuredFix",
+              "description": "Fix payload."
+            }
+          },
+          "required": [
+            "event",
+            "fix"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Named phase closed.",
+          "properties": {
+            "duration_ms": {
+              "description": "Monotonic phase duration.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "event": {
+              "const": "phase_finished",
+              "type": "string"
+            },
+            "phase": {
+              "description": "Stable phase identifier.",
+              "type": "string"
+            },
+            "success": {
+              "description": "Whether the phase completed successfully.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "event",
+            "phase",
+            "success",
+            "duration_ms"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Operation closed normally, including typed failures.",
+          "properties": {
+            "duration_ms": {
+              "description": "Monotonic operation duration.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "error": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ProtocolError"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Typed failure when `success` is false."
+            },
+            "event": {
+              "const": "operation_finished",
+              "type": "string"
+            },
+            "success": {
+              "description": "Whether every required phase succeeded.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "event",
+            "success",
+            "duration_ms"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Operation stopped after cancellation.",
+          "properties": {
+            "duration_ms": {
+              "description": "Monotonic operation duration.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "event": {
+              "const": "operation_cancelled",
+              "type": "string"
+            },
+            "reason": {
+              "description": "Stable cancellation reason.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "event",
+            "reason",
+            "duration_ms"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Device disappeared from a watched snapshot.",
+          "properties": {
+            "device_id": {
+              "description": "Stable device ID.",
+              "type": "string"
+            },
+            "event": {
+              "const": "device_removed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "event",
+            "device_id"
+          ],
+          "type": "object"
+        }
+      ],
+      "properties": {
+        "operation_id": {
+          "description": "Opaque ID shared by every event in this operation.",
+          "type": "string"
+        },
+        "parent_operation_id": {
+          "description": "Optional enclosing operation.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "protocol_version": {
+          "description": "Protocol version.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "timestamp_ms": {
+          "description": "Milliseconds since Unix epoch in UTC.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "operation_id",
+        "timestamp_ms"
+      ],
+      "type": "object"
+    },
+    "StructuredFix": {
+      "description": "Safe editor action.",
+      "properties": {
+        "command": {
+          "description": "Stable command ID, only for `command`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "edit": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TextEdit"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Exact text replacement, only for `text_edit`."
+        },
+        "kind": {
+          "$ref": "#/$defs/FixKind",
+          "description": "Action category."
+        },
+        "title": {
+          "description": "Picker title.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "TemplateMetadata": {
+      "description": "Generator-owned project template metadata.",
+      "properties": {
+        "description": {
+          "description": "Short purpose shown by editor pickers.",
+          "type": "string"
+        },
+        "id": {
+          "description": "Stable CLI value.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "description"
+      ],
+      "type": "object"
+    },
+    "TextEdit": {
+      "description": "One exact, file-bound replacement.",
+      "properties": {
+        "file": {
+          "description": "Absolute file path.",
+          "type": "string"
+        },
+        "new_text": {
+          "description": "Replacement UTF-8 text.",
+          "type": "string"
+        },
+        "range": {
+          "$ref": "#/$defs/SourceRange",
+          "description": "Text to replace."
+        }
+      },
+      "required": [
+        "file",
+        "range",
+        "new_text"
+      ],
+      "type": "object"
+    },
+    "ToolInfo": {
+      "description": "Executable name and package version.",
+      "properties": {
+        "name": {
+          "description": "Cargo package name.",
+          "type": "string"
+        },
+        "version": {
+          "description": "Cargo package version.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "version"
+      ],
+      "type": "object"
+    },
+    "ValidationResponse": {
+      "description": "Configuration validation result.",
+      "properties": {
+        "diagnostics": {
+          "description": "Stable, sorted diagnostics.",
+          "items": {
+            "$ref": "#/$defs/Diagnostic"
+          },
+          "type": "array"
+        },
+        "protocol_version": {
+          "description": "Protocol version.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "valid": {
+          "description": "True when no error diagnostics exist.",
+          "type": "boolean"
+        },
+        "workspace": {
+          "description": "Canonical absolute project root.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "workspace",
+        "valid",
+        "diagnostics"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "anyOf": [
+    {
+      "$ref": "#/$defs/HandshakeResponse",
+      "description": "Version negotiation response."
+    },
+    {
+      "$ref": "#/$defs/ProjectResponse",
+      "description": "Resolved project model."
+    },
+    {
+      "$ref": "#/$defs/ValidationResponse",
+      "description": "Configuration diagnostics."
+    },
+    {
+      "$ref": "#/$defs/DoctorResponse",
+      "description": "Host toolchain report."
+    },
+    {
+      "$ref": "#/$defs/DeviceSnapshotResponse",
+      "description": "One device inventory."
+    },
+    {
+      "$ref": "#/$defs/SigningTeamsResponse",
+      "description": "Usable Apple Development teams."
+    },
+    {
+      "$ref": "#/$defs/ProtocolErrorResponse",
+      "description": "Unary protocol failure."
+    },
+    {
+      "$ref": "#/$defs/StreamEvent",
+      "description": "One newline-delimited streaming event."
+    }
+  ],
+  "description": "Every top-level document described by the checked-in protocol schema.",
+  "title": "ProtocolMessage"
+}

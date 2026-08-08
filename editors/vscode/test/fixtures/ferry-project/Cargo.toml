@@ -1,0 +1,10 @@
+[package]
+name = "host-smoke-ferry"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+rustferry = { version = "=0.1.0", path = "../../../../../crates/rustferry", default-features = false }

@@ -856,7 +856,8 @@ final class FerryBridge {
         Notification.Builder builder = Build.VERSION.SDK_INT >= 26
                 ? new Notification.Builder(context, channel)
                 : new Notification.Builder(context);
-        int icon = context.getResources().getIdentifier("ferry_icon", "drawable", context.getPackageName());
+        int icon = context.getResources().getIdentifier("ferry_icon", "mipmap", context.getPackageName());
+        if (icon == 0) icon = context.getResources().getIdentifier("ferry_icon", "drawable", context.getPackageName());
         if (icon == 0) icon = android.R.drawable.ic_dialog_info;
         builder.setSmallIcon(icon)
                 .setContentTitle(source.optString("title", ""))

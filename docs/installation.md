@@ -7,15 +7,22 @@ Required:
 - Rust and Cargo 1.92 or newer;
 - Git when `cargo ferry new` should initialize a repository.
 
-Install from this checkout:
+Published-release flow (available after the coordinated crates are released):
 
 ```console
-cargo install --path crates/cargo-ferry
-export CARGO_FERRY_RUNTIME_PATH="$PWD/crates/rustferry"
-cargo ferry --version
+cargo install cargo-ferry
+cargo ferry new weather
 ```
 
-`CARGO_FERRY_RUNTIME_PATH` must be valid UTF-8, absolute, and remain set when running `cargo ferry new`. It must resolve canonically to a directory containing `Cargo.toml`; invalid values fail before project files are written. The generated `Cargo.toml` points at that canonical runtime directory. The current repository is pre-release: neither `cargo-ferry` nor `rustferry` 0.1.0 is claimed available from crates.io.
+Install from this checkout for contributor development:
+
+```console
+cargo install --locked --path crates/cargo-ferry
+cargo ferry --version
+cargo ferry new weather --runtime-source path --runtime-path "$PWD/crates/rustferry"
+```
+
+Normal generation writes an exact registry dependency and does not contain a developer checkout path. Contributors can select `--runtime-source workspace` or `--runtime-source path --runtime-path ABSOLUTE_PATH`. `CARGO_FERRY_RUNTIME_PATH` remains an optional development override; it must be UTF-8, absolute, canonicalizable, and contain `Cargo.toml`. Invalid inputs fail before files are written. The current repository is pre-release: neither `cargo-ferry` nor `rustferry` 0.1.0 is claimed available from crates.io.
 
 Checking a generated Slint/Skia application on Linux also requires `pkg-config` and the system Fontconfig development package (`libfontconfig1-dev` on Debian and Ubuntu). RustFerry reports the underlying Cargo diagnostic when either prerequisite is missing.
 
@@ -23,8 +30,8 @@ PowerShell equivalent:
 
 ```powershell
 cargo install --path crates/cargo-ferry
-$env:CARGO_FERRY_RUNTIME_PATH = (Resolve-Path crates/rustferry).Path
 cargo ferry --version
+cargo ferry new weather --runtime-source path --runtime-path (Resolve-Path crates/rustferry).Path
 ```
 
 ## Android artifacts

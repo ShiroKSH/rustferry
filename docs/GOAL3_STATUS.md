@@ -1,5 +1,10 @@
 # Goal 3 status
 
+Integration note (2026-08-08): Goal 3 is being combined with the Developer Experience work that
+continued from the original isolation base. Evidence below remains valid for the named exact Goal 3
+revisions; the integrated revision requires a fresh full workspace matrix and Linux-to-macOS
+acceptance before it inherits those results.
+
 ## Current milestone
 
 Milestone -2 — isolation: complete. Milestone -1 — inherited baseline: complete. Milestone 0 — remote/signing/source/artifact contracts: complete. Milestone 1 — physical-device compile: live-validated. Milestone 2 — signing engine and manual setup: implementation complete with synthetic fixtures. Milestone 3 — GitHub unsigned provider acceptance: complete. Milestone 4 — private execution repository and real development signing: in progress.
@@ -16,13 +21,13 @@ Milestone -2 — isolation: complete. Milestone -1 — inherited baseline: compl
 - GitHub provider: public source and private execution identities are now separate throughout config, workflow generation, temporary-ref publication, worker validation, Actions APIs, and artifact ingestion. Both fetch and push URLs are identity-checked. The private dispatch commit is an orphan containing only the approved workflow and strict request envelope, so it imports no public source tree/history. Setup/doctor prove public source visibility; signed readiness separately requires a private execution repository. Same-repository mode remains available for unsigned acceptance. The current `rustferry-github` run reports 122 tests passing and the worker reports 65. Schema-v2 same-repository compatibility is live-validated; distinct-private-execution acceptance remains pending. Linux acceptance run `30726401991` exercised the current artifact path successfully.
 - Manual GitHub signing setup: exact CLI grammar, dry-run preview, interactive or explicit confirmation, secure password sources, stable asset-file reads outside Git repositories, and one-profile/no-extension enforcement implemented. Preflight requires public source, distinct active private execution, required reviewer, the single `rustferry/goal3/builds/*` policy, and an empty Environment. Immediately before upload the retained bytes are cryptographically revalidated and converted to typed canonical-base64 PKCS#12/profile values plus a raw bounded password. Values are limited to 48 KiB each and sent to `gh` only through standard input. A project-local exclusive lock and stable no-follow snapshots serialize config writers. The client post-checks the exact three secret names and persists the local signing plan last; partial or indeterminate remote writes leave local configuration unsigned and identify both uploaded and possibly-uploaded cleanup roles. Post-rename durability failures report the config as possibly signed instead of claiming rollback.
 - IPA export: not validated.
-- Client download: validated by Linux acceptance run `30726401991`; the client automatically downloaded, rehashed, independently inspected, and atomically published the physical-device archive.
-- Install, launch, runtime: not validated.
+- Client download: most recently validated before integration by Linux acceptance run `30731551293`; the client automatically downloaded, rehashed, independently inspected, and atomically published the physical-device archive.
+- Install, launch, runtime: local physical install/launch services exist from the integrated Developer Experience path, but downloaded-remote-artifact install, launch, and runtime remain unvalidated.
 
 ## GitHub readiness observation
 
 - Repository: public `ShiroKSH/rustferry`; current user has admin access; Actions enabled.
-- Goal 3 branch workflows: the generated iPhone worker and Linux-client acceptance workflows are installed and have been triggered by exact branch commits.
+- Pre-integration Goal 3 branch workflows: the generated iPhone worker and Linux-client acceptance workflows were installed and triggered by exact branch commits. The integrated trusted ref and worker revision must be repinned and accepted separately.
 - Goal 3 protected environment: absent.
 - Repository signing secret names: none returned. No secret values were requested or accessed.
 - Signed setup, doctor, and submission intentionally reject this public repository; a private execution repository is required before development signing.
@@ -32,12 +37,15 @@ Milestone -2 — isolation: complete. Milestone -1 — inherited baseline: compl
 - Acceptance run `30724347922` launched macOS worker run `30724376092`. The worker built and independently inspected a real unsigned physical-iPhone archive, sealed and uploaded it, and confirmed compile-root cleanup. The Linux client automatically downloaded it, revalidated it, published it at the expected local path, and reported SHA-256 `15f5e4feba2cd5bb9385e73e729fe70980968c316b5a65ec0717758cb3680ffc` with `validated: true` and `cleanup_confirmed: true`. The acceptance job itself failed only because its extra ZIP-entry assertion expected `Counter.app` instead of the request-bound `counter.app`; the assertion is corrected and a fully green evidence rerun is pending.
 - Acceptance run `30724588475` and macOS worker run `30724621750` completed successfully. This is the independently recorded no-Mac unsigned acceptance: Linux had no Apple toolchain, submitted exact source revision `f7f43261967964dc50b0a70c03431c7d204a7ef0`, observed a real physical-iPhone macOS build, automatically downloaded the archive, matched archive SHA-256 `446d21ef42721ae83de356e5bda3e80e93af4f63b8573d64f09918433d54a3f1`, validated all 12 required archive entries, and uploaded the archive plus sanitized evidence. Downloaded evidence artifact `8825940702` has API digest `97b31e74db951031b133980d2912b068d6066a6cc767c29c8e55dd661b6d0fd9`; local `unzip -t` reports no errors. The provider implementation in this run also included repository-wide first-run discovery.
 - Schema-v2 regression run `30726401991` and macOS worker run `30726432908` completed successfully from exact source revision `d4fe76ff0d81afab140d1713b39431f310c3fbc1`. The worker revision `9a62db39eacda0daf8f6f3951452bad7c3aad582` enforced explicit public-source identity while keeping dispatch execution implicit, compiled and sealed the physical-iPhone archive, and confirmed cleanup. The Linux client automatically downloaded and independently validated archive SHA-256 `d8a36f5cb6582493cdeef5699d0db6c6e02a5fbc8490d7d4530e8d751407c747`. Evidence artifact `8826548085` has API digest `bda767d1ac176f3bfb701576fcfbc55cfa3767d1c4ecf24bdf031541c9d5ad57`; a fresh local `shasum -a 256` matched and `unzip -t` passed all 12 entries.
+- Final pre-integration acceptance run `30731551293` and macOS worker run `30731629789` completed successfully. The worker compiled, sealed, and cleaned up a real physical-iPhone archive; the Linux client automatically downloaded and independently validated archive SHA-256 `2b0a91a5b6e83d6655a137c3c95104466113963ce91332819f65b963c70112ed`. The sanitized evidence reported `validated: true`, `cleanup_confirmed: true`, and `dry_run: false`. This is the latest unsigned evidence, not evidence for the integrated revision or development signing.
 
-## Honest product status
+## Remaining validation
 
-Goal 3 unsigned no-Mac acceptance is live-validated end to end. Manual-development setup is
+Goal 3 unsigned no-Mac acceptance is live-validated end to end at the named pre-integration
+revision; a fresh integrated-revision rerun remains mandatory. Manual-development setup is
 implemented and synthetically validated, but no real signing secrets have been uploaded.
-Development signing, IPA export, install, launch, and physical-device runtime remain unvalidated.
+Development signing, IPA export, downloaded-artifact install/launch, and physical-device runtime
+remain unvalidated.
 The next product boundary is a distinct private execution repository plus real Apple Development
 certificate/profile/device assets; existing Simulator support and synthetic signing fixtures are
 not evidence for those remaining claims.

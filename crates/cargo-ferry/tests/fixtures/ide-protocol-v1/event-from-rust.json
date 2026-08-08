@@ -1,0 +1,1 @@
+{"protocol_version":1,"operation_id":"rust:artifact-1","timestamp_ms":1700000000000,"event":"artifact","artifact":{"platform":"android","kind":"apk","path":"/tmp/Ferry App 🚢/target/ferry/android/debug/app.apk","package_identifier":"com.example.ferry","architectures":["arm64-v8a"],"profile":"debug","validation":{"alignment":"verified","signature":"verified"}}}

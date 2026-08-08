@@ -2369,11 +2369,11 @@ fn sha256_file(path: &Utf8Path) -> Result<String, CliFailure> {
             "artifact changed during hashing",
         ));
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn sync_directory(path: &Utf8Path) -> Result<(), CliFailure> {
@@ -3312,7 +3312,7 @@ mod tests {
             project_path: ".".to_owned(),
             entries: Vec::new(),
             total_size: 0,
-            sha256: format!("{:x}", digest.finalize()),
+            sha256: hex::encode(digest.finalize()),
         }
     }
 

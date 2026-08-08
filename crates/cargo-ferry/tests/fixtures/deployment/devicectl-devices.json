@@ -1,0 +1,46 @@
+{
+  "info": {
+    "jsonVersion": 3,
+    "outcome": "success"
+  },
+  "result": {
+    "devices": [
+      {
+        "identifier": "core-id",
+        "deviceProperties": {
+          "name": "Shiro's iPhone",
+          "osVersionNumber": "18.5",
+          "pairingState": "paired",
+          "developerModeStatus": "enabled",
+          "ddiServicesAvailable": true
+        },
+        "hardwareProperties": {
+          "udid": "udid",
+          "platform": "iOS",
+          "cpuType": "arm64"
+        },
+        "connectionProperties": {
+          "transportType": "wired",
+          "tunnelState": "connected"
+        }
+      },
+      {
+        "identifier": "untrusted-core-id",
+        "deviceProperties": {
+          "name": "Untrusted iPhone",
+          "pairingState": "unpaired",
+          "developerModeStatus": "disabled",
+          "ddiServicesAvailable": false
+        },
+        "hardwareProperties": {
+          "udid": "untrusted-udid",
+          "platform": "iOS"
+        },
+        "connectionProperties": {
+          "transportType": "wired",
+          "tunnelState": "disconnected"
+        }
+      }
+    ]
+  }
+}

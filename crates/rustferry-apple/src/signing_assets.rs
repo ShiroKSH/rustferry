@@ -48,9 +48,9 @@ const APPLE_DEVELOPMENT_PREFIX: &str = "Apple Development: ";
 const IPHONE_DEVELOPER_PREFIX: &str = "iPhone Developer: ";
 const MAX_CERTIFICATE_CHAIN_DEPTH: i32 = 8;
 
-const APPLE_ROOT_CA_PEM: &[u8] = include_bytes!("../assets/apple-root-ca.pem");
-const APPLE_ROOT_CA_G2_PEM: &[u8] = include_bytes!("../assets/apple-root-ca-g2.pem");
-const APPLE_ROOT_CA_G3_PEM: &[u8] = include_bytes!("../assets/apple-root-ca-g3.pem");
+const APPLE_ROOT_CA_PEM: &[u8] = include_bytes!("../assets/apple-root-ca.crt");
+const APPLE_ROOT_CA_G2_PEM: &[u8] = include_bytes!("../assets/apple-root-ca-g2.crt");
+const APPLE_ROOT_CA_G3_PEM: &[u8] = include_bytes!("../assets/apple-root-ca-g3.crt");
 
 const PRODUCTION_TRUST_ANCHORS: [TrustAnchor<'static>; 3] = [
     TrustAnchor {

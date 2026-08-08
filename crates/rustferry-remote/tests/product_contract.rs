@@ -172,6 +172,6 @@ fn empty_source_manifest() -> SourceManifest {
         project_path: ".".to_owned(),
         entries: Vec::new(),
         total_size: 0,
-        sha256: format!("{:x}", digest.finalize()),
+        sha256: hex::encode(digest.finalize()),
     }
 }
