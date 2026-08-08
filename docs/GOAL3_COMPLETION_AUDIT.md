@@ -1,9 +1,9 @@
 # Goal 3 Completion Audit
 
 Audit date: 2026-08-09
-Audited code revision: local `master` includes `a339fffe3d1314a1be10500ede5649b4a4d17c58`
+Audited code revision: local `master` includes `43b44763b507231436bd8e26930623a8681c453a`
 
-This ledger evaluates the full Goal 3 specification against the local `e850deb` integration base plus code revision `a339fff`. The requested local SSH-snapshot merge is present at `e850deb`; the bounded multi-profile continuation is committed at `a339fff`. Local `master` is ahead of `origin/master` (`607fe78`) and has not been pushed. The affected-package tests pass locally; current-revision CI and live signed acceptance remain pending.
+This ledger evaluates the full Goal 3 specification against the local `e850deb` integration base plus the bounded multi-profile continuation at `a339fff` and protected signed-log transport at `43b4476`. The requested local SSH-snapshot merge is present at `e850deb`. Local `master` is ahead of `origin/master` (`607fe78`) and has not been pushed. The affected-package tests pass locally; current-revision CI and live signed acceptance remain pending.
 
 Status meanings:
 
@@ -14,15 +14,15 @@ Status meanings:
 
 Unit, integration, synthetic signing, and mocked-provider tests prove deterministic code behavior only. They are not counted as live GitHub, Apple, SSH-host, signing, or physical-device proof. The app/Widget/Live Activity profile continuation is therefore recorded only as implemented-unproven until its live signing gates pass.
 
-## Local verification at `a339fff`
+## Local verification at `43b4476`
 
 | Check | Result |
 |---|---|
-| Affected all-target tests | Pass: `cargo-ferry` 42 library, 106 binary, 52 CLI plus integration coverage; Apple 47 passed/1 Xcode-dependent ignored plus integration coverage; GitHub 131; remote 41 plus integration coverage; worker 70 library and 26 binary |
+| Affected all-target tests | Pass: `cargo-ferry` 42 library, 106 binary, 52 CLI plus integration coverage; Apple 47 passed/1 Xcode-dependent ignored plus integration coverage; GitHub 134; remote 41 plus integration coverage; worker 70 library and 27 binary |
 | Strict Clippy | Pass with `-D warnings` for cargo-ferry, Apple, GitHub, remote, and worker, all targets |
 | Formatting and patch hygiene | `cargo fmt --all -- --check` and `git diff --check` pass |
 | Generated workflows | Modern generated YAML passes `actionlint`; the schema-v2 legacy snapshot is byte-identical |
-| Independent review | No high-confidence actionable finding after target-graph, secret-buffer wiping, project-drift, remediation-name, Team-ID, and dotted-target fixes |
+| Independent review | Clean after exact sanitized-log allowlisting, compile/signed cache-path separation, target-graph, secret-buffer wiping, project-drift, remediation-name, Team-ID, and dotted-target fixes |
 
 The current-revision full workspace/CI matrix was not rerun: the workspace volume was 99% used with
 about 2.7 GiB free, while the affected dependency slice was fully tested from existing caches. The
@@ -175,4 +175,4 @@ These are validation blockers, not substitutes for missing implementation.
 
 ## Completion conclusion
 
-Goal 3 is **not complete**. The Linux-to-GitHub-to-macOS unsigned archive path is live-proven and the protocol, worker, artifact verification, redaction, deterministic SSH snapshot, and bounded multi-profile foundations are substantial. The affected-package integration suite passes at code revision `a339fff`. Completion still requires code for the missing CLI/Apple/snapshot/provider/logging surfaces and live evidence for signed artifacts and physical-device use. The local merge is present by user request; it is neither pushed nor validated by current-revision CI or signed live acceptance.
+Goal 3 is **not complete**. The Linux-to-GitHub-to-macOS unsigned archive path is live-proven and the protocol, worker, artifact verification, redaction, deterministic SSH snapshot, bounded multi-profile foundations, and exact default signed-result transport are substantial. The affected-package integration suite passes at code revision `43b4476`. Completion still requires code for the missing CLI/Apple/snapshot/provider/logging surfaces and live evidence for signed artifacts and physical-device use. The local merge is present by user request; it is neither pushed nor validated by current-revision CI or signed live acceptance.
