@@ -137,6 +137,7 @@ historical full-workspace and cross-platform CI results below remain separate ev
 | Goal 3 commits consistently use the mandated `goal3:` prefix | Contradicted | Integrated commit sequence includes `b32be13`, `36ea042`, and `e850deb` with conventional non-`goal3:` subjects. |
 | Reproducible integration package exists | Proven | `dist/goal3-integration/` contains patch series, bundle, checksums, apply/verify material. |
 | SSH continuation integration package exists | Proven | `dist/goal3-ssh-snapshot-v1/`; local integration commits `b32be13`, `36ea042`, `e850deb`. |
+| Multi-target signing integration package exists | Proven | `dist/goal3-multi-target-signing-v1/`; checksums pass and both mail-patch and aggregate-patch replays produce tree `37658727e2433b3b074fba1e811c58b36e409ae7`. |
 | Requested local merge is complete | Proven | Local `master` contains the SSH integration through `e850deb` and the multi-target signing code at `a339fff`. |
 | Integrated revision is pushed to origin | Missing | `origin/master` remains `607fe78`; local `master` is ahead. No push was requested or performed. |
 | Current integrated revision has CI/live acceptance | Missing | Last cited final CI run is `31261962607` at `607fe78`; no run at or after `a339fff`. |
