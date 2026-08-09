@@ -20,6 +20,7 @@ include = [
 
 [dependencies]
 camino.workspace = true
+goblin.workspace = true
 hex.workspace = true
 rustferry-core = { version = "=0.1.0", path = "../rustferry-core" }
 rustferry-remote = { version = "=0.1.0", path = "../rustferry-remote" }

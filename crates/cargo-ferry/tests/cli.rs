@@ -962,7 +962,9 @@ fn macless_iphone_and_github_remote_commands_are_exposed() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--remote"))
-        .stdout(predicate::str::contains("--unsigned"));
+        .stdout(predicate::str::contains("--unsigned"))
+        .stdout(predicate::str::contains("--artifact"))
+        .stdout(predicate::str::contains("--include-dsym"));
 
     cargo_bin_cmd!("cargo-ferry")
         .args(["remote", "setup", "github", "--help"])

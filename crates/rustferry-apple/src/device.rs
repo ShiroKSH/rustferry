@@ -33,6 +33,8 @@ pub struct IosDeviceArchiveRequest {
     pub profile: AppleBuildProfile,
     /// Explicit Cargo features enabled for the target build.
     pub cargo_features: Vec<String>,
+    /// Preserve Rust DWARF so the worker can produce a matching application dSYM.
+    pub generate_debug_symbols: bool,
     /// Plan only; perform no writes or subprocess execution.
     pub dry_run: bool,
 }
@@ -51,8 +53,16 @@ impl IosDeviceArchiveRequest {
             package_name: None,
             profile: AppleBuildProfile::Release,
             cargo_features: Vec::new(),
+            generate_debug_symbols: false,
             dry_run: false,
         }
+    }
+
+    /// Request retained DWARF for create-only dSYM generation after archiving.
+    #[must_use]
+    pub fn with_debug_symbols(mut self, enabled: bool) -> Self {
+        self.generate_debug_symbols = enabled;
+        self
     }
 }
 
@@ -94,6 +104,8 @@ pub struct IosDeviceArchivePlan {
     pub destination: String,
     /// Build profile.
     pub profile: AppleBuildProfile,
+    /// Whether exact Rust DWARF must survive into the archived executable.
+    pub generate_debug_symbols: bool,
     /// Explicitly non-installable output classification.
     pub disposition: IosDeviceArtifactDisposition,
     /// Internal generated Xcode root.
@@ -283,6 +295,7 @@ fn plan_with_assets(
         sdk: IOS_DEVICE_SDK.to_owned(),
         destination: IOS_GENERIC_DESTINATION.to_owned(),
         profile: request.profile,
+        generate_debug_symbols: request.generate_debug_symbols,
         disposition: IosDeviceArtifactDisposition::UnsignedCompileOnly,
         generated_root,
         cargo_target_dir,
@@ -370,6 +383,15 @@ fn cargo_build_command(
     command
         .environment
         .insert("CARGO_TARGET_DIR".to_owned(), cargo_target_dir.to_string());
+    if request.generate_debug_symbols {
+        let profile = match request.profile {
+            AppleBuildProfile::Debug => "DEV",
+            AppleBuildProfile::Release => "RELEASE",
+        };
+        command
+            .environment
+            .insert(format!("CARGO_PROFILE_{profile}_DEBUG"), "2".to_owned());
+    }
     command.environment.insert(
         "IPHONEOS_DEPLOYMENT_TARGET".to_owned(),
         request.config.ios.min_version.clone(),
@@ -452,6 +474,16 @@ fn xcode_archive_command(
         "ONLY_ACTIVE_ARCH=NO".to_owned(),
         "archive".to_owned(),
     ];
+    if request.generate_debug_symbols {
+        command.args.pop();
+        command.args.extend([
+            "COPY_PHASE_STRIP=NO".to_owned(),
+            "DEBUG_INFORMATION_FORMAT=dwarf".to_owned(),
+            "DEPLOYMENT_POSTPROCESSING=NO".to_owned(),
+            "STRIP_INSTALLED_PRODUCT=NO".to_owned(),
+            "archive".to_owned(),
+        ]);
+    }
     command.environment.insert(
         "DEVELOPER_DIR".to_owned(),
         toolchain.developer_dir.to_string(),

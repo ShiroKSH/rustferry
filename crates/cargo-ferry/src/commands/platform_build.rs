@@ -62,12 +62,52 @@ impl CargoTargets {
 }
 
 pub fn run(arguments: BuildArgs, dry_run: bool, reporter: &Reporter) -> Result<(), CliError> {
-    if build_route(&arguments) == BuildRoute::Remote {
+    validate_artifact_options(&arguments)?;
+    let route = build_route(&arguments);
+    if route == BuildRoute::Local {
+        validate_local_artifact_options(&arguments)?;
+    }
+    if route == BuildRoute::Remote {
         return run_remote(arguments, dry_run, reporter);
     }
     let output = execute(arguments, dry_run, reporter)?;
     report_build(&output, reporter);
     Ok(())
+}
+
+fn validate_local_artifact_options(arguments: &BuildArgs) -> Result<(), CliError> {
+    if arguments.artifact.is_none() && !arguments.include_dsym {
+        return Ok(());
+    }
+    if matches!(&arguments.platform, BuildPlatform::Ios(ios) if ios.device) {
+        return Err(CliError::Unsupported {
+            message: "local physical-iPhone builds do not support artifact selection yet"
+                .to_owned(),
+            help:
+                "Remove `--artifact` and `--include-dsym`, or explicitly select `--remote github`."
+                    .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_artifact_options(arguments: &BuildArgs) -> Result<(), CliError> {
+    if arguments.artifact.is_none() && !arguments.include_dsym {
+        return Ok(());
+    }
+    match &arguments.platform {
+        BuildPlatform::Android(_) => Err(CliError::Unsupported {
+            message: "physical-iPhone artifact options do not apply to Android builds".to_owned(),
+            help: "Remove `--artifact` and `--include-dsym` from the Android build command."
+                .to_owned(),
+        }),
+        BuildPlatform::Ios(ios) if ios.simulator => Err(CliError::Unsupported {
+            message: "physical-iPhone artifact options do not apply to iOS Simulator builds"
+                .to_owned(),
+            help: "Remove `--artifact` and `--include-dsym`, or select `--device`.".to_owned(),
+        }),
+        BuildPlatform::Iphone(_) | BuildPlatform::Ios(_) => Ok(()),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -142,6 +182,8 @@ fn run_remote(arguments: BuildArgs, dry_run: bool, reporter: &Reporter) -> Resul
         }
         BuildPlatform::Android(_) => unreachable!("only iPhone builds use the remote route"),
     };
+    let artifact = arguments.artifact;
+    let include_dsym = arguments.include_dsym;
 
     match remote_target {
         BuildRemoteTarget::Github => remote::build_iphone(
@@ -153,11 +195,18 @@ fn run_remote(arguments: BuildArgs, dry_run: bool, reporter: &Reporter) -> Resul
             team.as_deref(),
             arguments.release,
             arguments.unsigned,
+            artifact,
+            include_dsym,
             dry_run,
             reporter,
         ),
         BuildRemoteTarget::SshMac(name) => {
-            ssh_remote::validate_snapshot_build_mode(team.as_deref(), arguments.unsigned)?;
+            ssh_remote::validate_snapshot_build_mode(
+                team.as_deref(),
+                arguments.unsigned,
+                artifact,
+                include_dsym,
+            )?;
             let endpoint = ssh_remote::load_endpoint(&name, arguments.config_dir.as_deref())?;
             ssh_remote::build_iphone(
                 &root,
@@ -168,6 +217,8 @@ fn run_remote(arguments: BuildArgs, dry_run: bool, reporter: &Reporter) -> Resul
                 team.as_deref(),
                 arguments.release,
                 arguments.unsigned,
+                artifact,
+                include_dsym,
                 dry_run,
                 reporter,
             )
@@ -180,6 +231,8 @@ pub(crate) fn execute(
     dry_run: bool,
     reporter: &Reporter,
 ) -> Result<BuildOutput, CliError> {
+    validate_artifact_options(&arguments)?;
+    validate_local_artifact_options(&arguments)?;
     let root = find_project_root(arguments.project_dir.as_deref())?;
     let config = rustferry_core::FerryConfig::load(&root.join("ferry.toml"))?;
     let targets = read_cargo_targets(&root)?;
@@ -759,11 +812,15 @@ const fn profile_name(release: bool) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use crate::cli::{BuildArgs, BuildPlatform, BuildRemoteTarget, IosBuildArgs, IphoneBuildArgs};
+    use crate::cli::{
+        AndroidBuildArgs, BuildArgs, BuildArtifactSelection, BuildPlatform, BuildRemoteTarget,
+        IosBuildArgs, IphoneBuildArgs,
+    };
 
     use super::{
         BuildRoute, ClientHost, build_route_for_host, canonical_developer_dir_override,
-        intended_developer_dir, intended_xcrun_path,
+        intended_developer_dir, intended_xcrun_path, validate_artifact_options,
+        validate_local_artifact_options,
     };
 
     fn ios_arguments(device: bool, remote: Option<BuildRemoteTarget>, unsigned: bool) -> BuildArgs {
@@ -779,6 +836,8 @@ mod tests {
             remote,
             config_dir: None,
             unsigned,
+            artifact: None,
+            include_dsym: false,
             project_dir: None,
         }
     }
@@ -864,6 +923,43 @@ mod tests {
     }
 
     #[test]
+    fn artifact_options_are_physical_iphone_only() {
+        let mut simulator = ios_arguments(false, None, false);
+        simulator.artifact = Some(BuildArtifactSelection::App);
+        assert!(validate_artifact_options(&simulator).is_err());
+
+        let android = BuildArgs {
+            platform: BuildPlatform::Android(AndroidBuildArgs {
+                keystore: None,
+                key_alias: None,
+            }),
+            release: false,
+            remote: None,
+            config_dir: None,
+            unsigned: false,
+            artifact: None,
+            include_dsym: true,
+            project_dir: None,
+        };
+        assert!(validate_artifact_options(&android).is_err());
+
+        let mut device = ios_arguments(true, None, false);
+        device.artifact = Some(BuildArtifactSelection::Archive);
+        assert!(validate_artifact_options(&device).is_ok());
+        assert_eq!(
+            build_route_for_host(&device, ClientHost::MacOs),
+            BuildRoute::Local
+        );
+        assert!(validate_local_artifact_options(&device).is_err());
+
+        device.remote = Some(BuildRemoteTarget::Github);
+        assert_eq!(
+            build_route_for_host(&device, ClientHost::MacOs),
+            BuildRoute::Remote
+        );
+    }
+
+    #[test]
     fn iphone_alias_always_selects_the_remote_route() {
         let arguments = BuildArgs {
             platform: BuildPlatform::Iphone(IphoneBuildArgs { team: None }),
@@ -871,6 +967,8 @@ mod tests {
             remote: None,
             config_dir: None,
             unsigned: false,
+            artifact: None,
+            include_dsym: false,
             project_dir: None,
         };
         for host in [ClientHost::MacOs, ClientHost::NonMacOs] {

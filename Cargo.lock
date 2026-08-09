@@ -1982,6 +1982,7 @@ name = "rustferry-github"
 version = "0.1.0"
 dependencies = [
  "camino",
+ "goblin",
  "hex",
  "rustferry-core",
  "rustferry-remote",
@@ -2046,6 +2047,7 @@ dependencies = [
  "cap-std",
  "clap",
  "fs2",
+ "goblin",
  "hex",
  "plist",
  "rustferry-apple",
@@ -2058,6 +2060,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "toml",
+ "unicode-normalization",
  "uuid",
  "zip 6.0.0",
 ]

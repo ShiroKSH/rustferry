@@ -36,9 +36,10 @@ use zip::{CompressionMethod, ZipArchive, read::ZipFile};
 
 use crate::{
     artifact::{
-        ARTIFACT_MANIFEST_NAME, DEVELOPMENT_IPA_NAME, GithubArtifactError,
-        GithubArtifactExpectation, GithubArtifactIngestion, SANITIZED_BUILD_LOG_NAME,
-        SIGNING_REPORT_NAME, VALIDATION_REPORT_NAME, ingest_github_actions_artifact,
+        APP_BUNDLE_ARCHIVE_NAME, ARTIFACT_MANIFEST_NAME, DEVELOPMENT_IPA_NAME, DSYM_ARCHIVE_NAME,
+        GithubArtifactError, GithubArtifactExpectation, GithubArtifactIngestion,
+        SANITIZED_BUILD_LOG_NAME, SIGNED_XCARCHIVE_NAME, SIGNING_REPORT_NAME,
+        VALIDATION_REPORT_NAME, ingest_github_actions_artifact,
     },
     provider::{GITHUB_PROVIDER_ID, GithubArtifactContext, VerifiedArtifactStore},
     strict_json,
@@ -1080,17 +1081,29 @@ fn signed_verified_run(
         signing_report_path,
         validation_report_path,
         sanitized_log_path,
+        app_bundle_archive_path,
+        signed_xcarchive_path,
+        dsym_archive_path,
         mut manifest,
         manifest_sha256,
         manifest_size,
         ..
     } = published;
-    let paths = BTreeMap::from([
+    let mut paths = BTreeMap::from([
         (DEVELOPMENT_IPA_NAME, ipa_path),
         (SIGNING_REPORT_NAME, signing_report_path),
         (VALIDATION_REPORT_NAME, validation_report_path),
         (SANITIZED_BUILD_LOG_NAME, sanitized_log_path),
     ]);
+    for (name, path) in [
+        (APP_BUNDLE_ARCHIVE_NAME, app_bundle_archive_path),
+        (SIGNED_XCARCHIVE_NAME, signed_xcarchive_path),
+        (DSYM_ARCHIVE_NAME, dsym_archive_path),
+    ] {
+        if let Some(path) = path {
+            paths.insert(name, path);
+        }
+    }
     let mut artifacts = BTreeMap::new();
     for record in &manifest.artifacts {
         let path = paths

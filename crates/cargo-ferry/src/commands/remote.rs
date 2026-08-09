@@ -43,9 +43,9 @@ use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use crate::cli::{
-    RemoteArgs, RemoteBundleArgs, RemoteBundleCommand, RemoteBundleCreateArgs,
-    RemoteBundleInspectArgs, RemoteBundleVerifyArgs, RemoteCommand, RemoteDoctorArgs,
-    RemoteProviderChoice, RemoteSetupArgs, RemoteStatusArgs,
+    BuildArtifactSelection, RemoteArgs, RemoteBundleArgs, RemoteBundleCommand,
+    RemoteBundleCreateArgs, RemoteBundleInspectArgs, RemoteBundleVerifyArgs, RemoteCommand,
+    RemoteDoctorArgs, RemoteProviderChoice, RemoteSetupArgs, RemoteStatusArgs,
 };
 use crate::error::CliError;
 use crate::output::Reporter;
@@ -2345,7 +2345,54 @@ fn signing_config_commit_uncertain(error: &CliError, uploaded: &[SigningSecretUp
     )
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn select_requested_artifacts(
+    signing_mode: SigningMode,
+    artifact: Option<BuildArtifactSelection>,
+    include_dsym: bool,
+) -> Result<BTreeSet<IosArtifactType>, CliError> {
+    if signing_mode == SigningMode::UnsignedCompileOnly {
+        if !matches!(artifact, None | Some(BuildArtifactSelection::Archive)) {
+            return Err(CliError::Unsupported {
+                message: "unsigned physical-iPhone builds can return only an XCArchive".to_owned(),
+                help: "Remove `--artifact`, or pass `--artifact archive`.".to_owned(),
+            });
+        }
+        if include_dsym {
+            return Err(CliError::Unsupported {
+                message: "unsigned physical-iPhone builds cannot return a separate dSYM artifact"
+                    .to_owned(),
+                help: "Remove `--include-dsym`, or configure protected development signing."
+                    .to_owned(),
+            });
+        }
+        return Ok(BTreeSet::from([IosArtifactType::Xcarchive]));
+    }
+
+    let mut requested = BTreeSet::from([IosArtifactType::Ipa, IosArtifactType::SigningReport]);
+    match artifact {
+        None | Some(BuildArtifactSelection::Ipa) => {}
+        Some(BuildArtifactSelection::App) => {
+            requested.insert(IosArtifactType::AppBundle);
+        }
+        Some(BuildArtifactSelection::Archive) => {
+            requested.insert(IosArtifactType::Xcarchive);
+        }
+        Some(BuildArtifactSelection::All) => {
+            requested.insert(IosArtifactType::AppBundle);
+            requested.insert(IosArtifactType::Xcarchive);
+        }
+    }
+    if include_dsym {
+        requested.insert(IosArtifactType::Dsym);
+    }
+    Ok(requested)
+}
+
+#[allow(
+    clippy::fn_params_excessive_bools,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
 pub fn build_iphone(
     root: &Utf8Path,
     ferry_config: &rustferry_core::FerryConfig,
@@ -2355,10 +2402,15 @@ pub fn build_iphone(
     expected_team: Option<&str>,
     release: bool,
     unsigned: bool,
+    artifact: Option<BuildArtifactSelection>,
+    include_dsym: bool,
     dry_run: bool,
     reporter: &Reporter,
 ) -> Result<(), CliError> {
     let RemoteProviderChoice::Github = provider;
+    if unsigned {
+        select_requested_artifacts(SigningMode::UnsignedCompileOnly, artifact, include_dsym)?;
+    }
     let (stored, _config_lock) = load_config_for_build(root)?;
     let signing = select_signing_plan(&stored, ferry_config, binary_name, expected_team, unsigned)?;
     let git = git_context(root, &stored.source_remote_name, reporter)?;
@@ -2372,9 +2424,8 @@ pub fn build_iphone(
         rustferry_apple::derive_ios_device_product_expectation(ferry_config, binary_name)?;
     let signing_mode = signing.mode;
     let requested_artifacts = match signing_mode {
-        SigningMode::UnsignedCompileOnly => BTreeSet::from([IosArtifactType::Xcarchive]),
-        SigningMode::ManualDevelopment => {
-            BTreeSet::from([IosArtifactType::Ipa, IosArtifactType::SigningReport])
+        SigningMode::UnsignedCompileOnly | SigningMode::ManualDevelopment => {
+            select_requested_artifacts(signing_mode, artifact, include_dsym)?
         }
         _ => {
             return Err(remote_error(
@@ -2413,8 +2464,13 @@ pub fn build_iphone(
         )
     })?;
 
-    let expected_downloads =
-        expected_artifact_downloads(root, &request.product_name, release, signing_mode)?;
+    let expected_downloads = expected_artifact_downloads(
+        root,
+        &request.product_name,
+        release,
+        signing_mode,
+        &request.requested_artifacts,
+    )?;
     let artifact_path = expected_downloads[0].path.clone();
     let planned = RemoteBuildOutput {
         project: root.to_string(),
@@ -2456,7 +2512,7 @@ pub fn build_iphone(
         prepare_artifact_destination(root, &download.path)?;
     }
     let provider = build_provider(root, &git.root, &stored)?;
-    handshake(&provider, signing_mode)?;
+    handshake(&provider, signing_mode, &request.requested_artifacts)?;
     let readiness = provider_call(
         provider.doctor(
             ProviderDoctorRequest {
@@ -2558,13 +2614,8 @@ pub fn build_iphone(
                 "Do not use the artifact; retain the job metadata for investigation and retry with a new operation ID.",
             ));
         }
-        let requested_kinds = if signing_mode == SigningMode::UnsignedCompileOnly {
-            vec![ArtifactKind::Xcarchive]
-        } else {
-            vec![ArtifactKind::Ipa, ArtifactKind::SigningReport]
-        };
-        for kind in requested_kinds {
-            require_one_artifact(manifest, kind)?;
+        for artifact_type in &request.requested_artifacts {
+            require_one_artifact(manifest, artifact_type.artifact_kind())?;
         }
 
         let mut primary_sha256 = None;
@@ -4003,28 +4054,12 @@ fn build_provider(
     ))
 }
 
-fn handshake(provider: &GithubProvider, signing_mode: SigningMode) -> Result<(), CliError> {
-    let artifact = if signing_mode == SigningMode::UnsignedCompileOnly {
-        IosArtifactType::Xcarchive
-    } else {
-        IosArtifactType::Ipa
-    };
-    let mut required_features = vec![
-        ProviderFeature::SourceMode(SourceMode::Git),
-        ProviderFeature::IosDeviceBuild,
-        ProviderFeature::SigningMode(signing_mode),
-        ProviderFeature::LiveEvents,
-        ProviderFeature::Cancellation,
-        ProviderFeature::ArtifactType(artifact),
-        ProviderFeature::ArtifactListing,
-        ProviderFeature::ArtifactDownload,
-        ProviderFeature::Cleanup,
-    ];
-    if signing_mode.is_signed() {
-        required_features.push(ProviderFeature::ArtifactType(
-            IosArtifactType::SigningReport,
-        ));
-    }
+fn handshake(
+    provider: &GithubProvider,
+    signing_mode: SigningMode,
+    requested_artifacts: &BTreeSet<IosArtifactType>,
+) -> Result<(), CliError> {
+    let required_features = required_build_features(signing_mode, requested_artifacts);
     provider_call(
         provider.handshake(
             HandshakeRequest {
@@ -4039,6 +4074,29 @@ fn handshake(provider: &GithubProvider, signing_mode: SigningMode) -> Result<(),
         "the GitHub worker/provider contract is incompatible with this client",
     )?;
     Ok(())
+}
+
+fn required_build_features(
+    signing_mode: SigningMode,
+    requested_artifacts: &BTreeSet<IosArtifactType>,
+) -> Vec<ProviderFeature> {
+    let mut required_features = vec![
+        ProviderFeature::SourceMode(SourceMode::Git),
+        ProviderFeature::IosDeviceBuild,
+        ProviderFeature::SigningMode(signing_mode),
+        ProviderFeature::LiveEvents,
+        ProviderFeature::Cancellation,
+        ProviderFeature::ArtifactListing,
+        ProviderFeature::ArtifactDownload,
+        ProviderFeature::Cleanup,
+    ];
+    required_features.extend(
+        requested_artifacts
+            .iter()
+            .copied()
+            .map(ProviderFeature::ArtifactType),
+    );
+    required_features
 }
 
 #[derive(Debug)]
@@ -5744,6 +5802,7 @@ fn expected_artifact_downloads(
     product_name: &str,
     release: bool,
     signing_mode: SigningMode,
+    requested_artifacts: &BTreeSet<IosArtifactType>,
 ) -> Result<Vec<ExpectedDownload>, CliError> {
     validate_artifact_product_name(product_name)?;
     let directory = root
@@ -5755,11 +5814,29 @@ fn expected_artifact_downloads(
             path: directory.join(format!("{product_name}-unsigned.xcarchive.zip")),
         }]
     } else {
-        vec![
-            ExpectedDownload {
-                kind: ArtifactKind::Ipa,
-                path: directory.join(format!("{product_name}-development.ipa")),
-            },
+        let mut signed = vec![ExpectedDownload {
+            kind: ArtifactKind::Ipa,
+            path: directory.join(format!("{product_name}-development.ipa")),
+        }];
+        if requested_artifacts.contains(&IosArtifactType::AppBundle) {
+            signed.push(ExpectedDownload {
+                kind: ArtifactKind::App,
+                path: directory.join(format!("{product_name}.app.zip")),
+            });
+        }
+        if requested_artifacts.contains(&IosArtifactType::Xcarchive) {
+            signed.push(ExpectedDownload {
+                kind: ArtifactKind::Xcarchive,
+                path: directory.join(format!("{product_name}.xcarchive.zip")),
+            });
+        }
+        if requested_artifacts.contains(&IosArtifactType::Dsym) {
+            signed.push(ExpectedDownload {
+                kind: ArtifactKind::Dsym,
+                path: directory.join(format!("{product_name}.dSYM.zip")),
+            });
+        }
+        signed.extend([
             ExpectedDownload {
                 kind: ArtifactKind::Manifest,
                 path: directory.join("artifact-manifest.json"),
@@ -5768,7 +5845,8 @@ fn expected_artifact_downloads(
                 kind: ArtifactKind::ValidationReport,
                 path: directory.join("validation-report.json"),
             },
-        ]
+        ]);
+        signed
     };
     downloads.push(ExpectedDownload {
         kind: ArtifactKind::SanitizedLog,
@@ -6010,10 +6088,10 @@ mod tests {
         load_signing_project_state, parse_repository_spec, preflight_file,
         prepare_artifact_destination, provider_config_lock_for_signing,
         read_private_config_snapshot, remote_error, replace_private_config,
-        required_signing_secret_names, retry_artifact_listing, signing_config_commit_uncertain,
-        source_manifest_digest, unsigned_signing_plan, validate_git_remote_name,
-        validate_manual_assets_match_plan, validate_stored_config, workflow_from_stored,
-        write_create_only,
+        required_build_features, required_signing_secret_names, retry_artifact_listing,
+        select_requested_artifacts, signing_config_commit_uncertain, source_manifest_digest,
+        unsigned_signing_plan, validate_git_remote_name, validate_manual_assets_match_plan,
+        validate_stored_config, workflow_from_stored, write_create_only,
     };
     use std::cell::RefCell;
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -6022,6 +6100,7 @@ mod tests {
 
     #[cfg(unix)]
     use super::executable_entrypoint;
+    use crate::cli::BuildArtifactSelection;
     use crate::error::CliError;
     use crate::output::Reporter;
     use rustferry_github::transport::{
@@ -6031,11 +6110,12 @@ mod tests {
     use rustferry_remote::{
         ArtifactKind, ArtifactManifest, BundleIdentifier, CURRENT_PROTOCOL_VERSION,
         DevelopmentTeam, DevelopmentTeamPlan, DevicePlan, EntitlementPlan, EntitlementSet,
-        ProviderCapabilities, ProviderCheck, ProviderCheckStatus, ProviderDoctorReport,
-        ProvisioningPlan, ProvisioningPlatform, ProvisioningProfile, ProvisioningProfileType,
-        RemoteBuildError, SecretBytes, SecretReference, SecretReferenceKind, SigningCertificate,
-        SigningIdentity, SigningMode, SigningPlan, SigningPrivateKeyReference, SigningReference,
-        SigningTarget, SigningTargetKind, SourceBundleRequest, plan_source_bundle,
+        IosArtifactType, ProviderCapabilities, ProviderCheck, ProviderCheckStatus,
+        ProviderDoctorReport, ProviderFeature, ProvisioningPlan, ProvisioningPlatform,
+        ProvisioningProfile, ProvisioningProfileType, RemoteBuildError, SecretBytes,
+        SecretReference, SecretReferenceKind, SigningCertificate, SigningIdentity, SigningMode,
+        SigningPlan, SigningPrivateKeyReference, SigningReference, SigningTarget,
+        SigningTargetKind, SourceBundleRequest, plan_source_bundle,
     };
 
     fn unsigned_stored_config() -> StoredGithubConfig {
@@ -7419,9 +7499,16 @@ mod tests {
     #[test]
     fn signed_default_downloads_are_exact_and_product_named() {
         let root = camino::Utf8Path::new("/project");
-        let downloads =
-            expected_artifact_downloads(root, "Weather", false, SigningMode::ManualDevelopment)
-                .expect("download plan");
+        let requested = select_requested_artifacts(SigningMode::ManualDevelopment, None, false)
+            .expect("default artifact selection");
+        let downloads = expected_artifact_downloads(
+            root,
+            "Weather",
+            false,
+            SigningMode::ManualDevelopment,
+            &requested,
+        )
+        .expect("download plan");
         assert_eq!(
             downloads
                 .iter()
@@ -7438,6 +7525,142 @@ mod tests {
     }
 
     #[test]
+    fn signed_artifact_selection_keeps_ipa_and_adds_only_requested_outputs() {
+        let cases = [
+            (BuildArtifactSelection::Ipa, Vec::new()),
+            (
+                BuildArtifactSelection::App,
+                vec![IosArtifactType::AppBundle],
+            ),
+            (
+                BuildArtifactSelection::Archive,
+                vec![IosArtifactType::Xcarchive],
+            ),
+            (
+                BuildArtifactSelection::All,
+                vec![IosArtifactType::AppBundle, IosArtifactType::Xcarchive],
+            ),
+        ];
+        for (selection, optional) in cases {
+            let requested =
+                select_requested_artifacts(SigningMode::ManualDevelopment, Some(selection), false)
+                    .expect("signed artifact selection");
+            assert!(requested.contains(&IosArtifactType::Ipa));
+            assert!(requested.contains(&IosArtifactType::SigningReport));
+            assert_eq!(
+                requested.len(),
+                optional.len() + 2,
+                "selection={selection:?}"
+            );
+            for artifact in optional {
+                assert!(requested.contains(&artifact), "selection={selection:?}");
+            }
+        }
+
+        let with_dsym = select_requested_artifacts(
+            SigningMode::ManualDevelopment,
+            Some(BuildArtifactSelection::Ipa),
+            true,
+        )
+        .expect("dSYM selection");
+        assert!(with_dsym.contains(&IosArtifactType::Dsym));
+        assert!(with_dsym.contains(&IosArtifactType::Ipa));
+    }
+
+    #[test]
+    fn unsigned_artifact_selection_accepts_only_the_archive() {
+        for selection in [None, Some(BuildArtifactSelection::Archive)] {
+            assert_eq!(
+                select_requested_artifacts(SigningMode::UnsignedCompileOnly, selection, false)
+                    .expect("unsigned archive selection"),
+                BTreeSet::from([IosArtifactType::Xcarchive])
+            );
+        }
+        for selection in [
+            BuildArtifactSelection::Ipa,
+            BuildArtifactSelection::App,
+            BuildArtifactSelection::All,
+        ] {
+            assert!(
+                select_requested_artifacts(
+                    SigningMode::UnsignedCompileOnly,
+                    Some(selection),
+                    false,
+                )
+                .is_err(),
+                "selection={selection:?}"
+            );
+        }
+        assert!(select_requested_artifacts(SigningMode::UnsignedCompileOnly, None, true).is_err());
+    }
+
+    #[test]
+    fn optional_signed_downloads_use_portable_zip_destinations() {
+        let root = camino::Utf8Path::new("/project");
+        let requested = select_requested_artifacts(
+            SigningMode::ManualDevelopment,
+            Some(BuildArtifactSelection::All),
+            true,
+        )
+        .expect("all signed artifacts");
+        let downloads = expected_artifact_downloads(
+            root,
+            "Weather",
+            true,
+            SigningMode::ManualDevelopment,
+            &requested,
+        )
+        .expect("download plan");
+        let optional = downloads
+            .iter()
+            .filter(|download| {
+                matches!(
+                    download.kind,
+                    ArtifactKind::App | ArtifactKind::Xcarchive | ArtifactKind::Dsym
+                )
+            })
+            .map(|download| (download.kind, download.path.file_name().unwrap_or_default()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            optional,
+            [
+                (ArtifactKind::App, "Weather.app.zip"),
+                (ArtifactKind::Xcarchive, "Weather.xcarchive.zip"),
+                (ArtifactKind::Dsym, "Weather.dSYM.zip"),
+            ]
+        );
+    }
+
+    #[test]
+    fn handshake_and_manifest_require_every_selected_artifact_type() {
+        let requested = select_requested_artifacts(
+            SigningMode::ManualDevelopment,
+            Some(BuildArtifactSelection::All),
+            true,
+        )
+        .expect("all signed artifacts");
+        let features = required_build_features(SigningMode::ManualDevelopment, &requested);
+        let manifest_kinds = requested
+            .iter()
+            .copied()
+            .map(IosArtifactType::artifact_kind)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            manifest_kinds,
+            BTreeSet::from([
+                ArtifactKind::Ipa,
+                ArtifactKind::App,
+                ArtifactKind::Xcarchive,
+                ArtifactKind::Dsym,
+                ArtifactKind::SigningReport,
+            ])
+        );
+        for artifact in requested {
+            assert!(features.contains(&ProviderFeature::ArtifactType(artifact)));
+        }
+    }
+
+    #[test]
     fn every_download_accepts_only_the_client_verified_manifest_state() {
         let listed = ArtifactManifest::new("operation", "job");
         let downloaded = downloaded_manifest(&listed);
@@ -7447,11 +7670,14 @@ mod tests {
                 .validation_levels
                 .contains(&rustferry_remote::ValidationLevel::DownloadedToClient)
         );
+        let requested = select_requested_artifacts(SigningMode::ManualDevelopment, None, false)
+            .expect("default artifact selection");
         for _ in expected_artifact_downloads(
             camino::Utf8Path::new("/project"),
             "Weather",
             false,
             SigningMode::ManualDevelopment,
+            &requested,
         )
         .expect("download plan")
         {
@@ -7492,9 +7718,16 @@ mod tests {
     fn completed_default_downloads_make_retries_fail_without_clobbering() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let root = camino::Utf8Path::from_path(temporary.path()).expect("UTF-8 temp path");
-        let downloads =
-            expected_artifact_downloads(root, "Weather", false, SigningMode::ManualDevelopment)
-                .expect("download plan");
+        let requested = select_requested_artifacts(SigningMode::ManualDevelopment, None, false)
+            .expect("default artifact selection");
+        let downloads = expected_artifact_downloads(
+            root,
+            "Weather",
+            false,
+            SigningMode::ManualDevelopment,
+            &requested,
+        )
+        .expect("download plan");
         for download in &downloads {
             prepare_artifact_destination(root, &download.path).expect("new destination");
             std::fs::write(&download.path, [download.kind as u8]).expect("downloaded bytes");

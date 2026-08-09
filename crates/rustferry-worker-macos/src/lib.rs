@@ -27,6 +27,8 @@ pub mod sealed;
 pub mod session_output;
 /// Signed IPA validation and export evidence.
 pub mod signed_ipa;
+/// Optional signed app, XCArchive, and dSYM transports.
+pub(crate) mod signed_products;
 /// One-shot framed SSH snapshot-build session.
 pub mod snapshot_session;
 /// One-request, read-only stdio control plane for the SSH provider.

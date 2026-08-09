@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
-use crate::cli::{RemoteAddSshMacArgs, RemoteDoctorArgs};
+use crate::cli::{BuildArtifactSelection, RemoteAddSshMacArgs, RemoteDoctorArgs};
 use crate::error::CliError;
 use crate::output::Reporter;
 
@@ -1187,6 +1187,8 @@ pub(super) fn load_endpoint(
 pub(super) fn validate_snapshot_build_mode(
     expected_team: Option<&str>,
     unsigned: bool,
+    artifact: Option<BuildArtifactSelection>,
+    include_dsym: bool,
 ) -> Result<(), CliError> {
     if !unsigned {
         return Err(CliError::Unsupported {
@@ -1203,10 +1205,27 @@ pub(super) fn validate_snapshot_build_mode(
                 .to_owned(),
         });
     }
+    if !matches!(artifact, None | Some(BuildArtifactSelection::Archive)) {
+        return Err(CliError::Unsupported {
+            message: "SSH snapshot v1 can return only the unsigned XCArchive".to_owned(),
+            help: "Remove `--artifact`, or pass `--artifact archive`.".to_owned(),
+        });
+    }
+    if include_dsym {
+        return Err(CliError::Unsupported {
+            message: "SSH snapshot v1 cannot return a separate dSYM artifact".to_owned(),
+            help: "Remove `--include-dsym`, or use the configured GitHub provider for signed artifacts."
+                .to_owned(),
+        });
+    }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(
+    clippy::fn_params_excessive_bools,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
 pub(super) fn build_iphone(
     project: &Utf8Path,
     ferry_config: &rustferry_core::FerryConfig,
@@ -1216,10 +1235,12 @@ pub(super) fn build_iphone(
     expected_team: Option<&str>,
     release: bool,
     unsigned: bool,
+    artifact: Option<BuildArtifactSelection>,
+    include_dsym: bool,
     dry_run: bool,
     reporter: &Reporter,
 ) -> Result<(), CliError> {
-    validate_snapshot_build_mode(expected_team, unsigned)?;
+    validate_snapshot_build_mode(expected_team, unsigned, artifact, include_dsym)?;
 
     let (_workspace, source, _path_dependencies) =
         super::remote::snapshot_source_bundle_plan(project, &[], reporter)?;
@@ -3370,16 +3391,37 @@ mod tests {
 
     #[test]
     fn snapshot_build_mode_never_downgrades_signing() {
-        validate_snapshot_build_mode(None, true).expect("explicit unsigned build");
+        validate_snapshot_build_mode(None, true, None, false).expect("explicit unsigned build");
+        validate_snapshot_build_mode(
+            None,
+            true,
+            Some(crate::cli::BuildArtifactSelection::Archive),
+            false,
+        )
+        .expect("explicit archive selection");
 
-        let error = validate_snapshot_build_mode(None, false).expect_err("signed SSH request");
+        let error =
+            validate_snapshot_build_mode(None, false, None, false).expect_err("signed SSH request");
         assert_eq!(error.code(), "unsupported");
         assert!(error.to_string().contains("unsigned"));
 
-        let error = validate_snapshot_build_mode(Some("ABCDE12345"), true)
+        let error = validate_snapshot_build_mode(Some("ABCDE12345"), true, None, false)
             .expect_err("team-bound unsigned SSH request");
         assert_eq!(error.code(), "unsupported");
         assert!(error.to_string().contains("--team"));
+
+        let error = validate_snapshot_build_mode(
+            None,
+            true,
+            Some(crate::cli::BuildArtifactSelection::App),
+            false,
+        )
+        .expect_err("unsupported SSH artifact");
+        assert!(error.to_string().contains("XCArchive"));
+
+        let error =
+            validate_snapshot_build_mode(None, true, None, true).expect_err("unsupported SSH dSYM");
+        assert!(error.to_string().contains("dSYM"));
     }
 
     #[test]
@@ -3416,6 +3458,8 @@ mod tests {
             None,
             false,
             true,
+            None,
+            false,
             true,
             &reporter,
         )

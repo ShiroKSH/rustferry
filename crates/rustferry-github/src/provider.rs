@@ -2694,6 +2694,8 @@ fn provider_capabilities(
         cancellation: config.mutation_authorization.cancel_run,
         artifact_types: BTreeSet::from([
             IosArtifactType::Ipa,
+            IosArtifactType::AppBundle,
+            IosArtifactType::Dsym,
             IosArtifactType::SigningReport,
             IosArtifactType::Xcarchive,
         ]),
@@ -2910,10 +2912,7 @@ fn validate_submission(
                 ));
             }
             validate_signing_secret_references(config, request)?;
-            validate_exact_artifact_request(
-                request,
-                &BTreeSet::from([IosArtifactType::Ipa, IosArtifactType::SigningReport]),
-            )?;
+            validate_signed_artifact_request(request)?;
         }
         SigningMode::UnsignedCompileOnly => {
             validate_exact_artifact_request(
@@ -2988,6 +2987,28 @@ fn validate_exact_artifact_request(
     Err(provider_failure(
         "artifact_request_mismatch",
         "requested artifacts do not exactly match the selected signing mode",
+        false,
+    ))
+}
+
+fn validate_signed_artifact_request(request: &IosDeviceBuildRequest) -> RemoteBuildResult<()> {
+    let required = BTreeSet::from([IosArtifactType::Ipa, IosArtifactType::SigningReport]);
+    let supported = BTreeSet::from([
+        IosArtifactType::Ipa,
+        IosArtifactType::AppBundle,
+        IosArtifactType::Xcarchive,
+        IosArtifactType::Dsym,
+        IosArtifactType::SigningReport,
+    ]);
+    if let Some(extra) = request.requested_artifacts.difference(&supported).next() {
+        return Err(unsupported(ProviderFeature::ArtifactType(*extra)));
+    }
+    if required.is_subset(&request.requested_artifacts) {
+        return Ok(());
+    }
+    Err(provider_failure(
+        "artifact_request_mismatch",
+        "signed builds require the IPA and signing report artifact set",
         false,
     ))
 }
@@ -5190,6 +5211,8 @@ mod tests {
             provider.capabilities().artifact_types,
             BTreeSet::from([
                 IosArtifactType::Ipa,
+                IosArtifactType::AppBundle,
+                IosArtifactType::Dsym,
                 IosArtifactType::SigningReport,
                 IosArtifactType::Xcarchive,
             ])
@@ -5200,6 +5223,27 @@ mod tests {
                 SigningMode::ManualDevelopment,
                 SigningMode::UnsignedCompileOnly,
             ])
+        );
+
+        let mut optional_artifacts = valid_request();
+        optional_artifacts.requested_artifacts.extend([
+            IosArtifactType::AppBundle,
+            IosArtifactType::Dsym,
+            IosArtifactType::Xcarchive,
+        ]);
+        validate_submission(&config, &optional_artifacts)
+            .expect("provider accepts supported optional signed artifacts");
+
+        let mut missing_ipa = valid_request();
+        missing_ipa
+            .requested_artifacts
+            .remove(&IosArtifactType::Ipa);
+        assert_eq!(
+            validate_submission(&config, &missing_ipa).expect_err("signed IPA is mandatory"),
+            RemoteBuildError::InvalidEventPayload {
+                event: "ios_device_build_request",
+                reason: "signed builds must request the installable IPA",
+            }
         );
 
         let mut extra_artifact = valid_request();

@@ -438,9 +438,28 @@ pub struct BuildArgs {
     /// Compile a physical-iPhone archive without signing or provisioning.
     #[arg(long, global = true)]
     pub unsigned: bool,
+    /// Select physical-iPhone artifacts to download.
+    #[arg(long, global = true, value_enum, value_name = "ARTIFACT")]
+    pub artifact: Option<BuildArtifactSelection>,
+    /// Include compressed dSYM debug symbols in a signed physical-iPhone build.
+    #[arg(long, global = true)]
+    pub include_dsym: bool,
     /// Project root or a child directory.
     #[arg(long, visible_alias = "project", global = true)]
     pub project_dir: Option<Utf8PathBuf>,
+}
+
+/// Physical-iPhone artifact selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum BuildArtifactSelection {
+    /// Download the installable IPA and default evidence.
+    Ipa,
+    /// Also download the signed application bundle.
+    App,
+    /// Also download the signed Xcode archive.
+    Archive,
+    /// Also download the signed application bundle and Xcode archive.
+    All,
 }
 
 /// Platform-specific build mode.
@@ -1071,8 +1090,8 @@ mod tests {
     use clap::Parser as _;
 
     use super::{
-        BuildPlatform, BuildRemoteTarget, Cli, Command, RemoteBundleCommand, RemoteCommand,
-        RemoteProviderChoice, SigningCommand, SigningSetupMode,
+        BuildArtifactSelection, BuildPlatform, BuildRemoteTarget, Cli, Command,
+        RemoteBundleCommand, RemoteCommand, RemoteProviderChoice, SigningCommand, SigningSetupMode,
     };
 
     #[test]
@@ -1107,6 +1126,24 @@ mod tests {
         };
         assert!(matches!(ios.platform, BuildPlatform::Ios(_)));
         assert_eq!(ios.remote, Some(BuildRemoteTarget::Github));
+    }
+
+    #[test]
+    fn physical_iphone_artifact_flags_parse_after_the_platform() {
+        let parsed = Cli::try_parse_from([
+            "cargo-ferry",
+            "build",
+            "iphone",
+            "--artifact",
+            "all",
+            "--include-dsym",
+        ])
+        .expect("physical-iPhone artifact flags");
+        let Command::Build(arguments) = parsed.command else {
+            panic!("expected build command");
+        };
+        assert_eq!(arguments.artifact, Some(BuildArtifactSelection::All));
+        assert!(arguments.include_dsym);
     }
 
     #[test]

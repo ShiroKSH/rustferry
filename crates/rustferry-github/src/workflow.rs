@@ -1401,7 +1401,7 @@ fn render_sign_job(yaml: &mut String, config: &WorkflowConfig) {
     push(yaml, UPLOAD_ARTIFACT_ACTION_SHA);
     push(
         yaml,
-        " # v7\n        with:\n          name: 'rustferry-iphone-${{ github.run_id }}-${{ github.run_attempt }}'\n          path: |\n            ${{ runner.temp }}/rustferry-signed/application-development.ipa\n            ${{ runner.temp }}/rustferry-signed/artifact-manifest.json\n            ${{ runner.temp }}/rustferry-signed/signing-report.json\n            ${{ runner.temp }}/rustferry-signed/validation-report.json\n            ${{ runner.temp }}/rustferry-signed/sanitized-build-log.txt\n          if-no-files-found: error\n          compression-level: 0\n",
+        " # v7\n        with:\n          name: 'rustferry-iphone-${{ github.run_id }}-${{ github.run_attempt }}'\n          path: |\n            ${{ runner.temp }}/rustferry-signed/application-development.ipa\n            ${{ runner.temp }}/rustferry-signed/artifact-manifest.json\n            ${{ runner.temp }}/rustferry-signed/signing-report.json\n            ${{ runner.temp }}/rustferry-signed/validation-report.json\n            ${{ runner.temp }}/rustferry-signed/sanitized-build-log.txt\n            ${{ runner.temp }}/rustferry-signed/application.app.zip\n            ${{ runner.temp }}/rustferry-signed/application.xcarchive.zip\n            ${{ runner.temp }}/rustferry-signed/application.dSYM.zip\n          if-no-files-found: error\n          compression-level: 0\n",
     );
     line(
         yaml,
@@ -1922,8 +1922,8 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(first.path(), ".github/workflows/rustferry-goal3-iphone.yml");
-        assert_eq!(first.yaml().lines().count(), 277);
-        assert_eq!(fnv1a64(first.yaml().as_bytes()), 0x428b_4daf_9690_382e);
+        assert_eq!(first.yaml().lines().count(), 280);
+        assert_eq!(fnv1a64(first.yaml().as_bytes()), 0x8351_0daa_6cce_5721);
     }
 
     #[test]
@@ -1932,8 +1932,8 @@ mod tests {
         let second = generate_workflow(&fixture_source_config());
 
         assert_eq!(first, second);
-        assert_eq!(first.yaml().lines().count(), 366);
-        assert_eq!(fnv1a64(first.yaml().as_bytes()), 0x8e9d_42dc_7ec9_c5be);
+        assert_eq!(first.yaml().lines().count(), 369);
+        assert_eq!(fnv1a64(first.yaml().as_bytes()), 0x58cf_50e3_6f3d_c831);
     }
 
     #[test]
@@ -2326,7 +2326,7 @@ mod tests {
     }
 
     #[test]
-    fn signing_job_uploads_the_complete_default_artifact_set() {
+    fn signing_job_allowlists_every_supported_request_derived_artifact() {
         let workflow = generate_workflow(&fixture_config());
         let sign = workflow.yaml().split_once("\n  sign:\n").unwrap().1;
 
@@ -2336,6 +2336,9 @@ mod tests {
             "signing-report.json",
             "validation-report.json",
             "sanitized-build-log.txt",
+            "application.app.zip",
+            "application.xcarchive.zip",
+            "application.dSYM.zip",
         ] {
             assert!(sign.contains(&format!(
                 "${{{{ runner.temp }}}}/rustferry-signed/{file_name}"
@@ -2343,7 +2346,7 @@ mod tests {
         }
         assert_eq!(
             sign.matches("${{ runner.temp }}/rustferry-signed/").count(),
-            5
+            8
         );
     }
 

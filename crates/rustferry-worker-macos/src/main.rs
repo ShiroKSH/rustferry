@@ -1028,6 +1028,12 @@ fn run_sign(arguments: RunJobArgs) -> Result<(), CliFailure> {
         SIGNING_REPORT_NAME,
     )?
     .clone();
+    let product_outputs = bind_requested_product_outputs(
+        &handoff.request,
+        &manifest.artifacts,
+        &output.product_paths,
+        &internal_artifacts,
+    )?;
     if output.ipa_path != internal_artifacts.join(IPA_NAME)
         || sha256_file(&output.ipa_path)? != ipa_record.sha256
     {
@@ -1108,6 +1114,13 @@ fn run_sign(arguments: RunJobArgs) -> Result<(), CliFailure> {
         &output_directory.join(IPA_NAME),
         ipa_record.size,
     )?;
+    for (record, source) in &product_outputs {
+        atomic_copy_new(
+            source,
+            &output_directory.join(&record.file_name),
+            record.size,
+        )?;
+    }
     atomic_write_new(&output_directory.join(SIGNING_REPORT_NAME), &signing_bytes)?;
     atomic_write_new(
         &output_directory.join(VALIDATION_REPORT_NAME),
@@ -1121,14 +1134,7 @@ fn run_sign(arguments: RunJobArgs) -> Result<(), CliFailure> {
         &output_directory.join(ARTIFACT_MANIFEST_NAME),
         &manifest_bytes,
     )?;
-    verify_published_signing_output(
-        &output_directory,
-        &ipa_record,
-        &signing_record,
-        &validation_record,
-        &sanitized_log_record,
-        &manifest,
-    )?;
+    verify_published_signing_output(&output_directory, &manifest)?;
     sync_directory(&output_directory)?;
     output_guard.keep();
     write_json_stdout(&serde_json::json!({
@@ -1272,10 +1278,21 @@ fn validate_github_artifact_contract(request: &IosDeviceBuildRequest) -> Result<
             "GitHub worker requires immutable Git source mode",
         ));
     }
-    let expected = match request.signing.mode {
-        SigningMode::UnsignedCompileOnly => BTreeSet::from([IosArtifactType::Xcarchive]),
+    let valid = match request.signing.mode {
+        SigningMode::UnsignedCompileOnly => {
+            request.requested_artifacts == BTreeSet::from([IosArtifactType::Xcarchive])
+        }
         SigningMode::ManualDevelopment => {
-            BTreeSet::from([IosArtifactType::Ipa, IosArtifactType::SigningReport])
+            let required = BTreeSet::from([IosArtifactType::Ipa, IosArtifactType::SigningReport]);
+            let supported = BTreeSet::from([
+                IosArtifactType::Ipa,
+                IosArtifactType::SigningReport,
+                IosArtifactType::AppBundle,
+                IosArtifactType::Xcarchive,
+                IosArtifactType::Dsym,
+            ]);
+            required.is_subset(&request.requested_artifacts)
+                && request.requested_artifacts.is_subset(&supported)
         }
         SigningMode::Development
         | SigningMode::PersonalTeam
@@ -1287,10 +1304,10 @@ fn validate_github_artifact_contract(request: &IosDeviceBuildRequest) -> Result<
             ));
         }
     };
-    if request.requested_artifacts != expected {
+    if !valid {
         return Err(CliFailure::input(
             "invalid_artifact_contract",
-            "GitHub signing requires exactly IPA and signing-report artifacts",
+            "GitHub signing artifact selection is unsupported",
         ));
     }
     Ok(())
@@ -1993,6 +2010,87 @@ fn verify_bytes_record(bytes: &[u8], record: &ArtifactRecord) -> Result<(), CliF
     Ok(())
 }
 
+fn bind_requested_product_outputs(
+    request: &IosDeviceBuildRequest,
+    records: &[ArtifactRecord],
+    paths: &[Utf8PathBuf],
+    directory: &Utf8Path,
+) -> Result<Vec<(ArtifactRecord, Utf8PathBuf)>, CliFailure> {
+    let requested = request
+        .requested_artifacts
+        .iter()
+        .filter(|artifact| {
+            matches!(
+                artifact,
+                IosArtifactType::AppBundle | IosArtifactType::Xcarchive | IosArtifactType::Dsym
+            )
+        })
+        .map(|artifact| artifact.artifact_kind())
+        .collect::<BTreeSet<_>>();
+    let product_records = records
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.kind,
+                ArtifactKind::App | ArtifactKind::Xcarchive | ArtifactKind::Dsym
+            )
+        })
+        .collect::<Vec<_>>();
+    let actual = product_records
+        .iter()
+        .map(|record| record.kind)
+        .collect::<BTreeSet<_>>();
+    if actual != requested || product_records.len() != actual.len() || paths.len() != actual.len() {
+        return Err(CliFailure::execution(
+            "signed_product_set_mismatch",
+            "signed optional-product outputs do not match the request",
+        ));
+    }
+
+    let mut sources = BTreeMap::new();
+    for path in paths {
+        let file_name = path.file_name().ok_or_else(|| {
+            CliFailure::execution(
+                "signed_product_path_invalid",
+                "signed optional-product path is invalid",
+            )
+        })?;
+        let rebound = resolve_regular_under(directory, Utf8Path::new(file_name))?;
+        if &rebound != path || sources.insert(file_name.to_owned(), path.clone()).is_some() {
+            return Err(CliFailure::execution(
+                "signed_product_path_invalid",
+                "signed optional-product path is invalid",
+            ));
+        }
+    }
+
+    let mut outputs = Vec::new();
+    let mut artifact_ids = BTreeSet::new();
+    let mut file_names = BTreeSet::new();
+    for record in product_records {
+        validate_sha256(&record.sha256)?;
+        let source = sources.get(&record.file_name).ok_or_else(|| {
+            CliFailure::execution(
+                "signed_product_record_missing",
+                "signed optional-product record has no exact output",
+            )
+        })?;
+        if !artifact_ids.insert(record.artifact_id.as_str())
+            || !file_names.insert(record.file_name.as_str())
+            || fs::metadata(source).map(|metadata| metadata.len()).ok() != Some(record.size)
+            || sha256_file(source)? != record.sha256
+        {
+            return Err(CliFailure::execution(
+                "signed_product_binding_failed",
+                "signed optional-product output does not match its record",
+            ));
+        }
+        outputs.push((record.clone(), source.clone()));
+    }
+    outputs.sort_by(|left, right| left.0.artifact_id.cmp(&right.0.artifact_id));
+    Ok(outputs)
+}
+
 fn append_generated_artifact_record(
     manifest: &mut rustferry_remote::ArtifactManifest,
     record: ArtifactRecord,
@@ -2012,10 +2110,6 @@ fn append_generated_artifact_record(
 
 fn verify_published_signing_output(
     directory: &Utf8Path,
-    ipa: &ArtifactRecord,
-    signing: &ArtifactRecord,
-    validation: &ArtifactRecord,
-    sanitized_log: &ArtifactRecord,
     expected_manifest: &rustferry_remote::ArtifactManifest,
 ) -> Result<(), CliFailure> {
     let names = fs::read_dir(directory)
@@ -2034,20 +2128,27 @@ fn verify_published_signing_output(
         .ok_or_else(|| {
             CliFailure::execution("artifact_verification_failed", "artifact output is invalid")
         })?;
-    let expected = BTreeSet::from([
-        IPA_NAME.to_owned(),
-        ARTIFACT_MANIFEST_NAME.to_owned(),
-        SIGNING_REPORT_NAME.to_owned(),
-        VALIDATION_REPORT_NAME.to_owned(),
-        SANITIZED_BUILD_LOG_NAME.to_owned(),
-    ]);
+    let mut expected = expected_manifest
+        .artifacts
+        .iter()
+        .map(|record| record.file_name.clone())
+        .collect::<BTreeSet<_>>();
+    if expected.len() != expected_manifest.artifacts.len()
+        || !expected.insert(ARTIFACT_MANIFEST_NAME.to_owned())
+    {
+        return Err(CliFailure::execution(
+            "artifact_output_mismatch",
+            "signed artifact output set is ambiguous",
+        ));
+    }
     if names != expected {
         return Err(CliFailure::execution(
             "artifact_output_mismatch",
             "signed artifact output set is incomplete",
         ));
     }
-    for record in [ipa, signing, validation, sanitized_log] {
+    for record in &expected_manifest.artifacts {
+        validate_sha256(&record.sha256)?;
         let path = resolve_regular_under(directory, Utf8Path::new(&record.file_name))?;
         if fs::metadata(&path).map(|metadata| metadata.len()).ok() != Some(record.size)
             || sha256_file(&path)? != record.sha256
@@ -3705,6 +3806,10 @@ fn map_pipeline_error(error: PipelineError) -> CliFailure {
                 "unsigned physical-iPhone build failed",
             )
         }
+        PipelineError::DsymGenerationFailed => CliFailure::execution(
+            "dsym_generation_failed",
+            "application dSYM generation or validation failed",
+        ),
         PipelineError::ArchiveSealFailed
         | PipelineError::ArchiveUnsealFailed
         | PipelineError::ArchiveHandoffMismatch => CliFailure::execution(
@@ -4768,26 +4873,11 @@ unsafe_code = "deny"
             fs::write(directory.join(name), bytes).expect("artifact output");
         }
 
-        verify_published_signing_output(
-            &directory,
-            &ipa,
-            &signing,
-            &validation,
-            &sanitized_log,
-            &manifest,
-        )
-        .expect("complete signing output");
+        verify_published_signing_output(&directory, &manifest).expect("complete signing output");
 
         fs::write(directory.join(SANITIZED_BUILD_LOG_NAME), b"tampered\n").expect("tampered log");
-        let error = verify_published_signing_output(
-            &directory,
-            &ipa,
-            &signing,
-            &validation,
-            &sanitized_log,
-            &manifest,
-        )
-        .expect_err("tampered log must fail");
+        let error = verify_published_signing_output(&directory, &manifest)
+            .expect_err("tampered log must fail");
         assert_eq!(error.code, "artifact_hash_mismatch");
     }
 

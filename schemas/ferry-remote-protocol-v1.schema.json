@@ -1106,6 +1106,11 @@
           "const": "app_bundle"
         },
         {
+          "description": "Compressed debug symbols for the main application executable.",
+          "type": "string",
+          "const": "dsym"
+        },
+        {
           "description": "Sanitized signing validation report.",
           "type": "string",
           "const": "signing_report"

@@ -126,6 +126,61 @@ fn device_plan_uses_physical_target_sdk_destination_and_unsigned_archive() {
 }
 
 #[test]
+fn debug_symbol_plan_retains_rust_dwarf_without_enabling_signing() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = Utf8Path::from_path(temporary.path()).unwrap();
+    let request = request(root).with_debug_symbols(true);
+    let plan = plan_ios_device_unsigned(&request, &fake_toolchain(root)).unwrap();
+
+    assert!(plan.generate_debug_symbols);
+    assert_eq!(
+        plan.commands[1]
+            .environment
+            .get("CARGO_PROFILE_RELEASE_DEBUG")
+            .map(String::as_str),
+        Some("2")
+    );
+    let xcode = &plan.commands[2];
+    for setting in [
+        "COPY_PHASE_STRIP=NO",
+        "DEBUG_INFORMATION_FORMAT=dwarf",
+        "DEPLOYMENT_POSTPROCESSING=NO",
+        "STRIP_INSTALLED_PRODUCT=NO",
+        "CODE_SIGNING_ALLOWED=NO",
+        "CODE_SIGNING_REQUIRED=NO",
+    ] {
+        assert!(xcode.args.iter().any(|argument| argument == setting));
+    }
+    assert_eq!(xcode.args.last().map(String::as_str), Some("archive"));
+    assert!(
+        !xcode
+            .args
+            .iter()
+            .any(|argument| argument == "CODE_SIGNING_ALLOWED=YES")
+    );
+}
+
+#[test]
+fn default_device_plan_does_not_request_debug_symbols() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = Utf8Path::from_path(temporary.path()).unwrap();
+    let plan = plan_ios_device_unsigned(&request(root), &fake_toolchain(root)).unwrap();
+
+    assert!(!plan.generate_debug_symbols);
+    assert!(
+        !plan.commands[1]
+            .environment
+            .contains_key("CARGO_PROFILE_RELEASE_DEBUG")
+    );
+    assert!(
+        !plan.commands[2]
+            .args
+            .iter()
+            .any(|argument| argument == "DEBUG_INFORMATION_FORMAT=dwarf")
+    );
+}
+
+#[test]
 fn client_product_expectation_matches_the_worker_archive_plan() {
     let temporary = tempfile::tempdir().unwrap();
     let root = Utf8Path::from_path(temporary.path()).unwrap();

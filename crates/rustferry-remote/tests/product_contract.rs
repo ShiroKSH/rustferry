@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use rustferry_remote::{
-    BuildProfile, BundleIdentifier, CURRENT_PROTOCOL_VERSION, IosArtifactType,
+    ArtifactKind, BuildProfile, BundleIdentifier, CURRENT_PROTOCOL_VERSION, IosArtifactType,
     IosDeviceBuildRequest, IosDeviceProductExpectation, SigningMode, SigningPlan, SigningTarget,
     SigningTargetKind, SourceManifest, SourceMode, UnsignedNestedBundleExpectation,
     UnsignedNestedBundleKind, canonical_request_bytes, canonical_request_sha256,
@@ -11,6 +11,12 @@ use rustferry_remote::{
 use sha2::{Digest, Sha256};
 
 const SOURCE_REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
+
+#[test]
+fn dsym_request_has_stable_wire_name_and_manifest_kind() {
+    assert_eq!(IosArtifactType::Dsym.to_string(), "dsym");
+    assert_eq!(IosArtifactType::Dsym.artifact_kind(), ArtifactKind::Dsym);
+}
 
 #[test]
 fn request_derives_the_complete_ipa_expectation_and_canonical_hash() {

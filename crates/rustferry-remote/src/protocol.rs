@@ -8,7 +8,8 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::{
     artifact::{
-        ArtifactManifest, IosDeviceProductExpectation, IpaExpectation, UnsignedNestedBundleKind,
+        ArtifactKind, ArtifactManifest, IosDeviceProductExpectation, IpaExpectation,
+        UnsignedNestedBundleKind,
     },
     error::{RemoteBuildError, RemoteBuildResult},
     signing::{SigningMode, SigningPlan, SigningTargetKind},
@@ -127,6 +128,8 @@ pub enum IosArtifactType {
     Xcarchive,
     /// Unarchived application bundle.
     AppBundle,
+    /// Compressed debug symbols for the main application executable.
+    Dsym,
     /// Sanitized signing validation report.
     SigningReport,
     /// Sanitized provisioning validation report.
@@ -139,10 +142,26 @@ impl fmt::Display for IosArtifactType {
             Self::Ipa => "ipa",
             Self::Xcarchive => "xcarchive",
             Self::AppBundle => "app_bundle",
+            Self::Dsym => "dsym",
             Self::SigningReport => "signing_report",
             Self::ProvisioningReport => "provisioning_report",
         };
         formatter.write_str(name)
+    }
+}
+
+impl IosArtifactType {
+    /// Return the manifest kind that must represent this requested artifact.
+    #[must_use]
+    pub const fn artifact_kind(self) -> ArtifactKind {
+        match self {
+            Self::Ipa => ArtifactKind::Ipa,
+            Self::Xcarchive => ArtifactKind::Xcarchive,
+            Self::AppBundle => ArtifactKind::App,
+            Self::Dsym => ArtifactKind::Dsym,
+            Self::SigningReport => ArtifactKind::SigningReport,
+            Self::ProvisioningReport => ArtifactKind::ValidationReport,
+        }
     }
 }
 
@@ -393,14 +412,7 @@ impl IosDeviceBuildRequest {
                 reason: "signing plan application bundle identifier does not match request",
             });
         }
-        if self.signing.mode == SigningMode::UnsignedCompileOnly
-            && self.requested_artifacts.contains(&IosArtifactType::Ipa)
-        {
-            return Err(RemoteBuildError::InvalidEventPayload {
-                event: "ios_device_build_request",
-                reason: "unsigned compile-only mode cannot request an installable IPA",
-            });
-        }
+        validate_requested_artifact_selection(self.signing.mode, &self.requested_artifacts)?;
         match self.source_mode {
             SourceMode::Git => {
                 let repository = self.source_repository.as_deref().ok_or(
@@ -454,6 +466,33 @@ impl IosDeviceBuildRequest {
             provisioning_required: self.signing.mode.is_signed(),
         })
     }
+}
+
+fn validate_requested_artifact_selection(
+    signing_mode: SigningMode,
+    requested_artifacts: &BTreeSet<IosArtifactType>,
+) -> RemoteBuildResult<()> {
+    if signing_mode == SigningMode::UnsignedCompileOnly
+        && requested_artifacts.contains(&IosArtifactType::Ipa)
+    {
+        return Err(RemoteBuildError::InvalidEventPayload {
+            event: "ios_device_build_request",
+            reason: "unsigned compile-only mode cannot request an installable IPA",
+        });
+    }
+    if signing_mode.is_signed() && !requested_artifacts.contains(&IosArtifactType::Ipa) {
+        return Err(RemoteBuildError::InvalidEventPayload {
+            event: "ios_device_build_request",
+            reason: "signed builds must request the installable IPA",
+        });
+    }
+    if signing_mode.is_signed() && !requested_artifacts.contains(&IosArtifactType::SigningReport) {
+        return Err(RemoteBuildError::InvalidEventPayload {
+            event: "ios_device_build_request",
+            reason: "signed builds must request the signing report",
+        });
+    }
+    Ok(())
 }
 
 /// Serialize one validated iPhone build request using the protocol's deterministic field order.
@@ -1343,4 +1382,37 @@ fn is_absolute_path_text(value: &str) -> bool {
             && bytes[0].is_ascii_alphabetic()
             && bytes[1] == b':'
             && matches!(bytes[2], b'/' | b'\\'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signed_artifact_selection_requires_ipa_and_signing_report() {
+        let valid = BTreeSet::from([IosArtifactType::Ipa, IosArtifactType::SigningReport]);
+        assert!(
+            validate_requested_artifact_selection(SigningMode::ManualDevelopment, &valid).is_ok()
+        );
+
+        for (requested, expected_reason) in [
+            (
+                BTreeSet::from([IosArtifactType::SigningReport]),
+                "signed builds must request the installable IPA",
+            ),
+            (
+                BTreeSet::from([IosArtifactType::Ipa]),
+                "signed builds must request the signing report",
+            ),
+        ] {
+            assert!(matches!(
+                validate_requested_artifact_selection(
+                    SigningMode::ManualDevelopment,
+                    &requested
+                ),
+                Err(RemoteBuildError::InvalidEventPayload { reason, .. })
+                    if reason == expected_reason
+            ));
+        }
+    }
 }

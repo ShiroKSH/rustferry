@@ -181,6 +181,32 @@ pub struct SignedIpaValidationEvidence {
     pub cleanup_confirmed: bool,
 }
 
+/// Exact second-pass extraction of an IPA whose digest was already validated.
+///
+/// The extraction remains capability-anchored and must be explicitly cleaned
+/// before optional signed products can be published.
+pub(crate) struct ExtractedSignedIpa {
+    workspace: ValidationWorkspace,
+    inspection: IpaInspection,
+}
+
+impl ExtractedSignedIpa {
+    /// Exact extracted main application path.
+    pub(crate) fn app_path(&self) -> Utf8PathBuf {
+        self.workspace.path().join(&self.inspection.app_path)
+    }
+
+    /// Re-inspected IPA metadata bound to the extracted bytes.
+    pub(crate) const fn inspection(&self) -> &IpaInspection {
+        &self.inspection
+    }
+
+    /// Remove the capability-bound extraction and confirm absence.
+    pub(crate) fn cleanup(mut self) -> Result<(), SignedIpaValidationError> {
+        self.workspace.cleanup()
+    }
+}
+
 /// Secret-free category of one fixed Apple-tool operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SignedIpaCommandOperation {
@@ -425,6 +451,41 @@ pub fn validate_signed_development_ipa(
     }
     let mut runner = SystemCommandRunner;
     validate_signed_development_ipa_with_runner(request, &mut runner)
+}
+
+/// Re-inspect and safely extract the exact IPA bytes proven by prior evidence.
+///
+/// This helper does not perform signing validation itself. Callers must invoke
+/// it only after [`validate_signed_development_ipa`] succeeds and pass that
+/// validation's exact size and SHA-256.
+pub(crate) fn extract_validated_signed_ipa(
+    ipa_path: &Utf8Path,
+    workspace_root: &Utf8Path,
+    ipa_expectation: &IpaExpectation,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<ExtractedSignedIpa, SignedIpaValidationError> {
+    let inspection = inspect_ipa(ipa_path, ipa_expectation)
+        .map_err(|_| SignedIpaValidationError::IpaInspectionFailed)?;
+    if inspection.size != expected_size || inspection.sha256 != expected_sha256 {
+        return Err(SignedIpaValidationError::IpaChangedDuringValidation);
+    }
+    let mut workspace = ValidationWorkspace::create(workspace_root)?;
+    let extraction = (|| {
+        extract_inspected_ipa(ipa_path, &inspection, &workspace)?;
+        workspace.verify_binding()?;
+        validate_exact_payload_root(workspace.path(), &inspection.app_path)
+    })();
+    if let Err(error) = extraction {
+        return match workspace.cleanup() {
+            Ok(()) => Err(error),
+            Err(_) => Err(SignedIpaValidationError::CleanupIncomplete),
+        };
+    }
+    Ok(ExtractedSignedIpa {
+        workspace,
+        inspection,
+    })
 }
 
 fn validate_signed_development_ipa_with_runner(
