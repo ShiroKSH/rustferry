@@ -12,7 +12,7 @@
   <a href="https://github.com/ShiroKSH/rustferry/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/ShiroKSH/rustferry/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/ShiroKSH/rustferry/actions/workflows/platform-artifacts.yml"><img alt="Platform artifacts" src="https://github.com/ShiroKSH/rustferry/actions/workflows/platform-artifacts.yml/badge.svg"></a>
   <a href="https://github.com/ShiroKSH/rustferry/actions/workflows/vscode-extension.yml"><img alt="VS Code extension" src="https://github.com/ShiroKSH/rustferry/actions/workflows/vscode-extension.yml/badge.svg"></a>
-  <a href="https://marketplace.visualstudio.com/items?itemName=ShiroKSH.rustferry-vscode"><img alt="Install RustFerry for VS Code" src="https://img.shields.io/visual-studio-marketplace/v/ShiroKSH.rustferry-vscode?label=VS%20Code%20Marketplace&color=0e1a22&logo=visualstudiocode"></a>
+  <a href="https://marketplace.visualstudio.com/items?itemName=ShiroKSH.rustferry-vscode"><img alt="Install RustFerry for VS Code" src="https://img.shields.io/badge/VS%20Code-Marketplace-0078D4?logo=visualstudiocode&logoColor=white"></a>
   <a href="#license"><img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-2f7d73"></a>
   <a href="https://www.rust-lang.org/tools/install"><img alt="Rust 1.92 or newer" src="https://img.shields.io/badge/rust-1.92%2B-cb5a31?logo=rust"></a>
 </p>
