@@ -1,5 +1,6 @@
 /target/
 /.goal3/
+/.goal3-windows/
 /.idea/
 /.vscode/
 __pycache__/

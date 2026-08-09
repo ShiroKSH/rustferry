@@ -1,0 +1,11 @@
+{"at":"2026-08-09T10:31:05Z","phase":"handoff","command":"git fetch origin goal3/windows-handoff","exit_code":0,"result":"fetched origin/goal3/windows-handoff at 5363942040b2c17aa69f1f276a67ee7e0a302c0d"}
+{"at":"2026-08-09T10:31:05Z","phase":"handoff","command":"git merge-base --is-ancestor 2e0773a origin/goal3/windows-handoff","exit_code":0,"result":"ancestor"}
+{"at":"2026-08-09T10:31:05Z","phase":"handoff","command":"git merge-base --is-ancestor f2584f9 origin/goal3/windows-handoff","exit_code":0,"result":"ancestor"}
+{"at":"2026-08-09T10:31:05Z","phase":"handoff","command":"git merge-base --is-ancestor 5363942 origin/goal3/windows-handoff","exit_code":0,"result":"ancestor"}
+{"at":"2026-08-09T10:31:05Z","phase":"handoff","command":"git switch --create goal3/windows-live-acceptance --track origin/goal3/windows-handoff","exit_code":0,"result":"created working branch"}
+{"at":"2026-08-09T10:31:05Z","phase":"baseline","command":"Get-ComputerInfo; [Environment]::OSVersion; $PSVersionTable; Get-PSDrive -PSProvider FileSystem","exit_code":0,"result":"Windows 11 Pro build 26200 x64; PowerShell 5.1.26100.8875"}
+{"at":"2026-08-09T10:31:05Z","phase":"baseline","command":"where.exe git cargo rustc rustup gh xcodebuild codesign xcrun","exit_code":0,"result":"git/cargo/rustc/rustup/gh found; xcodebuild/codesign/xcrun each absent with individual exit code 1"}
+{"at":"2026-08-09T10:31:05Z","phase":"baseline","command":"git --version; rustc -Vv; cargo -V; rustup show; rustup target list --installed; gh --version","exit_code":0,"result":"git 2.54.0.windows.1; rustc/cargo 1.96.0; host and only active target x86_64-pc-windows-msvc; gh 2.95.0"}
+{"at":"2026-08-09T10:31:05Z","phase":"baseline","command":"cargo metadata --no-deps --format-version 1","exit_code":0,"result":"10 packages; target C:/Users/kushi/Documents/ChatGPT/RustFerry/.goal3-windows/target"}
+{"at":"2026-08-09T10:31:05Z","phase":"baseline","command":"cargo fmt --all -- --check","exit_code":0,"result":"passed"}
+{"at":"2026-08-09T10:31:05Z","phase":"baseline","command":"git diff --check","exit_code":0,"result":"passed before baseline documentation edit"}
