@@ -1,6 +1,10 @@
 # Install the VS Code extension
 
-RustFerry requires Visual Studio Code 1.100 or newer and a compatible `cargo-ferry` executable. The extension has not been published to the Visual Studio Marketplace; install the inspected VSIX from a source checkout or release candidate.
+RustFerry requires Visual Studio Code 1.100 or newer and a compatible `cargo-ferry` executable. Install [RustFerry for VS Code](https://marketplace.visualstudio.com/items?itemName=ShiroKSH.rustferry-vscode) from the Visual Studio Marketplace, or install the inspected VSIX from a source checkout.
+
+```console
+code --install-extension ShiroKSH.rustferry-vscode
+```
 
 ```console
 cargo build --locked -p cargo-ferry
