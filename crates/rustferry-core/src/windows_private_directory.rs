@@ -524,6 +524,25 @@ mod platform {
         Ok(file)
     }
 
+    pub(super) fn open_file_for_removal(path: &Path) -> Result<File, PrivateDirectoryError> {
+        open_file_for_removal_in_state(path, PrivateFileLinkState::Single)
+    }
+
+    pub(super) fn open_file_for_removal_in_state(
+        path: &Path,
+        link_state: PrivateFileLinkState,
+    ) -> Result<File, PrivateDirectoryError> {
+        let wide_path = wide_path(path)?;
+        let file = open_regular_file_for_removal(&wide_path)?;
+        let user = current_process_user_sid()?;
+        verify_with_user(
+            file.as_raw_handle(),
+            &user,
+            PrivateObjectKind::RegularFile(link_state),
+        )?;
+        Ok(file)
+    }
+
     pub(super) fn verify_file(
         handle: BorrowedHandle<'_>,
         link_state: PrivateFileLinkState,
@@ -534,6 +553,14 @@ mod platform {
             &user,
             PrivateObjectKind::RegularFile(link_state),
         )
+    }
+
+    pub(super) fn regular_file_link_count(
+        handle: BorrowedHandle<'_>,
+    ) -> Result<u32, PrivateDirectoryError> {
+        let information = query_attributes(handle.as_raw_handle())?;
+        verify_regular_file_attributes(&information)?;
+        Ok(information.nNumberOfLinks)
     }
 
     pub(super) fn remove(directory: File) -> Result<(), PrivateDirectoryError> {
@@ -599,15 +626,7 @@ mod platform {
         handle: HANDLE,
         kind: PrivateObjectKind,
     ) -> Result<(), PrivateDirectoryError> {
-        let mut information = BY_HANDLE_FILE_INFORMATION::default();
-        // SAFETY: `handle` is borrowed for the call and `information` is writable initialized
-        // storage of the exact structure expected by `GetFileInformationByHandle`.
-        unsafe {
-            win_bool(
-                GetFileInformationByHandle(handle, &raw mut information),
-                PrivateDirectoryOperation::QueryAttributes,
-            )?;
-        }
+        let information = query_attributes(handle)?;
         if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(PrivateDirectoryError::new(
                 PrivateDirectoryErrorKind::ReparsePoint,
@@ -623,23 +642,49 @@ mod platform {
                     None,
                 ));
             }
-            PrivateObjectKind::RegularFile(_)
-                if information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 =>
-            {
-                return Err(PrivateDirectoryError::new(
-                    PrivateDirectoryErrorKind::NotRegularFile,
-                    None,
-                ));
+            PrivateObjectKind::RegularFile(link_state) => {
+                verify_regular_file_attributes(&information)?;
+                if information.nNumberOfLinks != link_state.expected_links() {
+                    return Err(PrivateDirectoryError::new(
+                        PrivateDirectoryErrorKind::MultipleLinks,
+                        None,
+                    ));
+                }
             }
-            PrivateObjectKind::RegularFile(link_state)
-                if information.nNumberOfLinks != link_state.expected_links() =>
-            {
-                return Err(PrivateDirectoryError::new(
-                    PrivateDirectoryErrorKind::MultipleLinks,
-                    None,
-                ));
-            }
-            PrivateObjectKind::Directory | PrivateObjectKind::RegularFile(_) => {}
+            PrivateObjectKind::Directory => {}
+        }
+        Ok(())
+    }
+
+    fn query_attributes(
+        handle: HANDLE,
+    ) -> Result<BY_HANDLE_FILE_INFORMATION, PrivateDirectoryError> {
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: `handle` is borrowed for the call and `information` is writable initialized
+        // storage of the exact structure expected by `GetFileInformationByHandle`.
+        unsafe {
+            win_bool(
+                GetFileInformationByHandle(handle, &raw mut information),
+                PrivateDirectoryOperation::QueryAttributes,
+            )?;
+        }
+        Ok(information)
+    }
+
+    fn verify_regular_file_attributes(
+        information: &BY_HANDLE_FILE_INFORMATION,
+    ) -> Result<(), PrivateDirectoryError> {
+        if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(PrivateDirectoryError::new(
+                PrivateDirectoryErrorKind::ReparsePoint,
+                None,
+            ));
+        }
+        if information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+            return Err(PrivateDirectoryError::new(
+                PrivateDirectoryErrorKind::NotRegularFile,
+                None,
+            ));
         }
         Ok(())
     }
@@ -1024,13 +1069,29 @@ mod platform {
     }
 
     fn open_regular_file(path: &[u16]) -> Result<File, PrivateDirectoryError> {
+        open_regular_file_with_access(path, FILE_GENERIC_READ, FILE_SHARE_READ)
+    }
+
+    fn open_regular_file_for_removal(path: &[u16]) -> Result<File, PrivateDirectoryError> {
+        open_regular_file_with_access(
+            path,
+            FILE_GENERIC_READ | DELETE,
+            FILE_SHARE_READ | FILE_SHARE_DELETE,
+        )
+    }
+
+    fn open_regular_file_with_access(
+        path: &[u16],
+        desired_access: u32,
+        share_mode: u32,
+    ) -> Result<File, PrivateDirectoryError> {
         // SAFETY: `path` is NUL-terminated; null security/template pointers are permitted. The
-        // retained handle allows only other readers, so content and pathname remain stable.
+        // caller selects access and sharing appropriate to the lifetime contract of its handle.
         let handle = unsafe {
             CreateFileW(
                 path.as_ptr(),
-                FILE_GENERIC_READ,
-                FILE_SHARE_READ,
+                desired_access,
+                share_mode,
                 ptr::null(),
                 OPEN_EXISTING,
                 FILE_FLAG_OPEN_REPARSE_POINT,
@@ -1365,6 +1426,100 @@ mod platform {
         }
 
         #[test]
+        fn removal_handle_survives_rename_and_removes_the_exact_file() {
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let original = temporary.path().join("endpoint.json");
+            let renamed = temporary.path().join("renamed.json");
+            let replacement = b"replacement\n";
+            drop(create_file(&original, false).expect("protected private file"));
+
+            let handle = open_file_for_removal(&original).expect("open private file for removal");
+            fs::rename(&original, &renamed).expect("rename while removal handle is retained");
+            fs::write(&original, replacement).expect("create replacement at original path");
+
+            remove_file(handle, PrivateFileLinkState::Single)
+                .expect("remove renamed object by retained handle");
+            assert!(!renamed.exists());
+            assert_eq!(fs::read(&original).expect("read replacement"), replacement);
+            fs::remove_file(&original).expect("remove replacement");
+        }
+
+        #[test]
+        fn removal_open_rejects_additional_hard_links() {
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let original = temporary.path().join("endpoint.json");
+            let linked = temporary.path().join("linked.json");
+            drop(create_file(&original, false).expect("protected private file"));
+            fs::hard_link(&original, &linked).expect("test hard link");
+
+            let error = open_file_for_removal(&original)
+                .expect_err("removal open must reject multiple links");
+            assert_eq!(error.kind(), PrivateDirectoryErrorKind::MultipleLinks);
+            fs::remove_file(&linked).expect("remove added link");
+            fs::remove_file(&original).expect("remove original link");
+        }
+
+        #[test]
+        fn publication_pair_can_be_reopened_and_staging_link_removed_by_handle() {
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let staged = temporary.path().join("endpoint.tmp");
+            let published = temporary.path().join("endpoint.json");
+            drop(create_file(&staged, true).expect("protected staging file"));
+            fs::hard_link(&staged, &published).expect("publish final hard link");
+
+            let handle =
+                open_file_for_removal_in_state(&staged, PrivateFileLinkState::PublicationPair)
+                    .expect("reopen publication pair for removal");
+            remove_file(handle, PrivateFileLinkState::PublicationPair)
+                .expect("remove exact staging link");
+
+            assert!(!staged.exists());
+            let final_handle = open_file(&published).expect("open final private file");
+            verify_file(final_handle.as_handle(), PrivateFileLinkState::Single)
+                .expect("final file returned to single-link state");
+            drop(final_handle);
+            fs::remove_file(&published).expect("remove final file");
+        }
+
+        #[test]
+        fn publication_pair_removal_open_rejects_single_link_state() {
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let staged = temporary.path().join("endpoint.tmp");
+            let published = temporary.path().join("endpoint.json");
+            drop(create_file(&staged, true).expect("protected staging file"));
+            fs::hard_link(&staged, &published).expect("publish final hard link");
+
+            let error = open_file_for_removal(&staged)
+                .expect_err("single-link removal open must reject publication pair");
+            assert_eq!(error.kind(), PrivateDirectoryErrorKind::MultipleLinks);
+            fs::remove_file(&staged).expect("remove staging link");
+            fs::remove_file(&published).expect("remove final link");
+        }
+
+        #[test]
+        fn regular_file_link_count_tracks_added_hard_link_without_acl_policy() {
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let original = temporary.path().join("ordinary.txt");
+            let linked = temporary.path().join("linked.txt");
+            fs::write(&original, b"ordinary\n").expect("ordinary inherited-ACL file");
+            let handle = File::open(&original).expect("open ordinary file");
+
+            assert_eq!(
+                regular_file_link_count(handle.as_handle()).expect("single link count"),
+                1
+            );
+            fs::hard_link(&original, &linked).expect("add hard link");
+            assert_eq!(
+                regular_file_link_count(handle.as_handle()).expect("two-link count"),
+                2
+            );
+
+            drop(handle);
+            fs::remove_file(&linked).expect("remove added link");
+            fs::remove_file(&original).expect("remove original link");
+        }
+
+        #[test]
         fn inherited_regular_file_acl_is_not_private_policy() {
             let temporary = tempfile::tempdir().expect("temporary directory");
             let path = temporary.path().join("ordinary.json");
@@ -1562,6 +1717,45 @@ pub fn open_private_file(path: &std::path::Path) -> Result<std::fs::File, Privat
     platform::open_file(path)
 }
 
+/// Open an existing private regular file for identity-bound removal after a same-volume rename.
+///
+/// The returned handle requests `DELETE` access and permits read and delete sharing. It therefore
+/// remains bound to the verified file while another handle renames the file, and can subsequently
+/// be consumed by [`remove_private_file_handle`] to remove that exact renamed object. Write sharing
+/// remains denied while the handle is live.
+///
+/// # Errors
+///
+/// Returns a typed, path-free failure if the path cannot be opened or the file, filesystem,
+/// owner, single-link state, or protected DACL differs from the private-file policy.
+#[cfg(windows)]
+pub fn open_private_file_for_removal(
+    path: &std::path::Path,
+) -> Result<std::fs::File, PrivateDirectoryError> {
+    platform::open_file_for_removal(path)
+}
+
+/// Open an existing private regular file for identity-bound removal in an explicit link state.
+///
+/// Like [`open_private_file_for_removal`], the returned handle requests `DELETE` access, permits
+/// read and delete sharing, denies write sharing, and does not follow reparse points. The file must
+/// satisfy the strict private owner, protected-DACL, ACL-filesystem, and requested hard-link-state
+/// policy before the handle is returned. This permits crash recovery to reopen a staging path in
+/// [`PrivateFileLinkState::PublicationPair`] and safely consume it with
+/// [`remove_private_file_handle_in_state`].
+///
+/// # Errors
+///
+/// Returns a typed, path-free failure if the path cannot be opened or the file, filesystem,
+/// owner, requested link state, or protected DACL differs from the private-file policy.
+#[cfg(windows)]
+pub fn open_private_file_for_removal_in_state(
+    path: &std::path::Path,
+    link_state: PrivateFileLinkState,
+) -> Result<std::fs::File, PrivateDirectoryError> {
+    platform::open_file_for_removal_in_state(path, link_state)
+}
+
 /// Verify a retained Windows directory handle against the strict private-directory policy.
 ///
 /// # Errors
@@ -1601,6 +1795,24 @@ pub fn verify_private_file_handle_in_state(
     link_state: PrivateFileLinkState,
 ) -> Result<(), PrivateDirectoryError> {
     platform::verify_file(handle, link_state)
+}
+
+/// Return the hard-link count for an arbitrary retained Windows regular-file handle.
+///
+/// This policy-neutral query rejects directories and reparse points, but deliberately does not
+/// inspect filesystem ACL support, owner identity, or DACL contents. Callers that require the
+/// strict private-file policy must separately use [`verify_private_file_handle`] or
+/// [`verify_private_file_handle_in_state`].
+///
+/// # Errors
+///
+/// Returns a typed, path-free failure if Windows cannot query the handle or if it identifies a
+/// directory or reparse point rather than a regular file.
+#[cfg(windows)]
+pub fn regular_file_link_count(
+    handle: std::os::windows::io::BorrowedHandle<'_>,
+) -> Result<u32, PrivateDirectoryError> {
+    platform::regular_file_link_count(handle)
 }
 
 /// Verify and remove the exact empty private directory identified by a retained Windows handle.

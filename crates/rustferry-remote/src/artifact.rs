@@ -6,6 +6,9 @@ use std::{
     io::{Cursor, Read},
 };
 
+#[cfg(windows)]
+use std::os::windows::io::AsHandle as _;
+
 use camino::{Utf8Path, Utf8PathBuf};
 use cap_std::{ambient_authority, fs::Dir};
 use goblin::mach::{
@@ -23,6 +26,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use unicode_normalization::UnicodeNormalization;
 use zip::ZipArchive;
+
+#[cfg(windows)]
+use rustferry_core::windows_private_directory::regular_file_link_count;
 
 use crate::signing::{SigningMode, SigningStatus};
 
@@ -1445,6 +1451,7 @@ fn inspect_unsigned_app_bundle_from_capability(
                 format!("unexpected Mach-O code hidden at `{}`", entry.relative),
             );
         };
+        #[cfg(unix)]
         validate_executable_mode(filesystem, &entry.relative, file_path)?;
         let bytes = read_checked_file(filesystem, file_path, MAX_IPA_ENTRY_SIZE)?;
         let evidence = inspect_expected_unsigned_macho(
@@ -2127,6 +2134,7 @@ fn scan_real_tree(filesystem: &ArtifactFilesystem) -> Result<TreeIndex, Artifact
                     );
                 }
                 let child_directory = open_child_directory(root, &display_path, &directory, &name)?;
+                #[cfg(unix)]
                 let metadata = child_directory
                     .try_clone()
                     .and_then(|directory| directory.into_std_file().metadata())
@@ -2135,6 +2143,7 @@ fn scan_real_tree(filesystem: &ArtifactFilesystem) -> Result<TreeIndex, Artifact
                         path: display_path.clone(),
                         message: error.to_string(),
                     })?;
+                #[cfg(unix)]
                 reject_dangerous_mode(root, &relative, &metadata)?;
                 stack.push((child_directory, relative.clone(), depth + 1));
                 TreeEntryKind::Directory
@@ -2145,8 +2154,9 @@ fn scan_real_tree(filesystem: &ArtifactFilesystem) -> Result<TreeIndex, Artifact
                     path: display_path.clone(),
                     message: error.to_string(),
                 })?;
+                #[cfg(unix)]
                 reject_dangerous_mode(root, &relative, &metadata)?;
-                reject_hardlinked_file(root, &relative, &metadata)?;
+                reject_hardlinked_file(root, &relative, &file, &metadata)?;
                 if metadata.len() > MAX_IPA_ENTRY_SIZE {
                     return invalid_apple_bundle(
                         root,
@@ -2341,30 +2351,16 @@ fn validate_executable_mode(
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn validate_executable_mode(
-    _filesystem: &ArtifactFilesystem,
-    _relative: &str,
-    _path: &Utf8Path,
-) -> Result<(), ArtifactError> {
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn reject_dangerous_mode(
-    _root: &Utf8Path,
-    _relative: &str,
-    _metadata: &Metadata,
-) -> Result<(), ArtifactError> {
-    Ok(())
-}
-
+#[cfg(unix)]
 fn reject_hardlinked_file(
     root: &Utf8Path,
     relative: &str,
+    _file: &File,
     metadata: &Metadata,
 ) -> Result<(), ArtifactError> {
-    if has_multiple_file_links(metadata) {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if metadata.nlink() != 1 {
         return invalid_apple_bundle(
             root,
             format!("entry `{relative}` is a hard-linked regular file"),
@@ -2373,17 +2369,39 @@ fn reject_hardlinked_file(
     Ok(())
 }
 
-#[cfg(unix)]
-fn has_multiple_file_links(metadata: &Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-    metadata.nlink() != 1
+#[cfg(windows)]
+fn reject_hardlinked_file(
+    root: &Utf8Path,
+    relative: &str,
+    file: &File,
+    _metadata: &Metadata,
+) -> Result<(), ArtifactError> {
+    let links = regular_file_link_count(file.as_handle()).map_err(|error| {
+        ArtifactError::InvalidAppleBundle {
+            path: root.to_owned(),
+            reason: format!("cannot inspect hard-link count for entry `{relative}`: {error}"),
+        }
+    })?;
+    if links != 1 {
+        return invalid_apple_bundle(
+            root,
+            format!("entry `{relative}` is a hard-linked regular file"),
+        );
+    }
+    Ok(())
 }
 
-#[cfg(not(unix))]
-fn has_multiple_file_links(_metadata: &Metadata) -> bool {
-    // Stable std does not expose Windows link counts. Source ZIP extraction creates
-    // fresh files, while open-handle identity checks below still prevent path swaps.
-    false
+#[cfg(not(any(unix, windows)))]
+fn reject_hardlinked_file(
+    root: &Utf8Path,
+    relative: &str,
+    _file: &File,
+    _metadata: &Metadata,
+) -> Result<(), ArtifactError> {
+    invalid_apple_bundle(
+        root,
+        format!("cannot inspect hard-link count for entry `{relative}`"),
+    )
 }
 
 fn read_checked_file(
@@ -2483,8 +2501,9 @@ fn open_checked_file(
         path: display_path.clone(),
         message: error.to_string(),
     })?;
+    #[cfg(unix)]
     reject_dangerous_mode(root, relative.as_str(), &opened)?;
-    reject_hardlinked_file(root, relative.as_str(), &opened)?;
+    reject_hardlinked_file(root, relative.as_str(), &file, &opened)?;
     if !opened.is_file() || opened.len() > limit {
         return invalid_apple_bundle(
             root,
@@ -2508,6 +2527,7 @@ fn verify_open_file_stable(
         path: display_path.clone(),
         message: error.to_string(),
     })?;
+    reject_hardlinked_file(root, relative.as_str(), file, &opened_after)?;
     if !same_file_identity(before, &opened_after)
         || before.len() != opened_after.len()
         || before.modified().ok() != opened_after.modified().ok()
@@ -3381,6 +3401,43 @@ mod tests {
             canonical_archive_key("Payload/Café.app/FILE"),
             canonical_archive_key("payload/Cafe\u{301}.app/file")
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn artifact_scan_rejects_a_hard_link_outside_the_bundle() {
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = Utf8Path::from_path(temporary.path()).unwrap();
+        let root = parent.join("artifact.app");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("payload"), b"trusted bytes").unwrap();
+        fs::hard_link(root.join("payload"), parent.join("outside-link")).unwrap();
+
+        let filesystem = ArtifactFilesystem::open_ambient(&root).unwrap();
+        let error = scan_real_tree(&filesystem).unwrap_err();
+
+        assert!(matches!(error, ArtifactError::InvalidAppleBundle { .. }));
+        assert!(error.to_string().contains("hard-linked regular file"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_artifact_handle_detects_a_hard_link_added_after_open() {
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = Utf8Path::from_path(temporary.path()).unwrap();
+        let root = parent.join("artifact.app");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("payload"), b"trusted bytes").unwrap();
+
+        let filesystem = ArtifactFilesystem::open_ambient(&root).unwrap();
+        let (file, before) =
+            open_checked_file(&filesystem, Utf8Path::new("payload"), 1024).unwrap();
+        fs::hard_link(root.join("payload"), parent.join("outside-link")).unwrap();
+
+        let error = verify_open_file_stable(&filesystem, Utf8Path::new("payload"), &file, &before)
+            .unwrap_err();
+        assert!(matches!(error, ArtifactError::InvalidAppleBundle { .. }));
+        assert!(error.to_string().contains("hard-linked regular file"));
     }
 
     #[cfg(unix)]

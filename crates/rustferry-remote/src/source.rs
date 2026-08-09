@@ -23,9 +23,9 @@
 //! ZIP metadata is fixed and entries follow manifest order, producing identical
 //! bytes for identical inputs. The separately transported manifest remains the
 //! worker's source of truth.
-//! Unix hard links are refused. Windows does not expose link counts through a
-//! stable standard API, so Windows snapshots flatten links to bytes and bind
-//! them through repeated size, timestamp, and content-digest verification.
+//! Hard-linked source files are refused on Unix and Windows. Windows link
+//! counts are queried from retained file handles so path replacement cannot
+//! substitute the object whose link state is inspected.
 //! Callers may supply portable executable-mode metadata for selected files;
 //! this carries executable intent from filesystems which do not expose Unix
 //! mode bits. A live Unix executable bit is never cleared by portable metadata.
@@ -40,7 +40,7 @@ use std::{
 };
 
 #[cfg(windows)]
-use std::fs::OpenOptions;
+use std::{fs::OpenOptions, os::windows::io::AsHandle as _};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use cap_std::{
@@ -54,6 +54,9 @@ use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter, write::SimpleFileOptions};
+
+#[cfg(windows)]
+use rustferry_core::windows_private_directory::regular_file_link_count;
 
 const MANIFEST_SCHEMA_VERSION: u32 = 1;
 const MANIFEST_DOMAIN: &[u8] = b"rustferry-source-manifest-v1\0";
@@ -2041,6 +2044,7 @@ fn write_verified_zip_entry(
     if !initial.is_file() {
         return Err(SourceError::UnsupportedFileType { path: path_display });
     }
+    #[cfg(not(windows))]
     reject_hard_link(&initial, &expected.path)?;
     if initial.len() != expected.size
         || resolved_executable_mode(executable_bit(&initial), portable_executable)
@@ -2059,7 +2063,7 @@ fn write_verified_zip_entry(
         path: expected.path.clone(),
         source,
     })?;
-    reject_hard_link(&opened, &expected.path)?;
+    reject_open_hard_link(&source_file, &expected.path)?;
     if !opened.is_file()
         || !same_file_identity(&initial, &opened)
         || opened.len() != expected.size
@@ -2120,6 +2124,9 @@ fn write_verified_zip_entry(
         path: expected.path.clone(),
         source,
     })?;
+    reject_open_hard_link(&source_file, &expected.path)?;
+    #[cfg(not(windows))]
+    reject_hard_link(&path_final, &expected.path)?;
     ensure_source_metadata_stable(
         expected,
         &opened,
@@ -2779,6 +2786,7 @@ fn extract_verified_entry(
         source,
     })?;
     drop(entry);
+    #[cfg(unix)]
     set_extracted_permissions(&output, expected.executable).map_err(|source| SourceError::Io {
         operation: "set extracted source permissions",
         path: expected.path.clone(),
@@ -2855,11 +2863,6 @@ fn set_extracted_permissions(file: &cap_std::fs::File, executable: bool) -> io::
 
     let mode = if executable { 0o755 } else { 0o644 };
     file.set_permissions(cap_std::fs::Permissions::from_mode(mode))
-}
-
-#[cfg(not(unix))]
-fn set_extracted_permissions(_file: &cap_std::fs::File, _executable: bool) -> io::Result<()> {
-    Ok(())
 }
 
 fn open_new_private_capability_file(
@@ -2962,6 +2965,7 @@ fn scan_capability_paths(
                     path: child_display,
                 });
             }
+            #[cfg(not(windows))]
             reject_capability_hard_link(&metadata, &child_display)?;
             if entries.len() >= limits.max_file_count {
                 return Err(limit_error(
@@ -3040,7 +3044,7 @@ fn read_bounded_capability_file(
         path: display.to_owned(),
         source,
     })?;
-    reject_capability_hard_link(&opened, display)?;
+    reject_open_capability_hard_link(&file, display)?;
     if !opened.is_file() || !same_capability_file_identity(initial, &opened) {
         return Err(SourceError::ChangedDuringRead {
             path: display.to_owned(),
@@ -3080,6 +3084,9 @@ fn read_bounded_capability_file(
             path: display.to_owned(),
             source,
         })?;
+    reject_open_capability_hard_link(reader.get_ref(), display)?;
+    #[cfg(not(windows))]
+    reject_capability_hard_link(&path_final, display)?;
     if path_final.is_symlink()
         || !path_final.is_file()
         || !same_capability_file_identity(&opened, &opened_final)
@@ -3099,6 +3106,45 @@ fn read_bounded_capability_file(
     Ok(contents)
 }
 
+fn reject_link_count(links: u64, path: &str) -> Result<(), SourceError> {
+    match links {
+        1 => Ok(()),
+        2.. => Err(SourceError::HardLink {
+            path: path.to_owned(),
+            links,
+        }),
+        _ => Err(SourceError::HardLinkInspectionUnavailable {
+            path: path.to_owned(),
+        }),
+    }
+}
+
+#[cfg(windows)]
+fn reject_open_capability_hard_link(
+    file: &cap_std::fs::File,
+    path: &str,
+) -> Result<(), SourceError> {
+    let links = regular_file_link_count(file.as_handle()).map_err(|_| {
+        SourceError::HardLinkInspectionUnavailable {
+            path: path.to_owned(),
+        }
+    })?;
+    reject_link_count(u64::from(links), path)
+}
+
+#[cfg(not(windows))]
+fn reject_open_capability_hard_link(
+    file: &cap_std::fs::File,
+    path: &str,
+) -> Result<(), SourceError> {
+    let metadata = file.metadata().map_err(|source| SourceError::Io {
+        operation: "inspect open file hard-link count",
+        path: path.to_owned(),
+        source,
+    })?;
+    reject_capability_hard_link(&metadata, path)
+}
+
 #[cfg(unix)]
 fn reject_capability_hard_link(
     metadata: &cap_std::fs::Metadata,
@@ -3106,23 +3152,7 @@ fn reject_capability_hard_link(
 ) -> Result<(), SourceError> {
     use cap_std::fs::MetadataExt as _;
 
-    let links = metadata.nlink();
-    if links > 1 {
-        Err(SourceError::HardLink {
-            path: path.to_owned(),
-            links,
-        })
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(windows)]
-fn reject_capability_hard_link(
-    _metadata: &cap_std::fs::Metadata,
-    _path: &str,
-) -> Result<(), SourceError> {
-    Ok(())
+    reject_link_count(metadata.nlink(), path)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -3560,6 +3590,7 @@ fn load_ignore_rules(
         if !metadata.is_file() {
             return Err(SourceError::UnsupportedFileType { path: display });
         }
+        #[cfg(not(windows))]
         reject_hard_link(&metadata, &display)?;
         if metadata.len() > limits.max_ignore_file_size {
             return Err(limit_error(
@@ -3718,6 +3749,7 @@ fn scan_paths(
         if !metadata.is_file() {
             return Err(SourceError::UnsupportedFileType { path: display });
         }
+        #[cfg(not(windows))]
         reject_hard_link(&metadata, &display)?;
         register_collision_key(&display, &mut collisions)?;
         if entries.contains_key(&display) {
@@ -3827,7 +3859,7 @@ fn read_bounded_file(
         path: display.to_owned(),
         source,
     })?;
-    reject_hard_link(&opened_metadata, display)?;
+    reject_open_hard_link(&file, display)?;
     if !opened_metadata.is_file() || !same_file_identity(initial_metadata, &opened_metadata) {
         return Err(SourceError::ChangedDuringRead {
             path: display.to_owned(),
@@ -3875,8 +3907,12 @@ fn read_bounded_file(
             path: display.to_owned(),
         });
     }
-    reject_hard_link(&open_final_metadata, display)?;
-    reject_hard_link(&path_final_metadata, display)?;
+    reject_open_hard_link(reader.get_ref(), display)?;
+    #[cfg(not(windows))]
+    {
+        reject_hard_link(&open_final_metadata, display)?;
+        reject_hard_link(&path_final_metadata, display)?;
+    }
     let stable = open_final_metadata.is_file()
         && path_final_metadata.is_file()
         && same_file_identity(&opened_metadata, &open_final_metadata)
@@ -3896,24 +3932,31 @@ fn read_bounded_file(
     Ok(contents)
 }
 
+#[cfg(windows)]
+fn reject_open_hard_link(file: &File, path: &str) -> Result<(), SourceError> {
+    let links = regular_file_link_count(file.as_handle()).map_err(|_| {
+        SourceError::HardLinkInspectionUnavailable {
+            path: path.to_owned(),
+        }
+    })?;
+    reject_link_count(u64::from(links), path)
+}
+
+#[cfg(not(windows))]
+fn reject_open_hard_link(file: &File, path: &str) -> Result<(), SourceError> {
+    let metadata = file.metadata().map_err(|source| SourceError::Io {
+        operation: "inspect open file hard-link count",
+        path: path.to_owned(),
+        source,
+    })?;
+    reject_hard_link(&metadata, path)
+}
+
 #[cfg(unix)]
 fn reject_hard_link(metadata: &Metadata, path: &str) -> Result<(), SourceError> {
     use std::os::unix::fs::MetadataExt;
 
-    let links = metadata.nlink();
-    if links > 1 {
-        Err(SourceError::HardLink {
-            path: path.to_owned(),
-            links,
-        })
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(windows)]
-fn reject_hard_link(_metadata: &Metadata, _path: &str) -> Result<(), SourceError> {
-    Ok(())
+    reject_link_count(metadata.nlink(), path)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -4272,10 +4315,11 @@ fn has_unexpected_directory(directories: &[String], expected: &SourceManifest) -
     })
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn capability_root_binding_rejects_named_replacement() {
         let temporary = tempfile::tempdir().unwrap();
@@ -4293,5 +4337,50 @@ mod tests {
         fs::create_dir(&root).unwrap();
 
         assert!(ensure_capability_directory_path(&directory, &canonical_root, &identity).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bounded_read_rejects_a_hard_link_outside_the_selected_tree() {
+        let temporary = tempfile::tempdir().unwrap();
+        let selected = temporary.path().join("selected");
+        fs::create_dir(&selected).unwrap();
+        let source = selected.join("source.rs");
+        let outside_link = temporary.path().join("outside-link.rs");
+        fs::write(&source, b"fn main() {}").unwrap();
+        fs::hard_link(&source, &outside_link).unwrap();
+
+        let source = Utf8PathBuf::from_path_buf(source).unwrap();
+        let metadata = fs::symlink_metadata(&source).unwrap();
+        let error = read_bounded_file(
+            &source,
+            "selected/source.rs",
+            1024,
+            &metadata,
+            SourceLimitKind::FileSize,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, SourceError::HardLink { links: 2, .. }));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn capability_read_rejects_a_hard_link_outside_the_bundle() {
+        let temporary = tempfile::tempdir().unwrap();
+        let bundle = temporary.path().join("bundle");
+        fs::create_dir(&bundle).unwrap();
+        let source = bundle.join("source.rs");
+        let outside_link = temporary.path().join("outside-link.rs");
+        fs::write(&source, b"fn main() {}").unwrap();
+        fs::hard_link(&source, &outside_link).unwrap();
+
+        let directory = CapabilityDir::open_ambient_dir(&bundle, ambient_authority()).unwrap();
+        let metadata = directory.symlink_metadata("source.rs").unwrap();
+        let error =
+            read_bounded_capability_file(&directory, "source.rs", "source.rs", 1024, &metadata)
+                .unwrap_err();
+
+        assert!(matches!(error, SourceError::HardLink { links: 2, .. }));
     }
 }

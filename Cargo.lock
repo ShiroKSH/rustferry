@@ -2006,6 +2006,7 @@ dependencies = [
  "hex",
  "libc",
  "plist",
+ "rustferry-core",
  "same-file",
  "schemars",
  "semver",
