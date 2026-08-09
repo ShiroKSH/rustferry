@@ -521,6 +521,31 @@ pub fn canonical_request_sha256(request: &IosDeviceBuildRequest) -> RemoteBuildR
     )?)))
 }
 
+/// Return the version-1 semantic retry SHA-256 for one validated request.
+///
+/// The retry identity deliberately excludes only the caller-owned operation identifier. A retry
+/// therefore receives a fresh wire-request hash while remaining cryptographically bound to the
+/// same source, product, target, profile, signing plan, and artifact selection.
+///
+/// # Errors
+///
+/// Returns the same validation or serialization failure as [`canonical_request_bytes`].
+pub fn canonical_retry_template_sha256_v1(
+    request: &IosDeviceBuildRequest,
+) -> RemoteBuildResult<String> {
+    const DOMAIN: &[u8] = b"rustferry-retry-template-v1\0";
+    const OPERATION_ID_PLACEHOLDER: &str = "semantic-retry-template-v1";
+
+    request.validate()?;
+    let mut template = request.clone();
+    OPERATION_ID_PLACEHOLDER.clone_into(&mut template.operation_id);
+    let bytes = canonical_request_bytes(&template)?;
+    let mut digest = Sha256::new();
+    digest.update(DOMAIN);
+    digest.update(bytes);
+    Ok(hex::encode(digest.finalize()))
+}
+
 /// Provider result after a physical-iPhone build reaches a build-terminal state.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub struct IosDeviceBuildResult {

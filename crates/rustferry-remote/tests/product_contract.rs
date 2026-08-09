@@ -7,6 +7,7 @@ use rustferry_remote::{
     IosDeviceBuildRequest, IosDeviceProductExpectation, SigningMode, SigningPlan, SigningTarget,
     SigningTargetKind, SourceManifest, SourceMode, UnsignedNestedBundleExpectation,
     UnsignedNestedBundleKind, canonical_request_bytes, canonical_request_sha256,
+    canonical_retry_template_sha256_v1,
 };
 use sha2::{Digest, Sha256};
 
@@ -51,6 +52,31 @@ fn request_derives_the_complete_ipa_expectation_and_canonical_hash() {
     assert_ne!(
         first_hash,
         canonical_request_sha256(&changed).expect("changed request SHA-256")
+    );
+}
+
+#[test]
+fn semantic_retry_hash_excludes_only_the_operation_identifier() {
+    let first = valid_request();
+    let first_wire = canonical_request_sha256(&first).expect("first wire hash");
+    let first_semantic =
+        canonical_retry_template_sha256_v1(&first).expect("first semantic retry hash");
+
+    let mut retry = first.clone();
+    retry.operation_id = "operation-2".to_owned();
+    assert_ne!(
+        first_wire,
+        canonical_request_sha256(&retry).expect("retry wire hash")
+    );
+    assert_eq!(
+        first_semantic,
+        canonical_retry_template_sha256_v1(&retry).expect("retry semantic hash")
+    );
+
+    retry.profile = BuildProfile::Debug;
+    assert_ne!(
+        first_semantic,
+        canonical_retry_template_sha256_v1(&retry).expect("changed semantic hash")
     );
 }
 

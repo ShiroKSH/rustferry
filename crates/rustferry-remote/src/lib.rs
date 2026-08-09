@@ -73,6 +73,7 @@ pub use protocol::{
     IosDeviceBuildResult, JobState, ProtocolPath, ProtocolPathSemantics, ProtocolVersion,
     REMOTE_BUILD_EVENT_TYPES, RemoteBuildEvent, RemoteBuildEventKind, RemoteDiagnostic,
     RemoteErrorInfo, canonical_request_bytes, canonical_request_sha256,
+    canonical_retry_template_sha256_v1,
 };
 pub use provider::{
     ArtifactDownloadRequest, ArtifactDownloadResult, ArtifactListRequest, BuildProvider,
