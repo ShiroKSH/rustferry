@@ -289,7 +289,7 @@ fn run_command_with_output_limit(
                 |code| code.to_string(),
             ),
             summary: command_summary(&output.stdout, &output.stderr),
-            log: log_path.map(Utf8Path::to_owned),
+            log: log_path.map(|path| Box::new(path.to_owned())),
         });
     }
     Ok(CommandOutput {

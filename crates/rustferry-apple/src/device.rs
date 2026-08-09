@@ -628,6 +628,7 @@ fn execute_unsigned_archive(
             source,
         )
     })?;
+    #[cfg(unix)]
     make_executable(&plan.rust_binary_copy.destination)?;
 
     remove_stale_archive(&request.project_dir, &plan.archive_path)?;
@@ -1086,11 +1087,6 @@ fn make_executable(path: &Utf8Path) -> Result<(), AppleError> {
             source,
         )
     })
-}
-
-#[cfg(not(unix))]
-fn make_executable(_path: &Utf8Path) -> Result<(), AppleError> {
-    Ok(())
 }
 
 #[cfg(test)]

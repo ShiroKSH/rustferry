@@ -412,6 +412,7 @@ pub fn build_ios_simulator(
             source,
         )
     })?;
+    #[cfg(unix)]
     make_executable(&plan.rust_binary_copy.destination)?;
 
     remove_stale_artifact(&request.project_dir, &plan.artifact_path)?;
@@ -675,11 +676,6 @@ fn make_executable(path: &Utf8Path) -> Result<(), AppleError> {
     permissions.set_mode(permissions.mode() | 0o755);
     fs::set_permissions(path, permissions)
         .map_err(|source| io_error("mark staged Rust binary executable", path, source))
-}
-
-#[cfg(not(unix))]
-fn make_executable(_path: &Utf8Path) -> Result<(), AppleError> {
-    Ok(())
 }
 
 #[cfg(test)]
