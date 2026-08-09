@@ -3,6 +3,7 @@
 mod artifact;
 mod assets;
 mod config;
+mod filesystem_identity;
 mod naming;
 
 #[doc(hidden)]
@@ -18,6 +19,10 @@ pub use config::{
     FerryConfig, IosConfig, LiveActivityConfig, NetworkCapability, NetworkMode,
     NotificationCapability, Orientation, PermissionConfig, PermissionsConfig, TargetPlatform,
     Theme, ValidationIssue, WidgetConfig,
+};
+pub use filesystem_identity::{
+    DirectoryFilesystemIdentity, DirectoryIdentityError, DirectoryIdentityErrorKind,
+    DirectoryIdentityOperation, verify_directory_identity,
 };
 pub use naming::{
     NamingError, ProjectNames, derive_project_names, validate_application_identifier,

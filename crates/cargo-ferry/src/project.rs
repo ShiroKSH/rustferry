@@ -8,8 +8,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use camino::{Utf8Path, Utf8PathBuf};
-use rustferry_core::process_control::{
-    BoundedOutputCapture, DEFAULT_PROCESS_OUTPUT_LIMIT, OutputCaptureStatus,
+use rustferry_core::{
+    DirectoryFilesystemIdentity, DirectoryIdentityError,
+    process_control::{BoundedOutputCapture, DEFAULT_PROCESS_OUTPUT_LIMIT, OutputCaptureStatus},
+    verify_directory_identity,
 };
 
 use crate::error::CliError;
@@ -18,6 +20,45 @@ use crate::output::Reporter;
 const COMMAND_TIMEOUT: Duration = Duration::from_mins(30);
 const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(1);
+
+/// Capture the handle-bound filesystem identity of a canonical project directory.
+///
+/// # Errors
+///
+/// Returns a typed identity error when the path is not an absolute plain directory or the
+/// filesystem cannot provide the required persistent identity.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "durable jobs controller integration owns call sites"
+    )
+)]
+pub fn capture_project_directory_identity(
+    project_root: &Utf8Path,
+) -> Result<DirectoryFilesystemIdentity, DirectoryIdentityError> {
+    DirectoryFilesystemIdentity::capture(project_root.as_std_path())
+}
+
+/// Reopen a canonical project directory and require its exact persisted filesystem identity.
+///
+/// # Errors
+///
+/// Returns a typed identity error when the path cannot be reopened safely or identifies a
+/// different filesystem object.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "durable jobs controller integration owns call sites"
+    )
+)]
+pub fn verify_project_directory_identity(
+    project_root: &Utf8Path,
+    expected: &DirectoryFilesystemIdentity,
+) -> Result<(), DirectoryIdentityError> {
+    verify_directory_identity(project_root.as_std_path(), expected)
+}
 
 /// Resolve a `RustFerry` project from an explicit path or the current directory.
 pub fn find_project_root(explicit: Option<&Utf8Path>) -> Result<Utf8PathBuf, CliError> {
@@ -536,6 +577,39 @@ fn shell_display(value: &str) -> String {
         value.to_owned()
     } else {
         format!("{value:?}")
+    }
+}
+
+#[cfg(test)]
+mod filesystem_identity_tests {
+    use super::*;
+
+    #[test]
+    fn project_directory_identity_survives_reopen() {
+        let temporary = tempfile::tempdir().unwrap();
+        let project = Utf8PathBuf::from_path_buf(temporary.path().to_owned()).unwrap();
+        let identity = capture_project_directory_identity(&project).unwrap();
+
+        assert_eq!(
+            capture_project_directory_identity(&project).unwrap(),
+            identity
+        );
+        verify_project_directory_identity(&project, &identity).unwrap();
+    }
+
+    #[test]
+    fn project_directory_identity_rejects_replacement() {
+        let temporary = tempfile::tempdir().unwrap();
+        let project = temporary.path().join("project");
+        let displaced = temporary.path().join("displaced");
+        std::fs::create_dir(&project).unwrap();
+        let project = Utf8PathBuf::from_path_buf(project).unwrap();
+        let identity = capture_project_directory_identity(&project).unwrap();
+
+        std::fs::rename(project.as_std_path(), &displaced).unwrap();
+        std::fs::create_dir(&project).unwrap();
+
+        assert!(verify_project_directory_identity(&project, &identity).is_err());
     }
 }
 
