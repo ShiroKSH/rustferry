@@ -179,8 +179,18 @@ binary is rejected explicitly; arm64 alone is not device proof.
 The default protected GitHub result is an exact five-file transport set: development IPA, artifact
 manifest, signing report, validation report, and `sanitized-build-log.txt`. The fixed sanitized log
 is created only after protected signing, IPA export, validation, and signing-material cleanup are
-confirmed; its size and SHA-256 are part of the immutable worker manifest. Signed XCArchive and dSYM
-selection remain outside this implemented contract.
+confirmed; its size and SHA-256 are part of the immutable worker manifest. The client publishes the
+IPA, manifest, validation report, and sanitized log by default after verifying all five transport
+files.
+
+Signed optional products extend that exact set only when declared by the request.
+`--artifact app` adds `application.app.zip`, `--artifact archive` adds
+`application.xcarchive.zip`, and `--artifact all` adds both. `--include-dsym` separately adds
+`application.dSYM.zip`; `all` does not imply dSYM. The application and reconstructed XCArchive must
+contain the exact signed app tree independently validated from the IPA. A requested dSYM is limited
+to the main application executable, must contain real DWARF debug information, and must have the
+same nonzero arm64 Mach-O UUID as the signed executable. Every selected file is size- and
+SHA-256-bound in the manifest; absence, extras, or substitution fail the operation.
 
 A successful build and successful cleanup are distinct states. Cleanup proof records isolated
 workspace removal, signing-material/keychain removal, and intentional artifact retention. Cleanup

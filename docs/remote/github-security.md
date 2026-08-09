@@ -167,10 +167,13 @@ workspace, and private workspace. A missing cleanup proof prevents success.
 GitHub's successful conclusion is insufficient. The client selects artifact names by exact run ID
 and attempt, verifies GitHub metadata size/digest before writing, validates the sealed phase-A
 handoff, and binds the final report to the submitted request and sealed archive digests. Final ZIP
-ingestion accepts only the IPA, artifact manifest, signing report, validation report, and sanitized
-protected-signing log. The log is manifest-bound and plain-text validated; compile-phase output is
-not substituted for it. Ingestion rejects links, traversal, collisions, expansion bombs, unexpected
-files, identity drift, and existing output.
+ingestion accepts the exact request-derived set: the IPA, artifact manifest, signing report,
+validation report, and sanitized protected-signing log, plus only the explicitly selected
+`application.app.zip`, `application.xcarchive.zip`, and `application.dSYM.zip` products. The log is
+manifest-bound and plain-text validated; compile-phase output is not substituted for it. Ingestion
+rejects links, traversal, collisions, aliased ZIP headers or payload ranges, expansion bombs,
+implicit wrapper roots, source or signing-material paths, unexpected files, identity drift, and
+existing output.
 
 Verification uses a newly created operation directory beneath a private cache root. Any error removes
 that exact directory. A successful in-process cache retains only the verified downloadable files;
@@ -180,7 +183,18 @@ directory. Fresh CLI processes therefore do not accumulate duplicate multi-gigab
 Cross-platform IPA inspection verifies `Payload/<App>.app`, plist identity, arm64 Mach-O physical-iOS
 platform metadata, nested code inventory, and embedded provisioning presence. Remote evidence must
 also prove strict code-signature validation, certificate/profile/team/device/entitlement bindings,
-and complete signing cleanup.
+and complete signing cleanup. Optional application and XCArchive transports are accepted only when
+their path, size, SHA-256, and executable-bit trees exactly match the inspected IPA application; the
+archive application also requires a fresh deep strict signature check. The dSYM transport requires
+an explicit single wrapper, real DWARF content, an arm64 `MH_DSYM`, and an exact nonzero `LC_UUID`
+match with the signed main executable. Publication and rollback retain original file identities and
+fail closed when a replacement path is observed.
+
+The protected Phase B job has no source checkout, compile step, or untrusted same-UID process.
+Capability-relative file cleanup is fail-closed for observed identity replacement, but portable
+POSIX APIs do not provide atomic unlink-if-inode against an actively racing same-UID peer. A shared
+or multi-tenant runner therefore requires separate OS identities or stronger isolation and is not a
+validated deployment mode.
 
 ## Required external controls
 

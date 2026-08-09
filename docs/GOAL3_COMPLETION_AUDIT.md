@@ -1,9 +1,9 @@
 # Goal 3 Completion Audit
 
 Audit date: 2026-08-09
-Audited code revision: local `master` includes `43b44763b507231436bd8e26930623a8681c453a`
+Audited code revision: local `master` includes `2e0773a68d381ccf97aaa2fd7c099b3a3a2008bc`
 
-This ledger evaluates the full Goal 3 specification against the local `e850deb` integration base plus the bounded multi-profile continuation at `a339fff` and protected signed-log transport at `43b4476`. The requested local SSH-snapshot merge is present at `e850deb`. Local `master` is ahead of `origin/master` (`607fe78`) and has not been pushed. The affected-package tests pass locally; current-revision CI and live signed acceptance remain pending.
+This ledger evaluates the full Goal 3 specification against the local `e850deb` integration base plus bounded multi-profile signing at `a339fff`, protected signed-log transport at `43b4476`, and selectable signed products at `2e0773a`. The requested local SSH-snapshot merge is present at `e850deb`. Local `master` is ahead of `origin/master` (`607fe78`) and has not been pushed. The affected-package tests pass locally; current-revision CI and live signed acceptance remain pending.
 
 Status meanings:
 
@@ -14,18 +14,18 @@ Status meanings:
 
 Unit, integration, synthetic signing, and mocked-provider tests prove deterministic code behavior only. They are not counted as live GitHub, Apple, SSH-host, signing, or physical-device proof. The app/Widget/Live Activity profile continuation is therefore recorded only as implemented-unproven until its live signing gates pass.
 
-## Local verification at `43b4476`
+## Local verification at `2e0773a`
 
 | Check | Result |
 |---|---|
-| Affected all-target tests | Pass: `cargo-ferry` 42 library, 106 binary, 52 CLI plus integration coverage; Apple 47 passed/1 Xcode-dependent ignored plus integration coverage; GitHub 134; remote 41 plus integration coverage; worker 70 library and 27 binary |
+| Affected all-target tests | Pass: `cargo-ferry` 42 library, 112 binary, 52 CLI, 1 log-stream integration, and 1 doctest; Apple 47 library passed/1 ignored, 9 device passed/3 ignored, 2 golden passed, and 4 Xcode smoke ignored; GitHub 140; remote 42 library plus all integration suites and 4 doctests; worker 81 library and 27 binary |
 | Strict Clippy | Pass with `-D warnings` for cargo-ferry, Apple, GitHub, remote, and worker, all targets |
 | Formatting and patch hygiene | `cargo fmt --all -- --check` and `git diff --check` pass |
 | Generated workflows | Modern generated YAML passes `actionlint`; the schema-v2 legacy snapshot is byte-identical |
-| Independent review | Clean after exact sanitized-log allowlisting, compile/signed cache-path separation, target-graph, secret-buffer wiping, project-drift, remediation-name, Team-ID, and dotted-target fixes |
+| Independent review | Clean after signed-request base-contract, ZIP alias/tree/UUID, request-derived output, dSYM capability cleanup, optional-product ownership, and replacement-preservation fixes; active same-UID racing remains outside the isolated Phase B trust boundary |
 
 The current-revision full workspace/CI matrix was not rerun: the workspace volume was 99% used with
-about 2.7 GiB free, while the affected dependency slice was fully tested from existing caches. The
+about 3.1 GiB free, while the affected dependency slice was fully tested from existing caches. The
 historical full-workspace and cross-platform CI results below remain separate evidence.
 
 ## Main 27-point definition of done
@@ -40,7 +40,7 @@ historical full-workspace and cross-platform CI results below remain separate ev
 | 6 | Compile Rust for `aarch64-apple-ios` | Proven | Live unsigned worker run `31262066567`; toolchain and target checks in `crates/rustferry-worker-macos/src/host.rs`; build pipeline in `crates/rustferry-worker-macos/src/pipeline.rs`. |
 | 7 | Build a real `iphoneos` application bundle | Proven | Live unsigned `.xcarchive` path from runs `31261962599` / `31262066567`; validation recorded in `docs/GOAL3_STATUS.md`; pipeline in `crates/rustferry-worker-macos/src/pipeline.rs`. |
 | 8 | Produce a correctly signed `.app` | Implemented-unproven | Signing/keychain/provisioning pipeline exists in `crates/rustferry-worker-macos/src/keychain.rs`, `provisioning.rs`, and `pipeline.rs`; only synthetic evidence is recorded in `docs/GOAL3_STATUS.md`. |
-| 9 | Produce a correctly signed `.xcarchive` | Missing | Phase B exports and validates an IPA from the unsigned handoff but does not publish a signed XCArchive; `--artifact all` is also absent. |
+| 9 | Produce a correctly signed `.xcarchive` | Implemented-unproven | The worker reconstructs the archive from the exact independently validated signed IPA app tree, requires a fresh deep strict signature check, and transports it for `--artifact archive|all`; no real signed archive or Organizer/export proof exists. |
 | 10 | Export a signed `.ipa` | Implemented-unproven | Export implementation in `crates/rustferry-worker-macos/src/export.rs`; `docs/GOAL3_STATUS.md` states real IPA export remains unvalidated. |
 | 11 | Validate certificate identity and requested Apple Team ID | Implemented-unproven | Typed plans in `crates/rustferry-remote/src/signing.rs`; validation in worker signing/provisioning modules; no real certificate/account run. |
 | 12 | Validate provisioning profile against bundle, team, certificate, and device | Implemented-unproven | `crates/rustferry-worker-macos/src/provisioning.rs`; synthetic fixtures only. |
@@ -51,10 +51,10 @@ historical full-workspace and cross-platform CI results below remain separate ev
 | 17 | Submit an explicit deterministic source snapshot | Missing | SSH bundle machinery exists, but GitHub snapshot selection fails explicitly in `crates/cargo-ferry/src/commands/remote.rs`; no build `--snapshot` flag in `crates/cargo-ferry/src/cli.rs`. |
 | 18 | Emit structured job IDs, phases, progress, warnings, and terminal events | Implemented-unproven | Event model in `crates/rustferry-remote/src/protocol.rs`; GitHub polling implemented; required persistent `jobs` CLI is absent. |
 | 19 | Cancel and retry remote work safely | Implemented-unproven | Provider contracts include cancellation in `crates/rustferry-remote/src/provider.rs`; no required `jobs cancel/retry` commands and no live cancellation proof. |
-| 20 | List and download all declared artifacts | Proven | GitHub artifact flow in `crates/cargo-ferry/src/commands/remote.rs` and `crates/rustferry-github/src/provider.rs`; live unsigned archive download in run `31261962599`. |
+| 20 | List and download all declared artifacts | Implemented-unproven | GitHub artifact flow in `crates/cargo-ferry/src/commands/remote.rs` and `crates/rustferry-github/src/provider.rs`; run `31261962599` proves unsigned archive download, while selected signed app/archive/dSYM sets have deterministic local coverage only. |
 | 21 | Verify downloaded SHA-256 values before success | Proven | Strict artifact verification in `crates/rustferry-remote/src/artifact.rs`; live acceptance hash checks in `.github/workflows/rustferry-goal3-linux-client-acceptance.yml`. |
 | 22 | Reject unsafe artifact paths and archive contents | Proven | Path/archive validation and limits in `crates/rustferry-remote/src/artifact.rs` and remote security tests. |
-| 23 | Emit a complete, machine-readable artifact manifest and validation report | Implemented-unproven | Manifest fields and validation levels in `crates/rustferry-remote/src/artifact.rs`; complete signed-IPA manifest remains unproven. |
+| 23 | Emit a complete, machine-readable artifact manifest and validation report | Implemented-unproven | Manifest fields and validation levels in `crates/rustferry-remote/src/artifact.rs`; the worker and client enforce exact request-derived records and signed-product evidence locally, but no real signed manifest exists. |
 | 24 | Keep credentials and signing material out of source, argv, logs, and artifacts | Implemented-unproven | Central redaction tests in `crates/rustferry-remote/tests/security.rs`; protected sign phase and stdin frame in `.github/workflows/rustferry-goal3-iphone.yml`; no live signed-secret audit. |
 | 25 | Install the downloaded application on a physical iPhone | Implemented-unproven | Device install service exists under `crates/cargo-ferry/src/deployment/`; `docs/support-matrix.md` records no end-to-end downloaded signed artifact proof. |
 | 26 | Launch the installed application and report identity/result | Implemented-unproven | Run/device support exists under `crates/rustferry-apple/src` and cargo-ferry commands; no physical-device run. |
@@ -100,9 +100,9 @@ historical full-workspace and cross-platform CI results below remain separate ev
 | 12 | Every target embeds its matching provisioning profile | Implemented-unproven | Per-target loop in `crates/rustferry-worker-macos/src/pipeline.rs` and `provisioning.rs`; bounded named transport supplies the exact profile set in synthetic tests, but no real signed artifact exists. |
 | 13 | Frameworks and extensions are signed before the containing app | Implemented-unproven | Ordering in remote signing model and worker pipeline; synthetic proof only. |
 | 14 | Final signatures and entitlements are independently verified | Implemented-unproven | Worker signing/export validation code and artifact validation report; no real signed output. |
-| 15 | `.xcarchive` structure and metadata are valid | Missing | Unsigned archive structure is live-proven, but no signed XCArchive producer, transport, or live artifact exists. |
+| 15 | `.xcarchive` structure and metadata are valid | Implemented-unproven | The selected signed archive is reconstructed from the exact validated IPA app tree and rechecked with deep strict codesign; client tree verification passes synthetic coverage, but Organizer/export and real signed-artifact proof are absent. |
 | 16 | Export options are derived from validated manual-signing inputs | Implemented-unproven | `crates/rustferry-worker-macos/src/export.rs`; no real account/profile export. |
-| 17 | IPA, archive, manifest, validation report, and sanitized log are returned | Missing | The default IPA, manifest, validation report, and protected-phase sanitized log now form a locally tested exact transport; signed XCArchive selection via `--artifact all`, dSYM selection, and live signed evidence remain absent. |
+| 17 | IPA, archive, manifest, validation report, and sanitized log are returned | Implemented-unproven | The exact five-file default and request-selected signed app/archive/main-app-dSYM transports are implemented, manifest-bound, and locally tested; no protected live signing run has returned them. |
 | 18 | IPA installs, launches, and runs on the registered physical device | Missing | No real signed IPA artifact, device-install run, launch run, or runtime-log run; `docs/GOAL3_STATUS.md` and `docs/support-matrix.md`. |
 
 ## SSH Mac provider: 13 criteria
@@ -138,9 +138,9 @@ historical full-workspace and cross-platform CI results below remain separate ev
 | Reproducible integration package exists | Proven | `dist/goal3-integration/` contains patch series, bundle, checksums, apply/verify material. |
 | SSH continuation integration package exists | Proven | `dist/goal3-ssh-snapshot-v1/`; local integration commits `b32be13`, `36ea042`, `e850deb`. |
 | Multi-target signing integration package exists | Proven | `dist/goal3-multi-target-signing-v1/`; checksums pass and both mail-patch and aggregate-patch replays produce tree `37658727e2433b3b074fba1e811c58b36e409ae7`. |
-| Requested local merge is complete | Proven | Local `master` contains the SSH integration through `e850deb` and the multi-target signing code at `a339fff`. |
+| Requested local merge is complete | Proven | Local `master` contains the SSH integration through `e850deb`, multi-target signing at `a339fff`, and selectable signed products at `2e0773a`. |
 | Integrated revision is pushed to origin | Missing | `origin/master` remains `607fe78`; local `master` is ahead. No push was requested or performed. |
-| Current integrated revision has CI/live acceptance | Missing | Last cited final CI run is `31261962607` at `607fe78`; no run at or after `a339fff`. |
+| Current integrated revision has CI/live acceptance | Missing | Last cited final CI run is `31261962607` at `607fe78`; no run at or after `2e0773a`. |
 
 ## External and live blockers
 
@@ -153,7 +153,7 @@ These are validation blockers, not substitutes for missing implementation.
 | Real certificate, password, and matching provisioning profiles | Missing | Required for a live manual-signing run; synthetic fixtures do not count. |
 | Registered physical iPhone and device UDID/profile coverage | Missing | Required for install/launch/runtime acceptance. |
 | Successful protected GitHub signed run | Missing | Must cite run, job, commit, environment, and retained artifact IDs. |
-| Real signed `.app`, `.xcarchive`, and `.ipa` inspection | Missing | Must validate signatures, embedded profiles, entitlements, nested code, manifest, and SHA values. |
+| Real signed `.app`, `.xcarchive`, `.ipa`, and main-app dSYM inspection | Missing | Must validate signatures, embedded profiles, entitlements, nested code, manifest/SHA values, real DWARF content, and executable-to-dSYM UUID equality. |
 | Physical install and launch evidence | Missing | Must cite device, artifact SHA, install result, bundle launch result, and sanitized logs. |
 | Live Windows client acceptance | Missing | Run from Windows with no Xcode/macOS tools and cite job/artifact IDs. |
 | Live SSH Mac acceptance | Missing | Run handshake, doctor, upload, build, event stream, artifact verification, cancellation, and cleanup on a real remote Mac. |
@@ -175,4 +175,4 @@ These are validation blockers, not substitutes for missing implementation.
 
 ## Completion conclusion
 
-Goal 3 is **not complete**. The Linux-to-GitHub-to-macOS unsigned archive path is live-proven and the protocol, worker, artifact verification, redaction, deterministic SSH snapshot, bounded multi-profile foundations, and exact default signed-result transport are substantial. The affected-package integration suite passes at code revision `43b4476`. Completion still requires code for the missing CLI/Apple/snapshot/provider/logging surfaces and live evidence for signed artifacts and physical-device use. The local merge is present by user request; it is neither pushed nor validated by current-revision CI or signed live acceptance.
+Goal 3 is **not complete**. The Linux-to-GitHub-to-macOS unsigned archive path is live-proven and the protocol, worker, artifact verification, redaction, deterministic SSH snapshot, bounded multi-profile foundations, exact default signed-result transport, and selectable signed app/archive/main-app-dSYM path are substantial. The affected-package integration suite passes locally at `2e0773a`. Completion still requires code for the missing CLI/Apple/snapshot/provider/logging surfaces and live evidence for signed artifacts and physical-device use. The local merge is present by user request; it is neither pushed nor validated by current-revision CI or signed live acceptance.
