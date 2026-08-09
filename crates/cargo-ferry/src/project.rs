@@ -490,7 +490,9 @@ pub fn write_atomic(path: &Utf8Path, contents: &str) -> Result<(), CliError> {
         path: path.to_owned(),
         source: error.error,
     })?;
-    sync_directory(parent)
+    #[cfg(unix)]
+    sync_directory(parent)?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -502,11 +504,6 @@ fn sync_directory(path: &Utf8Path) -> Result<(), CliError> {
             path: path.to_owned(),
             source,
         })?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-const fn sync_directory(_path: &Utf8Path) -> Result<(), CliError> {
     Ok(())
 }
 
