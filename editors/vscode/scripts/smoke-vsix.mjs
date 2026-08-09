@@ -16,6 +16,7 @@ const ALLOWED_ENTRIES = new Set([
   "extension/SUPPORT.md",
   "extension/dist/extension.js",
   "extension/media/ferry.svg",
+  "extension/media/rustferry-icon.png",
   "extension/media/walkthrough/build.md",
   "extension/media/walkthrough/device.md",
   "extension/media/walkthrough/docs.md",
@@ -83,6 +84,9 @@ if (missing.length > 0) {
 const manifest = JSON.parse(strFromU8(archive["extension/package.json"]));
 if (manifest.main !== "./dist/extension.js") {
   throw new Error("VSIX manifest points at an unexpected extension entry point");
+}
+if (manifest.icon !== "media/rustferry-icon.png") {
+  throw new Error("VSIX manifest points at an unexpected extension icon");
 }
 for (const name of names) {
   const entry = archive[name];

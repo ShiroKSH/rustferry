@@ -12,4 +12,4 @@ Before publication:
 
 Publish the already-inspected VSIX, not a rebuilt package. Then verify the public publisher, version, listing, and install the Marketplace version into an isolated VS Code profile. Compare the installed package with the approved candidate where the Marketplace tooling permits it.
 
-Do not publish automatically from ordinary CI, expose the token to pull requests, or claim publication from a successful VSIX build. RustFerry has not been published to the Marketplace in the current work.
+Do not publish automatically from ordinary CI, expose the token to pull requests, or claim publication from a successful VSIX build. RustFerry for VS Code 0.1.0 is published at [ShiroKSH.rustferry-vscode](https://marketplace.visualstudio.com/items?itemName=ShiroKSH.rustferry-vscode).

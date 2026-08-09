@@ -5,6 +5,7 @@
   "version": "0.1.0",
   "publisher": "ShiroKSH",
   "license": "MIT",
+  "icon": "media/rustferry-icon.png",
   "files": [
     "CHANGELOG.md",
     "LICENSE",
@@ -12,6 +13,7 @@
     "SUPPORT.md",
     "dist/extension.js",
     "media/ferry.svg",
+    "media/rustferry-icon.png",
     "media/walkthrough/*.md",
     "snippets/rust.json"
   ],

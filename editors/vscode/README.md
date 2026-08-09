@@ -1,5 +1,15 @@
 # RustFerry for VS Code
 
+<p align="center">
+  <a href="https://marketplace.visualstudio.com/items?itemName=ShiroKSH.rustferry-vscode">
+    <img src="media/rustferry-icon.png" width="128" alt="RustFerry for VS Code">
+  </a>
+</p>
+
+<p align="center">
+  <a href="https://marketplace.visualstudio.com/items?itemName=ShiroKSH.rustferry-vscode">Install from the Visual Studio Marketplace</a>
+</p>
+
 RustFerry for VS Code is the native editor surface for RustFerry projects. It discovers `ferry.toml`, negotiates IDE protocol v1 with `cargo-ferry`, and exposes project, device, diagnostic, task, and artifact workflows without duplicating build logic.
 
 Configuration diagnostics track the current editor buffer, including unsaved changes. Dirty manifest text travels only through a bounded stdin protocol request; stale results and disk-backed quick fixes are rejected.
