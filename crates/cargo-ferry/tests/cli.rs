@@ -1215,6 +1215,7 @@ fn workspace_runtime_is_explicit_and_does_not_create_nested_workspace() {
 }
 
 #[test]
+#[cfg(target_os = "macos")]
 fn physical_ios_dry_run_uses_official_signing_plan_without_mutating_provisioning() {
     let temporary = tempfile::tempdir().expect("temporary directory");
     let project = generate_project(temporary.path(), "device-build-plan");

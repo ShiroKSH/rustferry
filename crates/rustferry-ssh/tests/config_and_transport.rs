@@ -189,10 +189,12 @@ fn invocation_uses_stable_private_snapshot_instead_of_mutable_trust_path() {
     let invocation = build_ssh_invocation(&fixture.config).expect("fixed invocation");
     let snapshot_path = invocation.known_hosts_snapshot_path().to_owned();
     let snapshot_directory = snapshot_path.parent().expect("snapshot parent").to_owned();
-    let expected_option = OsString::from(format!(
-        "UserKnownHostsFile=\"{}\"",
-        snapshot_path.display()
-    ));
+    let escaped_snapshot_path = snapshot_path
+        .to_str()
+        .expect("OpenSSH path is UTF-8")
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let expected_option = OsString::from(format!("UserKnownHostsFile=\"{escaped_snapshot_path}\""));
 
     assert_ne!(snapshot_path, original_path.as_std_path());
     assert!(

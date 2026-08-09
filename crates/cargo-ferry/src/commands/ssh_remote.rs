@@ -3216,11 +3216,19 @@ mod tests {
                 .any(|window| window == b"private-key-fixture")
         );
         let stored: StoredSshEndpoint = serde_json::from_slice(&bytes).expect("strict config");
+        let canonical_identity = fixture
+            .identity
+            .canonicalize_utf8()
+            .expect("canonical identity");
+        let canonical_known_hosts = fixture
+            .known_hosts
+            .canonicalize_utf8()
+            .expect("canonical known-hosts");
         assert_eq!(
             stored.identity_file.as_deref(),
-            Some(fixture.identity.as_path())
+            Some(canonical_identity.as_path())
         );
-        assert_eq!(stored.known_hosts_file, fixture.known_hosts);
+        assert_eq!(stored.known_hosts_file, canonical_known_hosts);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -3308,8 +3316,16 @@ mod tests {
         assert_eq!(endpoint.host().as_str(), "builder.example");
         assert_eq!(endpoint.user().as_str(), "builder");
         assert_eq!(endpoint.port(), 22);
-        assert_eq!(endpoint.known_hosts_file(), fixture.known_hosts);
-        assert_eq!(endpoint.identity_file(), Some(fixture.identity.as_path()));
+        let canonical_known_hosts = fixture
+            .known_hosts
+            .canonicalize_utf8()
+            .expect("canonical known-hosts");
+        let canonical_identity = fixture
+            .identity
+            .canonicalize_utf8()
+            .expect("canonical identity");
+        assert_eq!(endpoint.known_hosts_file(), canonical_known_hosts);
+        assert_eq!(endpoint.identity_file(), Some(canonical_identity.as_path()));
 
         let other_root = fixture.root.join("other-config");
         let error = load_endpoint(&name, Some(&other_root)).expect_err("no root fallback");

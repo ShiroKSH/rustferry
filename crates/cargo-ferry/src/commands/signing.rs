@@ -1143,6 +1143,24 @@ mod tests {
     const DEVICE_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const DEVICE_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
+    fn tempdir_outside_current_repository() -> tempfile::TempDir {
+        let current = std::env::current_dir()
+            .expect("current directory")
+            .canonicalize()
+            .expect("canonical current directory");
+        let outer_repository = current
+            .ancestors()
+            .filter(|ancestor| ancestor.join(".git").exists())
+            .last();
+        match outer_repository.and_then(std::path::Path::parent) {
+            Some(parent) => tempfile::Builder::new()
+                .prefix("rustferry-signing-asset-")
+                .tempdir_in(parent)
+                .expect("asset tempdir outside the repository"),
+            None => tempfile::tempdir().expect("asset tempdir"),
+        }
+    }
+
     #[test]
     fn signing_asset_reader_binds_a_stable_file_outside_git() {
         let project = tempfile::tempdir().expect("project tempdir");
@@ -1151,10 +1169,7 @@ mod tests {
             project.path().canonicalize().expect("canonical project"),
         )
         .expect("UTF-8 project");
-        #[cfg(unix)]
-        let outside = tempfile::tempdir_in("/tmp").expect("outside tempdir");
-        #[cfg(not(unix))]
-        let outside = tempfile::tempdir().expect("outside tempdir");
+        let outside = tempdir_outside_current_repository();
         let asset = camino::Utf8PathBuf::from_path_buf(outside.path().join("development.p12"))
             .expect("UTF-8 asset");
         std::fs::write(&asset, b"opaque-asset").expect("asset bytes");

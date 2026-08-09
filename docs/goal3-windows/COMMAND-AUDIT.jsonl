@@ -9,3 +9,8 @@
 {"at":"2026-08-09T10:31:05Z","phase":"baseline","command":"cargo metadata --no-deps --format-version 1","exit_code":0,"result":"10 packages; target C:/Users/kushi/Documents/ChatGPT/RustFerry/.goal3-windows/target"}
 {"at":"2026-08-09T10:31:05Z","phase":"baseline","command":"cargo fmt --all -- --check","exit_code":0,"result":"passed"}
 {"at":"2026-08-09T10:31:05Z","phase":"baseline","command":"git diff --check","exit_code":0,"result":"passed before baseline documentation edit"}
+{"at":"2026-08-09T11:09:16Z","phase":"windows-native","command":"cargo test -p rustferry-remote --all-features","exit_code":0,"result":"112 passed; 0 failed"}
+{"at":"2026-08-09T11:09:16Z","phase":"windows-native","command":"cargo test -p rustferry-github --all-features","exit_code":0,"result":"136 passed; 0 failed"}
+{"at":"2026-08-09T11:09:16Z","phase":"windows-native","command":"cargo test -p rustferry-ssh --all-features","exit_code":0,"result":"39 passed; 2 ignored subprocess helpers; 0 failed"}
+{"at":"2026-08-09T11:09:16Z","phase":"windows-native","command":"cargo test -p rustferry-core --all-features","exit_code":0,"result":"37 passed; 0 failed"}
+{"at":"2026-08-09T11:09:16Z","phase":"windows-native","command":"cargo test -p cargo-ferry --all-features","exit_code":0,"result":"199 passed across unit, integration, and doctest targets; 0 failed; macOS-only local physical-device dry-run test correctly excluded on Windows"}

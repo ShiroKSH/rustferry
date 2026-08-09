@@ -1173,12 +1173,17 @@ pub(super) fn snapshot_source_bundle_plan(
     explicit_executables: &[Utf8PathBuf],
     reporter: &Reporter,
 ) -> Result<(Utf8PathBuf, SourceBundlePlan, Vec<String>), CliError> {
-    let metadata = source_bundle_cargo_metadata(project, reporter)?;
-    let workspace = source_bundle_workspace(&metadata, project)?;
-    let selected_package = source_bundle_selected_package(&metadata, project)?;
+    let project = project.canonicalize_utf8().map_err(|source| CliError::Io {
+        action: "resolve RustFerry project root",
+        path: project.to_owned(),
+        source,
+    })?;
+    let metadata = source_bundle_cargo_metadata(&project, reporter)?;
+    let workspace = source_bundle_workspace(&metadata, &project)?;
+    let selected_package = source_bundle_selected_package(&metadata, &project)?;
     let reachable = source_bundle_reachable_packages(&metadata, &selected_package)?;
     let (mut request, path_dependencies) =
-        source_bundle_request(&metadata, &workspace, project, &reachable)?;
+        source_bundle_request(&metadata, &workspace, &project, &reachable)?;
     let baseline = plan_source_bundle(&request)
         .map_err(|error| source_bundle_error("source_bundle_plan_failed", &error))?;
     let executable_modes = explicit_executables

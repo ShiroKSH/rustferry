@@ -5,7 +5,7 @@ Captured `2026-08-09` on the physical Windows host.
 | Milestone | State | Evidence |
 | --- | --- | --- |
 | 0 — handoff and baseline | Complete | Handoff fetched at `5363942`; required ancestry passed; Windows branch and isolated directories created; metadata/fmt/diff baseline passed |
-| 1 — Windows native regression | Pending | No package or workspace test result yet |
+| 1 — Windows native regression | In progress | `rustferry-remote` 112 passed; `rustferry-github` 136 passed; `rustferry-ssh` 39 passed/2 ignored helpers; `rustferry-core` 37 passed; full `cargo-ferry` 199 passed/0 failed; strict Clippy and workspace-wide checks remain |
 | 2 — live Windows acceptance | Pending | No Windows-originated GitHub/macOS run yet |
 | 3 — persistent jobs | Pending | Existing implementation not yet audited against the Windows handoff specification |
 | 4 — cancel/retry | Pending | No live cancellation or exact-source retry evidence |

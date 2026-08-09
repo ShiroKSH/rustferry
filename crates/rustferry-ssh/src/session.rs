@@ -1438,29 +1438,30 @@ fn sync_parent_directory(path: &Utf8Path) -> std::io::Result<()> {
 mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
-        ffi::OsString,
         io::Cursor,
-        thread,
-        time::{Duration, Instant},
     };
     #[cfg(unix)]
     use std::{
+        ffi::OsString,
         panic::{AssertUnwindSafe, catch_unwind},
         process::{Command, Stdio},
+        thread,
+        time::{Duration, Instant},
     };
 
+    #[cfg(unix)]
+    use rustferry_remote::CancellationToken;
     use rustferry_remote::{
         ApplePlatform, ArtifactKind, ArtifactRecord, BuildProfile, BundleIdentifier,
-        COMPILE_PHASE_EVIDENCE_SCHEMA_VERSION, CURRENT_PROTOCOL_VERSION, CancellationToken,
-        CleanupConfirmation, CompilePhaseEvidence, CompileToolchainEvidence,
-        IOS_DEVICE_RUST_TARGET, IosArtifactType, IosDeviceBuildRequest,
-        IosDeviceProductExpectation, JobState, MachOSliceEvidence, ProtocolPathSemantics,
-        ProtocolVersion, RemoteBuildEventKind, SEALED_UNSIGNED_ARCHIVE_SCHEMA_VERSION,
-        SealedUnsignedArchive, SigningMode, SigningPlan, SigningTarget, SigningTargetKind,
-        SnapshotBuildParameters, SourceArchive, SourceBundleRequest, SourceMode,
-        UnsignedAppInspection, UnsignedXcarchiveExpectation, UnsignedXcarchiveInspection,
-        WorkerDataPlaneFrameError, copy_worker_data_plane_payload, plan_source_bundle,
-        write_worker_data_plane_frame,
+        COMPILE_PHASE_EVIDENCE_SCHEMA_VERSION, CURRENT_PROTOCOL_VERSION, CleanupConfirmation,
+        CompilePhaseEvidence, CompileToolchainEvidence, IOS_DEVICE_RUST_TARGET, IosArtifactType,
+        IosDeviceBuildRequest, IosDeviceProductExpectation, JobState, MachOSliceEvidence,
+        ProtocolPathSemantics, ProtocolVersion, RemoteBuildEventKind,
+        SEALED_UNSIGNED_ARCHIVE_SCHEMA_VERSION, SealedUnsignedArchive, SigningMode, SigningPlan,
+        SigningTarget, SigningTargetKind, SnapshotBuildParameters, SourceArchive,
+        SourceBundleRequest, SourceMode, UnsignedAppInspection, UnsignedXcarchiveExpectation,
+        UnsignedXcarchiveInspection, WorkerDataPlaneFrameError, copy_worker_data_plane_payload,
+        plan_source_bundle, write_worker_data_plane_frame,
     };
 
     use super::*;

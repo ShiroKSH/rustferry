@@ -744,7 +744,7 @@ fn read_bounded(mut reader: impl Read, maximum: usize) -> io::Result<BoundedRead
     Ok(BoundedRead { bytes, exceeded })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn test_invocation(
     program: impl Into<OsString>,
     arguments: impl IntoIterator<Item = OsString>,
@@ -772,6 +772,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(unix)]
     fn known_hosts_option_quotes_lists_and_escapes_tokens() {
         let option =
             known_hosts_option(Path::new("/tmp/rust ferry/\"key\"")).expect("quoted OpenSSH path");
@@ -782,8 +783,23 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn known_hosts_option_quotes_native_windows_paths() {
+        let option =
+            known_hosts_option(Path::new(r"C:\tmp\rust ferry\key")).expect("quoted OpenSSH path");
+        assert_eq!(
+            option,
+            OsString::from(r#"UserKnownHostsFile="C:\\tmp\\rust ferry\\key""#)
+        );
+    }
+
+    #[test]
     fn known_hosts_option_rejects_openssh_expansions() {
-        for path in ["/tmp/%h/known_hosts", "/tmp/${HOME}/known_hosts"] {
+        #[cfg(windows)]
+        let paths = [r"C:\tmp\%h\known_hosts", r"C:\tmp\${HOME}\known_hosts"];
+        #[cfg(not(windows))]
+        let paths = ["/tmp/%h/known_hosts", "/tmp/${HOME}/known_hosts"];
+        for path in paths {
             assert_eq!(
                 known_hosts_option(Path::new(path)),
                 Err(SshConfigError::KnownHostsSnapshotFailed)
