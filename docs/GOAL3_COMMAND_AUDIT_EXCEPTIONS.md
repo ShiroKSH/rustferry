@@ -46,3 +46,13 @@ One read-only local instruction check ran outside the Goal 3 wrapper:
 One wrapped recovery command has only a completion record because disk exhaustion prevented its initial record:
 
 - `./scripts/goal3-run cleanup goal3-target-cache -- zsh -lc 'export CARGO_TARGET_DIR="$PWD/.goal3/target"; cargo clean; df -h .'` — the wrapper's initial audit append failed with `ENOSPC`. The wrapper continued, and Cargo removed 4,665 files (1010.2 MiB) from the wrapper-scoped `.goal3/target` only. Operation `goal3-20260802T033119Z-48415-13727` subsequently appended its success record after space was recovered. The Goal 2 source checkout was not targeted.
+
+## 2026-08-09 recovery
+
+One wrapper invocation used the extension subdirectory as its working directory, so the relative
+wrapper path was not found:
+
+- `./scripts/goal3-run test merged-vscode-marketplace-check -- npm run check` — exited 127 with
+  `no such file or directory: ./scripts/goal3-run`; the wrapper and npm did not run, and no file was
+  changed. The check was immediately rerun from the repository root as the audited
+  `npm --prefix editors/vscode run check` command.

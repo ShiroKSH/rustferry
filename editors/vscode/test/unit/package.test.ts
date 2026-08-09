@@ -47,6 +47,7 @@ describe("extension manifest", () => {
       "SUPPORT.md",
       "dist/extension.js",
       "media/ferry.svg",
+      "media/rustferry-icon.png",
       "media/walkthrough/*.md",
       "snippets/rust.json"
     ]);
