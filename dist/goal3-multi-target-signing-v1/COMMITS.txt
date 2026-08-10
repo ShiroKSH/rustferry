@@ -1,2 +1,0 @@
-a339fffe3d1314a1be10500ede5649b4a4d17c58	2026-08-09T01:06:27+03:00	feat: support multi-target GitHub signing
-b2a2293852bacd9badde12339b85a4d1161a621d	2026-08-09T01:20:27+03:00	docs: record multi-target signing status
