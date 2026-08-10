@@ -25,7 +25,7 @@ keywords = ["rust", "mobile", "android", "ios", "slint"]
 categories = ["command-line-utilities", "development-tools::build-utils", "gui"]
 
 [workspace.dependencies]
-base64 = "0.22.1"
+base64 = "0.23.1"
 camino = { version = "1.1.10", features = ["serde1"] }
 cap-std = "4.0.2"
 clap = { version = "4.5.40", features = ["derive", "env", "wrap_help"] }
@@ -61,7 +61,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
-zip = { version = "6.0.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
