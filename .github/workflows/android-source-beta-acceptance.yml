@@ -1,0 +1,331 @@
+name: Android source beta acceptance
+
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_SHA: ed45328d6fc375e81b20ab10c1014c4b8d224a85
+  NDK_VERSION: 29.0.14206865
+  ANDROID_PLATFORM: android-35
+  BUILD_TOOLS_VERSION: 35.0.0
+
+jobs:
+  android-source-beta:
+    name: Ubuntu Android source acceptance
+    if: github.head_ref == 'release/android-beta-landing'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Inspect triggering head commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Permit exactly one APK attempt
+        id: gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          changed="$(git diff-tree --no-commit-id --name-only -r HEAD)"
+          if test "$changed" = '.github/workflows/android-source-beta-acceptance.yml'; then
+            echo 'run=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'run=false' >> "$GITHUB_OUTPUT"
+            echo 'No APK build: the triggering commit is not the acceptance-workflow commit.'
+          fi
+      - name: Check out exact accepted source
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - name: Verify exact source revision
+        if: steps.gate.outputs.run == 'true'
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - name: Set up Java
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Set up Android SDK
+        if: steps.gate.outputs.run == 'true'
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
+        with:
+          packages: ""
+          accept-android-sdk-licenses: "true"
+          log-accepted-android-sdk-licenses: "false"
+      - name: Install pinned Android components
+        if: steps.gate.outputs.run == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            "platforms;$ANDROID_PLATFORM" \
+            "build-tools;$BUILD_TOOLS_VERSION" \
+            "ndk;$NDK_VERSION" < /dev/null
+          ndk="$ANDROID_SDK_ROOT/ndk/$NDK_VERSION"
+          test -s "$ndk/source.properties"
+          test -d "$ndk/toolchains/llvm/prebuilt/linux-x86_64"
+          {
+            echo "ANDROID_NDK=$ndk"
+            echo "ANDROID_NDK_ROOT=$ndk"
+            echo "ANDROID_NDK_HOME=$ndk"
+          } >> "$GITHUB_ENV"
+      - name: Set up Rust
+        if: steps.gate.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+          targets: aarch64-linux-android
+      - name: Restore Rust cache
+        if: steps.gate.outputs.run == 'true'
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-bin: "false"
+      - name: Build release CLI
+        if: steps.gate.outputs.run == 'true'
+        run: cargo build -p cargo-ferry --release
+      - name: Generate path-runtime Android starter
+        if: steps.gate.outputs.run == 'true'
+        id: starter
+        shell: bash
+        run: |
+          set -euo pipefail
+          cli="$GITHUB_WORKSPACE/target/release/cargo-ferry"
+          metadata="$RUNNER_TEMP/workspace-metadata.json"
+          cargo metadata --locked --no-deps --format-version 1 > "$metadata"
+          runtime_manifest="$(jq -er \
+            '.packages[] | select(.name == "rustferry") | .manifest_path' \
+            "$metadata")"
+          runtime="$(dirname "$runtime_manifest")"
+          test "$runtime" = "$GITHUB_WORKSPACE/crates/rustferry"
+          project="$RUNNER_TEMP/rustferry-android-ubuntu-acceptance"
+          new_result="$RUNNER_TEMP/android-new.json"
+          "$cli" new rustferry-android-ubuntu-acceptance \
+            --id org.rustferry.ubuntuacceptance \
+            --parent "$RUNNER_TEMP" \
+            --platform android \
+            --runtime-source path \
+            --runtime-path "$runtime" \
+            --no-git \
+            --no-check \
+            --json > "$new_result"
+          jq -e '.status == "ok"' "$new_result" > /dev/null
+          test -s "$project/Cargo.toml"
+          test -s "$project/Cargo.lock"
+          test -s "$project/ferry.toml"
+          test -d "$project/src"
+          test -d "$project/assets"
+          project_metadata="$RUNNER_TEMP/project-metadata.json"
+          cargo metadata --locked --no-deps --format-version 1 \
+            --manifest-path "$project/Cargo.toml" > "$project_metadata"
+          test "$(jq -er \
+            '.packages[] | select(.name == "rustferry-android-ubuntu-acceptance")
+             | .dependencies[] | select(.name == "rustferry") | .path' \
+            "$project_metadata")" = "$runtime"
+          forbidden="$(find "$project" -path "$project/target" -prune -o \
+            \( -type f \( -name 'build.gradle' -o -name 'build.gradle.*' \
+              -o -name 'settings.gradle' -o -name 'settings.gradle.*' \
+              -o -name 'gradlew' -o -name '*.kt' -o -name '*.java' \) \
+              -o -type d \( -name gradle -o -name android \) \) \
+            -print -quit)"
+          test -z "$forbidden"
+          echo "project=$project" >> "$GITHUB_OUTPUT"
+          echo "cli=$cli" >> "$GITHUB_OUTPUT"
+      - name: Run Android doctor
+        if: steps.gate.outputs.run == 'true'
+        id: doctor
+        shell: bash
+        run: |
+          set -euo pipefail
+          result="$RUNNER_TEMP/android-doctor.json"
+          (cd "${{ steps.starter.outputs.project }}" && \
+            "${{ steps.starter.outputs.cli }}" doctor --json) > "$result"
+          jq -e '
+            .status == "ok" and
+            .data.ready_for_android_build == true and
+            .data.android.ready_for_build == true
+          ' "$result" > /dev/null
+          echo "result=$result" >> "$GITHUB_OUTPUT"
+      - name: Build exactly one release APK
+        if: steps.gate.outputs.run == 'true'
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          project="${{ steps.starter.outputs.project }}"
+          cli="${{ steps.starter.outputs.cli }}"
+          result="$RUNNER_TEMP/android-build.json"
+          raw_log="$RUNNER_TEMP/android-build.raw.log"
+          sanitized_log="$RUNNER_TEMP/android-build.log"
+          set +e
+          "$cli" build android --release --project-dir "$project" --json \
+            > "$result" 2> "$raw_log"
+          status=$?
+          set -e
+          python3 - "$raw_log" "$sanitized_log" <<'PY'
+          from pathlib import Path
+          import os
+          import sys
+
+          source = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+          for name, replacement in (
+              ("GITHUB_WORKSPACE", "$GITHUB_WORKSPACE"),
+              ("RUNNER_TEMP", "$RUNNER_TEMP"),
+              ("HOME", "$HOME"),
+          ):
+              value = os.environ.get(name)
+              if value:
+                  source = source.replace(value, replacement)
+          Path(sys.argv[2]).write_text(source, encoding="utf-8")
+          PY
+          if test "$status" -ne 0; then
+            cat "$result"
+            cat "$sanitized_log"
+            exit "$status"
+          fi
+          jq -e '.status == "ok" and .data.validated == true' "$result" > /dev/null
+          echo "result=$result" >> "$GITHUB_OUTPUT"
+          echo "log=$sanitized_log" >> "$GITHUB_OUTPUT"
+      - name: Independently validate APK and write evidence
+        if: steps.gate.outputs.run == 'true'
+        id: evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          project="${{ steps.starter.outputs.project }}"
+          result="${{ steps.build.outputs.result }}"
+          artifact="$(jq -er '.data.artifact' "$result")"
+          case "$artifact" in
+            "$project"/target/ferry/*) ;;
+            *) echo "Unexpected artifact path: $artifact" >&2; exit 1 ;;
+          esac
+          test -s "$artifact"
+          unzip -tq "$artifact"
+          entries="$RUNNER_TEMP/apk-entries.txt"
+          unzip -Z1 "$artifact" > "$entries"
+          grep -Fx 'AndroidManifest.xml' "$entries"
+          grep -Fx 'classes.dex' "$entries"
+          grep -Fx 'resources.arsc' "$entries"
+          grep -E '^lib/arm64-v8a/lib.*\.so$' "$entries"
+          grep -E '^res/mipmap-.*ferry_icon\.png$' "$entries"
+          build_tools="$ANDROID_SDK_ROOT/build-tools/$BUILD_TOOLS_VERSION"
+          signature="$RUNNER_TEMP/apk-signature.txt"
+          "$build_tools/apksigner" verify --verbose --print-certs "$artifact" \
+            > "$signature"
+          grep -E '^Verified using v2 scheme .*: true$' "$signature"
+          grep -E '^Verified using v3 scheme .*: true$' "$signature"
+          "$build_tools/zipalign" -c -P 16 4 "$artifact"
+          badging="$RUNNER_TEMP/apk-badging.txt"
+          "$build_tools/aapt2" dump badging "$artifact" > "$badging"
+          package="$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" "$badging")"
+          version_code="$(sed -n "s/^package:.* versionCode='\([^']*\)'.*/\1/p" "$badging")"
+          version_name="$(sed -n "s/^package:.* versionName='\([^']*\)'.*/\1/p" "$badging")"
+          min_sdk="$(sed -n "s/^sdkVersion:'\([^']*\)'.*/\1/p" "$badging")"
+          target_sdk="$(sed -n "s/^targetSdkVersion:'\([^']*\)'.*/\1/p" "$badging")"
+          launcher="$(sed -n \
+            "s/^launchable-activity: name='\([^']*\)'.*/\1/p" "$badging")"
+          test "$package" = 'org.rustferry.ubuntuacceptance'
+          test "$min_sdk" = '26'
+          test "$target_sdk" = '35'
+          test "$launcher" = 'org.rustferry.bridge.FerryActivity'
+          abi="$(sed -n 's#^lib/\([^/]*\)/.*\.so$#\1#p' "$entries" \
+            | LC_ALL=C sort -u | paste -sd, -)"
+          test "$abi" = 'arm64-v8a'
+          certificate="$(sed -n \
+            's/^Signer #1 certificate SHA-256 digest: //p' "$signature")"
+          test -n "$certificate"
+          apk_sha="$(sha256sum "$artifact" | cut -d' ' -f1)"
+          apk_size="$(stat -c '%s' "$artifact")"
+          apk_name="$(basename "$artifact")"
+          out="$RUNNER_TEMP/android-source-beta-acceptance"
+          mkdir -p "$out"
+          cp "$artifact" "$out/$apk_name"
+          evidence_json="$out/android-acceptance.json"
+          evidence_md="$out/android-acceptance.md"
+          cp "${{ steps.build.outputs.log }}" "$out/android-build.log"
+          ndk_revision="$(sed -n 's/^Pkg.Revision[[:space:]]*=[[:space:]]*//p' \
+            "$ANDROID_NDK/source.properties")"
+          rust_version="$(rustc --version)"
+          cli_version="$("${{ steps.starter.outputs.cli }}" --version)"
+          runner_image="${ImageOS:-ubuntu}-${ImageVersion:-unknown}"
+          jq -n \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg runner_os "$RUNNER_OS" \
+            --arg runner_image "$runner_image" \
+            --arg rust_version "$rust_version" \
+            --arg cargo_ferry_version "$cli_version" \
+            --arg android_sdk "$ANDROID_PLATFORM;build-tools=$BUILD_TOOLS_VERSION" \
+            --arg ndk_revision "$ndk_revision" \
+            --arg rust_target 'aarch64-linux-android' \
+            --arg runtime_source_mode 'local workspace path' \
+            --arg doctor_result 'ready_for_android_build=true' \
+            --arg build_profile 'release' \
+            --arg apk_filename "$apk_name" \
+            --argjson apk_size "$apk_size" \
+            --arg apk_sha256 "$apk_sha" \
+            --arg package_id "$package" \
+            --arg version_code "$version_code" \
+            --arg version_name "$version_name" \
+            --arg min_sdk "$min_sdk" \
+            --arg target_sdk "$target_sdk" \
+            --arg abi "$abi" \
+            --arg launcher "$launcher" \
+            --arg signature 'v2=true;v3=true' \
+            --arg certificate_sha256 "$certificate" \
+            --arg alignment 'passed' \
+            --argjson gradle_absent true \
+            '{source_sha:$source_sha,runner_os:$runner_os,runner_image:$runner_image,
+              rust_version:$rust_version,cargo_ferry_version:$cargo_ferry_version,
+              android_sdk:$android_sdk,ndk_revision:$ndk_revision,
+              rust_target:$rust_target,runtime_source_mode:$runtime_source_mode,
+              doctor_result:$doctor_result,build_profile:$build_profile,
+              apk_filename:$apk_filename,apk_size:$apk_size,apk_sha256:$apk_sha256,
+              package_id:$package_id,version_code:$version_code,
+              version_name:$version_name,min_sdk:$min_sdk,target_sdk:$target_sdk,
+              abi:$abi,launcher:$launcher,signature:$signature,
+              certificate_sha256:$certificate_sha256,alignment:$alignment,
+              gradle_absent:$gradle_absent}' > "$evidence_json"
+          cat > "$evidence_md" <<EOF
+          # Android source beta acceptance
+
+          - Source: \`$SOURCE_SHA\`
+          - Runner: \`$RUNNER_OS\` / \`$runner_image\`
+          - Rust: \`$rust_version\`
+          - cargo-ferry: \`$cli_version\`
+          - NDK: \`$ndk_revision\`
+          - Target / ABI: \`aarch64-linux-android\` / \`$abi\`
+          - Doctor: \`ready_for_android_build=true\`
+          - Profile: \`release\`
+          - APK: \`$apk_name\` ($apk_size bytes)
+          - SHA-256: \`$apk_sha\`
+          - Package: \`$package\`
+          - Version: \`$version_name\` (\`$version_code\`)
+          - SDK: min \`$min_sdk\`, target \`$target_sdk\`
+          - Launcher: \`$launcher\`
+          - Signature: v2/v3 verified; certificate SHA-256 \`$certificate\`
+          - Alignment: passed
+          - Gradle/Kotlin/user Java: absent
+          - Install, launch, and device runtime: not validated
+          EOF
+          (
+            cd "$out"
+            sha256sum "$apk_name" android-acceptance.json \
+              android-acceptance.md android-build.log > checksums.txt
+          )
+          echo "directory=$out" >> "$GITHUB_OUTPUT"
+          echo "apk=$out/$apk_name" >> "$GITHUB_OUTPUT"
+      - name: Upload APK and acceptance evidence
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: android-source-beta-acceptance-ed45328
+          path: ${{ steps.evidence.outputs.directory }}/*
+          if-no-files-found: error
+          retention-days: 14
