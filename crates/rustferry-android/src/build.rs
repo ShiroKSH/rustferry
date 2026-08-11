@@ -738,15 +738,76 @@ fn javac_command(
         "8".to_owned(),
         "-Xlint:-options".to_owned(),
         "-bootclasspath".to_owned(),
-        toolchain.platform.android_jar.to_string(),
+        java_tool_path_arg(&toolchain.platform.android_jar)?,
         "-d".to_owned(),
-        output.to_string(),
+        java_tool_path_arg(output)?,
     ];
-    command
-        .args
-        .extend(generated.java_sources.iter().map(ToString::to_string));
+    command.args.extend(
+        generated
+            .java_sources
+            .iter()
+            .map(|path| java_tool_path_arg(path))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
     command.timeout = timeout;
     Ok(command)
+}
+
+fn java_tool_path_arg(path: &Utf8Path) -> Result<String, AndroidError> {
+    let value = path.as_str();
+    if value.chars().any(char::is_control) {
+        return Err(AndroidError::InvalidJavaToolPath {
+            reason: "control characters are not allowed",
+        });
+    }
+
+    #[cfg(windows)]
+    {
+        if strip_ascii_prefix(value, r"\\.\").is_some() {
+            return Err(AndroidError::InvalidJavaToolPath {
+                reason: "Windows device namespaces are not supported",
+            });
+        }
+        if let Some(verbatim) = strip_ascii_prefix(value, r"\\?\") {
+            if let Some(unc) = strip_ascii_prefix(verbatim, r"UNC\") {
+                let mut components = unc.split('\\');
+                if components.next().is_some_and(|part| !part.is_empty())
+                    && components.next().is_some_and(|part| !part.is_empty())
+                {
+                    return Ok(format!(r"\\{unc}"));
+                }
+                return Err(AndroidError::InvalidJavaToolPath {
+                    reason: "verbatim UNC paths require a server and share",
+                });
+            }
+            let bytes = verbatim.as_bytes();
+            if bytes.len() >= 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && bytes[2] == b'\\'
+            {
+                return Ok(verbatim.to_owned());
+            }
+            return Err(AndroidError::InvalidJavaToolPath {
+                reason: "unsupported Windows verbatim namespace",
+            });
+        }
+    }
+
+    if !path.is_absolute() {
+        return Err(AndroidError::InvalidJavaToolPath {
+            reason: "path must be absolute",
+        });
+    }
+    Ok(value.to_owned())
+}
+
+#[cfg(windows)]
+fn strip_ascii_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    value
+        .get(..prefix.len())
+        .filter(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        .map(|_| &value[prefix.len()..])
 }
 
 fn compile_bridge_classes(
@@ -891,11 +952,16 @@ fn d8_command(
         "--min-api".to_owned(),
         request.config.android.min_sdk.to_string(),
         "--lib".to_owned(),
-        toolchain.platform.android_jar.to_string(),
+        java_tool_path_arg(&toolchain.platform.android_jar)?,
         "--output".to_owned(),
-        output.to_string(),
+        java_tool_path_arg(output)?,
     ];
-    command.args.extend(inputs.iter().map(ToString::to_string));
+    command.args.extend(
+        inputs
+            .iter()
+            .map(|path| java_tool_path_arg(path))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
     Ok(command)
 }
 
@@ -1509,6 +1575,128 @@ mod tests {
         dex[STRING_DATA + 1..STRING_DATA + 1 + descriptor.len()]
             .copy_from_slice(descriptor.as_bytes());
         dex
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn java_tool_path_normalizes_verbatim_drive_unc_and_unicode_paths() {
+        assert_eq!(
+            java_tool_path_arg(Utf8Path::new(r"\\?\C:\work\generated\App.java")).unwrap(),
+            r"C:\work\generated\App.java"
+        );
+        assert_eq!(
+            java_tool_path_arg(Utf8Path::new(r"\\?\C:\work\classes")).unwrap(),
+            r"C:\work\classes"
+        );
+        assert_eq!(
+            java_tool_path_arg(Utf8Path::new(
+                r"\\?\UNC\server\share\work\App.java"
+            ))
+            .unwrap(),
+            r"\\server\share\work\App.java"
+        );
+        assert_eq!(
+            java_tool_path_arg(Utf8Path::new(r"C:\work\обычный\App.java")).unwrap(),
+            r"C:\work\обычный\App.java"
+        );
+        assert_eq!(
+            java_tool_path_arg(Utf8Path::new(r"\\?\C:\работа\App.java")).unwrap(),
+            r"C:\работа\App.java"
+        );
+    }
+
+    #[test]
+    fn java_tool_path_rejects_relative_and_control_character_paths() {
+        for path in ["relative/App.java", "C:/work/App.java\nother"] {
+            assert!(matches!(
+                java_tool_path_arg(Utf8Path::new(path)),
+                Err(AndroidError::InvalidJavaToolPath { .. })
+            ));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn java_tool_path_rejects_device_and_unsupported_verbatim_namespaces() {
+        for path in [
+            r"\\.\C:\work\App.java",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1\App.java",
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\App.java",
+        ] {
+            assert!(matches!(
+                java_tool_path_arg(Utf8Path::new(path)),
+                Err(AndroidError::InvalidJavaToolPath { .. })
+            ));
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn java_tool_path_preserves_absolute_non_windows_paths() {
+        assert_eq!(
+            java_tool_path_arg(Utf8Path::new("/tmp/работа/App.java")).unwrap(),
+            "/tmp/работа/App.java"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn java_tool_path_normalizes_javac_command_plan() {
+        let temp = TempDir::new().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_owned()).unwrap();
+        let mut toolchain = fixture_toolchain(&root);
+        toolchain.platform.android_jar = r"\\?\C:\Android\platforms\android-36\android.jar".into();
+        let generated = GeneratedAndroidFiles {
+            root: r"\\?\C:\work\generated".into(),
+            manifest: r"\\?\C:\work\generated\AndroidManifest.xml".into(),
+            resources: r"\\?\C:\work\generated\res".into(),
+            java_sources: vec![r"\\?\C:\work\generated\FerryActivity.java".into()],
+        };
+        let command = javac_command(
+            &toolchain,
+            &generated,
+            Utf8Path::new(r"\\?\C:\work\classes"),
+            &root,
+            crate::DEFAULT_COMMAND_TIMEOUT,
+        )
+        .unwrap();
+
+        assert!(command.args.iter().all(|argument| !argument.contains(r"\\?\")));
+        assert!(command.args.contains(&r"C:\Android\platforms\android-36\android.jar".to_owned()));
+        assert!(command.args.contains(&r"C:\work\classes".to_owned()));
+        assert!(command.args.contains(&r"C:\work\generated\FerryActivity.java".to_owned()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn java_tool_path_normalizes_d8_command_plan() {
+        let temp = TempDir::new().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_owned()).unwrap();
+        let mut toolchain = fixture_toolchain(&root);
+        toolchain.platform.android_jar = r"\\?\C:\Android\platforms\android-36\android.jar".into();
+        let request = AndroidBuildRequest::new(
+            &root,
+            FerryConfig::starter("App", "com.example.app"),
+            "app",
+            "app",
+        );
+        let command = d8_command(
+            &toolchain,
+            &request,
+            &[r"\\?\C:\work\classes".into(), r"\\?\C:\work\dependency.jar".into()],
+            Utf8Path::new(r"\\?\C:\work\dex"),
+        )
+        .unwrap();
+
+        assert!(command.args.iter().all(|argument| !argument.contains(r"\\?\")));
+        for expected in [
+            r"C:\Android\platforms\android-36\android.jar",
+            r"C:\work\classes",
+            r"C:\work\dependency.jar",
+            r"C:\work\dex",
+        ] {
+            assert!(command.args.contains(&expected.to_owned()));
+        }
     }
 
     #[test]

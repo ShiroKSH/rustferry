@@ -15,6 +15,12 @@ pub enum AndroidError {
     /// A request value cannot safely be used by the build pipeline.
     #[error("invalid Android build request: {0}")]
     InvalidRequest(String),
+    /// A filesystem path cannot safely cross a Java tool process boundary.
+    #[error("invalid Java tool path: {reason}")]
+    InvalidJavaToolPath {
+        /// Secret-free reason for rejecting the path.
+        reason: &'static str,
+    },
     /// `ferry.toml` failed semantic validation.
     #[error("invalid RustFerry configuration: {0}")]
     InvalidConfig(String),
