@@ -7,7 +7,7 @@ Commands work as a Cargo subcommand (`cargo ferry ...`) or direct binary (`cargo
 - `--verbose`: external-command/discovery detail in human mode; conflicts with `--quiet`, `--json`, and `--json-stream`; secrets must be redacted.
 - `--quiet`: suppress successful human output; conflicts with `--verbose`, `--json`, and `--json-stream`.
 - `--json`: schema-versioned JSON without terminal styling; conflicts with human verbosity flags and `--json-stream`. Current output schema is version 1.
-- `--json-stream`: protocol-v1 NDJSON for `ide` operations, `devices`, and live `logs`; conflicts with human verbosity flags and `--json`. Other commands reject it and use `--json` instead.
+- `--json-stream`: protocol-v1 NDJSON for `ide` operations, `devices`, live application `logs`, and `jobs logs`; conflicts with human verbosity flags and `--json`. Other commands reject it and use `--json` instead.
 - `--dry-run`: validate and show intended mutations where the command supports planning.
 
 ## Commands
@@ -25,20 +25,29 @@ Commands work as a Cargo subcommand (`cargo ferry ...`) or direct binary (`cargo
 | `build ios --device --team <id>` | Implemented official arm64/Xcode development-signing build; provisioning updates remain explicit; no identity, Team, profile, or signed artifact was available for artifact validation, and no device was available for device validation |
 | `build ios --device` | Uses GitHub automatically on Linux/Windows; remains local by default on macOS; an explicit `--remote` always wins |
 | `build iphone --unsigned` | Remote-only alias; defaults to GitHub when `--remote` is omitted, submits an exact source revision, then rehashes, inspects, and atomically publishes the downloaded unsigned physical-device archive |
+| `build iphone --remote github --snapshot --unsigned` | Explicit public GitSnapshot of the canonical current project; dry-run is zero-write, interactive execution asks `[y/N]`, and JSON/non-interactive execution requires `--yes` |
 | `build iphone --team <id>` | Defaults to protected GitHub Apple Development signing when `--remote` is omitted; implemented and synthetically tested, but no real signed IPA acceptance has run |
 | `remote setup github` | Validate source/execution Git remote identities, generate the trusted workflow, and persist ignored provider metadata; signing requires a distinct private execution repository |
-| `remote doctor github` | Read-only provider, repository, workflow, and signed-readiness checks |
+| `remote doctor github` | Read-only provider, repository, and workflow health; use `signing doctor --remote github` for protected-signing readiness |
 | `remote add ssh-mac <name>` | Persist a create-only named endpoint after validating an exact dedicated `known_hosts` entry, pinned host-key fingerprint, and optional private-key path reference |
 | `remote doctor <name>` | Run the fixed-command SSH worker handshake and host doctor; readiness requires snapshot/unsigned/XCArchive/events/cancellation/download/cleanup and retention zero, but is not live-build evidence |
 | `build iphone --remote <name> --unsigned` | Create a deterministic snapshot, use fixed SSH session v1, stream ordered events, independently verify and create-only publish the unsigned XCArchive, acknowledge it, then require non-retaining cleanup |
 | `remote bundle inspect` | Print the deterministic snapshot manifest, path dependencies, rejected-symlink set, excluded sensitive roots, sizes, executable bits, and SHA-256 digests |
 | `remote bundle create` | Create a no-clobber deterministic source ZIP and separate versioned descriptor; global `--dry-run` writes neither |
 | `remote bundle verify` | Treat ZIP and descriptor as untrusted, perform bounded extraction, and require exact manifest/archive integrity |
+| `jobs list [--limit <1..1000>]` | List bounded newest private project-bound durable jobs |
+| `jobs show <job-id>` / `jobs artifacts <job-id>` | Show one secret-free durable job or its recorded artifact metadata |
+| `jobs logs <job-id>` | Refresh and read bounded sanitized durable lifecycle/worker events; `--follow`, `--since`, `--phase`, and create-new `--output` are supported |
+| `jobs cancel <job-id>` | Persist exact owned cancellation intent before at most one provider request, then reconcile terminal state and cleanup across restarts |
+| `jobs retry <job-id>` | Create/resume one exact-source child; retrying a fully evidenced successful parent requires `--force`; current-source recapture requires `--use-current-source --yes` |
+| `jobs prune --before <unix-ms>` | Plan or, with `--yes`, remove complete terminal retry lineages only after local artifact removal and retained-source release authorization |
+| `artifact list\|show\|inspect\|verify\|reveal\|remove` | Manage durable local artifact evidence; bare IDs must resolve uniquely, exact removal is Windows-only and requires `--yes`, and local removal never means remote Actions deletion |
 | `devices [--platform all\|android\|ios]` | Typed ADB/simctl/devicectl inventory; `--watch --json-stream` emits the initial snapshot followed by polling deltas until cancelled |
 | `install android\|ios` | Build, independently validate, select an exact compatible device, then install |
 | `run android\|ios` | Build → validate → install → launch; `--logs` adds one bounded filtered snapshot where standalone logging is supported |
 | `logs android\|ios` | Finite application-filtered history by default; `--json-stream` runs the live protocol stream until cancellation or platform-tool exit |
 | `signing teams` | Read-only Apple Development identity/Team inventory |
+| `signing doctor --remote github` | Metadata-only signing readiness; non-ready returns `github_signing_not_ready` without reading secret values |
 | `signing setup manual` | Validate one PKCS#12 plus one profile per application/extension target outside Git, check protected GitHub Environment policy, and upload secrets only after dry-run review and confirmation |
 | `assets check\|generate` | Validate release sources; generate fingerprinted Android densities and an iOS asset catalog |
 | `clean [android\|ios\|generated]` | Remove only selected generated output below `target/ferry/` |
@@ -51,6 +60,14 @@ Commands work as a Cargo subcommand (`cargo ferry ...`) or direct binary (`cargo
 | `examples` | List bundled template choices and generation commands |
 | `docs [topic]` | Show the source-tree page when available; otherwise print packaged embedded content |
 | `completions <shell>` | Generate shell completion definitions |
+| `ide <operation>` | Direct protocol-v1 JSON/NDJSON for editor integrations, including durable jobs/log pages/cancel/retry/artifacts, snapshot preview/submit, and signing readiness |
+
+Goal 3 IDE-v1 operations are `jobs-list`, `jobs-show`, `jobs-artifacts`, `jobs-logs`,
+`jobs-logs-page`, `jobs-cancel`, `jobs-retry`, `jobs-artifact-verify`,
+`jobs-artifact-reveal`, `jobs-artifact-remove`, `remote-build-preview`,
+`remote-build-submit`, and `signing-readiness`. Legacy `jobs-logs` remains a finite timestamp
+snapshot; the UI uses decimal-cursor `jobs-logs-page`. Preview and submit are capability-co-gated,
+and submit accepts one bounded consent object on standard input.
 
 Capabilities accepted by `add`/`remove`: `network`, `notifications`, `storage`, `haptics`, `clipboard`, `deep-links`, `share`, `widget`, and `live-activity`.
 
@@ -76,6 +93,15 @@ downgraded. Named SSH endpoints are always selected explicitly; omission never f
 GitHub to a configured SSH endpoint. The returned XCArchive ZIP is not an IPA and is not installable
 on a stock iPhone. Unsigned remote archives are published at
 `target/ferry/ios/device/<debug|release>/<Product>-unsigned.xcarchive.zip`.
+
+GitHub GitSnapshot is also unsigned-only and explicit. Preview binds the invocation, exact source
+manifest, public repository/ref, retention, and side effects; archive construction occurs only after
+consent. The caller branch, worktree, index, remotes, and hooks are unchanged. Public Git objects may
+remain recoverable after RustFerry deletes its temporary ref.
+
+Durable job logs use `log_scope=durable_sanitized_job_events`. Raw provider payloads and raw worker
+bytes are never stored. `provider_full_logs=true` requires an exact completion proof for the current
+run attempt. Local artifact removal and job pruning do not delete GitHub Actions artifacts.
 
 ## JSON failures
 

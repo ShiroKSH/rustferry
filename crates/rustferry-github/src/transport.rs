@@ -9,9 +9,8 @@ use std::{
     collections::BTreeSet,
     error::Error,
     ffi::{OsStr, OsString},
-    fmt,
-    fs::{self, OpenOptions},
-    io::{self, Read, Write},
+    fmt, fs,
+    io::{Read, Write},
     path::{Component, Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
@@ -22,38 +21,95 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(not(windows))]
+use std::fs::OpenOptions;
+#[cfg(any(not(windows), feature = "secure-job-log-http"))]
+use std::io;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt as _;
+#[cfg(windows)]
+use std::os::windows::io::AsHandle as _;
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(windows)]
+use rustferry_core::windows_private_directory::{
+    PrivateDirectoryCleanupStatus, PrivateDirectoryError, PrivateDirectoryErrorKind,
+    create_private_file as create_windows_private_file,
+    remove_private_file_handle as remove_windows_private_file_handle,
+    verify_private_file_handle as verify_windows_private_file_handle,
+};
 use rustferry_remote::SecretBytes;
 
+#[cfg(feature = "secure-job-log-http")]
+use crate::job_logs::{
+    GithubJobLogAccept, GithubJobLogAuthorization, GithubJobLogHttpBody, GithubJobLogHttpClient,
+    GithubJobLogHttpError, GithubJobLogHttpRequest, GithubJobLogHttpResponse,
+};
 use crate::workflow::{ProtectedEnvironment, SecretName, TemporaryBranchNamespace};
 
 const GITHUB_HOST: &str = "github.com";
 const API_ACCEPT: &str = "Accept: application/vnd.github+json";
 const API_VERSION: &str = "X-GitHub-Api-Version: 2022-11-28";
+const WORKFLOW_DISPATCH_API_VERSION: &str = "2026-03-10";
+const WORKFLOW_DISPATCH_API_VERSION_HEADER: &str = "X-GitHub-Api-Version: 2026-03-10";
+const WORKFLOW_DISPATCH_ACCEPT: &str = "application/vnd.github+json";
+const WORKFLOW_DISPATCH_CONTENT_TYPE: &str = "application/json";
+const MAX_WORKFLOW_DISPATCH_BODY_BYTES: usize = 2 * 1024;
+const MAX_WORKFLOW_DISPATCH_RESPONSE_BYTES: usize = 4 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const MAX_SECRET_SET_OUTPUT_BYTES: usize = 4 * 1024;
+#[cfg(feature = "secure-job-log-http")]
+const MAX_GITHUB_TOKEN_BYTES: usize = 4 * 1024;
+#[cfg(feature = "secure-job-log-http")]
+const GH_AUTH_TOKEN_OUTPUT_BYTES: usize = MAX_GITHUB_TOKEN_BYTES + 2;
+#[cfg(feature = "secure-job-log-http")]
+const GH_AUTH_TOKEN_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(feature = "secure-job-log-http")]
+const JOB_LOG_API_ORIGIN: &str = "https://api.github.com";
+#[cfg(feature = "secure-job-log-http")]
+const JOB_LOG_API_ACCEPT: &str = "application/vnd.github+json";
+#[cfg(feature = "secure-job-log-http")]
+const JOB_LOG_PLAINTEXT_ACCEPT: &str = "text/plain";
+#[cfg(feature = "secure-job-log-http")]
+const JOB_LOG_API_VERSION: &str = "2026-03-10";
+#[cfg(feature = "secure-job-log-http")]
+const MAX_JOB_LOG_RESPONSE_HEADER_BYTES: usize = 8 * 1024;
+#[cfg(feature = "secure-job-log-http")]
+const MAX_JOB_LOG_HTTP_CHUNK_BYTES: usize = 64 * 1024 + 1;
+#[cfg(feature = "secure-job-log-http")]
+const MAX_JOB_LOG_HTTP_TIMEOUT: Duration = Duration::from_hours(1);
+#[cfg(feature = "secure-job-log-http")]
+const _: () = assert!(
+    (log::STATIC_MAX_LEVEL as usize) <= (log::LevelFilter::Debug as usize),
+    "secure-job-log-http must compile out URL-bearing ureq TRACE diagnostics"
+);
 const PROCESS_CLEANUP_GRACE: Duration = Duration::from_secs(1);
+const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_API_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_PAGES: u16 = 100;
 const MAX_POLL_ATTEMPTS: u16 = 2_000;
 const MAX_DEPLOYMENT_POLICY_NAME_BYTES: usize = 255;
+const MAX_WORKFLOW_DISPATCH_RUN_NAME_BYTES: usize = 240;
+const WORKFLOW_DISPATCH_RUN_NAME_PREFIX: &str = "rustferry-v1|";
 const ZIP_END_RECORD_MINIMUM_BYTES: usize = 22;
 const ZIP_END_RECORD_SEARCH_BYTES: usize = 65_557;
 
 /// Maximum value accepted by GitHub Actions for one Environment secret.
 pub const MAX_ENVIRONMENT_SECRET_BYTES: usize = 48 * 1024;
 
-const USER_QUERY: &str = ".login";
+const USER_QUERY: &str = "[.id,(.login | @base64)] | @tsv";
 const INSTALLATION_REPOSITORY_QUERY: &str = ".repositories[] | [.id,(.full_name | @base64)] | @tsv";
 const REPOSITORY_QUERY: &str =
     "[.id,.full_name,.private,.archived,.disabled,.default_branch] | @tsv";
+const ACTIONS_PERMISSIONS_QUERY: &str = ".enabled";
+const WORKFLOW_QUERY: &str = "[.id,(.path | @base64),.state] | @tsv";
 const RUN_LIST_QUERY: &str = ".workflow_runs[] | [.id,.workflow_id,(.path | @base64),.run_number,.run_attempt,.head_sha,(.head_branch | @base64),.event,.status,(.conclusion // \"\")] | @tsv";
 const RUN_QUERY: &str = "[.id,.workflow_id,(.path | @base64),.run_number,.run_attempt,.head_sha,(.head_branch | @base64),.event,.status,(.conclusion // \"\")] | @tsv";
+const WORKFLOW_DISPATCH_RUN_LIST_QUERY: &str = ".workflow_runs[] | [.id,.workflow_id,(.path | @base64),.run_number,.run_attempt,.head_sha,(.head_branch | @base64),.event,.status,(.conclusion // \"\"),(.display_title | @base64)] | @tsv";
+const WORKFLOW_DISPATCH_RUN_QUERY: &str = "[.id,.workflow_id,(.path | @base64),.run_number,.run_attempt,.head_sha,(.head_branch | @base64),.event,.status,(.conclusion // \"\"),(.display_title | @base64)] | @tsv";
 const ARTIFACT_LIST_QUERY: &str =
     ".artifacts[] | [.id,(.name | @base64),.size_in_bytes,.expired,(.digest // \"\")] | @tsv";
 const ENVIRONMENT_QUERY: &str = "[(.name | @base64),.deployment_branch_policy.protected_branches,.deployment_branch_policy.custom_branch_policies,([.protection_rules[]? | select(.type == \"required_reviewers\") | .reviewers[]?] | length > 0)] | @tsv";
@@ -525,6 +581,7 @@ pub struct GhRequest {
     silent: bool,
     output_limit: usize,
     timeout: Duration,
+    api_version: &'static str,
 }
 
 impl GhRequest {
@@ -548,6 +605,11 @@ impl GhRequest {
         self.timeout
     }
 
+    /// Exact `X-GitHub-Api-Version` header planned for this request.
+    pub const fn api_version_header(&self) -> &'static str {
+        self.api_version
+    }
+
     /// Render fixed argv entries for `gh`; no shell parsing is involved.
     pub fn arguments(&self) -> Vec<OsString> {
         let mut arguments = vec![
@@ -559,7 +621,7 @@ impl GhRequest {
             OsString::from("-H"),
             OsString::from(API_ACCEPT),
             OsString::from("-H"),
-            OsString::from(API_VERSION),
+            OsString::from(self.api_version),
             OsString::from(&self.endpoint),
         ];
         for (name, value) in &self.fields {
@@ -711,6 +773,21 @@ pub trait GhRunner {
     ///
     /// Returns only redacted process failure categories.
     fn execute(&mut self, request: &GhRequest) -> Result<Vec<u8>, GhExecutionError>;
+
+    /// Clone a lazy, credential-owning factory for one direct workflow dispatch client.
+    ///
+    /// Implementations must not read credentials or access the network until the returned
+    /// factory is consumed. Callers consume it before publishing a temporary ref or committing a
+    /// durable dispatch intent, so deterministic credential failures cannot strand that intent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted authentication or client-construction failure.
+    fn workflow_dispatch_client_factory(
+        &self,
+    ) -> Result<Box<dyn GithubWorkflowDispatchHttpClientFactory>, GhExecutionError> {
+        Err(GhExecutionError::AuthenticationUnavailable)
+    }
 }
 
 /// Injectable executor for one fixed-argv Environment-secret write.
@@ -793,6 +870,8 @@ pub struct GhProcessRunner {
     authentication: GhAuthentication,
     configuration_directory: PathBuf,
     private_state: Arc<GhPrivateState>,
+    #[cfg(windows)]
+    system_root: PathBuf,
 }
 
 impl GhProcessRunner {
@@ -821,12 +900,20 @@ impl GhProcessRunner {
             GhAuthentication::EnvironmentToken { .. } => private_state.root.clone(),
             GhAuthentication::ConfigDirectory(directory) => directory.clone(),
         };
+        #[cfg(windows)]
+        let system_root = rustferry_core::windows_system_root().map_err(|_| {
+            TransportConfigError::InvalidLocalPath {
+                field: "Windows system root",
+            }
+        })?;
         Ok(Self {
             executable,
             neutral_working_directory,
             authentication,
             configuration_directory,
             private_state,
+            #[cfg(windows)]
+            system_root,
         })
     }
 
@@ -858,7 +945,10 @@ impl GhProcessRunner {
             .env("HOME", &self.private_state.root)
             .env("USERPROFILE", &self.private_state.root)
             .env("APPDATA", &self.private_state.root)
-            .env("LOCALAPPDATA", &self.private_state.root)
+            .env("LOCALAPPDATA", &self.private_state.root);
+        #[cfg(windows)]
+        command.env("SystemRoot", &self.system_root);
+        command
             .stdin(stdin)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -876,6 +966,86 @@ impl GhProcessRunner {
         }
         Ok(())
     }
+
+    #[cfg(feature = "secure-job-log-http")]
+    fn authentication_token_command(&self) -> Command {
+        self.command_with_arguments(
+            vec![
+                OsString::from("auth"),
+                OsString::from("token"),
+                OsString::from("--hostname"),
+                OsString::from(GITHUB_HOST),
+            ],
+            Stdio::null(),
+        )
+    }
+
+    /// Acquire the configured credential and construct the bounded direct
+    /// GitHub HTTPS client used by API dispatch and attempt-scoped job logs.
+    ///
+    /// Environment authentication reads only its selected allowlisted variable.
+    /// Configuration-directory authentication runs exactly
+    /// `gh auth token --hostname github.com` in the isolated process context.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted authentication or bounded process failure. Token
+    /// contents and command output are never included.
+    #[cfg(feature = "secure-job-log-http")]
+    pub fn github_api_http_client(&self) -> Result<UreqGithubApiHttpClient, GhExecutionError> {
+        let token = match &self.authentication {
+            GhAuthentication::EnvironmentToken { variable } => {
+                let value = std::env::var(variable.as_str())
+                    .map_err(|_| GhExecutionError::AuthenticationUnavailable)?;
+                validate_github_token(value.into_bytes(), false)?
+            }
+            GhAuthentication::ConfigDirectory(_) => {
+                let output = run_process(
+                    self.authentication_token_command(),
+                    GH_AUTH_TOKEN_TIMEOUT,
+                    GH_AUTH_TOKEN_OUTPUT_BYTES,
+                )?;
+                validate_github_token(output, true)?
+            }
+        };
+        UreqGithubJobLogHttpClient::new(token)
+    }
+
+    /// Backward-compatible job-log-specific name for the same fixed-origin client.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted authentication or bounded process failure.
+    #[cfg(feature = "secure-job-log-http")]
+    pub fn job_log_http_client(&self) -> Result<UreqGithubJobLogHttpClient, GhExecutionError> {
+        self.github_api_http_client()
+    }
+}
+
+#[cfg(feature = "secure-job-log-http")]
+fn validate_github_token(
+    mut bytes: Vec<u8>,
+    strip_process_newline: bool,
+) -> Result<SecretBytes, GhExecutionError> {
+    if strip_process_newline && bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    if bytes.is_empty()
+        || bytes.len() > MAX_GITHUB_TOKEN_BYTES
+        || !bytes.iter().all(|byte| (b'!'..=b'~').contains(byte))
+    {
+        let oversized = bytes.len() > MAX_GITHUB_TOKEN_BYTES;
+        bytes.fill(0);
+        return Err(if oversized {
+            GhExecutionError::OutputLimitExceeded
+        } else {
+            GhExecutionError::AuthenticationUnavailable
+        });
+    }
+    Ok(SecretBytes::new(bytes))
 }
 
 impl GhRunner for GhProcessRunner {
@@ -883,6 +1053,19 @@ impl GhRunner for GhProcessRunner {
         let mut command = self.command(request);
         self.apply_authentication(&mut command)?;
         run_process(command, request.timeout, request.output_limit)
+    }
+
+    fn workflow_dispatch_client_factory(
+        &self,
+    ) -> Result<Box<dyn GithubWorkflowDispatchHttpClientFactory>, GhExecutionError> {
+        #[cfg(feature = "secure-job-log-http")]
+        {
+            Ok(Box::new(self.clone()))
+        }
+        #[cfg(not(feature = "secure-job-log-http"))]
+        {
+            Err(GhExecutionError::AuthenticationUnavailable)
+        }
     }
 }
 
@@ -900,6 +1083,498 @@ impl GhSecretRunner for GhProcessRunner {
         self.apply_authentication(&mut command)?;
         run_process_with_secret_input(command, timeout, MAX_SECRET_SET_OUTPUT_BYTES, value)
     }
+}
+
+/// Production no-auto-redirect HTTPS adapter for attempt-scoped GitHub job logs.
+///
+/// The adapter owns the authorization value in zeroing [`SecretBytes`]. It
+/// ignores ambient proxy variables, permits HTTPS only, returns redirects to
+/// the caller without following them, and attaches authorization only to the
+/// fixed GitHub API origin.
+///
+/// Enabling `secure-job-log-http` deliberately enables
+/// `log/max_level_debug`. Cargo feature unification therefore compiles out
+/// TRACE process-wide for any final binary that opts into this adapter. This
+/// prevents ureq TRACE diagnostics from exposing signed redirect targets.
+#[cfg(feature = "secure-job-log-http")]
+pub struct UreqGithubJobLogHttpClient {
+    agent: ureq::Agent,
+    authorization: SecretBytes,
+}
+
+/// Direct fixed-origin GitHub API client; retained alias for additive dispatch use.
+#[cfg(feature = "secure-job-log-http")]
+pub type UreqGithubApiHttpClient = UreqGithubJobLogHttpClient;
+
+#[cfg(feature = "secure-job-log-http")]
+impl fmt::Debug for UreqGithubJobLogHttpClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UreqGithubJobLogHttpClient")
+            .field("https_only", &self.agent.config().https_only())
+            .field("proxy", &"disabled")
+            .field("redirects", &"disabled")
+            .field("authorization", &"<redacted>")
+            .finish()
+    }
+}
+
+#[cfg(feature = "secure-job-log-http")]
+impl UreqGithubJobLogHttpClient {
+    /// Construct an adapter from one owned raw GitHub token.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty, oversized, whitespace-containing, or non-ASCII tokens
+    /// with a redacted authentication failure.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the adapter must take ownership and zero the supplied credential"
+    )]
+    pub fn new(token: SecretBytes) -> Result<Self, GhExecutionError> {
+        validate_github_token_bytes(token.expose_secret_bytes())?;
+        let mut authorization = Vec::with_capacity("Bearer ".len() + token.len());
+        authorization.extend_from_slice(b"Bearer ");
+        authorization.extend_from_slice(token.expose_secret_bytes());
+        Ok(Self {
+            agent: build_job_log_agent(),
+            authorization: SecretBytes::new(authorization),
+        })
+    }
+
+    fn prepare_get(
+        &self,
+        target: &str,
+        api_path: bool,
+        authorization: GithubJobLogAuthorization,
+        accept: GithubJobLogAccept,
+        timeout: Duration,
+    ) -> Result<ureq::RequestBuilder<ureq::typestate::WithoutBody>, GithubJobLogHttpError> {
+        validate_job_log_request_mode(api_path, authorization, accept, timeout)?;
+        let target = resolve_job_log_target(target, api_path)?;
+        let mut builder = self.agent.get(target).header(
+            "Accept",
+            match accept {
+                GithubJobLogAccept::Json => JOB_LOG_API_ACCEPT,
+                GithubJobLogAccept::PlainText => JOB_LOG_PLAINTEXT_ACCEPT,
+            },
+        );
+        if authorization == GithubJobLogAuthorization::GithubApi {
+            let mut value =
+                ureq::http::HeaderValue::from_bytes(self.authorization.expose_secret_bytes())
+                    .map_err(|_| GithubJobLogHttpError::Protocol)?;
+            value.set_sensitive(true);
+            builder = builder
+                .header("Authorization", value)
+                .header("X-GitHub-Api-Version", JOB_LOG_API_VERSION);
+        }
+        Ok(builder
+            .config()
+            .timeout_global(Some(timeout))
+            .timeout_resolve(Some(timeout))
+            .timeout_connect(Some(timeout))
+            .timeout_send_request(Some(timeout))
+            .timeout_recv_response(Some(timeout))
+            .timeout_recv_body(Some(timeout))
+            .build())
+    }
+
+    fn prepare_workflow_dispatch_post(
+        &self,
+        request: &GithubWorkflowDispatchHttpRequest,
+    ) -> Result<ureq::RequestBuilder<ureq::typestate::WithBody>, GithubWorkflowDispatchHttpError>
+    {
+        let target = resolve_workflow_dispatch_target(request.endpoint())?;
+        let mut authorization =
+            ureq::http::HeaderValue::from_bytes(self.authorization.expose_secret_bytes())
+                .map_err(|_| GithubWorkflowDispatchHttpError::Protocol)?;
+        authorization.set_sensitive(true);
+        Ok(self
+            .agent
+            .post(target)
+            .header("Accept", request.accept())
+            .header("Content-Type", request.content_type())
+            .header("X-GitHub-Api-Version", request.api_version())
+            .header("Authorization", authorization)
+            .config()
+            .timeout_global(Some(request.timeout()))
+            .timeout_resolve(Some(request.timeout()))
+            .timeout_connect(Some(request.timeout()))
+            .timeout_send_request(Some(request.timeout()))
+            .timeout_recv_response(Some(request.timeout()))
+            .timeout_recv_body(Some(request.timeout()))
+            .build())
+    }
+}
+
+#[cfg(feature = "secure-job-log-http")]
+fn validate_github_token_bytes(bytes: &[u8]) -> Result<(), GhExecutionError> {
+    if bytes.is_empty()
+        || bytes.len() > MAX_GITHUB_TOKEN_BYTES
+        || !bytes.iter().all(|byte| (b'!'..=b'~').contains(byte))
+    {
+        return Err(if bytes.len() > MAX_GITHUB_TOKEN_BYTES {
+            GhExecutionError::OutputLimitExceeded
+        } else {
+            GhExecutionError::AuthenticationUnavailable
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "secure-job-log-http")]
+fn build_job_log_agent() -> ureq::Agent {
+    let tls = ureq::tls::TlsConfig::builder()
+        .provider(ureq::tls::TlsProvider::Rustls)
+        .build();
+    let config = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .https_only(true)
+        .tls_config(tls)
+        .proxy(None)
+        .max_redirects(0)
+        .max_redirects_will_error(false)
+        .redirect_auth_headers(ureq::config::RedirectAuthHeaders::Never)
+        .save_redirect_history(false)
+        .user_agent(concat!("rustferry/", env!("CARGO_PKG_VERSION")))
+        .accept("")
+        .accept_encoding("")
+        .timeout_global(Some(MAX_JOB_LOG_HTTP_TIMEOUT))
+        .timeout_resolve(Some(MAX_JOB_LOG_HTTP_TIMEOUT))
+        .timeout_connect(Some(MAX_JOB_LOG_HTTP_TIMEOUT))
+        .timeout_send_request(Some(MAX_JOB_LOG_HTTP_TIMEOUT))
+        .timeout_recv_response(Some(MAX_JOB_LOG_HTTP_TIMEOUT))
+        .timeout_recv_body(Some(MAX_JOB_LOG_HTTP_TIMEOUT))
+        .max_response_header_size(MAX_JOB_LOG_RESPONSE_HEADER_BYTES)
+        .build();
+    config.into()
+}
+
+#[cfg(feature = "secure-job-log-http")]
+fn validate_job_log_request_mode(
+    api_path: bool,
+    authorization: GithubJobLogAuthorization,
+    accept: GithubJobLogAccept,
+    timeout: Duration,
+) -> Result<(), GithubJobLogHttpError> {
+    if timeout.is_zero()
+        || timeout > MAX_JOB_LOG_HTTP_TIMEOUT
+        || !matches!(
+            (api_path, authorization, accept),
+            (
+                true,
+                GithubJobLogAuthorization::GithubApi,
+                GithubJobLogAccept::Json
+            ) | (
+                false,
+                GithubJobLogAuthorization::Omit,
+                GithubJobLogAccept::PlainText
+            )
+        )
+    {
+        return Err(GithubJobLogHttpError::Protocol);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "secure-job-log-http")]
+fn resolve_job_log_target(target: &str, api_path: bool) -> Result<String, GithubJobLogHttpError> {
+    if api_path {
+        if !target.starts_with("/repos/")
+            || target.starts_with("//")
+            || !target.is_ascii()
+            || target.bytes().any(|byte| {
+                !byte.is_ascii_alphanumeric()
+                    && !matches!(byte, b'/' | b'?' | b'=' | b'&' | b'_' | b'.' | b'-')
+            })
+        {
+            return Err(GithubJobLogHttpError::Protocol);
+        }
+        return Ok(format!("{JOB_LOG_API_ORIGIN}{target}"));
+    }
+
+    let uri = target
+        .parse::<ureq::http::Uri>()
+        .map_err(|_| GithubJobLogHttpError::Protocol)?;
+    if uri.scheme_str() != Some("https")
+        || uri
+            .authority()
+            .is_none_or(|authority| authority.as_str().contains('@'))
+    {
+        return Err(GithubJobLogHttpError::Protocol);
+    }
+    Ok(target.to_owned())
+}
+
+/// Incremental, deadline-bound ureq response body.
+#[cfg(feature = "secure-job-log-http")]
+pub struct UreqGithubJobLogHttpBody {
+    reader: ureq::BodyReader<'static>,
+    request_deadline: Instant,
+}
+
+#[cfg(feature = "secure-job-log-http")]
+impl GithubJobLogHttpBody for UreqGithubJobLogHttpBody {
+    fn next_chunk(
+        &mut self,
+        maximum_bytes: usize,
+        cancellation: &rustferry_remote::CancellationToken,
+    ) -> Result<Option<Vec<u8>>, GithubJobLogHttpError> {
+        read_job_log_body_chunk(
+            &mut self.reader,
+            maximum_bytes,
+            self.request_deadline,
+            cancellation,
+        )
+    }
+}
+
+#[cfg(feature = "secure-job-log-http")]
+impl GithubJobLogHttpClient for UreqGithubJobLogHttpClient {
+    type Body = UreqGithubJobLogHttpBody;
+
+    fn get(
+        &mut self,
+        request: &GithubJobLogHttpRequest,
+        cancellation: &rustferry_remote::CancellationToken,
+    ) -> Result<GithubJobLogHttpResponse<Self::Body>, GithubJobLogHttpError> {
+        let request_deadline = Instant::now()
+            .checked_add(request.timeout())
+            .ok_or(GithubJobLogHttpError::TimedOut)?;
+        check_job_log_http_active(cancellation, request_deadline)?;
+        let response = self
+            .prepare_get(
+                request.target(),
+                request.is_api_path(),
+                request.authorization(),
+                request.accept(),
+                request.timeout(),
+            )?
+            .call();
+        check_job_log_http_active(cancellation, request_deadline)?;
+        let response = response.map_err(map_ureq_request_error)?;
+
+        let status = response.status().as_u16();
+        let content_type = selected_job_log_header(response.headers(), "content-type")?;
+        let location = selected_job_log_header(response.headers(), "location")?;
+        let (_, body) = response.into_parts();
+        Ok(GithubJobLogHttpResponse::new(
+            status,
+            content_type,
+            location,
+            UreqGithubJobLogHttpBody {
+                reader: body.into_reader(),
+                request_deadline,
+            },
+        ))
+    }
+}
+
+#[cfg(feature = "secure-job-log-http")]
+impl GithubWorkflowDispatchHttpClient for UreqGithubJobLogHttpClient {
+    fn post(
+        &mut self,
+        request: &GithubWorkflowDispatchHttpRequest,
+    ) -> Result<GithubWorkflowDispatchHttpResponse, GithubWorkflowDispatchHttpError> {
+        if request.body().is_empty() || request.body().len() > MAX_WORKFLOW_DISPATCH_BODY_BYTES {
+            return Err(GithubWorkflowDispatchHttpError::Protocol);
+        }
+        let response = self
+            .prepare_workflow_dispatch_post(request)?
+            .send(request.body())
+            .map_err(map_ureq_workflow_dispatch_error)?;
+        let status = response.status().as_u16();
+        let content_type = selected_workflow_dispatch_header(response.headers(), "content-type")?;
+        let (_, body) = response.into_parts();
+        let mut reader = body
+            .into_reader()
+            .take(u64::try_from(request.response_limit()).unwrap_or(u64::MAX) + 1);
+        let mut bytes = Vec::with_capacity(request.response_limit().saturating_add(1));
+        reader
+            .read_to_end(&mut bytes)
+            .map_err(|error| map_ureq_workflow_dispatch_body_error(&error))?;
+        if bytes.len() > request.response_limit() {
+            bytes.fill(0);
+            return Err(GithubWorkflowDispatchHttpError::ResponseTooLarge);
+        }
+        Ok(GithubWorkflowDispatchHttpResponse::new(
+            status,
+            content_type,
+            bytes,
+        ))
+    }
+}
+
+#[cfg(feature = "secure-job-log-http")]
+fn resolve_workflow_dispatch_target(
+    endpoint: &str,
+) -> Result<String, GithubWorkflowDispatchHttpError> {
+    if !endpoint.starts_with("/repos/")
+        || endpoint.starts_with("//")
+        || !endpoint.is_ascii()
+        || endpoint
+            .bytes()
+            .any(|byte| !byte.is_ascii_alphanumeric() && !matches!(byte, b'/' | b'_' | b'.' | b'-'))
+        || !endpoint.ends_with("/dispatches")
+    {
+        return Err(GithubWorkflowDispatchHttpError::Protocol);
+    }
+    Ok(format!("{JOB_LOG_API_ORIGIN}{endpoint}"))
+}
+
+#[cfg(feature = "secure-job-log-http")]
+fn selected_workflow_dispatch_header(
+    headers: &ureq::http::HeaderMap,
+    name: &'static str,
+) -> Result<Option<String>, GithubWorkflowDispatchHttpError> {
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(GithubWorkflowDispatchHttpError::Protocol);
+    }
+    let value = value
+        .to_str()
+        .map_err(|_| GithubWorkflowDispatchHttpError::Protocol)?;
+    if value.len() > MAX_JOB_LOG_RESPONSE_HEADER_BYTES {
+        return Err(GithubWorkflowDispatchHttpError::Protocol);
+    }
+    Ok(Some(value.to_owned()))
+}
+
+#[cfg(feature = "secure-job-log-http")]
+fn map_ureq_workflow_dispatch_error(error: ureq::Error) -> GithubWorkflowDispatchHttpError {
+    match error {
+        ureq::Error::Timeout(_) => GithubWorkflowDispatchHttpError::TimedOut,
+        ureq::Error::Io(error) if io_error_is_timeout(&error) => {
+            GithubWorkflowDispatchHttpError::TimedOut
+        }
+        ureq::Error::Http(_)
+        | ureq::Error::BadUri(_)
+        | ureq::Error::Protocol(_)
+        | ureq::Error::RedirectFailed
+        | ureq::Error::BodyExceedsLimit(_)
+        | ureq::Error::TooManyRedirects
+        | ureq::Error::RequireHttpsOnly(_)
+        | ureq::Error::LargeResponseHeader(_, _)
+        | ureq::Error::StatusCode(_) => GithubWorkflowDispatchHttpError::Protocol,
+        _ => GithubWorkflowDispatchHttpError::Unavailable,
+    }
+}
+
+#[cfg(feature = "secure-job-log-http")]
+fn map_ureq_workflow_dispatch_body_error(error: &io::Error) -> GithubWorkflowDispatchHttpError {
+    if io_error_is_timeout(error) {
+        GithubWorkflowDispatchHttpError::TimedOut
+    } else {
+        GithubWorkflowDispatchHttpError::BodyRead
+    }
+}
+
+#[cfg(feature = "secure-job-log-http")]
+fn check_job_log_http_active(
+    cancellation: &rustferry_remote::CancellationToken,
+    deadline: Instant,
+) -> Result<(), GithubJobLogHttpError> {
+    if cancellation.is_cancelled() {
+        Err(GithubJobLogHttpError::Cancelled)
+    } else if Instant::now() >= deadline {
+        Err(GithubJobLogHttpError::TimedOut)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "secure-job-log-http")]
+fn selected_job_log_header(
+    headers: &ureq::http::HeaderMap,
+    name: &'static str,
+) -> Result<Option<String>, GithubJobLogHttpError> {
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(GithubJobLogHttpError::Protocol);
+    }
+    let value = value
+        .to_str()
+        .map_err(|_| GithubJobLogHttpError::Protocol)?;
+    if value.len() > MAX_JOB_LOG_RESPONSE_HEADER_BYTES {
+        return Err(GithubJobLogHttpError::Protocol);
+    }
+    Ok(Some(value.to_owned()))
+}
+
+#[cfg(feature = "secure-job-log-http")]
+fn read_job_log_body_chunk(
+    reader: &mut impl Read,
+    maximum_bytes: usize,
+    request_deadline: Instant,
+    cancellation: &rustferry_remote::CancellationToken,
+) -> Result<Option<Vec<u8>>, GithubJobLogHttpError> {
+    if cancellation.is_cancelled() {
+        return Err(GithubJobLogHttpError::Cancelled);
+    }
+    if maximum_bytes == 0 || maximum_bytes > MAX_JOB_LOG_HTTP_CHUNK_BYTES {
+        return Err(GithubJobLogHttpError::Protocol);
+    }
+    if Instant::now() >= request_deadline {
+        return Err(GithubJobLogHttpError::TimedOut);
+    }
+    let mut bytes = vec![0_u8; maximum_bytes];
+    let read = reader.read(&mut bytes);
+    if cancellation.is_cancelled() {
+        return Err(GithubJobLogHttpError::Cancelled);
+    }
+    if Instant::now() >= request_deadline {
+        return Err(GithubJobLogHttpError::TimedOut);
+    }
+    let read = read.map_err(|error| map_ureq_body_error(&error))?;
+    if read == 0 {
+        return Ok(None);
+    }
+    bytes.truncate(read);
+    Ok(Some(bytes))
+}
+
+#[cfg(feature = "secure-job-log-http")]
+fn map_ureq_request_error(error: ureq::Error) -> GithubJobLogHttpError {
+    match error {
+        ureq::Error::Timeout(_) => GithubJobLogHttpError::TimedOut,
+        ureq::Error::Io(error) if io_error_is_timeout(&error) => GithubJobLogHttpError::TimedOut,
+        ureq::Error::Http(_)
+        | ureq::Error::BadUri(_)
+        | ureq::Error::Protocol(_)
+        | ureq::Error::RedirectFailed
+        | ureq::Error::BodyExceedsLimit(_)
+        | ureq::Error::TooManyRedirects
+        | ureq::Error::RequireHttpsOnly(_)
+        | ureq::Error::LargeResponseHeader(_, _)
+        | ureq::Error::StatusCode(_) => GithubJobLogHttpError::Protocol,
+        _ => GithubJobLogHttpError::Unavailable,
+    }
+}
+
+#[cfg(feature = "secure-job-log-http")]
+fn map_ureq_body_error(error: &io::Error) -> GithubJobLogHttpError {
+    if io_error_is_timeout(error) {
+        GithubJobLogHttpError::TimedOut
+    } else {
+        GithubJobLogHttpError::BodyRead
+    }
+}
+
+#[cfg(feature = "secure-job-log-http")]
+fn io_error_is_timeout(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+    ) || error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<ureq::Error>())
+        .is_some_and(|source| matches!(source, ureq::Error::Timeout(_)))
 }
 
 fn create_private_gh_state(
@@ -936,6 +1611,7 @@ fn validate_private_gh_state_root(
 /// Parsed authenticated GitHub account.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthenticatedUser {
+    id: u64,
     login: String,
 }
 
@@ -946,7 +1622,10 @@ pub enum AuthenticatedPrincipal {
     User(AuthenticatedUser),
     /// Installation credential whose accessible-repository list contains the
     /// exact requested repository.
-    RepositoryCredential,
+    RepositoryCredential {
+        /// Stable database ID returned by the installation repository list.
+        repository_id: u64,
+    },
 }
 
 impl AuthenticatedPrincipal {
@@ -954,7 +1633,7 @@ impl AuthenticatedPrincipal {
     pub fn label(&self) -> &str {
         match self {
             Self::User(user) => user.login(),
-            Self::RepositoryCredential => "repository-scoped token",
+            Self::RepositoryCredential { .. } => "repository-scoped token",
         }
     }
 
@@ -962,12 +1641,25 @@ impl AuthenticatedPrincipal {
     pub fn user_login(&self) -> Option<&str> {
         match self {
             Self::User(user) => Some(user.login()),
-            Self::RepositoryCredential => None,
+            Self::RepositoryCredential { .. } => None,
+        }
+    }
+
+    /// Exact repository ID independently proven by an installation credential.
+    pub const fn repository_id(&self) -> Option<u64> {
+        match self {
+            Self::User(_) => None,
+            Self::RepositoryCredential { repository_id } => Some(*repository_id),
         }
     }
 }
 
 impl AuthenticatedUser {
+    /// Stable GitHub user database identifier.
+    pub const fn id(&self) -> u64 {
+        self.id
+    }
+
     /// Authenticated GitHub login.
     pub fn login(&self) -> &str {
         &self.login
@@ -1015,6 +1707,560 @@ impl RepositoryInfo {
     pub fn default_branch(&self) -> &BranchName {
         &self.default_branch
     }
+}
+
+/// Repository-scoped GitHub Actions availability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActionsPermissions {
+    enabled: bool,
+}
+
+impl ActionsPermissions {
+    /// Whether GitHub Actions is enabled for the exact repository.
+    pub const fn enabled(self) -> bool {
+        self.enabled
+    }
+}
+
+/// One active workflow registration bound to its exact repository path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkflowRegistration {
+    repository: Repository,
+    id: WorkflowId,
+    path: String,
+}
+
+impl WorkflowRegistration {
+    pub(crate) fn restore(
+        repository: Repository,
+        id: WorkflowId,
+        path: impl Into<String>,
+    ) -> Result<Self, TransportConfigError> {
+        let path = path.into();
+        validated_workflow_filename(&path).map_err(|_| TransportConfigError::InvalidFormat {
+            field: "workflow registration path",
+        })?;
+        Ok(Self {
+            repository,
+            id,
+            path,
+        })
+    }
+
+    /// Exact repository whose API registry returned this workflow.
+    pub const fn repository(&self) -> &Repository {
+        &self.repository
+    }
+
+    /// Stable GitHub workflow identifier.
+    pub const fn id(&self) -> WorkflowId {
+        self.id
+    }
+
+    /// Exact repository-relative workflow path returned by GitHub.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+}
+
+/// Validated public inputs for one no-secret workflow dispatch.
+#[derive(Clone, Eq, PartialEq)]
+pub struct WorkflowDispatchRequest {
+    repository: Repository,
+    workflow: WorkflowRegistration,
+    temporary_ref: TemporaryGitRef,
+    operation_id: String,
+    request_sha256: String,
+    source_revision: CommitSha,
+    dispatch_revision: CommitSha,
+    run_name: String,
+    body_sha256: String,
+    body: Vec<u8>,
+}
+
+impl fmt::Debug for WorkflowDispatchRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkflowDispatchRequest")
+            .field("repository", &self.repository)
+            .field("workflow", &self.workflow)
+            .field("temporary_ref", &self.temporary_ref)
+            .field("operation_id", &self.operation_id)
+            .field("request_sha256", &"<redacted>")
+            .field("source_revision", &self.source_revision)
+            .field("dispatch_revision", &self.dispatch_revision)
+            .field("run_name", &"<redacted>")
+            .field("body_sha256", &"<redacted>")
+            .field("body", &"<redacted>")
+            .field("body_bytes", &self.body.len())
+            .finish()
+    }
+}
+
+impl WorkflowDispatchRequest {
+    /// Bind one exact temporary ref and complete public dispatch input set.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an unsafe operation identifier, a non-lowercase SHA-256, an
+    /// operation/ref mismatch, or an unexpectedly large serialized body.
+    pub fn new(
+        repository: Repository,
+        workflow: WorkflowRegistration,
+        temporary_ref: TemporaryGitRef,
+        operation_id: impl Into<String>,
+        request_sha256: impl Into<String>,
+        source_revision: CommitSha,
+        dispatch_revision: CommitSha,
+    ) -> Result<Self, TransportConfigError> {
+        let operation_id = operation_id.into();
+        if repository != workflow.repository {
+            return Err(TransportConfigError::InvalidFormat {
+                field: "workflow dispatch repository",
+            });
+        }
+        validate_workflow_dispatch_operation(&operation_id)?;
+        if temporary_ref
+            .branch()
+            .as_str()
+            .rsplit_once('/')
+            .is_none_or(|(_, suffix)| suffix != operation_id)
+        {
+            return Err(TransportConfigError::InvalidFormat {
+                field: "workflow dispatch operation ref",
+            });
+        }
+        let request_sha256 = request_sha256.into();
+        validate_lower_sha256("request sha256", &request_sha256)?;
+        let run_name = canonical_workflow_dispatch_run_name(
+            &operation_id,
+            &request_sha256,
+            &source_revision,
+            &dispatch_revision,
+        )?;
+        let body = serde_json::to_vec(&WorkflowDispatchBody {
+            git_ref: temporary_ref.branch().as_str(),
+            inputs: WorkflowDispatchInputs {
+                operation_id: &operation_id,
+                request_sha256: &request_sha256,
+                source_revision: source_revision.as_str(),
+                dispatch_revision: dispatch_revision.as_str(),
+            },
+        })
+        .map_err(|_| TransportConfigError::InvalidFormat {
+            field: "workflow dispatch body",
+        })?;
+        if body.len() > MAX_WORKFLOW_DISPATCH_BODY_BYTES {
+            return Err(TransportConfigError::TooLong {
+                field: "workflow dispatch body",
+                maximum: MAX_WORKFLOW_DISPATCH_BODY_BYTES,
+            });
+        }
+        let body_sha256 = hex::encode(Sha256::digest(&body));
+        Ok(Self {
+            repository,
+            workflow,
+            temporary_ref,
+            operation_id,
+            request_sha256,
+            source_revision,
+            dispatch_revision,
+            run_name,
+            body_sha256,
+            body,
+        })
+    }
+
+    /// Exact target repository.
+    pub const fn repository(&self) -> &Repository {
+        &self.repository
+    }
+
+    /// Active workflow selected before dispatch.
+    pub const fn workflow(&self) -> &WorkflowRegistration {
+        &self.workflow
+    }
+
+    /// Exact temporary branch passed as the dispatch ref.
+    pub const fn temporary_ref(&self) -> &TemporaryGitRef {
+        &self.temporary_ref
+    }
+
+    /// Provider operation identifier.
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    /// Canonical complete request digest.
+    pub fn request_sha256(&self) -> &str {
+        &self.request_sha256
+    }
+
+    /// Exact trusted source commit.
+    pub const fn source_revision(&self) -> &CommitSha {
+        &self.source_revision
+    }
+
+    /// Exact temporary-ref commit expected as `GITHUB_SHA`.
+    pub const fn dispatch_revision(&self) -> &CommitSha {
+        &self.dispatch_revision
+    }
+
+    /// Exact public run title derived from all four dispatch inputs.
+    pub fn run_name(&self) -> &str {
+        &self.run_name
+    }
+
+    /// SHA-256 of the canonical no-secret dispatch body and its complete input set.
+    pub fn body_sha256(&self) -> &str {
+        &self.body_sha256
+    }
+}
+
+#[derive(Serialize)]
+struct WorkflowDispatchBody<'a> {
+    #[serde(rename = "ref")]
+    git_ref: &'a str,
+    inputs: WorkflowDispatchInputs<'a>,
+}
+
+#[derive(Serialize)]
+struct WorkflowDispatchInputs<'a> {
+    operation_id: &'a str,
+    request_sha256: &'a str,
+    source_revision: &'a str,
+    dispatch_revision: &'a str,
+}
+
+pub(crate) fn canonical_workflow_dispatch_run_name(
+    operation_id: &str,
+    request_sha256: &str,
+    source_revision: &CommitSha,
+    dispatch_revision: &CommitSha,
+) -> Result<String, TransportConfigError> {
+    validate_workflow_dispatch_operation(operation_id)?;
+    validate_lower_sha256("request sha256", request_sha256)?;
+    let run_name = format!(
+        "{WORKFLOW_DISPATCH_RUN_NAME_PREFIX}{operation_id}|{request_sha256}|{}|{}",
+        source_revision.as_str(),
+        dispatch_revision.as_str()
+    );
+    if run_name.len() > MAX_WORKFLOW_DISPATCH_RUN_NAME_BYTES {
+        return Err(TransportConfigError::TooLong {
+            field: "workflow dispatch run name",
+            maximum: MAX_WORKFLOW_DISPATCH_RUN_NAME_BYTES,
+        });
+    }
+    Ok(run_name)
+}
+
+/// Bounded direct HTTPS request for one workflow dispatch.
+#[derive(Clone, Eq, PartialEq)]
+pub struct GithubWorkflowDispatchHttpRequest {
+    endpoint: String,
+    body: Vec<u8>,
+    timeout: Duration,
+}
+
+impl fmt::Debug for GithubWorkflowDispatchHttpRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GithubWorkflowDispatchHttpRequest")
+            .field("endpoint", &"<redacted>")
+            .field("body", &"<redacted>")
+            .field("body_bytes", &self.body.len())
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
+impl GithubWorkflowDispatchHttpRequest {
+    /// Fixed GitHub API path. HTTP adapters must not log this value.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// Exact deterministic JSON body. It contains no credential or raw device value.
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
+
+    /// Required GitHub media type.
+    pub const fn accept(&self) -> &'static str {
+        WORKFLOW_DISPATCH_ACCEPT
+    }
+
+    /// Required request content type.
+    pub const fn content_type(&self) -> &'static str {
+        WORKFLOW_DISPATCH_CONTENT_TYPE
+    }
+
+    /// Required API contract version.
+    pub const fn api_version(&self) -> &'static str {
+        WORKFLOW_DISPATCH_API_VERSION
+    }
+
+    /// Whole-request deadline.
+    pub const fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// Maximum accepted response bytes.
+    pub const fn response_limit(&self) -> usize {
+        MAX_WORKFLOW_DISPATCH_RESPONSE_BYTES
+    }
+}
+
+/// Bounded HTTP result. Debug output never includes response bytes or URLs.
+#[derive(Clone, Eq, PartialEq)]
+pub struct GithubWorkflowDispatchHttpResponse {
+    status: u16,
+    content_type: Option<String>,
+    body: Vec<u8>,
+}
+
+impl fmt::Debug for GithubWorkflowDispatchHttpResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GithubWorkflowDispatchHttpResponse")
+            .field("status", &self.status)
+            .field("content_type", &self.content_type)
+            .field("body", &"<redacted>")
+            .field("body_bytes", &self.body.len())
+            .finish()
+    }
+}
+
+impl GithubWorkflowDispatchHttpResponse {
+    /// Construct one adapter response for strict transport validation.
+    pub fn new(status: u16, content_type: Option<String>, body: Vec<u8>) -> Self {
+        Self {
+            status,
+            content_type,
+            body,
+        }
+    }
+}
+
+/// Redacted direct-HTTPS dispatch failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GithubWorkflowDispatchHttpError {
+    /// The fixed API endpoint or HTTP exchange violated the protocol.
+    Protocol,
+    /// The request exceeded its deadline.
+    TimedOut,
+    /// The response body could not be read.
+    BodyRead,
+    /// The response body exceeded the fixed cap.
+    ResponseTooLarge,
+    /// The HTTP client or network was unavailable.
+    Unavailable,
+}
+
+impl fmt::Display for GithubWorkflowDispatchHttpError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Protocol => formatter.write_str("GitHub workflow dispatch protocol failed"),
+            Self::TimedOut => formatter.write_str("GitHub workflow dispatch timed out"),
+            Self::BodyRead => formatter.write_str("GitHub workflow dispatch response read failed"),
+            Self::ResponseTooLarge => {
+                formatter.write_str("GitHub workflow dispatch response exceeded its limit")
+            }
+            Self::Unavailable => formatter.write_str("GitHub workflow dispatch is unavailable"),
+        }
+    }
+}
+
+impl Error for GithubWorkflowDispatchHttpError {}
+
+/// Injectable no-auto-redirect HTTPS adapter for workflow dispatch.
+pub trait GithubWorkflowDispatchHttpClient {
+    /// Send one fixed-origin API request and return a bounded response.
+    ///
+    /// # Errors
+    ///
+    /// Returns only redacted transport categories; credentials, endpoints,
+    /// bodies, response URLs, and underlying diagnostics must not surface.
+    fn post(
+        &mut self,
+        request: &GithubWorkflowDispatchHttpRequest,
+    ) -> Result<GithubWorkflowDispatchHttpResponse, GithubWorkflowDispatchHttpError>;
+}
+
+/// Lazy factory detached from the provider's metadata-transport lock.
+pub trait GithubWorkflowDispatchHttpClientFactory: Send {
+    /// Consume the factory and acquire one credential-owning direct HTTPS client.
+    ///
+    /// # Errors
+    ///
+    /// Returns only redacted authentication or bounded process failures.
+    fn create(
+        self: Box<Self>,
+    ) -> Result<Box<dyn GithubWorkflowDispatchHttpClient + Send>, GhExecutionError>;
+}
+
+/// One request-scoped dispatch attempt detached from the metadata transport lock.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WorkflowDispatchAttempt {
+    http_request: GithubWorkflowDispatchHttpRequest,
+    request: WorkflowDispatchRequest,
+}
+
+impl WorkflowDispatchAttempt {
+    pub(crate) fn send(
+        self,
+        client: &mut (impl GithubWorkflowDispatchHttpClient + ?Sized),
+    ) -> Result<WorkflowDispatchReceipt, TransportError> {
+        let response = client.post(&self.http_request)?;
+        if response.status != 200 {
+            return Err(TransportError::WorkflowDispatchStatusMismatch);
+        }
+        if response.body.len() > MAX_WORKFLOW_DISPATCH_RESPONSE_BYTES
+            || response.content_type.as_deref().is_none_or(|content_type| {
+                content_type
+                    .split_once(';')
+                    .map_or(content_type, |(media_type, _)| media_type)
+                    .trim()
+                    != WORKFLOW_DISPATCH_CONTENT_TYPE
+            })
+        {
+            return Err(TransportError::MalformedResponse {
+                operation: "workflow dispatch receipt",
+            });
+        }
+        let wire: WorkflowDispatchReceiptWire =
+            crate::strict_json::decode(&response.body, MAX_WORKFLOW_DISPATCH_RESPONSE_BYTES)
+                .map_err(|_| TransportError::MalformedResponse {
+                    operation: "workflow dispatch receipt",
+                })?;
+        let run_id =
+            RunId::new(wire.workflow_run_id).map_err(|_| TransportError::MalformedResponse {
+                operation: "workflow dispatch receipt",
+            })?;
+        if !valid_workflow_dispatch_receipt_url(
+            &wire.run_url,
+            "https://api.github.com/repos/",
+            &self.request.repository,
+            run_id,
+        ) || !valid_workflow_dispatch_receipt_url(
+            &wire.html_url,
+            "https://github.com/",
+            &self.request.repository,
+            run_id,
+        ) {
+            return Err(TransportError::MalformedResponse {
+                operation: "workflow dispatch receipt",
+            });
+        }
+        Ok(WorkflowDispatchReceipt {
+            repository: self.request.repository.clone(),
+            run_id,
+            workflow_id: self.request.workflow.id,
+            workflow_path: self.request.workflow.path.clone(),
+            dispatch_revision: self.request.dispatch_revision.clone(),
+            branch: self.request.temporary_ref.branch().clone(),
+            run_name: self.request.run_name.clone(),
+        })
+    }
+}
+
+#[cfg(feature = "secure-job-log-http")]
+impl GithubWorkflowDispatchHttpClientFactory for GhProcessRunner {
+    fn create(
+        self: Box<Self>,
+    ) -> Result<Box<dyn GithubWorkflowDispatchHttpClient + Send>, GhExecutionError> {
+        self.github_api_http_client()
+            .map(|client| Box::new(client) as Box<dyn GithubWorkflowDispatchHttpClient + Send>)
+    }
+}
+
+/// Secret-free receipt binding one positive run ID to every expected run identity field.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkflowDispatchReceipt {
+    repository: Repository,
+    run_id: RunId,
+    workflow_id: WorkflowId,
+    workflow_path: String,
+    dispatch_revision: CommitSha,
+    branch: BranchName,
+    run_name: String,
+}
+
+impl WorkflowDispatchReceipt {
+    pub(crate) fn restore(
+        repository: Repository,
+        run_id: RunId,
+        workflow_id: WorkflowId,
+        workflow_path: impl Into<String>,
+        dispatch_revision: CommitSha,
+        branch: BranchName,
+        run_name: impl Into<String>,
+    ) -> Result<Self, TransportConfigError> {
+        let workflow_path = workflow_path.into();
+        let run_name = run_name.into();
+        validated_workflow_filename(&workflow_path).map_err(|_| {
+            TransportConfigError::InvalidFormat {
+                field: "workflow dispatch receipt path",
+            }
+        })?;
+        if run_name.is_empty() || run_name.len() > MAX_WORKFLOW_DISPATCH_RUN_NAME_BYTES {
+            return Err(TransportConfigError::InvalidFormat {
+                field: "workflow dispatch receipt run name",
+            });
+        }
+        Ok(Self {
+            repository,
+            run_id,
+            workflow_id,
+            workflow_path,
+            dispatch_revision,
+            branch,
+            run_name,
+        })
+    }
+
+    /// Exact repository that accepted the dispatch.
+    pub const fn repository(&self) -> &Repository {
+        &self.repository
+    }
+
+    /// Positive run identifier returned by the 2026-03-10 API.
+    pub const fn run_id(&self) -> RunId {
+        self.run_id
+    }
+
+    /// Workflow registration used for the dispatch.
+    pub const fn workflow_id(&self) -> WorkflowId {
+        self.workflow_id
+    }
+
+    /// Exact registered workflow path.
+    pub fn workflow_path(&self) -> &str {
+        &self.workflow_path
+    }
+
+    /// Exact commit expected from the run metadata and worker `GITHUB_SHA`.
+    pub const fn dispatch_revision(&self) -> &CommitSha {
+        &self.dispatch_revision
+    }
+
+    /// Exact temporary branch expected from run metadata and worker `GITHUB_REF`.
+    pub const fn branch(&self) -> &BranchName {
+        &self.branch
+    }
+
+    /// Exact public run title binding all four dispatch inputs.
+    pub fn run_name(&self) -> &str {
+        &self.run_name
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowDispatchReceiptWire {
+    workflow_run_id: u64,
+    run_url: String,
+    html_url: String,
 }
 
 /// Security-relevant metadata for one exact GitHub Environment.
@@ -1168,6 +2414,30 @@ pub struct RunHandle {
 }
 
 impl RunHandle {
+    /// Reconstruct one already validated durable run identity inside this crate.
+    pub(crate) fn restore(
+        id: u64,
+        workflow_id: u64,
+        workflow_path: String,
+        head_sha: String,
+        branch: String,
+        event: RunEvent,
+    ) -> Result<Self, TransportConfigError> {
+        validated_workflow_filename(&workflow_path).map_err(|_| {
+            TransportConfigError::InvalidFormat {
+                field: "workflow path",
+            }
+        })?;
+        Ok(Self {
+            id: RunId::new(id)?,
+            workflow_id: WorkflowId::new(workflow_id)?,
+            workflow_path,
+            head_sha: CommitSha::new(head_sha)?,
+            branch: BranchName::new(branch)?,
+            event,
+        })
+    }
+
     /// Stable run identifier.
     pub const fn id(&self) -> RunId {
         self.id
@@ -1209,7 +2479,35 @@ pub struct RunSnapshot {
     conclusion: Option<RunConclusion>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WorkflowDispatchRunSnapshot {
+    snapshot: RunSnapshot,
+    run_name: String,
+}
+
 impl RunSnapshot {
+    /// Reconstruct one validated durable observation inside this crate.
+    pub(crate) fn restore(
+        handle: RunHandle,
+        run_number: u64,
+        run_attempt: u64,
+        status: RunStatus,
+        conclusion: Option<RunConclusion>,
+    ) -> Result<Self, TransportConfigError> {
+        if run_number == 0 || run_attempt == 0 || (status.is_terminal() != conclusion.is_some()) {
+            return Err(TransportConfigError::InvalidFormat {
+                field: "run snapshot",
+            });
+        }
+        Ok(Self {
+            handle,
+            run_number,
+            run_attempt,
+            status,
+            conclusion,
+        })
+    }
+
     /// Exact immutable run identity.
     pub fn handle(&self) -> &RunHandle {
         &self.handle
@@ -1342,6 +2640,8 @@ impl DownloadedArtifact {
 pub enum TransportError {
     /// The underlying fixed-argv request failed.
     Execution(GhExecutionError),
+    /// The direct no-auto-redirect workflow-dispatch exchange failed.
+    WorkflowDispatchHttp(GithubWorkflowDispatchHttpError),
     /// One Environment-secret value exceeded GitHub's fixed 48 KiB limit.
     EnvironmentSecretTooLarge,
     /// GitHub returned malformed or unsupported metadata.
@@ -1357,6 +2657,12 @@ pub enum TransportError {
     EnvironmentIdentityMismatch,
     /// Workflow path was not one validated `.github/workflows/*.yml` file.
     InvalidWorkflowPath,
+    /// Workflow metadata did not match the exact requested path.
+    WorkflowIdentityMismatch,
+    /// The exact registered workflow is not active.
+    WorkflowInactive,
+    /// Workflow dispatch did not return the required HTTP 200 response.
+    WorkflowDispatchStatusMismatch,
     /// No exact matching run was found within the page bound.
     RunNotFound,
     /// More than one exact matching run was returned.
@@ -1386,14 +2692,17 @@ pub enum TransportError {
     ArtifactDigestMismatch,
     /// The exact destination already exists; it is never overwritten.
     DestinationExists,
-    /// Creating, writing, syncing, or cleaning up the new destination failed.
+    /// Creating, writing, syncing, or verifying the new destination failed.
     ArtifactWriteFailed,
+    /// A failed create, write, or verification may have left the new destination on disk.
+    ArtifactCleanupUncertain,
 }
 
 impl fmt::Display for TransportError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Execution(error) => error.fmt(formatter),
+            Self::WorkflowDispatchHttp(error) => error.fmt(formatter),
             Self::EnvironmentSecretTooLarge => {
                 formatter.write_str("GitHub Environment secret exceeds size limit")
             }
@@ -1410,6 +2719,13 @@ impl fmt::Display for TransportError {
                 formatter.write_str("GitHub returned a different environment identity")
             }
             Self::InvalidWorkflowPath => formatter.write_str("workflow path is invalid"),
+            Self::WorkflowIdentityMismatch => {
+                formatter.write_str("GitHub returned a different workflow identity")
+            }
+            Self::WorkflowInactive => formatter.write_str("GitHub workflow is not active"),
+            Self::WorkflowDispatchStatusMismatch => {
+                formatter.write_str("GitHub workflow dispatch returned an unexpected status")
+            }
             Self::RunNotFound => formatter.write_str("matching GitHub Actions run was not found"),
             Self::AmbiguousRun => {
                 formatter.write_str("multiple GitHub Actions runs matched exact identity")
@@ -1438,6 +2754,9 @@ impl fmt::Display for TransportError {
             }
             Self::DestinationExists => formatter.write_str("artifact destination already exists"),
             Self::ArtifactWriteFailed => formatter.write_str("artifact write failed"),
+            Self::ArtifactCleanupUncertain => {
+                formatter.write_str("artifact cleanup could not be confirmed")
+            }
         }
     }
 }
@@ -1447,6 +2766,12 @@ impl Error for TransportError {}
 impl From<GhExecutionError> for TransportError {
     fn from(value: GhExecutionError) -> Self {
         Self::Execution(value)
+    }
+}
+
+impl From<GithubWorkflowDispatchHttpError> for TransportError {
+    fn from(value: GithubWorkflowDispatchHttpError) -> Self {
+        Self::WorkflowDispatchHttp(value)
     }
 }
 
@@ -1487,6 +2812,39 @@ impl<R> GithubTransport<R> {
     /// Borrow the runner for adapter-specific inspection.
     pub fn runner(&self) -> &R {
         &self.runner
+    }
+
+    /// Dispatch one active registered workflow through a direct, no-redirect
+    /// HTTPS adapter and parse the strict 2026-03-10 receipt.
+    ///
+    /// # Errors
+    ///
+    /// Requires HTTP 200, JSON content, an exact bounded response object, and
+    /// a positive workflow run identifier. Response URLs are validated then
+    /// discarded and never enter the returned receipt or diagnostics.
+    pub fn dispatch_workflow(
+        &self,
+        client: &mut (impl GithubWorkflowDispatchHttpClient + ?Sized),
+        request: &WorkflowDispatchRequest,
+    ) -> Result<WorkflowDispatchReceipt, TransportError> {
+        self.workflow_dispatch_attempt(request).send(client)
+    }
+
+    pub(crate) fn workflow_dispatch_attempt(
+        &self,
+        request: &WorkflowDispatchRequest,
+    ) -> WorkflowDispatchAttempt {
+        WorkflowDispatchAttempt {
+            http_request: GithubWorkflowDispatchHttpRequest {
+                endpoint: request.repository.endpoint(&format!(
+                    "/actions/workflows/{}/dispatches",
+                    request.workflow.id.get()
+                )),
+                body: request.body.clone(),
+                timeout: self.limits.api_timeout,
+            },
+            request: request.clone(),
+        }
     }
 }
 
@@ -1533,8 +2891,8 @@ impl<R: GhRunner> GithubTransport<R> {
         match self.authenticated_user() {
             Ok(user) => Ok(AuthenticatedPrincipal::User(user)),
             Err(TransportError::Execution(GhExecutionError::CommandFailed { .. })) => {
-                self.prove_installation_repository_access(repository)?;
-                Ok(AuthenticatedPrincipal::RepositoryCredential)
+                let repository_id = self.prove_installation_repository_access(repository)?;
+                Ok(AuthenticatedPrincipal::RepositoryCredential { repository_id })
             }
             Err(error) => Err(error),
         }
@@ -1548,13 +2906,27 @@ impl<R: GhRunner> GithubTransport<R> {
     pub fn authenticated_user(&mut self) -> Result<AuthenticatedUser, TransportError> {
         let request = self.metadata_request(ApiMethod::Get, "/user".to_owned(), USER_QUERY);
         let output = self.runner.execute(&request)?;
-        let login = parse_single_utf8_line(&output, "authenticated user")?;
-        validate_owner(login).map_err(|_| TransportError::MalformedResponse {
+        let line = parse_single_utf8_line(&output, "authenticated user")?;
+        let columns = line.split('\t').collect::<Vec<_>>();
+        if columns.len() != 2 {
+            return Err(TransportError::MalformedResponse {
+                operation: "authenticated user",
+            });
+        }
+        let id = columns[0].parse::<u64>().ok().filter(|id| *id != 0).ok_or(
+            TransportError::MalformedResponse {
+                operation: "authenticated user",
+            },
+        )?;
+        let login = decode_base64(columns[1])
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .ok_or(TransportError::MalformedResponse {
+                operation: "authenticated user",
+            })?;
+        validate_owner(&login).map_err(|_| TransportError::MalformedResponse {
             operation: "authenticated user",
         })?;
-        Ok(AuthenticatedUser {
-            login: login.to_owned(),
-        })
+        Ok(AuthenticatedUser { id, login })
     }
 
     /// Fetch and locally bind repository metadata to the exact owner/name.
@@ -1572,10 +2944,52 @@ impl<R: GhRunner> GithubTransport<R> {
         parse_repository(&output, repository)
     }
 
+    /// Fetch the exact repository's GitHub Actions enablement policy.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unavailable or malformed repository policy metadata.
+    pub fn actions_permissions(
+        &mut self,
+        repository: &Repository,
+    ) -> Result<ActionsPermissions, TransportError> {
+        let request = self.metadata_request(
+            ApiMethod::Get,
+            repository.endpoint("/actions/permissions"),
+            ACTIONS_PERMISSIONS_QUERY,
+        );
+        let output = self.runner.execute(&request)?;
+        parse_actions_permissions(&output)
+    }
+
+    /// Resolve one workflow file through GitHub's registry and require an
+    /// active registration at the exact repository-relative path.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an invalid requested path, malformed metadata, path drift, or
+    /// any state other than `active`.
+    pub fn workflow_registration(
+        &mut self,
+        repository: &Repository,
+        workflow_path: &str,
+    ) -> Result<WorkflowRegistration, TransportError> {
+        let filename = validated_workflow_filename(workflow_path)?;
+        let endpoint = repository.endpoint(&format!("/actions/workflows/{filename}"));
+        let request = self.metadata_request_at_version(
+            ApiMethod::Get,
+            endpoint,
+            WORKFLOW_QUERY,
+            WORKFLOW_DISPATCH_API_VERSION_HEADER,
+        );
+        let output = self.runner.execute(&request)?;
+        parse_workflow_registration(&output, repository, workflow_path)
+    }
+
     fn prove_installation_repository_access(
         &mut self,
         repository: &Repository,
-    ) -> Result<(), TransportError> {
+    ) -> Result<u64, TransportError> {
         for page in 1..=self.limits.pages {
             let fields = vec![
                 ("per_page".to_owned(), self.limits.per_page.to_string()),
@@ -1590,11 +3004,16 @@ impl<R: GhRunner> GithubTransport<R> {
             let output = self.runner.execute(&request)?;
             let repositories = parse_installation_repositories(&output)?;
             let page_length = repositories.len();
-            if repositories
+            if let Some(candidate) = repositories
                 .iter()
-                .any(|candidate| candidate.eq_ignore_ascii_case(&repository.full_name()))
+                .find(|candidate| {
+                    candidate
+                        .repository
+                        .full_name()
+                        .eq_ignore_ascii_case(&repository.full_name())
+                })
             {
-                return Ok(());
+                return Ok(candidate.id);
             }
             if page_length < usize::from(self.limits.per_page) {
                 return Err(TransportError::RepositoryAuthorizationMissing);
@@ -1744,14 +3163,87 @@ impl<R: GhRunner> GithubTransport<R> {
             let output = self.runner.execute(&request)?;
             let rows = parse_run_rows(&output, "run list")?;
             for candidate in &rows {
-                if candidate.handle.workflow_path == workflow_path
+                if workflow_run_path_matches(&candidate.handle.workflow_path, workflow_path, branch)
                     && candidate.handle.head_sha == *head_sha
                     && candidate.handle.branch == *branch
                     && candidate.handle.event == event
                 {
+                    let mut candidate = candidate.clone();
+                    workflow_path.clone_into(&mut candidate.handle.workflow_path);
                     match &matching {
-                        None => matching = Some(candidate.clone()),
-                        Some(previous) if previous == candidate => {}
+                        None => matching = Some(candidate),
+                        Some(previous) if *previous == candidate => {}
+                        Some(_) => return Err(TransportError::AmbiguousRun),
+                    }
+                }
+            }
+            if rows.len() < usize::from(self.limits.per_page) {
+                return matching
+                    .map(|snapshot| snapshot.handle)
+                    .ok_or(TransportError::RunNotFound);
+            }
+        }
+        Err(TransportError::PaginationLimitReached { resource: "run" })
+    }
+
+    /// Find exactly one workflow-dispatch run whose public title binds all four inputs.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed pages, missing or ambiguous exact matches, correlation drift, and
+    /// incomplete pagination.
+    pub fn find_workflow_dispatch_run(
+        &mut self,
+        request: &WorkflowDispatchRequest,
+    ) -> Result<RunHandle, TransportError> {
+        let mut matching: Option<RunSnapshot> = None;
+        for page in 1..=self.limits.pages {
+            let endpoint = request.repository.endpoint("/actions/runs");
+            let fields = vec![
+                (
+                    "head_sha".to_owned(),
+                    request.dispatch_revision.as_str().to_owned(),
+                ),
+                (
+                    "branch".to_owned(),
+                    request.temporary_ref.branch().as_str().to_owned(),
+                ),
+                (
+                    "event".to_owned(),
+                    RunEvent::WorkflowDispatch.as_str().to_owned(),
+                ),
+                ("exclude_pull_requests".to_owned(), "true".to_owned()),
+                ("per_page".to_owned(), self.limits.per_page.to_string()),
+                ("page".to_owned(), page.to_string()),
+            ];
+            let api_request = self.metadata_request_with_fields(
+                ApiMethod::Get,
+                endpoint,
+                fields,
+                WORKFLOW_DISPATCH_RUN_LIST_QUERY,
+            );
+            let output = self.runner.execute(&api_request)?;
+            let rows = parse_workflow_dispatch_run_rows(&output, "workflow dispatch run list")?;
+            for candidate in &rows {
+                let handle = candidate.snapshot.handle();
+                if workflow_run_path_matches(
+                    handle.workflow_path(),
+                    request.workflow.path(),
+                    request.temporary_ref.branch(),
+                ) && handle.workflow_id() == request.workflow.id()
+                    && handle.head_sha() == request.dispatch_revision()
+                    && handle.branch() == request.temporary_ref.branch()
+                    && handle.event() == RunEvent::WorkflowDispatch
+                    && candidate.run_name == request.run_name
+                {
+                    let mut candidate = candidate.snapshot.clone();
+                    request
+                        .workflow
+                        .path()
+                        .clone_into(&mut candidate.handle.workflow_path);
+                    match &matching {
+                        None => matching = Some(candidate),
+                        Some(previous) if *previous == candidate => {}
                         Some(_) => return Err(TransportError::AmbiguousRun),
                     }
                 }
@@ -1782,8 +3274,72 @@ impl<R: GhRunner> GithubTransport<R> {
         if rows.len() != 1 {
             return Err(TransportError::MalformedResponse { operation: "run" });
         }
-        let snapshot = rows.remove(0);
+        let mut snapshot = rows.remove(0);
+        if workflow_run_path_matches(
+            &snapshot.handle.workflow_path,
+            &handle.workflow_path,
+            &handle.branch,
+        ) {
+            snapshot
+                .handle
+                .workflow_path
+                .clone_from(&handle.workflow_path);
+        }
         if snapshot.handle != *handle {
+            return Err(TransportError::RunIdentityMismatch);
+        }
+        Ok(snapshot)
+    }
+
+    /// Fetch the run ID returned directly by workflow dispatch and re-check
+    /// workflow ID/path, dispatch commit, temporary branch, and event locally.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed run metadata or any immutable identity mismatch.
+    pub fn run_by_id(
+        &mut self,
+        receipt: &WorkflowDispatchReceipt,
+    ) -> Result<RunSnapshot, TransportError> {
+        let endpoint = receipt
+            .repository
+            .endpoint(&format!("/actions/runs/{}", receipt.run_id.get()));
+        let request = self.metadata_request_at_version(
+            ApiMethod::Get,
+            endpoint,
+            WORKFLOW_DISPATCH_RUN_QUERY,
+            WORKFLOW_DISPATCH_API_VERSION_HEADER,
+        );
+        let output = self.runner.execute(&request)?;
+        let mut rows = parse_workflow_dispatch_run_rows(&output, "workflow dispatch run")?;
+        if rows.len() != 1 {
+            return Err(TransportError::MalformedResponse {
+                operation: "workflow dispatch run",
+            });
+        }
+        let correlated = rows.remove(0);
+        if correlated.run_name != receipt.run_name {
+            return Err(TransportError::RunIdentityMismatch);
+        }
+        let mut snapshot = correlated.snapshot;
+        if workflow_run_path_matches(
+            &snapshot.handle.workflow_path,
+            &receipt.workflow_path,
+            &receipt.branch,
+        ) {
+            snapshot
+                .handle
+                .workflow_path
+                .clone_from(&receipt.workflow_path);
+        }
+        let handle = snapshot.handle();
+        if handle.id != receipt.run_id
+            || handle.workflow_id != receipt.workflow_id
+            || handle.workflow_path != receipt.workflow_path
+            || handle.head_sha != receipt.dispatch_revision
+            || handle.branch != receipt.branch
+            || handle.event != RunEvent::WorkflowDispatch
+        {
             return Err(TransportError::RunIdentityMismatch);
         }
         Ok(snapshot)
@@ -1927,8 +3483,9 @@ impl<R: GhRunner> GithubTransport<R> {
 
     /// Download one exact artifact ZIP without extracting it.
     ///
-    /// The destination is created with no-clobber semantics and mode 0600 on
-    /// Unix. Both API metadata and actual stdout are independently bounded.
+    /// The destination is created with no-clobber semantics, a strict private
+    /// DACL on Windows, and mode 0600 on Unix. Both API metadata and actual
+    /// stdout are independently bounded.
     ///
     /// # Errors
     ///
@@ -1958,6 +3515,7 @@ impl<R: GhRunner> GithubTransport<R> {
             silent: false,
             output_limit,
             timeout: self.limits.download_timeout,
+            api_version: API_VERSION,
         };
         let bytes = self.runner.execute(&request)?;
         if usize_to_u64(bytes.len()) > self.limits.artifact_bytes || !looks_like_zip(&bytes) {
@@ -1987,6 +3545,25 @@ impl<R: GhRunner> GithubTransport<R> {
         self.metadata_request_with_fields(method, endpoint, Vec::new(), jq)
     }
 
+    fn metadata_request_at_version(
+        &self,
+        method: ApiMethod,
+        endpoint: String,
+        jq: &'static str,
+        api_version: &'static str,
+    ) -> GhRequest {
+        GhRequest {
+            method,
+            endpoint,
+            fields: Vec::new(),
+            jq: Some(jq),
+            silent: false,
+            output_limit: self.limits.api_response_bytes,
+            timeout: self.limits.api_timeout,
+            api_version,
+        }
+    }
+
     fn metadata_request_with_fields(
         &self,
         method: ApiMethod,
@@ -2002,6 +3579,7 @@ impl<R: GhRunner> GithubTransport<R> {
             silent: false,
             output_limit: self.limits.api_response_bytes,
             timeout: self.limits.api_timeout,
+            api_version: API_VERSION,
         }
     }
 
@@ -2014,6 +3592,7 @@ impl<R: GhRunner> GithubTransport<R> {
             silent: true,
             output_limit: 1_024,
             timeout: self.limits.api_timeout,
+            api_version: API_VERSION,
         }
     }
 }
@@ -2045,7 +3624,47 @@ fn parse_repository(
     })
 }
 
-fn parse_installation_repositories(output: &[u8]) -> Result<Vec<String>, TransportError> {
+fn parse_actions_permissions(output: &[u8]) -> Result<ActionsPermissions, TransportError> {
+    let operation = "GitHub Actions permissions";
+    let line = parse_single_utf8_line(output, operation)?;
+    Ok(ActionsPermissions {
+        enabled: parse_bool(line, operation)?,
+    })
+}
+
+fn parse_workflow_registration(
+    output: &[u8],
+    repository: &Repository,
+    expected_path: &str,
+) -> Result<WorkflowRegistration, TransportError> {
+    let operation = "workflow registration";
+    let line = parse_single_utf8_line(output, operation)?;
+    let columns = split_columns(line, 3, operation)?;
+    let id = WorkflowId::new(parse_nonzero_u64(columns[0], operation)?)
+        .map_err(|_| TransportError::MalformedResponse { operation })?;
+    let path = parse_base64_metadata_name(columns[1], operation, 4_096)?;
+    if path != expected_path {
+        return Err(TransportError::WorkflowIdentityMismatch);
+    }
+    if columns[2] != "active" {
+        return Err(TransportError::WorkflowInactive);
+    }
+    Ok(WorkflowRegistration {
+        repository: repository.clone(),
+        id,
+        path,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InstallationRepository {
+    id: u64,
+    repository: Repository,
+}
+
+fn parse_installation_repositories(
+    output: &[u8],
+) -> Result<Vec<InstallationRepository>, TransportError> {
     let operation = "installation repository list";
     let text = parse_utf8(output, operation)?;
     if text.is_empty() {
@@ -2054,7 +3673,7 @@ fn parse_installation_repositories(output: &[u8]) -> Result<Vec<String>, Transpo
     text.lines()
         .map(|line| {
             let columns = split_columns(line, 2, operation)?;
-            parse_nonzero_u64(columns[0], operation)?;
+            let id = parse_nonzero_u64(columns[0], operation)?;
             let full_name = parse_base64_metadata_name(columns[1], operation, 256)?;
             let (owner, name) = full_name
                 .split_once('/')
@@ -2062,9 +3681,9 @@ fn parse_installation_repositories(output: &[u8]) -> Result<Vec<String>, Transpo
             if name.contains('/') {
                 return Err(TransportError::MalformedResponse { operation });
             }
-            Repository::new(owner, name)
+            let repository = Repository::new(owner, name)
                 .map_err(|_| TransportError::MalformedResponse { operation })?;
-            Ok(full_name)
+            Ok(InstallationRepository { id, repository })
         })
         .collect()
 }
@@ -2159,6 +3778,28 @@ fn parse_run_rows(
         .collect()
 }
 
+fn parse_workflow_dispatch_run_rows(
+    output: &[u8],
+    operation: &'static str,
+) -> Result<Vec<WorkflowDispatchRunSnapshot>, TransportError> {
+    let text = parse_utf8(output, operation)?;
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    text.lines()
+        .map(|line| {
+            let columns = split_columns(line, 11, operation)?;
+            let run_name = parse_base64_metadata_name(
+                columns[10],
+                operation,
+                MAX_WORKFLOW_DISPATCH_RUN_NAME_BYTES,
+            )?;
+            let snapshot = parse_run_row(&columns[..10].join("\t"), operation)?;
+            Ok(WorkflowDispatchRunSnapshot { snapshot, run_name })
+        })
+        .collect()
+}
+
 fn parse_run_row(line: &str, operation: &'static str) -> Result<RunSnapshot, TransportError> {
     let columns = split_columns(line, 10, operation)?;
     let id = RunId::new(parse_nonzero_u64(columns[0], operation)?)
@@ -2205,6 +3846,14 @@ fn parse_run_row(line: &str, operation: &'static str) -> Result<RunSnapshot, Tra
         status,
         conclusion,
     })
+}
+
+fn workflow_run_path_matches(value: &str, expected_path: &str, branch: &BranchName) -> bool {
+    value == expected_path
+        || value
+            .strip_prefix(expected_path)
+            .and_then(|suffix| suffix.strip_prefix('@'))
+            == Some(branch.as_str())
 }
 
 fn parse_artifacts(output: &[u8]) -> Result<Vec<ArtifactInfo>, TransportError> {
@@ -2388,6 +4037,43 @@ fn looks_like_zip(bytes: &[u8]) -> bool {
         .is_some()
 }
 
+#[cfg(windows)]
+fn write_new_artifact(target: &ArtifactDownloadTarget, bytes: &[u8]) -> Result<(), TransportError> {
+    let path = target.path();
+    let mut file = create_windows_private_file(&path)
+        .map_err(|error| map_windows_artifact_create_error(&error))?;
+    if file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .is_err()
+    {
+        remove_failed_windows_artifact(file)?;
+        return Err(TransportError::ArtifactWriteFailed);
+    }
+    if verify_windows_private_file_handle(file.as_handle()).is_err() {
+        remove_failed_windows_artifact(file)?;
+        return Err(TransportError::ArtifactWriteFailed);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn map_windows_artifact_create_error(error: &PrivateDirectoryError) -> TransportError {
+    if error.cleanup_status() == PrivateDirectoryCleanupStatus::Uncertain {
+        TransportError::ArtifactCleanupUncertain
+    } else if error.kind() == PrivateDirectoryErrorKind::AlreadyExists {
+        TransportError::DestinationExists
+    } else {
+        TransportError::ArtifactWriteFailed
+    }
+}
+
+#[cfg(windows)]
+fn remove_failed_windows_artifact(file: fs::File) -> Result<(), TransportError> {
+    remove_windows_private_file_handle(file).map_err(|_| TransportError::ArtifactCleanupUncertain)
+}
+
+#[cfg(not(windows))]
 fn write_new_artifact(target: &ArtifactDownloadTarget, bytes: &[u8]) -> Result<(), TransportError> {
     let path = target.path();
     let mut options = OpenOptions::new();
@@ -2420,7 +4106,14 @@ fn run_process(
     timeout: Duration,
     stdout_limit: usize,
 ) -> Result<Vec<u8>, GhExecutionError> {
-    run_process_inner(command, timeout, stdout_limit, None, true)
+    run_process_inner(
+        command,
+        timeout,
+        stdout_limit,
+        None,
+        true,
+        PROCESS_POLL_INTERVAL,
+    )
 }
 
 fn run_process_with_secret_input(
@@ -2429,7 +4122,15 @@ fn run_process_with_secret_input(
     stdout_limit: usize,
     input: &SecretBytes,
 ) -> Result<(), GhExecutionError> {
-    run_process_inner(command, timeout, stdout_limit, Some(input), false).map(drop)
+    run_process_inner(
+        command,
+        timeout,
+        stdout_limit,
+        Some(input),
+        false,
+        PROCESS_POLL_INTERVAL,
+    )
+    .map(drop)
 }
 
 fn run_process_inner(
@@ -2438,6 +4139,7 @@ fn run_process_inner(
     stdout_limit: usize,
     input: Option<&SecretBytes>,
     retain_stdout: bool,
+    poll_interval: Duration,
 ) -> Result<Vec<u8>, GhExecutionError> {
     let mut child = command.spawn().map_err(|_| GhExecutionError::SpawnFailed)?;
     let mut process_tree = ProcessTreeGuard::attach(&child).inspect_err(|_| {
@@ -2474,63 +4176,100 @@ fn run_process_inner(
         spawn_process_worker(move || read_capped(stdout, stdout_limit, retain_stdout));
     let stderr_reader = spawn_process_worker(move || read_capped(stderr, MAX_STDERR_BYTES, false));
     let Some(deadline) = Instant::now().checked_add(timeout) else {
-        let cleanup_deadline = process_cleanup_deadline();
-        terminate_process_tree(&mut child, &mut process_tree, cleanup_deadline);
-        let _ = collect_process_workers(
+        terminate_and_discard_process_output(
+            &mut child,
+            &mut process_tree,
             stdin_writer.as_ref(),
             &stdout_reader,
             &stderr_reader,
-            cleanup_deadline,
         );
         return Err(GhExecutionError::TimedOut);
     };
 
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => {
-                thread::sleep(Duration::from_millis(20));
-            }
-            Ok(None) => {
-                let cleanup_deadline = process_cleanup_deadline();
-                terminate_process_tree(&mut child, &mut process_tree, cleanup_deadline);
-                let _ = collect_process_workers(
-                    stdin_writer.as_ref(),
-                    &stdout_reader,
-                    &stderr_reader,
-                    cleanup_deadline,
-                );
-                return Err(GhExecutionError::TimedOut);
-            }
-            Err(_) => {
-                let cleanup_deadline = process_cleanup_deadline();
-                terminate_process_tree(&mut child, &mut process_tree, cleanup_deadline);
-                let _ = collect_process_workers(
-                    stdin_writer.as_ref(),
-                    &stdout_reader,
-                    &stderr_reader,
-                    cleanup_deadline,
-                );
-                return Err(GhExecutionError::ProcessIo);
-            }
+    let status = match wait_for_process_exit(&mut child, deadline, poll_interval) {
+        Ok(status) => status,
+        Err(error) => {
+            terminate_and_discard_process_output(
+                &mut child,
+                &mut process_tree,
+                stdin_writer.as_ref(),
+                &stdout_reader,
+                &stderr_reader,
+            );
+            return Err(error);
         }
     };
     // `gh` has exited, but a descendant may still hold one of its inherited
     // pipes open. End the complete supervised tree before collecting output.
     process_tree.terminate_descendants();
-    let (stdout, stderr) = collect_process_workers(
+    if Instant::now() >= deadline {
+        terminate_and_discard_process_output(
+            &mut child,
+            &mut process_tree,
+            stdin_writer.as_ref(),
+            &stdout_reader,
+            &stderr_reader,
+        );
+        return Err(GhExecutionError::TimedOut);
+    }
+    let output = collect_process_workers(
         stdin_writer.as_ref(),
         &stdout_reader,
         &stderr_reader,
-        process_cleanup_deadline(),
-    )?;
+        deadline,
+    );
+    if Instant::now() >= deadline {
+        drop(output);
+        return Err(GhExecutionError::TimedOut);
+    }
+    let (mut stdout, stderr) = output?;
     if !status.success() {
         return Err(command_failed(status));
     }
     if stdout.truncated || stderr.truncated {
         return Err(GhExecutionError::OutputLimitExceeded);
     }
-    Ok(stdout.bytes)
+    if Instant::now() >= deadline {
+        return Err(GhExecutionError::TimedOut);
+    }
+    Ok(std::mem::take(&mut stdout.bytes))
+}
+
+fn wait_for_process_exit(
+    child: &mut Child,
+    deadline: Instant,
+    poll_interval: Duration,
+) -> Result<ExitStatus, GhExecutionError> {
+    debug_assert!(!poll_interval.is_zero());
+    loop {
+        if Instant::now() >= deadline {
+            return Err(GhExecutionError::TimedOut);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) if Instant::now() < deadline => return Ok(status),
+            Ok(Some(_)) => return Err(GhExecutionError::TimedOut),
+            Ok(None) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if !remaining.is_zero() {
+                    thread::sleep(remaining.min(poll_interval));
+                }
+            }
+            Err(_) => return Err(GhExecutionError::ProcessIo),
+        }
+    }
+}
+
+fn terminate_and_discard_process_output(
+    child: &mut Child,
+    process_tree: &mut ProcessTreeGuard,
+    stdin_writer: Option<&Receiver<Result<(), GhExecutionError>>>,
+    stdout_reader: &Receiver<Result<CapturedOutput, GhExecutionError>>,
+    stderr_reader: &Receiver<Result<CapturedOutput, GhExecutionError>>,
+) {
+    // The fresh grace is teardown-only; its output can never determine success.
+    let cleanup_deadline = process_cleanup_deadline();
+    terminate_process_tree(child, process_tree, cleanup_deadline);
+    let _ = collect_process_workers(stdin_writer, stdout_reader, stderr_reader, cleanup_deadline);
 }
 
 fn spawn_process_worker<T>(
@@ -2667,6 +4406,12 @@ struct CapturedOutput {
     truncated: bool,
 }
 
+impl Drop for CapturedOutput {
+    fn drop(&mut self) {
+        self.bytes.fill(0);
+    }
+}
+
 fn read_capped(
     mut reader: impl Read,
     limit: usize,
@@ -2786,6 +4531,54 @@ fn validate_repository_name(value: &str) -> Result<(), TransportConfigError> {
 }
 
 #[allow(clippy::case_sensitive_file_extension_comparisons)]
+fn validate_workflow_dispatch_operation(value: &str) -> Result<(), TransportConfigError> {
+    validate_nonempty_length("workflow dispatch operation", value, 64)?;
+    validate_ascii_allowlist("workflow dispatch operation", value, |byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+    })?;
+    if value.starts_with('.')
+        || value.ends_with('.')
+        || value.ends_with(".lock")
+        || value.contains("..")
+    {
+        return Err(TransportConfigError::InvalidFormat {
+            field: "workflow dispatch operation",
+        });
+    }
+    Ok(())
+}
+
+fn validate_lower_sha256(field: &'static str, value: &str) -> Result<(), TransportConfigError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(TransportConfigError::InvalidFormat { field });
+    }
+    Ok(())
+}
+
+fn valid_workflow_dispatch_receipt_url(
+    value: &str,
+    origin: &str,
+    repository: &Repository,
+    run_id: RunId,
+) -> bool {
+    let expected = format!(
+        "{origin}{}/{}/actions/runs/{}",
+        repository.owner(),
+        repository.name(),
+        run_id.get()
+    );
+    !value.is_empty()
+        && value.len() <= 2_048
+        && value.is_ascii()
+        && !value.bytes().any(|byte| byte.is_ascii_control())
+        && value.eq_ignore_ascii_case(&expected)
+}
+
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
 fn validated_workflow_filename(workflow_path: &str) -> Result<&str, TransportError> {
     let filename = workflow_path
         .strip_prefix(".github/workflows/")
@@ -2863,6 +4656,10 @@ fn usize_to_u64(value: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "secure-job-log-http")]
+    use std::io::Cursor;
+    #[cfg(windows)]
+    use std::os::windows::io::AsHandle as _;
     use std::{
         collections::VecDeque,
         sync::atomic::{AtomicU64, Ordering},
@@ -2874,6 +4671,7 @@ mod tests {
     const BRANCH_B64: &str = "cnVzdGZlcnJ5L2dvYWwzL2J1aWxkcy9qb2ItMQ==";
     const WORKFLOW_PATH: &str = ".github/workflows/rustferry-goal3-iphone.yml";
     const WORKFLOW_PATH_B64: &str = "LmdpdGh1Yi93b3JrZmxvd3MvcnVzdGZlcnJ5LWdvYWwzLWlwaG9uZS55bWw=";
+    const WORKFLOW_DISPATCH_RUN_PATH_B64: &str = "LmdpdGh1Yi93b3JrZmxvd3MvcnVzdGZlcnJ5LWdvYWwzLWlwaG9uZS55bWxAcnVzdGZlcnJ5L2dvYWwzL2J1aWxkcy9qb2ItMQ==";
     const ENVIRONMENT_B64: &str = "cnVzdGZlcnJ5LWdvYWwzLXNpZ25pbmc=";
     const DEPLOYMENT_POLICY_B64: &str = "cnVzdGZlcnJ5L2dvYWwzL2J1aWxkcy8q";
     const CERTIFICATE_P12_B64: &str = "UlVTVEZFUlJZX0dPQUwzX0lPU19DRVJUSUZJQ0FURV9QMTI=";
@@ -2881,6 +4679,30 @@ mod tests {
         "UlVTVEZFUlJZX0dPQUwzX0lPU19DRVJUSUZJQ0FURV9QQVNTV09SRA==";
     const PROVISIONING_PROFILE_B64: &str =
         "UlVTVEZFUlJZX0dPQUwzX0lPU19QUk9WSVNJT05JTkdfUFJPRklMRQ==";
+
+    fn base64_fixture(value: &str) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut encoded = String::with_capacity(value.len().div_ceil(3) * 4);
+        for chunk in value.as_bytes().chunks(3) {
+            let first = chunk[0];
+            let second = chunk.get(1).copied().unwrap_or(0);
+            let third = chunk.get(2).copied().unwrap_or(0);
+            encoded.push(char::from(ALPHABET[usize::from(first >> 2)]));
+            encoded.push(char::from(ALPHABET[usize::from((first & 0x03) << 4 | second >> 4)]));
+            encoded.push(if chunk.len() > 1 {
+                char::from(ALPHABET[usize::from((second & 0x0f) << 2 | third >> 6)])
+            } else {
+                '='
+            });
+            encoded.push(if chunk.len() > 2 {
+                char::from(ALPHABET[usize::from(third & 0x3f)])
+            } else {
+                '='
+            });
+        }
+        encoded
+    }
 
     #[cfg(target_os = "linux")]
     fn process_is_zombie(process_id: u32) -> bool {
@@ -2934,6 +4756,36 @@ mod tests {
         requests: Vec<GhRequest>,
         secret_responses: VecDeque<Result<(), GhExecutionError>>,
         secret_writes: Vec<RecordedSecretWrite>,
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeWorkflowDispatchHttpClient {
+        responses:
+            VecDeque<Result<GithubWorkflowDispatchHttpResponse, GithubWorkflowDispatchHttpError>>,
+        requests: Vec<GithubWorkflowDispatchHttpRequest>,
+    }
+
+    impl FakeWorkflowDispatchHttpClient {
+        fn with(
+            responses: impl IntoIterator<
+                Item = Result<GithubWorkflowDispatchHttpResponse, GithubWorkflowDispatchHttpError>,
+            >,
+        ) -> Self {
+            Self {
+                responses: responses.into_iter().collect(),
+                requests: Vec::new(),
+            }
+        }
+    }
+
+    impl GithubWorkflowDispatchHttpClient for FakeWorkflowDispatchHttpClient {
+        fn post(
+            &mut self,
+            request: &GithubWorkflowDispatchHttpRequest,
+        ) -> Result<GithubWorkflowDispatchHttpResponse, GithubWorkflowDispatchHttpError> {
+            self.requests.push(request.clone());
+            self.responses.pop_front().expect("unexpected dispatch")
+        }
     }
 
     #[derive(Debug, Eq, PartialEq)]
@@ -3000,6 +4852,40 @@ mod tests {
 
     fn environment() -> ProtectedEnvironment {
         ProtectedEnvironment::new("rustferry-goal3-signing").expect("environment")
+    }
+
+    fn workflow_registration() -> WorkflowRegistration {
+        WorkflowRegistration {
+            repository: repository(),
+            id: WorkflowId::new(42).expect("workflow id"),
+            path: WORKFLOW_PATH.to_owned(),
+        }
+    }
+
+    fn workflow_dispatch_request() -> WorkflowDispatchRequest {
+        let namespace = TemporaryBranchNamespace::new("rustferry/goal3/builds").expect("namespace");
+        let temporary_ref = TemporaryGitRef::new(
+            &namespace,
+            BranchName::new("rustferry/goal3/builds/job-1").expect("branch"),
+        )
+        .expect("temporary ref");
+        WorkflowDispatchRequest::new(
+            repository(),
+            workflow_registration(),
+            temporary_ref,
+            "job-1",
+            "f".repeat(64),
+            CommitSha::new(SHA).expect("source revision"),
+            CommitSha::new("fedcba9876543210fedcba9876543210fedcba98").expect("dispatch revision"),
+        )
+        .expect("workflow dispatch request")
+    }
+
+    fn workflow_dispatch_receipt_body(run_id: u64) -> Vec<u8> {
+        format!(
+            "{{\"workflow_run_id\":{run_id},\"run_url\":\"https://api.github.com/repos/ShiroKSH/rustferry/actions/runs/{run_id}\",\"html_url\":\"https://github.com/ShiroKSH/rustferry/actions/runs/{run_id}\"}}"
+        )
+        .into_bytes()
     }
 
     fn environment_secret_write_request() -> EnvironmentSecretWriteRequest {
@@ -3109,6 +4995,534 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "secure-job-log-http")]
+    #[test]
+    fn job_log_agent_is_direct_https_no_redirect_and_trace_suppressed() {
+        let client = UreqGithubJobLogHttpClient::new(SecretBytes::new(b"test-token".to_vec()))
+            .expect("job-log client");
+        let config = client.agent.config();
+
+        assert!(config.https_only());
+        assert!(config.proxy().is_none());
+        assert_eq!(config.max_redirects(), 0);
+        assert!(!config.max_redirects_will_error());
+        assert_eq!(
+            config.redirect_auth_headers(),
+            ureq::config::RedirectAuthHeaders::Never
+        );
+        assert!(!config.save_redirect_history());
+        assert_eq!(
+            config.max_response_header_size(),
+            MAX_JOB_LOG_RESPONSE_HEADER_BYTES
+        );
+        assert_eq!(
+            config.tls_config().provider(),
+            ureq::tls::TlsProvider::Rustls
+        );
+        let timeouts = config.timeouts();
+        assert_eq!(timeouts.global, Some(MAX_JOB_LOG_HTTP_TIMEOUT));
+        assert_eq!(timeouts.resolve, Some(MAX_JOB_LOG_HTTP_TIMEOUT));
+        assert_eq!(timeouts.connect, Some(MAX_JOB_LOG_HTTP_TIMEOUT));
+        assert_eq!(timeouts.send_request, Some(MAX_JOB_LOG_HTTP_TIMEOUT));
+        assert_eq!(timeouts.recv_response, Some(MAX_JOB_LOG_HTTP_TIMEOUT));
+        assert_eq!(timeouts.recv_body, Some(MAX_JOB_LOG_HTTP_TIMEOUT));
+        // ureq reveals paths, queries, and Location at TRACE. The facade cap is
+        // therefore a signed-redirect confidentiality boundary, not a tuning knob.
+        assert!(log::STATIC_MAX_LEVEL <= log::LevelFilter::Debug);
+    }
+
+    #[cfg(feature = "secure-job-log-http")]
+    #[test]
+    fn job_log_request_attaches_auth_only_to_the_fixed_api_origin() {
+        const TOKEN: &str = "fake-job-log-token-sentinel";
+        let client = UreqGithubJobLogHttpClient::new(SecretBytes::new(TOKEN.as_bytes().to_vec()))
+            .expect("job-log client");
+        let api = client
+            .prepare_get(
+                "/repos/ShiroKSH/rustferry/actions/jobs/42/logs",
+                true,
+                GithubJobLogAuthorization::GithubApi,
+                GithubJobLogAccept::Json,
+                Duration::from_secs(5),
+            )
+            .expect("API request");
+        let api_headers = api.headers_ref().expect("API headers");
+        let authorization = api_headers.get("authorization").expect("API authorization");
+        assert_eq!(
+            authorization.as_bytes(),
+            format!("Bearer {TOKEN}").as_bytes()
+        );
+        assert!(authorization.is_sensitive());
+        assert_eq!(
+            api_headers
+                .get("x-github-api-version")
+                .expect("API version"),
+            JOB_LOG_API_VERSION
+        );
+        assert_eq!(JOB_LOG_API_VERSION, "2026-03-10");
+        assert_eq!(
+            api.uri_ref().expect("API URI").to_string(),
+            "https://api.github.com/repos/ShiroKSH/rustferry/actions/jobs/42/logs"
+        );
+
+        let redirect = client
+            .prepare_get(
+                "https://pipelines.actions.githubusercontent.com/results/log.txt?signed=secret",
+                false,
+                GithubJobLogAuthorization::Omit,
+                GithubJobLogAccept::PlainText,
+                Duration::from_secs(5),
+            )
+            .expect("signed redirect request");
+        let redirect_headers = redirect.headers_ref().expect("redirect headers");
+        assert!(redirect_headers.get("authorization").is_none());
+        assert!(redirect_headers.get("proxy-authorization").is_none());
+        assert!(redirect_headers.get("x-github-api-version").is_none());
+        assert!(redirect_headers.get("cookie").is_none());
+        assert_eq!(
+            redirect_headers.get("accept").expect("plain-text accept"),
+            JOB_LOG_PLAINTEXT_ACCEPT
+        );
+    }
+
+    #[cfg(feature = "secure-job-log-http")]
+    #[test]
+    fn workflow_dispatch_http_request_uses_fixed_origin_headers_and_no_redirects() {
+        const TOKEN: &str = "fake-dispatch-token-sentinel";
+        let client = UreqGithubApiHttpClient::new(SecretBytes::new(TOKEN.as_bytes().to_vec()))
+            .expect("GitHub API client");
+        let request = workflow_dispatch_request();
+        let http_request = GithubWorkflowDispatchHttpRequest {
+            endpoint: request.repository.endpoint(&format!(
+                "/actions/workflows/{}/dispatches",
+                request.workflow.id.get()
+            )),
+            body: request.body.clone(),
+            timeout: Duration::from_secs(5),
+        };
+        let planned = client
+            .prepare_workflow_dispatch_post(&http_request)
+            .expect("dispatch request");
+        let headers = planned.headers_ref().expect("dispatch headers");
+        let authorization = headers
+            .get("authorization")
+            .expect("dispatch authorization");
+        assert_eq!(
+            authorization.as_bytes(),
+            format!("Bearer {TOKEN}").as_bytes()
+        );
+        assert!(authorization.is_sensitive());
+        assert_eq!(
+            headers.get("accept").expect("accept"),
+            WORKFLOW_DISPATCH_ACCEPT
+        );
+        assert_eq!(
+            headers.get("content-type").expect("content type"),
+            WORKFLOW_DISPATCH_CONTENT_TYPE
+        );
+        assert_eq!(
+            headers.get("x-github-api-version").expect("API version"),
+            WORKFLOW_DISPATCH_API_VERSION
+        );
+        assert_eq!(
+            planned.uri_ref().expect("dispatch URI").to_string(),
+            "https://api.github.com/repos/ShiroKSH/rustferry/actions/workflows/42/dispatches"
+        );
+        assert_eq!(client.agent.config().max_redirects(), 0);
+        assert_eq!(
+            client.agent.config().redirect_auth_headers(),
+            ureq::config::RedirectAuthHeaders::Never
+        );
+        let rendered = format!("{client:?}\n{http_request:?}");
+        assert!(!rendered.contains(TOKEN));
+        assert!(!rendered.contains("api.github.com"));
+        assert!(!rendered.contains("request_sha256"));
+    }
+
+    #[cfg(feature = "secure-job-log-http")]
+    #[test]
+    fn job_log_request_modes_and_errors_fail_closed_without_sensitive_values() {
+        const SENTINEL: &str = "signed-url-token-never-surface";
+        let client = UreqGithubJobLogHttpClient::new(SecretBytes::new(b"test-token".to_vec()))
+            .expect("job-log client");
+        for error in [
+            client
+                .prepare_get(
+                    &format!("http://example.invalid/log?sig={SENTINEL}"),
+                    false,
+                    GithubJobLogAuthorization::Omit,
+                    GithubJobLogAccept::PlainText,
+                    Duration::from_secs(5),
+                )
+                .expect_err("HTTP redirect must fail"),
+            client
+                .prepare_get(
+                    "/repos/ShiroKSH/rustferry/actions/jobs/42/logs",
+                    true,
+                    GithubJobLogAuthorization::Omit,
+                    GithubJobLogAccept::Json,
+                    Duration::from_secs(5),
+                )
+                .expect_err("API auth omission must fail"),
+            map_ureq_request_error(ureq::Error::BadUri(SENTINEL.to_owned())),
+            map_ureq_body_error(&io::Error::other(SENTINEL)),
+        ] {
+            let rendered = format!("{error:?}\n{error}");
+            assert!(!rendered.contains(SENTINEL));
+        }
+        let rendered_client = format!("{client:?}");
+        assert!(!rendered_client.contains("test-token"));
+        assert!(rendered_client.contains("<redacted>"));
+        let response = GithubJobLogHttpResponse::new(
+            302,
+            None,
+            Some(format!("https://example.invalid/log?sig={SENTINEL}")),
+            Cursor::new(Vec::<u8>::new()),
+        );
+        assert!(!format!("{response:?}").contains(SENTINEL));
+    }
+
+    #[cfg(feature = "secure-job-log-http")]
+    #[test]
+    fn job_log_body_reads_bounded_chunks_and_checks_cancellation_first() {
+        let cancellation = rustferry_remote::CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut body = Cursor::new(b"abcdefgh".to_vec());
+
+        assert_eq!(
+            read_job_log_body_chunk(&mut body, 3, deadline, &cancellation,).expect("first chunk"),
+            Some(b"abc".to_vec())
+        );
+        assert_eq!(
+            read_job_log_body_chunk(
+                &mut body,
+                MAX_JOB_LOG_HTTP_CHUNK_BYTES + 1,
+                deadline,
+                &cancellation,
+            ),
+            Err(GithubJobLogHttpError::Protocol)
+        );
+        assert!(cancellation.cancel());
+        assert_eq!(
+            read_job_log_body_chunk(&mut body, 3, deadline, &cancellation,),
+            Err(GithubJobLogHttpError::Cancelled)
+        );
+    }
+
+    #[cfg(feature = "secure-job-log-http")]
+    #[test]
+    fn job_log_deadlines_and_post_io_cancellation_fail_closed() {
+        struct StallingReader;
+
+        impl Read for StallingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                thread::sleep(Duration::from_millis(30));
+                buffer[0] = b'x';
+                Ok(1)
+            }
+        }
+
+        struct CancellingReader(rustferry_remote::CancellationToken);
+
+        impl Read for CancellingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                buffer[0] = b'x';
+                assert!(self.0.cancel());
+                Ok(1)
+            }
+        }
+
+        struct CancellingEofReader(rustferry_remote::CancellationToken);
+
+        impl Read for CancellingEofReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                assert!(self.0.cancel());
+                Ok(0)
+            }
+        }
+
+        let active = rustferry_remote::CancellationToken::new();
+        assert_eq!(
+            read_job_log_body_chunk(
+                &mut StallingReader,
+                1,
+                Instant::now() + Duration::from_millis(10),
+                &active,
+            ),
+            Err(GithubJobLogHttpError::TimedOut)
+        );
+
+        let cancelled_during_read = rustferry_remote::CancellationToken::new();
+        assert_eq!(
+            read_job_log_body_chunk(
+                &mut CancellingReader(cancelled_during_read.clone()),
+                1,
+                Instant::now() + Duration::from_secs(1),
+                &cancelled_during_read,
+            ),
+            Err(GithubJobLogHttpError::Cancelled)
+        );
+
+        let cancelled_at_eof = rustferry_remote::CancellationToken::new();
+        assert_eq!(
+            read_job_log_body_chunk(
+                &mut CancellingEofReader(cancelled_at_eof.clone()),
+                1,
+                Instant::now() + Duration::from_secs(1),
+                &cancelled_at_eof,
+            ),
+            Err(GithubJobLogHttpError::Cancelled)
+        );
+
+        let cancelled_after_get = rustferry_remote::CancellationToken::new();
+        assert!(cancelled_after_get.cancel());
+        assert_eq!(
+            check_job_log_http_active(
+                &cancelled_after_get,
+                Instant::now() + Duration::from_secs(1),
+            ),
+            Err(GithubJobLogHttpError::Cancelled)
+        );
+        assert_eq!(
+            check_job_log_http_active(
+                &rustferry_remote::CancellationToken::new(),
+                Instant::now()
+                    .checked_sub(Duration::from_millis(1))
+                    .expect("past deadline"),
+            ),
+            Err(GithubJobLogHttpError::TimedOut)
+        );
+    }
+
+    #[cfg(feature = "secure-job-log-http")]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the self-contained fake keeps ureq's unversioned transport API out of production code"
+    )]
+    fn job_log_ureq_deadline_and_redirect_policy_are_enforced() {
+        use ureq::unversioned::resolver::{ResolvedSocketAddrs, Resolver};
+        use ureq::unversioned::transport::{
+            Buffers, ConnectionDetails, Connector, LazyBuffers, NextTimeout, Transport,
+        };
+
+        #[derive(Debug)]
+        struct LoopbackResolver;
+
+        impl Resolver for LoopbackResolver {
+            fn resolve(
+                &self,
+                _uri: &ureq::http::Uri,
+                _config: &ureq::config::Config,
+                _timeout: NextTimeout,
+            ) -> Result<ResolvedSocketAddrs, ureq::Error> {
+                let mut addresses = self.empty();
+                addresses.push(std::net::SocketAddr::from(([127, 0, 0, 1], 443)));
+                Ok(addresses)
+            }
+        }
+
+        const DELAYED_BODY_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 1\r\nConnection: close\r\n\r\n";
+        const REDIRECT_RESPONSE: &[u8] = b"HTTP/1.1 302 Found\r\nLocation: https://redirect.example.invalid/job.txt?signed=redirect-must-not-surface\r\nContent-Length: 0\r\n\r\n";
+
+        #[derive(Debug)]
+        struct ScriptedConnector {
+            response: &'static [u8],
+            connects: Arc<AtomicU64>,
+        }
+
+        impl Connector for ScriptedConnector {
+            type Out = ScriptedTransport;
+
+            fn connect(
+                &self,
+                details: &ConnectionDetails<'_>,
+                _chained: Option<()>,
+            ) -> Result<Option<Self::Out>, ureq::Error> {
+                self.connects.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(ScriptedTransport {
+                    buffers: LazyBuffers::new(
+                        details.config.input_buffer_size(),
+                        details.config.output_buffer_size(),
+                    ),
+                    response: self.response,
+                    response_head_sent: false,
+                }))
+            }
+        }
+
+        #[derive(Debug)]
+        struct ScriptedTransport {
+            buffers: LazyBuffers,
+            response: &'static [u8],
+            response_head_sent: bool,
+        }
+
+        impl Transport for ScriptedTransport {
+            fn buffers(&mut self) -> &mut dyn Buffers {
+                &mut self.buffers
+            }
+
+            fn transmit_output(
+                &mut self,
+                _amount: usize,
+                _timeout: NextTimeout,
+            ) -> Result<(), ureq::Error> {
+                Ok(())
+            }
+
+            fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
+                if !self.response_head_sent {
+                    let input = self.buffers.input_append_buf();
+                    input[..self.response.len()].copy_from_slice(self.response);
+                    self.buffers.input_appended(self.response.len());
+                    self.response_head_sent = true;
+                    return Ok(true);
+                }
+
+                let delay = timeout
+                    .not_zero()
+                    .map_or(Duration::from_millis(100), |duration| *duration)
+                    .min(Duration::from_millis(100));
+                thread::sleep(delay.saturating_add(Duration::from_millis(5)));
+                Err(ureq::Error::Timeout(timeout.reason))
+            }
+
+            fn is_open(&mut self) -> bool {
+                true
+            }
+
+            fn is_tls(&self) -> bool {
+                true
+            }
+        }
+
+        const SIGNED_TARGET_SENTINEL: &str =
+            "https://logs.example.invalid/job.txt?signed=must-not-surface";
+        const TOKEN_SENTINEL: &[u8] = b"fake-transport-token-must-not-surface";
+        let mut client = UreqGithubJobLogHttpClient::new(SecretBytes::new(TOKEN_SENTINEL.to_vec()))
+            .expect("job-log client");
+        let delayed_connects = Arc::new(AtomicU64::new(0));
+        client.agent = ureq::Agent::with_parts(
+            client.agent.config().clone(),
+            ScriptedConnector {
+                response: DELAYED_BODY_RESPONSE,
+                connects: Arc::clone(&delayed_connects),
+            },
+            LoopbackResolver,
+        );
+        let timeout = Duration::from_millis(40);
+        let started = Instant::now();
+        let response = client
+            .prepare_get(
+                SIGNED_TARGET_SENTINEL,
+                false,
+                GithubJobLogAuthorization::Omit,
+                GithubJobLogAccept::PlainText,
+                timeout,
+            )
+            .expect("signed request")
+            .call()
+            .expect("response head before deadline");
+        let (_, body) = response.into_parts();
+        let mut body = UreqGithubJobLogHttpBody {
+            reader: body.into_reader(),
+            request_deadline: started.checked_add(timeout).expect("request deadline"),
+        };
+        let error = body
+            .next_chunk(1, &rustferry_remote::CancellationToken::new())
+            .expect_err("body must time out");
+
+        assert_eq!(error, GithubJobLogHttpError::TimedOut);
+        let rendered = format!("{error:?}\n{error}");
+        assert!(!rendered.contains(SIGNED_TARGET_SENTINEL));
+        assert!(!rendered.contains("logs.example.invalid"));
+        assert!(!rendered.contains("signed=must-not-surface"));
+        assert!(!rendered.contains(std::str::from_utf8(TOKEN_SENTINEL).expect("ASCII token")));
+        assert_eq!(delayed_connects.load(Ordering::SeqCst), 1);
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        let redirect_connects = Arc::new(AtomicU64::new(0));
+        client.agent = ureq::Agent::with_parts(
+            client.agent.config().clone(),
+            ScriptedConnector {
+                response: REDIRECT_RESPONSE,
+                connects: Arc::clone(&redirect_connects),
+            },
+            LoopbackResolver,
+        );
+        let redirect = client
+            .prepare_get(
+                SIGNED_TARGET_SENTINEL,
+                false,
+                GithubJobLogAuthorization::Omit,
+                GithubJobLogAccept::PlainText,
+                Duration::from_secs(1),
+            )
+            .expect("signed request")
+            .call()
+            .expect("redirect response");
+
+        assert_eq!(redirect.status().as_u16(), 302);
+        assert_eq!(redirect_connects.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            redirect.headers().get("location").expect("Location"),
+            "https://redirect.example.invalid/job.txt?signed=redirect-must-not-surface"
+        );
+    }
+
+    #[cfg(feature = "secure-job-log-http")]
+    #[test]
+    fn job_log_token_validation_is_bounded_and_never_accepts_output_lines() {
+        assert_eq!(
+            validate_github_token(vec![b'x'; MAX_GITHUB_TOKEN_BYTES], false)
+                .expect("maximum token")
+                .len(),
+            MAX_GITHUB_TOKEN_BYTES
+        );
+        assert_eq!(
+            validate_github_token(b"test-token\r\n".to_vec(), true)
+                .expect("gh output token")
+                .len(),
+            "test-token".len()
+        );
+        assert!(matches!(
+            validate_github_token(b"test-token\nsecond-line".to_vec(), true),
+            Err(GhExecutionError::AuthenticationUnavailable)
+        ));
+        assert!(matches!(
+            validate_github_token(vec![b'x'; MAX_GITHUB_TOKEN_BYTES + 1], false),
+            Err(GhExecutionError::OutputLimitExceeded)
+        ));
+    }
+
+    #[cfg(feature = "secure-job-log-http")]
+    #[test]
+    fn job_log_token_process_uses_only_fixed_auth_argv() {
+        let executable_directory = tempfile::TempDir::new().expect("executable directory");
+        let executable =
+            executable_directory
+                .path()
+                .join(if cfg!(windows) { "gh.exe" } else { "gh" });
+        fs::write(&executable, []).expect("fake gh executable");
+        let neutral = tempfile::TempDir::new().expect("neutral directory");
+        let config = tempfile::TempDir::new().expect("config directory");
+        let runner = GhProcessRunner::new(
+            &executable,
+            neutral.path(),
+            GhAuthentication::config_directory(config.path()).expect("gh config"),
+        )
+        .expect("isolated gh runner");
+        let command = runner.authentication_token_command();
+
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["auth", "token", "--hostname", "github.com"]
+                .map(OsStr::new)
+                .as_slice()
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn private_gh_state_rejects_a_parent_symlink_alias_into_the_project() {
@@ -3150,6 +5564,7 @@ mod tests {
             silent: false,
             output_limit: 1024,
             timeout: Duration::from_secs(1),
+            api_version: API_VERSION,
         };
         let command = runner.command(&request);
         let environment = command
@@ -3178,7 +5593,55 @@ mod tests {
         ] {
             assert_eq!(value(name), Some(runner.private_state.root.as_os_str()));
         }
-        assert_eq!(environment.len(), 15);
+        #[cfg(windows)]
+        {
+            assert_eq!(value("SystemRoot"), Some(runner.system_root.as_os_str()));
+            assert!(runner.system_root.is_absolute());
+            assert_eq!(environment.len(), 16);
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(value("SystemRoot"), None);
+            assert_eq!(environment.len(), 15);
+        }
+        for name in [
+            "PATH",
+            "PATHEXT",
+            "WINDIR",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "no_proxy",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+        ] {
+            assert_eq!(value(name), None, "unexpected child variable {name}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires explicit live gh executable and config-directory paths"]
+    fn live_windows_config_directory_authenticates_through_keyring() {
+        let executable = std::env::var_os("RUSTFERRY_LIVE_GH_EXECUTABLE")
+            .expect("set RUSTFERRY_LIVE_GH_EXECUTABLE to the real gh.exe path");
+        let configuration_directory = std::env::var_os("RUSTFERRY_LIVE_GH_CONFIG_DIR")
+            .expect("set RUSTFERRY_LIVE_GH_CONFIG_DIR to the authenticated gh config directory");
+        let neutral = tempfile::TempDir::new().expect("neutral directory");
+        let authentication = GhAuthentication::config_directory(configuration_directory)
+            .expect("canonical live gh config directory");
+        let runner = GhProcessRunner::new(executable, neutral.path(), authentication)
+            .expect("isolated live gh runner");
+        let mut transport = GithubTransport::new(runner, TransportLimits::secure_defaults());
+
+        let user = transport
+            .authenticated_user()
+            .expect("GET /user through Windows keyring authentication");
+
+        assert_ne!(user.id(), 0);
+        assert!(!user.login().is_empty());
     }
 
     #[test]
@@ -3369,6 +5832,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn process_deadline_child_helper() {
+        const CHILD_MODE: &str = "RUSTFERRY_PROCESS_DEADLINE_CHILD";
+        const LATE_OUTPUT: &[u8] = b"late-process-output-must-not-succeed";
+        if std::env::var_os(CHILD_MODE).as_deref() != Some(OsStr::new("1")) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+        std::io::stdout()
+            .write_all(LATE_OUTPUT)
+            .expect("write late child output");
+    }
+
+    #[test]
+    fn process_deadline_rejects_exit_and_output_during_poll_sleep() {
+        const CHILD_MODE: &str = "RUSTFERRY_PROCESS_DEADLINE_CHILD";
+        const LATE_OUTPUT: &str = "late-process-output-must-not-succeed";
+        let mut command = Command::new(std::env::current_exe().expect("current test executable"));
+        command
+            .args([
+                "--exact",
+                "transport::tests::process_deadline_child_helper",
+                "--nocapture",
+            ])
+            .env(CHILD_MODE, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_process_tree(&mut command);
+
+        let started = Instant::now();
+        let error = run_process_inner(
+            command,
+            Duration::from_millis(25),
+            64 * 1024,
+            None,
+            true,
+            Duration::from_secs(2),
+        )
+        .expect_err("an exit observed after the original deadline must time out");
+
+        assert_eq!(error, GhExecutionError::TimedOut);
+        assert!(!format!("{error:?}\n{error}").contains(LATE_OUTPUT));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "cleanup grace must not become an output-success deadline"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn gh_process_runner_timeout_kills_descendants_holding_output_pipes() {
@@ -3445,6 +5957,261 @@ mod tests {
     }
 
     #[test]
+    fn workflow_dispatch_uses_exact_v2026_request_and_revalidates_run_id() {
+        let registration = format!("42\t{WORKFLOW_PATH_B64}\tactive\n");
+        let expected = workflow_dispatch_request();
+        let run_name = base64_fixture(expected.run_name());
+        let run = format!(
+            "777\t42\t{WORKFLOW_DISPATCH_RUN_PATH_B64}\t8\t1\tfedcba9876543210fedcba9876543210fedcba98\t{BRANCH_B64}\tworkflow_dispatch\tqueued\t\t{run_name}\n"
+        );
+        let runner = FakeRunner::with([Ok(registration.into_bytes()), Ok(run.into_bytes())]);
+        let mut transport = GithubTransport::new(runner, limits(2, 3));
+        let registration = transport
+            .workflow_registration(&repository(), WORKFLOW_PATH)
+            .expect("active exact workflow");
+        assert_eq!(registration, workflow_registration());
+
+        let mut request = expected;
+        request.workflow = registration;
+        let mut client =
+            FakeWorkflowDispatchHttpClient::with([Ok(GithubWorkflowDispatchHttpResponse::new(
+                200,
+                Some("application/json; charset=utf-8".to_owned()),
+                workflow_dispatch_receipt_body(777),
+            ))]);
+        let receipt = transport
+            .dispatch_workflow(&mut client, &request)
+            .expect("strict 200 receipt");
+        assert_eq!(receipt.run_id().get(), 777);
+
+        let http_request = &client.requests[0];
+        assert_eq!(
+            http_request.endpoint(),
+            "/repos/ShiroKSH/rustferry/actions/workflows/42/dispatches"
+        );
+        assert_eq!(http_request.accept(), "application/vnd.github+json");
+        assert_eq!(http_request.content_type(), "application/json");
+        assert_eq!(http_request.api_version(), "2026-03-10");
+        assert_eq!(
+            http_request.body(),
+            format!(
+                "{{\"ref\":\"rustferry/goal3/builds/job-1\",\"inputs\":{{\"operation_id\":\"job-1\",\"request_sha256\":\"{}\",\"source_revision\":\"{SHA}\",\"dispatch_revision\":\"fedcba9876543210fedcba9876543210fedcba98\"}}}}",
+                "f".repeat(64)
+            )
+            .as_bytes()
+        );
+        let snapshot = transport
+            .run_by_id(&receipt)
+            .expect("run identity from receipt");
+        assert_eq!(snapshot.handle().id(), receipt.run_id());
+        assert_eq!(snapshot.handle().event(), RunEvent::WorkflowDispatch);
+        assert_eq!(snapshot.handle().workflow_path(), WORKFLOW_PATH);
+
+        let runner = transport.into_runner();
+        assert_eq!(runner.requests.len(), 2);
+        assert_eq!(
+            runner.requests[0].endpoint(),
+            "/repos/ShiroKSH/rustferry/actions/workflows/rustferry-goal3-iphone.yml"
+        );
+        assert_eq!(
+            runner.requests[0].api_version_header(),
+            WORKFLOW_DISPATCH_API_VERSION_HEADER
+        );
+        assert_eq!(
+            runner.requests[1].endpoint(),
+            "/repos/ShiroKSH/rustferry/actions/runs/777"
+        );
+        assert_eq!(
+            runner.requests[1].api_version_header(),
+            WORKFLOW_DISPATCH_API_VERSION_HEADER
+        );
+    }
+
+    #[test]
+    fn workflow_dispatch_request_rejects_ref_operation_and_digest_drift() {
+        let namespace = TemporaryBranchNamespace::new("rustferry/goal3/builds").expect("namespace");
+        let temporary_ref = || {
+            TemporaryGitRef::new(
+                &namespace,
+                BranchName::new("rustferry/goal3/builds/job-1").expect("branch"),
+            )
+            .expect("temporary ref")
+        };
+        let source = CommitSha::new(SHA).expect("source revision");
+        let dispatch =
+            CommitSha::new("fedcba9876543210fedcba9876543210fedcba98").expect("dispatch revision");
+
+        for (operation, digest) in [
+            ("job-2", "f".repeat(64)),
+            ("../job-1", "f".repeat(64)),
+            ("job-1", "F".repeat(64)),
+            ("job-1", "f".repeat(63)),
+        ] {
+            assert!(
+                WorkflowDispatchRequest::new(
+                    repository(),
+                    workflow_registration(),
+                    temporary_ref(),
+                    operation,
+                    digest,
+                    source.clone(),
+                    dispatch.clone(),
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            WorkflowDispatchRequest::new(
+                Repository::new("Other", "repository").expect("other repository"),
+                workflow_registration(),
+                temporary_ref(),
+                "job-1",
+                "f".repeat(64),
+                source,
+                dispatch,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn workflow_registration_and_run_by_id_reject_identity_drift() {
+        assert!(!workflow_run_path_matches(
+            &format!("{WORKFLOW_PATH}@other-branch"),
+            WORKFLOW_PATH,
+            &BranchName::new("rustferry/goal3/builds/job-1").expect("branch"),
+        ));
+        assert_eq!(
+            parse_workflow_registration(
+                format!("42\t{WORKFLOW_PATH_B64}\tdisabled_manually\n").as_bytes(),
+                &repository(),
+                WORKFLOW_PATH,
+            ),
+            Err(TransportError::WorkflowInactive)
+        );
+        assert_eq!(
+            parse_workflow_registration(
+                b"42\tLmdpdGh1Yi93b3JrZmxvd3Mvb3RoZXIueW1s\tactive\n",
+                &repository(),
+                WORKFLOW_PATH,
+            ),
+            Err(TransportError::WorkflowIdentityMismatch)
+        );
+
+        let request = workflow_dispatch_request();
+        let run_name = base64_fixture(request.run_name());
+        let drifted = format!(
+            "778\t42\t{WORKFLOW_DISPATCH_RUN_PATH_B64}\t8\t1\tfedcba9876543210fedcba9876543210fedcba98\t{BRANCH_B64}\tworkflow_dispatch\tqueued\t\t{run_name}\n"
+        );
+        let runner = FakeRunner::with([Ok(drifted.into_bytes())]);
+        let mut transport = GithubTransport::new(runner, limits(2, 3));
+        let receipt = WorkflowDispatchReceipt {
+            repository: request.repository.clone(),
+            run_id: RunId::new(777).expect("run id"),
+            workflow_id: request.workflow.id,
+            workflow_path: request.workflow.path.clone(),
+            dispatch_revision: request.dispatch_revision.clone(),
+            branch: request.temporary_ref.branch().clone(),
+            run_name: request.run_name.clone(),
+        };
+        assert_eq!(
+            transport.run_by_id(&receipt),
+            Err(TransportError::RunIdentityMismatch)
+        );
+    }
+
+    #[test]
+    fn workflow_dispatch_receipt_requires_exact_200_json_and_positive_id() {
+        let request = workflow_dispatch_request();
+        let transport = GithubTransport::new(FakeRunner::default(), limits(2, 3));
+        let cases = [
+            GithubWorkflowDispatchHttpResponse::new(
+                302,
+                Some("application/json".to_owned()),
+                workflow_dispatch_receipt_body(777),
+            ),
+            GithubWorkflowDispatchHttpResponse::new(
+                200,
+                None,
+                workflow_dispatch_receipt_body(777),
+            ),
+            GithubWorkflowDispatchHttpResponse::new(
+                200,
+                Some("text/plain".to_owned()),
+                workflow_dispatch_receipt_body(777),
+            ),
+            GithubWorkflowDispatchHttpResponse::new(
+                200,
+                Some("application/json".to_owned()),
+                workflow_dispatch_receipt_body(0),
+            ),
+            GithubWorkflowDispatchHttpResponse::new(
+                200,
+                Some("application/json".to_owned()),
+                br#"{"workflow_run_id":777,"run_url":"https://api.github.com/repos/x/y/actions/runs/777","html_url":"https://github.com/x/y/actions/runs/777","extra":true}"#.to_vec(),
+            ),
+            GithubWorkflowDispatchHttpResponse::new(
+                200,
+                Some("application/json".to_owned()),
+                br#"{"workflow_run_id":777,"workflow_run_id":778,"run_url":"https://api.github.com/repos/ShiroKSH/rustferry/actions/runs/777","html_url":"https://github.com/ShiroKSH/rustferry/actions/runs/777"}"#.to_vec(),
+            ),
+            GithubWorkflowDispatchHttpResponse::new(
+                200,
+                Some("application/json".to_owned()),
+                [workflow_dispatch_receipt_body(777), b" null".to_vec()].concat(),
+            ),
+            GithubWorkflowDispatchHttpResponse::new(
+                200,
+                Some("application/json".to_owned()),
+                vec![b'x'; MAX_WORKFLOW_DISPATCH_RESPONSE_BYTES + 1],
+            ),
+        ];
+        for response in cases {
+            let mut client = FakeWorkflowDispatchHttpClient::with([Ok(response)]);
+            assert!(transport.dispatch_workflow(&mut client, &request).is_err());
+        }
+
+        let mut client =
+            FakeWorkflowDispatchHttpClient::with([Err(GithubWorkflowDispatchHttpError::TimedOut)]);
+        assert_eq!(
+            transport.dispatch_workflow(&mut client, &request),
+            Err(TransportError::WorkflowDispatchHttp(
+                GithubWorkflowDispatchHttpError::TimedOut
+            ))
+        );
+    }
+
+    #[test]
+    fn workflow_dispatch_debug_and_errors_omit_tokens_bodies_and_urls() {
+        const TOKEN: &str = "dispatch-token-must-not-surface";
+        const URL: &str = "https://api.github.com/repos/private/hidden/actions/runs/777";
+        let transport = GithubTransport::new(FakeRunner::default(), limits(2, 3));
+        let request = workflow_dispatch_request();
+        let mut client = FakeWorkflowDispatchHttpClient::with([Ok(
+            GithubWorkflowDispatchHttpResponse::new(
+                200,
+                Some("application/json".to_owned()),
+                format!(
+                    "{{\"workflow_run_id\":777,\"run_url\":\"{URL}\",\"html_url\":\"https://github.com/private/hidden/actions/runs/777\"}}"
+                )
+                .into_bytes(),
+            ),
+        )]);
+        let error = transport
+            .dispatch_workflow(&mut client, &request)
+            .expect_err("unbound receipt URLs must fail");
+        let rendered = format!(
+            "{:?}\n{:?}\n{error:?}\n{error}",
+            client.requests[0], client.responses
+        );
+        assert!(!rendered.contains(TOKEN));
+        assert!(!rendered.contains(URL));
+        assert!(!rendered.contains("private/hidden"));
+        assert!(!rendered.contains("request_sha256"));
+        assert!(!rendered.contains("/repos/ShiroKSH/rustferry"));
+    }
+
+    #[test]
     fn request_arguments_are_explicit_and_do_not_paginate_implicitly() {
         let runner = FakeRunner::with([Ok(Vec::new())]);
         let mut transport = GithubTransport::new(runner, limits(2, 3));
@@ -3476,19 +6243,62 @@ mod tests {
     #[test]
     fn auth_and_repository_metadata_are_locally_validated() {
         let runner = FakeRunner::with([
-            Ok(b"ShiroKSH\n".to_vec()),
+            Ok(b"42\tU2hpcm9LU0g=\n".to_vec()),
             Ok(b"991\tshiroksh/RustFerry\tfalse\tfalse\tfalse\tmaster\n".to_vec()),
         ]);
         let mut transport = GithubTransport::new(runner, limits(2, 3));
-        assert_eq!(
-            transport.authenticated_user().expect("auth").login(),
-            "ShiroKSH"
-        );
+        let user = transport.authenticated_user().expect("auth");
+        assert_eq!(user.id(), 42);
+        assert_eq!(user.login(), "ShiroKSH");
         let info = transport.repository(&repository()).expect("repository");
         assert_eq!(info.id(), 991);
         assert_eq!(info.full_name(), "shiroksh/RustFerry");
         assert!(!info.is_private());
         assert_eq!(info.default_branch().as_str(), "master");
+    }
+
+    #[test]
+    fn actions_permissions_require_one_exact_enabled_boolean() {
+        let runner = FakeRunner::with([Ok(b"true\n".to_vec()), Ok(b"false\n".to_vec())]);
+        let mut transport = GithubTransport::new(runner, limits(2, 3));
+        assert!(
+            transport
+                .actions_permissions(&repository())
+                .expect("enabled Actions policy")
+                .enabled()
+        );
+        assert!(
+            !transport
+                .actions_permissions(&repository())
+                .expect("disabled Actions policy")
+                .enabled()
+        );
+        let runner = transport.into_runner();
+        for request in &runner.requests {
+            assert_eq!(request.method(), ApiMethod::Get);
+            assert_eq!(
+                request.endpoint(),
+                "/repos/ShiroKSH/rustferry/actions/permissions"
+            );
+            assert_eq!(request.jq, Some(ACTIONS_PERMISSIONS_QUERY));
+            assert!(request.fields.is_empty());
+        }
+
+        for malformed in [
+            b"".as_slice(),
+            b"TRUE\n".as_slice(),
+            b"1\n".as_slice(),
+            b"true\nfalse\n".as_slice(),
+        ] {
+            let mut transport =
+                GithubTransport::new(FakeRunner::with([Ok(malformed.to_vec())]), limits(2, 3));
+            assert_eq!(
+                transport.actions_permissions(&repository()),
+                Err(TransportError::MalformedResponse {
+                    operation: "GitHub Actions permissions"
+                })
+            );
+        }
     }
 
     #[test]
@@ -3501,7 +6311,11 @@ mod tests {
         let principal = transport
             .authenticate(&repository())
             .expect("repository credential");
-        assert_eq!(principal, AuthenticatedPrincipal::RepositoryCredential);
+        assert_eq!(
+            principal,
+            AuthenticatedPrincipal::RepositoryCredential { repository_id: 991 }
+        );
+        assert_eq!(principal.repository_id(), Some(991));
         assert_eq!(principal.label(), "repository-scoped token");
         assert_eq!(principal.user_login(), None);
 
@@ -3513,7 +6327,7 @@ mod tests {
 
     #[test]
     fn successful_user_probe_takes_precedence_over_installation_fallback() {
-        let runner = FakeRunner::with([Ok(b"ShiroKSH\n".to_vec())]);
+        let runner = FakeRunner::with([Ok(b"42\tU2hpcm9LU0g=\n".to_vec())]);
         let mut transport = GithubTransport::new(runner, limits(2, 3));
         let principal = transport
             .authenticate(&repository())
@@ -3895,12 +6709,32 @@ mod tests {
             fs::read(downloaded.path()).expect("read"),
             [b"PK\x05\x06".as_slice(), &[0_u8; 18]].concat()
         );
+        #[cfg(windows)]
+        {
+            let file =
+                rustferry_core::windows_private_directory::open_private_file(downloaded.path())
+                    .expect("open downloaded private file");
+            rustferry_core::windows_private_directory::verify_private_file_handle(file.as_handle())
+                .expect("verify downloaded private file");
+        }
         assert_eq!(
             transport.download_artifact_zip(&repository(), &artifact, &target),
             Err(TransportError::DestinationExists)
         );
         fs::remove_file(downloaded.path()).expect("remove file");
         fs::remove_dir(&directory).expect("remove directory");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_windows_artifact_cleanup_consumes_the_created_handle() {
+        let directory = tempfile::TempDir::new().expect("temporary directory");
+        let path = directory.path().join("failed-download.zip");
+        let file = create_windows_private_file(&path).expect("create private artifact");
+
+        remove_failed_windows_artifact(file).expect("remove exact artifact handle");
+
+        assert!(!path.exists());
     }
 
     #[test]

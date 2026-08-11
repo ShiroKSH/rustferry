@@ -6,12 +6,15 @@ one-shot `master` acceptance at `607fe78cf1ae22f8c569fb48d067d8478f407883`. This
 preserves the Developer Experience line while adding the remote protocol/provider/worker path and
 the portability, file-identity, no-clobber, bounded-process, and cleanup hardening recorded below.
 
+Windows continuation pre-docs source commit: `GOAL3_SOURCE_COMMIT_PENDING`. This continuation is
+implemented and Windows-native tested; it has no Windows-originated GitHub/macOS run.
+
 ## Current milestone
 
-Milestone -2 — isolation: complete. Milestone -1 — inherited baseline: complete. Milestone 0 — remote/signing/source/artifact contracts: complete. Milestone 1 — physical-device compile: live-validated. Milestone 2 — signing engine and bounded app/extension manual setup: implemented and locally integration-tested. Milestone 3 — integrated GitHub unsigned provider acceptance: complete. Milestone 4 — private execution repository and real development signing: pending external Apple signing assets and a device. Milestone 5 — SSH unsigned snapshot v1: implementation and deterministic local validation complete; live SSH macOS acceptance pending.
+Milestone -2 — isolation: complete. Milestone -1 — inherited baseline: complete. Milestone 0 — remote/signing/source/artifact contracts: complete. Milestone 1 — physical-device compile: Linux-originated GitHub live-validated. Milestone 2 — signing engine and bounded app/extension manual setup: implemented and locally integration-tested. Milestone 3 — integrated GitHub unsigned provider acceptance: historical Linux path complete. Milestone 4 — private execution repository and real development signing: pending external Apple signing assets and a device. Milestone 5 — SSH unsigned snapshot v1: implementation and deterministic local validation complete; live SSH macOS acceptance pending. Milestone 6 — Windows durable jobs/cancel/retry/artifacts/GitSnapshot/IDE: implemented and Windows-native tested; live Windows acceptance pending.
 
 The Goal 3 definition of done is **not complete**. The mandatory chain currently ends at a real
-unsigned XCArchive returned to a Linux client. No real development-signed IPA, registered-device
+unsigned XCArchive returned to a Linux client. No Windows-originated archive, real development-signed IPA, registered-device
 profile acceptance, physical install/launch/logs, Personal Team flow, extension device signing,
 live SSH build, performance matrix, or reference managed-cloud provider has been validated. The
 exact 18-scenario ledger is in [the support matrix](support-matrix.md#goal-3-physical-iphone-scenarios).
@@ -24,9 +27,35 @@ exact 18-scenario ledger is in [the support matrix](support-matrix.md#goal-3-phy
 - [Final CI run `31261962607`](https://github.com/ShiroKSH/rustferry/actions/runs/31261962607) completed successfully on attempt 2 at the same exact head. All five jobs are green: Linux quality/docs, Rust 1.92, Ubuntu tests/templates, macOS tests/templates, and Windows tests/templates. The run passed license policy, release contract, archive guards, formatting, Clippy, packaged CLI sources, all workspace package archives, examples, Rustdoc/doctests, cookbook, links, mdBook, Windows workspace tests, and Windows starter generation/check.
 - The merged Apple path preserves local device/deployment, IDE, extension, and asset behavior while adding remote compilation and signing contracts. Physical builds bind canonical Apple developer tools, use fixed `/usr/bin/xcrun` and `/usr/bin/security`, set the validated `DEVELOPER_DIR` for every Apple-tool invocation, and reject relative, directory, or symlink tool substitutions.
 
+## Windows control-plane continuation
+
+The frozen continuation adds a private immutable job store, bounded sanitized provider-log refresh,
+fresh-process cancellation, exact and current-source retry, complete-lineage prune, managed artifact
+operations, explicit public GitHub GitSnapshot submission, metadata-only signing readiness, and the
+VS Code Remote Jobs view. Push remains the compatible/default GitHub trigger. WorkflowDispatch is
+an additive foundation only: live use requires the exact four-input definition on both the default
+branch and dispatched ref. No Windows-originated GitHub run, snapshot run, cancellation, retry,
+signed artifact, or device result is claimed.
+
+| Area | Implemented | Locally tested | Windows-native tested | GitHub live validated | Apple signed validated | Physical-device validated |
+| --- | --- | --- | --- | --- | --- | --- |
+| Durable jobs/logs/cancel/retry/prune | Yes | Yes | Yes | No | No | No |
+| Managed artifacts | Yes | Yes | Yes | No new live management result | No | No |
+| GitHub GitSnapshot | Yes | Yes | Yes | No | No | No |
+| VS Code Remote Jobs | Yes | Yes | Yes | No | No | No |
+| Signing readiness | Yes | Yes | CLI path tested; no ready configuration | No signed run | No | No |
+
+Frozen local gates: cargo-ferry library 139/139, binary 235/235, jobs CLI 11/11,
+artifact module 12/12, artifact CLI 9/9, GitHub provider 316 passed/1 explicit live ignored, IDE
+black-box 4/4, and live TypeScript 74 passed/8 skipped. All-target check, strict Clippy, formatting,
+diff hygiene, and independent P0–P2 reviews pass. The two checked-in IDE schemas share SHA-256
+`DAC218CBCE888ACF6079E4DF304452D22990CE0DB81EDB5382549198255DB270`.
+
 ## Current continuation
 
-The current continuation after the accepted `master` head adds physical-iOS auto-routing on
+### Earlier SSH snapshot continuation
+
+The earlier continuation after the accepted `master` head added physical-iOS auto-routing on
 non-macOS hosts, deterministic source-bundle inspect/create/verify commands, and SSH snapshot
 session v1. Source bundles include only the selected package dependency closure, exclude audited
 sensitive roots, reject links and collisions, publish each output create-only, and bind descriptor,
@@ -54,17 +83,18 @@ SSH, signing, IPA, installation, launch, device runtime, or multi-tenant worker 
 - Source baseline: isolated at `d6887eba95b8116799801118c5026210628397f9`; metadata and workspace check passed; workspace tests reported 158 passed, 0 failed, 7 intentionally ignored.
 - Isolation audit: source checkout remains read-only. A bounded set of independent review checks bypassed the Goal 3 command wrapper; exact commands/outcomes and recovery are recorded in `GOAL3_COMMAND_AUDIT_EXCEPTIONS.md`. The resulting Goal 3-only root build cache was removed with an audited `cargo clean`; subsequent checks use the wrapper.
 - Remote protocol: v1.0 Rust contracts, provider boundary, cancellation, 24 typed events, and checked-in JSON Schema implemented.
+- Windows job control: immutable project-bound revisions, exact provider-session restoration, durable cancellation intent, exact/recaptured retry lineage, bounded sanitized log ingestion, complete-lineage pruning, and managed artifact verification/removal pass the frozen Windows suites. No GitHub-live Windows mutation is inferred.
 - SSH snapshot v1: strict full-duplex framing, deterministic source upload, unsigned compile-only
   request binding, ordered events, cancellation, digest-bound artifact/receipt, durable no-clobber
   client publication, and capability-bound zero-retention cleanup are locally tested. No live SSH
   Mac artifact exists. The current `rustferry-ssh` run reports 54 passed and 2 ignored live-process
   tests.
-- Source snapshots: deterministic manifest selection, deterministic ZIP transport, per-output create-only publication, strict worker extraction, and exact post-extraction verification implemented.
+- Source snapshots: deterministic manifest selection, deterministic ZIP transport, per-output create-only publication, strict worker extraction, and exact post-extraction verification implemented. Explicit public unsigned GitHub GitSnapshot adds invocation-bound zero-write preview, consent/replan, private staging, create-only temporary-ref ownership, restart recovery, retained exact retry source, and cleanup authorization. It has no live GitHub result.
 - Signing/provisioning: public certificate metadata plus opaque private-key/password/profile references, temporary-Keychain worker isolation, staged validation state, central chunk-safe redaction, and profile/entitlement/nested-code validation implemented. Manual setup accepts at most three exact application/extension profiles, requires a common selected device, assigns canonical static per-target GitHub secrets, and uses bounded `RFSIGNV2` input for a multi-profile worker job while retaining the legacy single-application frame. Modern setup stores the exact public application/extension/framework/dynamic-library graph; the generated workflow embeds its domain-separated canonical SHA-256, and the worker rederives it before checkout of the requested project revision or compilation. It validates PKCS#12 and CMS profile bytes locally, pins three Apple roots, checks certificate/private-key/team/profile/device/target bindings, and retains only a lowercase SHA-256 of the UDID. The affected-package integration suite passes. No real certificate/profile bytes or Apple signing operation have been validated.
 - Artifact inspection: cross-platform strict unsigned `.xcarchive`/`.app` and IPA ZIP/plist/Mach-O parsers implemented. Client-owned product identity now binds the exact app path, versions, deployment target, nested bundle graph, source manifest, and canonical request digest across compile and signing. They reject Simulator code, signing residue in unsigned input, hidden code, bundle-set drift, resource drift, links, collisions, and archive-limit violations. The current affected run passes 42 `rustferry-remote` library tests plus its integration suites; strict clippy passes. The parent-swap regression synchronizes its attacker before publication and passes. The real physical-device archive from run `30724621750` passed worker-side inspection and independent Linux-client revalidation.
 - Signed artifact transport: the protected worker keeps the exact five-file default, then materializes only request-selected `application.app.zip`, reconstructed `application.xcarchive.zip`, and main-application `application.dSYM.zip` products. `--artifact all` selects the app and archive while `--include-dsym` remains separate. Worker and cross-platform client independently bind the complete app trees, archive deep-signature evidence, manifest records, real DWARF content, and the dSYM-to-signed-executable arm64 UUID. The workflow allowlists all eight possible paths, but ingestion requires the exact request-derived subset and preserves replacement paths during rollback. This path is locally tested only; no development-signed IPA, signed archive, dSYM, Organizer/export round trip, or device evidence exists.
 - Physical-device compile: deterministic unsigned `aarch64-apple-ios`/`iphoneos`/generic-device archive plan and executor implemented. The Apple crate now exposes one pure request-product derivation shared by local and remote planners. The final affected run passes 47 `rustferry-apple` library tests with 1 Xcode-dependent ignore plus its integration suites; strict clippy passes. Local Xcode 26.6 accepted the generated device project and a real signed Simulator extension smoke passed. GitHub-hosted `macos-15` run `30724621750` produced a real physical-iPhone archive from an exact Rust 1.92 toolchain and confirmed cleanup. Local physical-device compilation remains unavailable because the isolated host lacks the Rust target and iPhoneOS platform component; it is no longer required for the validated remote path.
-- GitHub provider: public source and private execution identities are now separate throughout config, workflow generation, temporary-ref publication, worker validation, Actions APIs, and artifact ingestion. Both fetch and push URLs are identity-checked. The private dispatch commit is an orphan containing only the approved workflow and strict request envelope, so it imports no public source tree/history. Setup/doctor prove public source visibility; signed readiness separately requires a private execution repository. Same-repository mode remains available for unsigned acceptance. The current affected run passes 140 GitHub provider tests and 81 worker library plus 27 worker binary tests, including capability-owned cleanup replacement regressions. Schema-v2 same-repository compatibility is live-validated; distinct-private-execution acceptance remains pending. Linux acceptance run `30726401991` exercised the unsigned artifact path successfully.
+- GitHub provider: public source and private execution identities are separate throughout config, workflow generation, temporary-ref publication, worker validation, Actions APIs, and artifact ingestion. Both fetch and push URLs are identity-checked. Push remains compatible/default. WorkflowDispatch has exact input/request/run binding but no wired provider consumer or live result; default-branch and dispatched-ref definitions must both carry its exact contract. Metadata-only signing doctor proves policy/identity facts without reading secret values. Historical schema-v2 same-repository Push compatibility is live-validated; distinct-private-execution, GitSnapshot, and WorkflowDispatch acceptance remain pending. Linux acceptance run `30726401991` exercised the unsigned exact-Git artifact path successfully.
 - Workspace regression: the preceding continuation's full workspace test run passed, including the
   generated-project template check (94.56 seconds). The earlier `ENOSPC` interruption was
   environmental; after the specification-authorized Goal 3 target-cache cleanup, the same test
@@ -78,6 +108,8 @@ SSH, signing, IPA, installation, launch, device runtime, or multi-tenant worker 
 ## GitHub readiness observation
 
 - Repository: public `ShiroKSH/rustferry`; current user has admin access; Actions enabled.
+- Current default-branch worker definition is active but Push-only. This satisfies registration discovery, not WorkflowDispatch readiness; no dispatch request was sent.
+- Windows Push-mode preflight was read-only and made no mutation because the source/workflow revision and provider configuration were not yet frozen. No Windows run/job/artifact ID exists for this continuation.
 - Integrated workflows: worker pinning and exact-source dispatch were accepted at `607fe78cf1ae22f8c569fb48d067d8478f407883` by Linux-client run `31261962599` and worker run `31262066567`.
 - Goal 3 protected environment: absent.
 - Repository signing secret names: none returned. No secret values were requested or accessed.
@@ -100,15 +132,20 @@ SSH, signing, IPA, installation, launch, device runtime, or multi-tenant worker 
 
 Goal 3 unsigned no-Mac acceptance is live-validated end to end on final `master` revision
 `607fe78cf1ae22f8c569fb48d067d8478f407883`.
+The Windows continuation completes the local durable control plane and explicit GitSnapshot route at
+the frozen source revision recorded above. These paths are implemented, locally tested, and
+Windows-native tested; no Windows-originated Push build, GitSnapshot build, cancellation, retry, or
+artifact-management operation has GitHub-live evidence.
 Manual-development setup now includes bounded app/Widget/Live Activity profile transport and its
 affected-package integration tests pass, but no real signing secrets have been uploaded. Development
 signing, IPA export, downloaded-artifact install/launch, extension behavior, and physical-device
 runtime remain unvalidated. Live SSH/OpenSSH end-to-end acceptance also remains
 pending. Final CI run `31261962607` is green across Linux,
 macOS, and Windows, including the full workspace and platform starter checks.
-The next product boundary is a distinct private execution repository plus real Apple Development
-certificate/profile/device assets; existing Simulator support and synthetic signing fixtures are
-not evidence for those remaining claims.
+The next product boundaries are a real Windows Push-mode archive acceptance, a live GitSnapshot and
+cancel/retry sequence, then a distinct private execution repository plus real Apple Development
+PKCS#12/password/profile/registered-device assets and a protected Environment. Existing Simulator
+support, readiness metadata, and synthetic signing fixtures are not evidence for signed/device claims.
 
 The specification's requested documentation inventory is also incomplete as a path-by-path
 deliverable: the implemented material is currently consolidated in `docs/remote/`, existing iOS,

@@ -14,8 +14,12 @@ use rustferry_remote::source::{
     verify_materialized_bundle, verify_source_bundle_plan, verify_source_manifest,
 };
 use rustferry_remote::{
-    MAX_SOURCE_BUNDLE_DESCRIPTOR_BYTES, SOURCE_BUNDLE_DESCRIPTOR_SCHEMA_VERSION,
-    SourceBundleDescriptor, write_source_bundle_descriptor_file,
+    GIT_SNAPSHOT_ARCHIVE_PATH, GIT_SNAPSHOT_DESCRIPTOR_PATH,
+    GIT_SNAPSHOT_DESCRIPTOR_SCHEMA_VERSION, GIT_SNAPSHOT_TREE_PATHS, GitSnapshotDescriptor,
+    MAX_GIT_SNAPSHOT_BYTES, MAX_SOURCE_BUNDLE_DESCRIPTOR_BYTES,
+    SOURCE_BUNDLE_DESCRIPTOR_SCHEMA_VERSION, SourceBundleDescriptor,
+    canonical_git_snapshot_descriptor_bytes, git_snapshot_archive_limits, git_snapshot_ref,
+    write_source_bundle_descriptor_file,
 };
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -64,14 +68,98 @@ fn paths(manifest: &SourceManifest) -> Vec<&str> {
         .collect()
 }
 
+fn putty_private_key_fixture(line_ending: &[u8]) -> Vec<u8> {
+    let mut contents = vec![b'X'; 64 * 1024 - 8];
+    contents.extend_from_slice(line_ending);
+    for line in [
+        b"PuTTY-User-Key-File-3: ssh-ed25519".as_slice(),
+        b"Encryption: none".as_slice(),
+        b"Comment: validation fixture".as_slice(),
+        b"Public-Lines: 1".as_slice(),
+    ] {
+        contents.extend_from_slice(line);
+        contents.extend_from_slice(line_ending);
+    }
+    contents.extend(std::iter::repeat_n(b'A', 64));
+    contents.extend_from_slice(line_ending);
+    contents.extend_from_slice(b"Private-Lines: 2");
+    contents.extend_from_slice(line_ending);
+    contents.extend(std::iter::repeat_n(b'B', 64));
+    contents.extend_from_slice(line_ending);
+    contents.extend(std::iter::repeat_n(b'C', 64));
+    contents.extend_from_slice(line_ending);
+    contents.extend_from_slice(
+        b"Private-MAC: 0000000000000000000000000000000000000000000000000000000000000000",
+    );
+    contents.extend_from_slice(line_ending);
+    contents
+}
+
 #[test]
 fn source_mode_has_canonical_wire_values() {
     assert_eq!(serde_json::to_string(&SourceMode::Git).unwrap(), "\"git\"");
     assert_eq!(
+        serde_json::to_string(&SourceMode::GitSnapshot).unwrap(),
+        "\"git_snapshot\""
+    );
+    assert_eq!(
         serde_json::to_string(&SourceMode::Snapshot).unwrap(),
         "\"snapshot\""
     );
-    assert!(SourceMode::Git < SourceMode::Snapshot);
+    assert!(SourceMode::Git < SourceMode::GitSnapshot);
+    assert!(SourceMode::GitSnapshot < SourceMode::Snapshot);
+}
+
+#[test]
+fn git_snapshot_descriptor_has_one_operation_derived_two_file_contract() {
+    let fixture = Fixture::new();
+    let plan = plan_source_bundle(&fixture.request()).unwrap();
+    let descriptor = GitSnapshotDescriptor {
+        schema_version: GIT_SNAPSHOT_DESCRIPTOR_SCHEMA_VERSION,
+        operation_id: "operation-1".to_owned(),
+        source_repository: "https://github.com/example/project".to_owned(),
+        snapshot_ref: git_snapshot_ref("operation-1").unwrap(),
+        request_template_sha256: "a".repeat(64),
+        bundle: SourceBundleDescriptor::new(
+            SourceArchive {
+                size: 1,
+                sha256: "b".repeat(64),
+            },
+            plan.manifest().clone(),
+        ),
+    };
+
+    assert_eq!(
+        GIT_SNAPSHOT_TREE_PATHS,
+        [GIT_SNAPSHOT_DESCRIPTOR_PATH, GIT_SNAPSHOT_ARCHIVE_PATH]
+    );
+    assert_eq!(
+        descriptor.snapshot_ref,
+        "refs/rustferry/goal3/snapshots/operation-1"
+    );
+    descriptor.validate(git_snapshot_archive_limits()).unwrap();
+    let first = canonical_git_snapshot_descriptor_bytes(&descriptor).unwrap();
+    let second = canonical_git_snapshot_descriptor_bytes(&descriptor).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(first.last(), Some(&b'\n'));
+
+    for operation in ["", ".hidden", "../escape", "bad:ref", "name.lock"] {
+        assert!(git_snapshot_ref(operation).is_err(), "{operation:?}");
+    }
+
+    let mut wrong_ref = descriptor.clone();
+    wrong_ref.snapshot_ref = "refs/heads/main".to_owned();
+    assert!(wrong_ref.validate(git_snapshot_archive_limits()).is_err());
+
+    let mut oversized = descriptor;
+    oversized.bundle.archive.size = MAX_GIT_SNAPSHOT_BYTES;
+    assert!(matches!(
+        canonical_git_snapshot_descriptor_bytes(&oversized),
+        Err(SourceError::LimitExceeded {
+            kind: SourceLimitKind::GitSnapshotSize,
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -389,6 +477,10 @@ fn workspace_exclusions_precede_excluded_ignore_policy_files() {
 fn sensitive_exclusions_are_case_insensitive_and_non_overridable() {
     let fixture = Fixture::new();
     write(&fixture.project.join(".env"), b"TOKEN=secret");
+    write(&fixture.project.join(".envrc"), b"export TOKEN=secret");
+    write(&fixture.project.join("deploy.PPK"), b"private key");
+    write(&fixture.project.join("nested/vault.CrD"), b"credentials");
+    write(&fixture.project.join("keys/Caf\u{e9}.PpK"), b"private key");
     write(&fixture.project.join("TARGET/cache.bin"), b"cache");
     write(&fixture.project.join("Signing/key.P12"), b"secret");
     write(&fixture.project.join(".cargo/credentials.toml"), b"token");
@@ -398,6 +490,26 @@ fn sensitive_exclusions_are_case_insensitive_and_non_overridable() {
 
     let plan = plan_source_bundle(&fixture.request()).unwrap();
     assert!(paths(plan.manifest()).contains(&"app/src/lib.rs"));
+    assert!(
+        plan.excluded_sensitive_paths()
+            .iter()
+            .any(|path| path == "app/.envrc")
+    );
+    assert!(
+        plan.excluded_sensitive_paths()
+            .iter()
+            .any(|path| path == "app/deploy.PPK")
+    );
+    assert!(
+        plan.excluded_sensitive_paths()
+            .iter()
+            .any(|path| path == "app/nested/vault.CrD")
+    );
+    assert!(
+        plan.excluded_sensitive_paths()
+            .iter()
+            .any(|path| path == "app/keys/Caf\u{e9}.PpK")
+    );
     assert!(paths(plan.manifest()).iter().all(|path| {
         !path.to_lowercase().contains("secret")
             && !path.to_lowercase().contains("target")
@@ -413,12 +525,38 @@ fn sensitive_exclusions_are_case_insensitive_and_non_overridable() {
     write(&fixture.workspace.join(".env"), b"TOKEN=secret");
     let error = plan_source_bundle(&fixture.request().include_workspace_path(".env")).unwrap_err();
     assert!(matches!(error, SourceError::SensitivePath { .. }));
+
+    for path in [
+        ".envrc",
+        "deploy.PPK",
+        "nested/vault.CrD",
+        "keys/Caf\u{e9}.PpK",
+    ] {
+        let error =
+            plan_source_bundle(&fixture.request().include_workspace_path(path)).unwrap_err();
+        assert!(
+            matches!(error, SourceError::SensitivePath { .. }),
+            "{path:?}: {error:?}"
+        );
+    }
+
+    let decomposed = "keys/Cafe\u{301}.ppk";
+    let error =
+        plan_source_bundle(&fixture.request().include_workspace_path(decomposed)).unwrap_err();
+    assert!(matches!(
+        error,
+        SourceError::NonPortablePath {
+            reason: PortablePathReason::NonNfc,
+            ..
+        }
+    ));
 }
 
 #[test]
 fn sensitive_exclusion_audit_is_sorted_exact_and_does_not_traverse_roots() {
     let fixture = Fixture::new();
     write(&fixture.project.join(".env"), b"TOKEN=secret");
+    write(&fixture.project.join(".envrc"), b"export TOKEN=secret");
     write(&fixture.project.join(".git-credentials"), b"secret");
     write(
         &fixture.project.join("application_default_credentials.json"),
@@ -427,6 +565,8 @@ fn sensitive_exclusion_audit_is_sorted_exact_and_does_not_traverse_roots() {
     write(&fixture.project.join("credentials.json"), b"secret");
     write(&fixture.project.join("credentials.yaml"), b"secret");
     write(&fixture.project.join("credentials.yml"), b"secret");
+    write(&fixture.project.join("deploy.ppk"), b"secret");
+    write(&fixture.project.join("keys/vault.crd"), b"secret");
     write(
         &fixture.project.join("credentials/nested/private.txt"),
         b"secret",
@@ -447,16 +587,134 @@ fn sensitive_exclusion_audit_is_sorted_exact_and_does_not_traverse_roots() {
         excluded,
         vec![
             "app/.env",
+            "app/.envrc",
             "app/.git-credentials",
             "app/application_default_credentials.json",
             "app/credentials",
             "app/credentials.json",
             "app/credentials.yaml",
             "app/credentials.yml",
+            "app/deploy.ppk",
+            "app/keys/vault.crd",
         ]
     );
     assert!(paths(plan.manifest()).contains(&"app/config/credentials.txt"));
     assert!(!excluded.iter().any(|path| path.contains("nested")));
+}
+
+#[test]
+fn conservative_private_key_and_token_signatures_are_rejected_without_echoing_contents() {
+    let fixture = Fixture::new();
+    let mut private_key = b"-----BEGIN ".to_vec();
+    private_key.extend_from_slice(b"PRIVATE KEY-----\n");
+    private_key.extend(std::iter::repeat_n(b'A', 160));
+    private_key.extend_from_slice(b"\n-----END PRIVATE KEY-----\n");
+    write(&fixture.project.join("src/key_fixture.txt"), &private_key);
+    let error = plan_source_bundle(&fixture.request()).unwrap_err();
+    assert!(matches!(error, SourceError::SensitiveContent { .. }));
+    assert!(!error.to_string().contains(&"A".repeat(32)));
+
+    let fixture = Fixture::new();
+    let prefix = ["gh", "p_"].concat();
+    let token = format!("{prefix}{}", "a".repeat(36));
+    write(
+        &fixture.project.join("src/token_fixture.txt"),
+        token.as_bytes(),
+    );
+    let error = plan_source_bundle(&fixture.request()).unwrap_err();
+    assert!(matches!(error, SourceError::SensitiveContent { .. }));
+    assert!(!error.to_string().contains(&token));
+
+    for (index, line_ending) in [b"\n".as_slice(), b"\r\n".as_slice(), b"\r".as_slice()]
+        .into_iter()
+        .enumerate()
+    {
+        let fixture = Fixture::new();
+        let putty_private_key = putty_private_key_fixture(line_ending);
+        write(
+            &fixture
+                .project
+                .join(format!("src/putty_key_fixture_{index}.txt")),
+            &putty_private_key,
+        );
+        let error = plan_source_bundle(&fixture.request()).unwrap_err();
+        assert!(matches!(error, SourceError::SensitiveContent { .. }));
+        assert!(!error.to_string().contains("PuTTY-User-Key-File"));
+        assert!(!error.to_string().contains(&"B".repeat(32)));
+    }
+
+    let fixture = Fixture::new();
+    write(
+        &fixture.project.join("src/documentation.txt"),
+        b"short ghp_example, -----BEGIN PRIVATE KEY-----, and PuTTY-User-Key-File-3: ssh-ed25519 without a private body are documentation",
+    );
+    plan_source_bundle(&fixture.request()).expect("short signatures are not credentials");
+}
+
+#[test]
+fn putty_private_keys_and_sensitive_archive_paths_fail_closed_before_publication() {
+    let fixture = Fixture::new();
+    let putty_private_key = putty_private_key_fixture(b"\r\n");
+    let disguised = fixture.project.join("src/putty_key_fixture.txt");
+    write(&disguised, &vec![b'X'; putty_private_key.len()]);
+    let plan = plan_source_bundle(&fixture.request()).unwrap();
+    write(&disguised, &putty_private_key);
+    let output = fixture.workspace.parent().unwrap().join("putty-source.zip");
+    let error =
+        create_source_bundle_archive(&plan, &output, SourceArchiveLimits::default()).unwrap_err();
+    assert!(matches!(error, SourceError::SensitiveContent { .. }));
+    assert!(!error.to_string().contains("PuTTY-User-Key-File"));
+    assert!(!output.exists());
+
+    for (index, sensitive_path) in [
+        "app/.envrc",
+        "app/deploy.PPK",
+        "app/nested/vault.CrD",
+        "app/keys/Caf\u{e9}.PpK",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let archive = fixture
+            .workspace
+            .parent()
+            .unwrap()
+            .join(format!("sensitive-{index}.zip"));
+        let archive_descriptor = craft_zip(
+            &archive,
+            &[CraftedEntry::File(sensitive_path, b"fixture", false)],
+        );
+        let manifest = SourceManifest {
+            schema_version: 1,
+            project_path: "app".to_owned(),
+            entries: vec![SourceManifestEntry {
+                path: sensitive_path.to_owned(),
+                size: 7,
+                sha256: "0".repeat(64),
+                executable: false,
+            }],
+            total_size: 7,
+            sha256: "0".repeat(64),
+        };
+        let destination = fixture
+            .workspace
+            .parent()
+            .unwrap()
+            .join(format!("sensitive-{index}"));
+        let error = verify_and_extract_source_bundle(
+            &archive,
+            &archive_descriptor,
+            &manifest,
+            &destination,
+            SourceArchiveLimits::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, SourceError::SensitivePath { .. }),
+            "{sensitive_path:?}: {error:?}"
+        );
+        assert!(!destination.exists());
+    }
 }
 
 #[test]
@@ -522,7 +780,10 @@ fn explicit_inputs_reject_cross_platform_escape_forms() {
         ("//server/share", PortablePathReason::UncPrefix),
         ("../outside", PortablePathReason::DotComponent),
         ("safe\\outside", PortablePathReason::Backslash),
+        ("src/lib.rs:secret", PortablePathReason::InvalidCharacter),
         ("CON/file", PortablePathReason::ReservedName),
+        ("CONIN$", PortablePathReason::ReservedName),
+        ("CLOCK$.txt", PortablePathReason::ReservedName),
         ("COM¹/file", PortablePathReason::ReservedName),
         ("com².txt", PortablePathReason::ReservedName),
         ("COM³", PortablePathReason::ReservedName),
@@ -551,8 +812,8 @@ fn explicit_inputs_reject_cross_platform_escape_forms() {
 fn manifest_rejects_case_and_unicode_normalization_collisions() {
     for colliding_paths in [
         ["app/Foo.rs", "app/foo.rs"],
-        ["app/Caf\u{e9}.rs", "app/Cafe\u{301}.rs"],
         ["app/Foo/one.rs", "app/foo/two.rs"],
+        ["app/\u{130}.rs", "app/i\u{307}.rs"],
     ] {
         let mut entries: Vec<_> = colliding_paths
             .into_iter()
@@ -576,6 +837,26 @@ fn manifest_rejects_case_and_unicode_normalization_collisions() {
             Err(SourceError::CaseCollision { .. })
         ));
     }
+
+    let decomposed = SourceManifest {
+        schema_version: 1,
+        project_path: "app".to_owned(),
+        entries: vec![SourceManifestEntry {
+            path: "app/Cafe\u{301}.rs".to_owned(),
+            size: 0,
+            sha256: "0".repeat(64),
+            executable: false,
+        }],
+        total_size: 0,
+        sha256: "0".repeat(64),
+    };
+    assert!(matches!(
+        validate_source_manifest(&decomposed, SourceLimits::default()),
+        Err(SourceError::NonPortablePath {
+            reason: PortablePathReason::NonNfc,
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -614,6 +895,62 @@ fn symlinks_and_symlinked_explicit_ancestors_are_rejected() {
         ),
         Err(SourceError::Symlink { .. })
     ));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_reparse_source_ancestors_are_rejected_when_supported() {
+    use std::os::windows::fs::symlink_dir;
+
+    let fixture = Fixture::new();
+    let outside = fixture.workspace.parent().unwrap().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    write(&outside.join("secret.txt"), b"outside");
+    let linked = fixture.workspace.join("linked");
+    if symlink_dir(&outside, &linked).is_err() {
+        return;
+    }
+    let error = plan_source_bundle(
+        &fixture
+            .request()
+            .include_workspace_path("linked/secret.txt"),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        SourceError::Symlink { .. } | SourceError::ReparsePoint { .. }
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_named_streams_are_rejected_without_leaking_the_stream_name() {
+    let fixture = Fixture::new();
+    let source = fixture.project.join("src/main.rs");
+    write(&source, b"fn main() {}\n");
+    let stream_name = "private-fixture-stream";
+    fs::write(format!("{}:{stream_name}", source.as_str()), b"credential").unwrap();
+
+    let error = plan_source_bundle(&fixture.request()).unwrap_err();
+    assert!(matches!(error, SourceError::AlternateDataStream { .. }));
+    assert!(!error.to_string().contains(stream_name));
+}
+
+#[cfg(windows)]
+#[test]
+fn named_stream_added_after_planning_aborts_archive_publication() {
+    let fixture = Fixture::new();
+    let source = fixture.project.join("src/main.rs");
+    write(&source, b"fn main() {}\n");
+    let plan = plan_source_bundle(&fixture.request()).unwrap();
+    fs::write(format!("{}:late-stream", source.as_str()), b"late").unwrap();
+    let archive = fixture.workspace.join("snapshot.zip");
+
+    assert!(matches!(
+        create_source_bundle_archive(&plan, &archive, SourceArchiveLimits::default()),
+        Err(SourceError::AlternateDataStream { .. })
+    ));
+    assert!(!archive.exists());
 }
 
 #[cfg(unix)]
@@ -1090,6 +1427,9 @@ fn source_zip_roundtrip_is_exact() {
     )
     .unwrap();
     assert_eq!(actual_archive, expected_archive);
+    #[cfg(windows)]
+    rustferry_core::windows_private_directory::open_private_directory(destination.as_std_path())
+        .expect("protected extraction root");
     verify_materialized_bundle(&destination, plan.manifest(), limits.source).unwrap();
     assert_eq!(
         fs::read(destination.join("app/src/lib.rs")).unwrap(),

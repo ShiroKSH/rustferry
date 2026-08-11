@@ -414,6 +414,8 @@ pub struct ArtifactDownloadResult {
     pub manifest: ArtifactManifest,
     /// Absolute client path containing verified bytes.
     pub local_path: ProtocolPath,
+    /// Canonical, secret-free identity captured from the retained published file object.
+    pub local_file_identity: String,
 }
 
 /// Request to remove provider-owned material for one job.

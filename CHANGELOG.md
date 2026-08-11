@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Add private immutable remote-job history with bounded sanitized provider logs, fresh-process cancellation, exact and current-source retry lineage, and crash-safe complete-lineage pruning.
+- Add explicit consent-bound public GitHub GitSnapshot builds for dirty projects with zero-write preview, create-only temporary refs, restart recovery, retained exact-source retry, and non-erasure warnings.
+- Add managed artifact list/show/inspect/verify/reveal/remove commands with exact provenance, Windows retained-identity removal, replacement preservation, and durable idempotence.
+- Extend IDE protocol v1 and the VS Code Remote Jobs view with cursor-paged logs, cancel/retry, artifact actions, snapshot preview/submit, and metadata-only signing readiness.
+- Add an additive exact-input `workflow_dispatch` transport foundation while retaining Push as the compatible/default provider trigger; live dispatch still requires a wired provider consumer plus matching default-branch and dispatched-ref workflow definitions.
 - Return a manifest-bound sanitized protected-signing log with every default GitHub development IPA, keep the exact five-file default transport, and add request-bound signed `.app`, reconstructed XCArchive, and main-application dSYM selection with independent client verification.
 - Add the public Visual Studio Marketplace listing and marketplace icon for RustFerry for VS Code.
 - Add bounded per-target GitHub manual signing for an application, Widget, and Live Activity with exact repeatable profile selection, canonical static protected secrets, complete target-graph binding, versioned multi-profile stdin transport, and legacy single-application compatibility.

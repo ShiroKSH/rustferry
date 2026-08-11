@@ -266,7 +266,7 @@ impl SnapshotOperationRoot {
     }
 
     fn verify(&self) -> Result<(), CliError> {
-        let _directory_handle = self.directory.as_ref().ok_or_else(|| {
+        let directory_handle = self.directory.as_ref().ok_or_else(|| {
             ssh_error(
                 "ssh_session_directory_unavailable",
                 "the private SSH session directory handle is unavailable",
@@ -279,10 +279,12 @@ impl SnapshotOperationRoot {
             use std::os::windows::io::AsHandle as _;
 
             rustferry_core::windows_private_directory::verify_private_directory_handle(
-                _directory_handle.as_handle(),
+                directory_handle.as_handle(),
             )
             .map_err(map_windows_private_directory_error)?;
         }
+        #[cfg(not(windows))]
+        let _ = directory_handle;
         let identity = self.identity.as_ref().ok_or_else(|| {
             ssh_error(
                 "ssh_session_directory_unavailable",
@@ -416,6 +418,10 @@ fn cleanup_pending_snapshot_directory(
 }
 
 #[cfg(windows)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "this is a direct Result::map_err adapter at Windows security boundaries"
+)]
 fn map_windows_private_directory_error(
     error: rustferry_core::windows_private_directory::PrivateDirectoryError,
 ) -> CliError {
@@ -439,6 +445,10 @@ fn map_windows_private_directory_error(
 }
 
 #[cfg(windows)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "this is a direct Result::map_err adapter at Windows security boundaries"
+)]
 fn map_windows_private_config_error(
     error: rustferry_core::windows_private_directory::PrivateDirectoryError,
 ) -> CliError {
@@ -2137,6 +2147,10 @@ fn open_private_child(
 }
 
 #[cfg(windows)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "directory creation, retained-handle validation, and exact cleanup form one transaction"
+)]
 fn open_private_child(
     parent: &Dir,
     name: &str,
@@ -2344,6 +2358,10 @@ fn publish_config_create_only(
 }
 
 #[cfg(windows)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "create-only publication and retained-handle rollback form one auditable transaction"
+)]
 fn publish_config_create_only(
     directory: &Dir,
     filename: &str,
@@ -2490,7 +2508,7 @@ fn publish_config_create_only(
     drop(staging_identity);
     if let Err(original) = publication_check {
         drop(staging);
-        return Err(windows_config_commit_uncertain(absolute_path, original));
+        return Err(windows_config_commit_uncertain(absolute_path, &original));
     }
 
     rustferry_core::windows_private_directory::remove_private_file_handle_in_state(
@@ -2532,7 +2550,7 @@ fn publish_config_create_only(
             })?;
         validate_cap_config_metadata(&linked, absolute_path)
     })();
-    finalization.map_err(|original| windows_config_commit_uncertain(absolute_path, original))
+    finalization.map_err(|original| windows_config_commit_uncertain(absolute_path, &original))
 }
 
 #[cfg(windows)]
@@ -2557,7 +2575,7 @@ fn cleanup_failed_windows_config(
 }
 
 #[cfg(windows)]
-fn windows_config_commit_uncertain(absolute_path: &Utf8Path, original: CliError) -> CliError {
+fn windows_config_commit_uncertain(absolute_path: &Utf8Path, original: &CliError) -> CliError {
     ssh_error(
         "ssh_remote_config_commit_uncertain",
         "the SSH endpoint config was published, but final verification is uncertain",

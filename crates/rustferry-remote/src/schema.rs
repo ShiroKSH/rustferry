@@ -5,11 +5,11 @@ use schemars::{JsonSchema, schema_for};
 use crate::{
     ArtifactDownloadRequest, ArtifactDownloadResult, ArtifactListRequest, ArtifactManifest,
     CancellationAck, CancellationRequest, CleanupConfirmation, CleanupRequest, CompileHandoff,
-    CompilePhaseEvidence, EventPage, EventRequest, HandshakeRequest, HandshakeResponse,
-    IosDeviceBuildRequest, IosDeviceBuildResult, JobHandle, ProviderDoctorReport,
-    ProviderDoctorRequest, RemoteBuildEvent, SealedUnsignedArchive, SnapshotArtifactDescriptor,
-    SnapshotArtifactReceipt, SnapshotBuildComplete, SnapshotBuildStart, SnapshotJobAccepted,
-    SnapshotSessionError, SourceBundleDescriptor,
+    CompilePhaseEvidence, EventPage, EventRequest, GitSnapshotDescriptor, HandshakeRequest,
+    HandshakeResponse, IosDeviceBuildRequest, IosDeviceBuildResult, JobHandle,
+    ProviderDoctorReport, ProviderDoctorRequest, RemoteBuildEvent, SealedUnsignedArchive,
+    SnapshotArtifactDescriptor, SnapshotArtifactReceipt, SnapshotBuildComplete, SnapshotBuildStart,
+    SnapshotJobAccepted, SnapshotSessionError, SourceBundleDescriptor,
 };
 
 /// Every standalone document exchanged or persisted by protocol v1.
@@ -36,6 +36,8 @@ pub enum RemoteProtocolV1Document {
     SnapshotBuildStart(SnapshotBuildStart),
     /// Separately framed deterministic source descriptor.
     SourceBundleDescriptor(SourceBundleDescriptor),
+    /// Operation-bound descriptor for one GitHub dirty-source snapshot.
+    GitSnapshotDescriptor(GitSnapshotDescriptor),
     /// Worker acknowledgement for one snapshot job.
     SnapshotJobAccepted(SnapshotJobAccepted),
     /// Unsigned archive descriptor and compile evidence.

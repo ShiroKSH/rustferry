@@ -16,8 +16,8 @@ use rustferry_remote::{
 use same_file::Handle as FileIdentityHandle;
 
 use crate::cli::{
-    ManualSigningSetupArgs, RemoteProviderChoice, SigningArgs, SigningCommand, SigningSetupArgs,
-    SigningSetupMode,
+    ManualSigningSetupArgs, RemoteProviderChoice, SigningArgs, SigningCommand, SigningDoctorArgs,
+    SigningSetupArgs, SigningSetupMode,
 };
 use crate::error::CliError;
 use crate::output::Reporter;
@@ -36,7 +36,98 @@ struct TargetProfilePath {
 pub fn run(arguments: SigningArgs, dry_run: bool, reporter: &Reporter) -> Result<(), CliError> {
     match arguments.command {
         SigningCommand::Setup(arguments) => setup(arguments, dry_run, reporter),
+        SigningCommand::Doctor(arguments) => doctor(&arguments, reporter),
         SigningCommand::Teams(arguments) => teams(arguments.project_dir, reporter),
+    }
+}
+
+fn doctor(arguments: &SigningDoctorArgs, reporter: &Reporter) -> Result<(), CliError> {
+    let RemoteProviderChoice::Github = arguments.remote;
+    let root = find_project_root(arguments.project_dir.as_deref())
+        .map_err(|_| signing_readiness_unavailable())?;
+    let binding = remote::ProjectFilesystemBinding::capture(&root)
+        .map_err(|_| signing_readiness_unavailable())?;
+    let readiness = remote::github_signing_readiness(&binding)?;
+    if readiness.ready {
+        reporter.success(
+            "signing-doctor",
+            &readiness,
+            || render_signing_readiness(&readiness),
+            &[],
+        );
+        return Ok(());
+    }
+
+    let error = signing_not_ready();
+    let exit_code = error.exit_code();
+    reporter.failure_with_data("signing-doctor", &readiness, &error, || {
+        render_signing_readiness(&readiness)
+    });
+    Err(CliError::AlreadyReported { exit_code })
+}
+
+fn render_signing_readiness(readiness: &remote::IdeSigningReadiness) -> String {
+    let checks = std::iter::once(format!("ready={}", readiness.ready))
+        .chain(readiness.checks.iter().map(|check| {
+            format!(
+                "code={} required={} ready={} reason_code={}",
+                check.code,
+                check.required,
+                check.ready,
+                check.reason_code.unwrap_or("none")
+            )
+        }))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if missing_assets_with_ready_phase_implementation(readiness) {
+        const MISSING_ASSETS: &str = concat!(
+            "Signed Phase B implementation is ready,\n",
+            "but real Apple signing assets are not configured.\n\n",
+            "Required:\n",
+            "  Apple Development PKCS#12\n",
+            "  PKCS#12 password\n",
+            "  development provisioning profile\n",
+            "  registered device\n",
+            "  private execution repository\n",
+            "  protected Environment",
+        );
+        return format!("{MISSING_ASSETS}\n\n{checks}");
+    }
+    checks
+}
+
+fn missing_assets_with_ready_phase_implementation(readiness: &remote::IdeSigningReadiness) -> bool {
+    let check_ready = |code| {
+        readiness
+            .checks
+            .iter()
+            .any(|check| check.code == code && check.ready)
+    };
+    let assets_missing = readiness.checks.iter().any(|check| {
+        check.code == "github_actions_ios_signing.configured" && check.required && !check.ready
+    });
+    assets_missing
+        && check_ready("github.workflow.phase_a_secret_isolation")
+        && check_ready("github.workflow.phase_b_no_source_execution")
+}
+
+fn signing_readiness_unavailable() -> CliError {
+    CliError::Remote {
+        code: "signing_readiness_unavailable",
+        message: "GitHub iPhone-signing readiness could not be established safely".to_owned(),
+        help: "Verify the project and GitHub remote configuration, then retry the signing doctor."
+            .to_owned(),
+        details: Vec::new(),
+    }
+}
+
+fn signing_not_ready() -> CliError {
+    CliError::Remote {
+        code: "github_signing_not_ready",
+        message: "GitHub iPhone signing is not ready".to_owned(),
+        help: "Resolve every required readiness code before requesting a signed iPhone build."
+            .to_owned(),
+        details: Vec::new(),
     }
 }
 
@@ -1142,6 +1233,112 @@ mod tests {
 
     const DEVICE_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const DEVICE_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn signing_doctor_render_contains_only_stable_readiness_fields() {
+        let readiness = remote::IdeSigningReadiness {
+            ready: false,
+            checks: vec![remote::IdeSigningReadinessCheck {
+                code: "github.signing_environment.reviewers".to_owned(),
+                required: true,
+                ready: false,
+                reason_code: Some("required_reviewer_gate_unproven"),
+            }],
+        };
+
+        assert_eq!(
+            super::render_signing_readiness(&readiness),
+            concat!(
+                "ready=false\n",
+                "code=github.signing_environment.reviewers required=true ready=false ",
+                "reason_code=required_reviewer_gate_unproven",
+            )
+        );
+    }
+
+    #[test]
+    fn signing_doctor_explains_missing_assets_after_phase_implementation_is_proven() {
+        let readiness = remote::IdeSigningReadiness {
+            ready: false,
+            checks: vec![
+                remote::IdeSigningReadinessCheck {
+                    code: "github_actions_ios_signing.configured".to_owned(),
+                    required: true,
+                    ready: false,
+                    reason_code: Some("signing_not_configured"),
+                },
+                remote::IdeSigningReadinessCheck {
+                    code: "github.workflow.phase_a_secret_isolation".to_owned(),
+                    required: true,
+                    ready: true,
+                    reason_code: None,
+                },
+                remote::IdeSigningReadinessCheck {
+                    code: "github.workflow.phase_b_no_source_execution".to_owned(),
+                    required: true,
+                    ready: true,
+                    reason_code: None,
+                },
+            ],
+        };
+
+        let rendered = super::render_signing_readiness(&readiness);
+        assert!(rendered.starts_with(concat!(
+            "Signed Phase B implementation is ready,\n",
+            "but real Apple signing assets are not configured.\n\n",
+            "Required:\n",
+            "  Apple Development PKCS#12\n",
+            "  PKCS#12 password\n",
+            "  development provisioning profile\n",
+            "  registered device\n",
+            "  private execution repository\n",
+            "  protected Environment\n\n",
+        )));
+        assert!(rendered.contains("code=github_actions_ios_signing.configured"));
+    }
+
+    #[test]
+    fn signing_doctor_does_not_claim_phase_b_readiness_when_a_phase_check_fails() {
+        let readiness = remote::IdeSigningReadiness {
+            ready: false,
+            checks: vec![
+                remote::IdeSigningReadinessCheck {
+                    code: "github_actions_ios_signing.configured".to_owned(),
+                    required: true,
+                    ready: false,
+                    reason_code: Some("signing_not_configured"),
+                },
+                remote::IdeSigningReadinessCheck {
+                    code: "github.workflow.phase_a_secret_isolation".to_owned(),
+                    required: true,
+                    ready: true,
+                    reason_code: None,
+                },
+                remote::IdeSigningReadinessCheck {
+                    code: "github.workflow.phase_b_no_source_execution".to_owned(),
+                    required: true,
+                    ready: false,
+                    reason_code: Some("phase_b_source_isolation_unproven"),
+                },
+            ],
+        };
+
+        let rendered = super::render_signing_readiness(&readiness);
+        assert!(!rendered.contains("Signed Phase B implementation is ready"));
+        assert!(rendered.starts_with("ready=false\n"));
+    }
+
+    #[test]
+    fn signing_doctor_failures_are_typed_and_context_free() {
+        let unavailable = super::signing_readiness_unavailable();
+        assert_eq!(unavailable.code(), "signing_readiness_unavailable");
+        assert!(unavailable.details().is_empty());
+
+        let not_ready = super::signing_not_ready();
+        assert_eq!(not_ready.code(), "github_signing_not_ready");
+        assert!(not_ready.details().is_empty());
+        assert_ne!(not_ready.exit_code(), 0);
+    }
 
     fn tempdir_outside_current_repository() -> tempfile::TempDir {
         let current = std::env::current_dir()

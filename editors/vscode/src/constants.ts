@@ -5,11 +5,37 @@ export const PROTOCOL_MAX_VERSION = 1;
 export const PROJECT_MANIFEST = "ferry.toml";
 export const OUTPUT_CHANNEL = "RustFerry";
 export const LOGS_CHANNEL = "RustFerry Logs";
+export const JOB_LOGS_CHANNEL = "RustFerry Job Logs";
 export const DOCUMENTATION_URL = "https://shiroksh.github.io/rustferry/";
 export const INSTALLATION_URL = "https://shiroksh.github.io/rustferry/installation.html";
 export const ANDROID_SETUP_URL = "https://shiroksh.github.io/rustferry/android/setup.html";
 export const IOS_SETUP_URL = "https://shiroksh.github.io/rustferry/ios/setup.html";
 export const IOS_SIGNING_URL = "https://shiroksh.github.io/rustferry/ios/physical-device.html";
+
+export const jobIdeCommands = {
+  list: "jobs-list",
+  show: "jobs-show",
+  logs: "jobs-logs",
+  logsPage: "jobs-logs-page",
+  artifacts: "jobs-artifacts",
+  // Mutation IDs are dormant gates: no action is visible or invoked until the CLI advertises
+  // that exact endpoint, after it has its own workspace/ownership revalidation contract.
+  cancel: "jobs-cancel",
+  retry: "jobs-retry",
+  artifactVerify: "jobs-artifact-verify",
+  artifactReveal: "jobs-artifact-reveal",
+  artifactRemove: "jobs-artifact-remove"
+} as const;
+
+export type JobIdeCommand = typeof jobIdeCommands[keyof typeof jobIdeCommands];
+
+export const remoteIdeCommands = {
+  buildPreview: "remote-build-preview",
+  buildSubmit: "remote-build-submit",
+  signingReadiness: "signing-readiness"
+} as const;
+
+export type RemoteIdeCommand = typeof remoteIdeCommands[keyof typeof remoteIdeCommands];
 
 export const commands = {
   createProject: "rustferry.createProject",
@@ -43,5 +69,17 @@ export const commands = {
   deleteArtifact: "rustferry.deleteArtifact",
   applyValidatedFix: "rustferry.applyValidatedFix",
   trustWorkspace: "rustferry.trustWorkspace",
-  selectCli: "rustferry.selectCli"
+  selectCli: "rustferry.selectCli",
+  refreshJobs: "rustferry.jobs.refresh",
+  showJob: "rustferry.jobs.show",
+  showJobLogs: "rustferry.jobs.logs",
+  loadMoreJobLogs: "rustferry.jobs.logs.loadMore",
+  followJobLogs: "rustferry.jobs.logs.follow",
+  cancelJob: "rustferry.jobs.cancel",
+  retryJob: "rustferry.jobs.retry",
+  verifyJobArtifact: "rustferry.jobs.artifact.verify",
+  revealJobArtifact: "rustferry.jobs.artifact.reveal",
+  removeJobArtifact: "rustferry.jobs.artifact.remove",
+  remoteSnapshotBuild: "rustferry.jobs.remoteSnapshotBuild",
+  signingReadiness: "rustferry.jobs.signingReadiness"
 } as const;

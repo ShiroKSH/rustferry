@@ -49,14 +49,24 @@ pub enum PrivateDirectoryOperation {
     OpenDirectory,
     /// Read directory attributes from the retained handle.
     QueryAttributes,
+    /// Resolve the stable DOS path of a retained no-delete-sharing directory handle.
+    ResolvePath,
+    /// Enumerate file identifiers through a retained directory handle.
+    EnumerateDirectory,
+    /// Open one enumerated directory-tree entry without following reparse points.
+    OpenTreeEntry,
     /// Read filesystem capabilities from the retained handle.
     QueryFileSystem,
+    /// Flush retained directory metadata through the exact handle.
+    FlushDirectory,
     /// Read the security descriptor from the retained handle.
     QuerySecurityDescriptor,
     /// Mark the exact retained directory object for deletion.
     RemoveDirectory,
     /// Mark the exact retained regular-file link for deletion.
     RemoveFile,
+    /// Atomically rename a retained private file into a retained directory.
+    RenameFile,
 }
 
 /// Expected hard-link state for a private regular-file handle.
@@ -125,6 +135,8 @@ pub enum PrivateDirectoryErrorKind {
     ReparsePoint,
     /// A private regular file has a hard-link count that differs from the expected state.
     MultipleLinks,
+    /// A pathname entry no longer identifies the object enumerated through its parent handle.
+    IdentityMismatch,
     /// The security descriptor has no owner SID.
     OwnerMissing,
     /// The directory owner is not the current process-token user.
@@ -223,6 +235,162 @@ impl fmt::Display for PrivateDirectoryError {
 
 impl Error for PrivateDirectoryError {}
 
+/// Whether a failed handle-bound private-file publication changed the destination namespace.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum PrivatePublicationPhase {
+    /// The handle-bound rename was not reported successful, so the staging name remains authoritative.
+    Unpublished,
+    /// The rename succeeded, but a handle-bound postcondition could not be confirmed.
+    CommitUncertain,
+}
+
+/// Recoverable failure from handle-bound private-file publication.
+///
+/// The exact input file handle is always retained. Callers must branch on [`Self::phase`] before
+/// deciding which durable record or namespace entry is authoritative; they must never fall back to
+/// deleting a pathname after this error.
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct PrivatePublicationError {
+    phase: PrivatePublicationPhase,
+    file: std::fs::File,
+    error: PrivateDirectoryError,
+}
+
+#[cfg(windows)]
+impl PrivatePublicationError {
+    fn new(
+        phase: PrivatePublicationPhase,
+        file: std::fs::File,
+        error: PrivateDirectoryError,
+    ) -> Self {
+        Self { phase, file, error }
+    }
+
+    /// Return the namespace phase reached before publication failed.
+    pub const fn phase(&self) -> PrivatePublicationPhase {
+        self.phase
+    }
+
+    /// Return the underlying strict-policy or Windows failure.
+    pub const fn error(&self) -> &PrivateDirectoryError {
+        &self.error
+    }
+
+    /// Borrow the exact retained file involved in the attempted publication.
+    pub const fn retained_file(&self) -> &std::fs::File {
+        &self.file
+    }
+
+    /// Recover the phase, exact retained file, and underlying failure.
+    pub fn into_parts(
+        self,
+    ) -> (
+        PrivatePublicationPhase,
+        std::fs::File,
+        PrivateDirectoryError,
+    ) {
+        (self.phase, self.file, self.error)
+    }
+}
+
+#[cfg(windows)]
+impl fmt::Display for PrivatePublicationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "private file publication failed in phase {:?}: {}",
+            self.phase, self.error
+        )
+    }
+}
+
+#[cfg(windows)]
+impl Error for PrivatePublicationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// Exact-handle state retained when legacy hard-link publication recovery fails.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum PrivatePublicationPairPhase {
+    /// Removal of the staging link was not reported successful; the retained handle is staging.
+    PairIntact,
+    /// The staging link was removed; the retained exact final handle still permits delete sharing.
+    FinalSingleSharedDelete,
+    /// A no-write/no-delete-sharing exact final handle was acquired, but validation failed.
+    FinalSingleSealed,
+}
+
+/// Recoverable failure while collapsing a legacy private publication hard-link pair.
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct PrivatePublicationPairError {
+    phase: PrivatePublicationPairPhase,
+    file: std::fs::File,
+    error: PrivateDirectoryError,
+}
+
+#[cfg(windows)]
+impl PrivatePublicationPairError {
+    fn new(
+        phase: PrivatePublicationPairPhase,
+        file: std::fs::File,
+        error: PrivateDirectoryError,
+    ) -> Self {
+        Self { phase, file, error }
+    }
+
+    /// Return the exact-handle phase reached before recovery failed.
+    pub const fn phase(&self) -> PrivatePublicationPairPhase {
+        self.phase
+    }
+
+    /// Return the underlying strict-policy or Windows failure.
+    pub const fn error(&self) -> &PrivateDirectoryError {
+        &self.error
+    }
+
+    /// Borrow the exact retained staging or final file.
+    pub const fn retained_file(&self) -> &std::fs::File {
+        &self.file
+    }
+
+    /// Recover the phase, exact retained file, and underlying failure.
+    pub fn into_parts(
+        self,
+    ) -> (
+        PrivatePublicationPairPhase,
+        std::fs::File,
+        PrivateDirectoryError,
+    ) {
+        (self.phase, self.file, self.error)
+    }
+}
+
+#[cfg(windows)]
+impl fmt::Display for PrivatePublicationPairError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "private publication-pair recovery failed in phase {:?}: {}",
+            self.phase, self.error
+        )
+    }
+}
+
+#[cfg(windows)]
+impl Error for PrivatePublicationPairError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
 #[cfg(test)]
 fn validate_acl(raw: &[u8], principals: &[&[u8]]) -> Result<(), PrivateDirectoryAclViolation> {
     validate_acl_with_flags(raw, principals, DIRECTORY_INHERIT_FLAGS)
@@ -318,22 +486,27 @@ fn valid_sid_bytes(sid: &[u8]) -> bool {
 #[cfg(windows)]
 mod platform {
     use std::{
+        collections::BTreeSet,
         ffi::c_void,
+        ffi::{OsStr, OsString},
         fs::File,
         io,
-        mem::size_of,
+        mem::{offset_of, size_of, size_of_val},
         os::windows::{
-            ffi::OsStrExt as _,
+            ffi::{OsStrExt as _, OsStringExt as _},
             io::{AsRawHandle as _, BorrowedHandle, FromRawHandle as _, OwnedHandle},
         },
-        path::Path,
+        path::{Component, Path, PathBuf},
         ptr, slice,
     };
 
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_RENAME_INFORMATION, FileRenameInformation, NtFlushBuffersFileEx, NtSetInformationFile,
+    };
     use windows_sys::Win32::{
         Foundation::{
-            ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_INSUFFICIENT_BUFFER, HANDLE,
-            INVALID_HANDLE_VALUE,
+            ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_INSUFFICIENT_BUFFER,
+            ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE, RtlNtStatusToDosError,
         },
         Security::{
             ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAceEx, CopySid,
@@ -348,12 +521,18 @@ mod platform {
         Storage::FileSystem::{
             BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE,
             FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
-            FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-            FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE,
-            FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo, GetFileInformationByHandle,
-            GetVolumeInformationByHandleW, OPEN_EXISTING, SetFileInformationByHandle, WRITE_DAC,
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_FLAG_DELETE,
+            FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+            FILE_GENERIC_WRITE, FILE_ID_EXTD_DIR_INFO, FILE_ID_INFO, FILE_SHARE_DELETE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA, FileDispositionInfo,
+            FileDispositionInfoEx, FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo,
+            FileIdInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+            GetFinalPathNameByHandleW, GetVolumeInformationByHandleW, OPEN_EXISTING, ReOpenFile,
+            SetFileInformationByHandle, WRITE_DAC,
         },
         System::{
+            IO::IO_STATUS_BLOCK,
             SystemServices::{FILE_PERSISTENT_ACLS, SECURITY_DESCRIPTOR_REVISION},
             Threading::{GetCurrentProcess, OpenProcessToken},
         },
@@ -362,11 +541,24 @@ mod platform {
     use super::{
         DIRECTORY_INHERIT_FLAGS, FILE_ACE_FLAGS, PrivateDirectoryAclViolation,
         PrivateDirectoryCleanupStatus, PrivateDirectoryError, PrivateDirectoryErrorKind,
-        PrivateDirectoryOperation, PrivateFileLinkState, SID_HEADER_BYTES, valid_sid_bytes,
-        validate_acl_with_flags,
+        PrivateDirectoryOperation, PrivateFileLinkState, PrivatePublicationError,
+        PrivatePublicationPairError, PrivatePublicationPairPhase, PrivatePublicationPhase,
+        SID_HEADER_BYTES, valid_sid_bytes, validate_acl_with_flags,
     };
 
     const MAX_SECURITY_DESCRIPTOR_BYTES: usize = 128 * 1024;
+    const DIRECTORY_ENUMERATION_BUFFER_BYTES: usize = 64 * 1024;
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct DirectoryEntryIdentity {
+        name: OsString,
+        file_id: [u8; 16],
+    }
+
+    enum BoundTreeEntry {
+        Directory { handle: File, path: PathBuf },
+        RegularFile(File),
+    }
 
     #[derive(Clone, Copy)]
     enum PrivateObjectKind {
@@ -453,6 +645,18 @@ mod platform {
         Ok(directory)
     }
 
+    pub(super) fn open_read_guard(path: &Path) -> Result<File, PrivateDirectoryError> {
+        let wide_path = wide_path(path)?;
+        let directory = open_directory_read_guard(&wide_path)?;
+        let user = current_process_user_sid()?;
+        verify_with_user(
+            directory.as_raw_handle(),
+            &user,
+            PrivateObjectKind::Directory,
+        )?;
+        Ok(directory)
+    }
+
     pub(super) fn create_file(
         path: &Path,
         share_delete: bool,
@@ -507,14 +711,432 @@ mod platform {
         Ok(file)
     }
 
+    pub(super) fn create_lock_file(path: &Path) -> Result<File, PrivateDirectoryError> {
+        create_lock_file_with_callback(path, || {})
+    }
+
+    fn create_lock_file_with_callback(
+        path: &Path,
+        after_create: impl FnOnce(),
+    ) -> Result<File, PrivateDirectoryError> {
+        let wide_path = wide_path(path)?;
+        let (file, user) = with_private_security_attributes(
+            PrivateObjectKind::RegularFile(PrivateFileLinkState::Single),
+            |attributes| {
+                // SAFETY: the path and strict security descriptor are retained for this call.
+                // CREATE_NEW cannot replace a peer's existing lock file.
+                let handle = unsafe {
+                    CreateFileW(
+                        wide_path.as_ptr(),
+                        FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        attributes,
+                        CREATE_NEW,
+                        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                        ptr::null_mut(),
+                    )
+                };
+                if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+                    let code = last_os_code();
+                    return Err(PrivateDirectoryError::new(
+                        if is_win32_error(code, ERROR_ALREADY_EXISTS)
+                            || is_win32_error(code, ERROR_FILE_EXISTS)
+                        {
+                            PrivateDirectoryErrorKind::AlreadyExists
+                        } else {
+                            PrivateDirectoryErrorKind::WindowsApi(
+                                PrivateDirectoryOperation::CreateFile,
+                            )
+                        },
+                        code,
+                    ));
+                }
+                // SAFETY: successful CreateFileW returns one owned real handle.
+                Ok(unsafe { File::from_raw_handle(handle) })
+            },
+        )?;
+        after_create();
+        let kind = PrivateObjectKind::RegularFile(PrivateFileLinkState::Single);
+        if let Err(error) = verify_with_user(file.as_raw_handle(), &user, kind) {
+            drop(file);
+            return Err(error.with_cleanup(PrivateDirectoryCleanupStatus::Uncertain, None));
+        }
+        Ok(file)
+    }
+
+    pub(super) fn open_lock_file(path: &Path) -> Result<File, PrivateDirectoryError> {
+        let wide_path = wide_path(path)?;
+        let file = open_regular_file_with_access(
+            &wide_path,
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+        )?;
+        let user = current_process_user_sid()?;
+        verify_with_user(
+            file.as_raw_handle(),
+            &user,
+            PrivateObjectKind::RegularFile(PrivateFileLinkState::Single),
+        )?;
+        Ok(file)
+    }
+
+    pub(super) fn publish_file_create_new(
+        file: File,
+        destination_directory: BorrowedHandle<'_>,
+        destination_name: &OsStr,
+    ) -> Result<File, PrivatePublicationError> {
+        publish_file_create_new_with_callback(file, destination_directory, destination_name, || {})
+    }
+
+    fn publish_file_create_new_with_callback(
+        file: File,
+        destination_directory: BorrowedHandle<'_>,
+        destination_name: &OsStr,
+        after_rename: impl FnOnce(),
+    ) -> Result<File, PrivatePublicationError> {
+        let encoded_name = match private_destination_name(destination_name) {
+            Ok(name) => name,
+            Err(error) => {
+                return Err(PrivatePublicationError::new(
+                    PrivatePublicationPhase::Unpublished,
+                    file,
+                    error,
+                ));
+            }
+        };
+        let user = match current_process_user_sid() {
+            Ok(user) => user,
+            Err(error) => {
+                return Err(PrivatePublicationError::new(
+                    PrivatePublicationPhase::Unpublished,
+                    file,
+                    error,
+                ));
+            }
+        };
+        if let Err(error) = verify_with_user(
+            destination_directory.as_raw_handle(),
+            &user,
+            PrivateObjectKind::Directory,
+        ) {
+            return Err(PrivatePublicationError::new(
+                PrivatePublicationPhase::Unpublished,
+                file,
+                error,
+            ));
+        }
+        let file_kind = PrivateObjectKind::RegularFile(PrivateFileLinkState::Single);
+        if let Err(error) = verify_with_user(file.as_raw_handle(), &user, file_kind) {
+            return Err(PrivatePublicationError::new(
+                PrivatePublicationPhase::Unpublished,
+                file,
+                error,
+            ));
+        }
+        if let Err(error) = verify_directory_contains_file_identity(
+            destination_directory.as_raw_handle(),
+            file.as_raw_handle(),
+        ) {
+            return Err(PrivatePublicationError::new(
+                PrivatePublicationPhase::Unpublished,
+                file,
+                error,
+            ));
+        }
+        if let Err(error) = rename_file_handle_create_new(
+            file.as_raw_handle(),
+            destination_directory.as_raw_handle(),
+            &encoded_name,
+        ) {
+            return Err(PrivatePublicationError::new(
+                PrivatePublicationPhase::Unpublished,
+                file,
+                error,
+            ));
+        }
+
+        after_rename();
+        let postcondition = (|| {
+            verify_with_user(
+                destination_directory.as_raw_handle(),
+                &user,
+                PrivateObjectKind::Directory,
+            )?;
+            verify_with_user(file.as_raw_handle(), &user, file_kind)?;
+            verify_directory_entry_identity(
+                destination_directory.as_raw_handle(),
+                destination_name,
+                file.as_raw_handle(),
+            )
+        })();
+        if let Err(error) = postcondition {
+            return Err(PrivatePublicationError::new(
+                PrivatePublicationPhase::CommitUncertain,
+                file,
+                error,
+            ));
+        }
+        Ok(file)
+    }
+
+    pub(super) fn complete_publication_pair(
+        staging: File,
+        destination_directory: BorrowedHandle<'_>,
+        destination_name: &OsStr,
+    ) -> Result<File, PrivatePublicationPairError> {
+        complete_publication_pair_with_callback(
+            staging,
+            destination_directory,
+            destination_name,
+            || {},
+        )
+    }
+
+    fn complete_publication_pair_with_callback(
+        staging: File,
+        destination_directory: BorrowedHandle<'_>,
+        destination_name: &OsStr,
+        after_staging_unlink: impl FnOnce(),
+    ) -> Result<File, PrivatePublicationPairError> {
+        let user = match current_process_user_sid() {
+            Ok(user) => user,
+            Err(error) => {
+                return Err(PrivatePublicationPairError::new(
+                    PrivatePublicationPairPhase::PairIntact,
+                    staging,
+                    error,
+                ));
+            }
+        };
+        let final_transient = match open_bound_publication_pair_final(
+            &staging,
+            destination_directory,
+            destination_name,
+            &user,
+        ) {
+            Ok(file) => file,
+            Err(error) => {
+                return Err(PrivatePublicationPairError::new(
+                    PrivatePublicationPairPhase::PairIntact,
+                    staging,
+                    error,
+                ));
+            }
+        };
+        if let Err(error) = remove_link_by_handle_posix(staging.as_raw_handle()) {
+            drop(final_transient);
+            return Err(PrivatePublicationPairError::new(
+                PrivatePublicationPairPhase::PairIntact,
+                staging,
+                error,
+            ));
+        }
+        drop(staging);
+
+        after_staging_unlink();
+        let sealed = match reopen_private_file(
+            final_transient.as_raw_handle(),
+            FILE_GENERIC_READ | DELETE,
+            FILE_SHARE_READ,
+        ) {
+            Ok(file) => file,
+            Err(error) => {
+                return Err(PrivatePublicationPairError::new(
+                    PrivatePublicationPairPhase::FinalSingleSharedDelete,
+                    final_transient,
+                    error,
+                ));
+            }
+        };
+        drop(final_transient);
+
+        if let Err(error) =
+            verify_completed_publication(&sealed, destination_directory, destination_name, &user)
+        {
+            return Err(PrivatePublicationPairError::new(
+                PrivatePublicationPairPhase::FinalSingleSealed,
+                sealed,
+                error,
+            ));
+        }
+        Ok(sealed)
+    }
+
+    fn open_bound_publication_pair_final(
+        staging: &File,
+        destination_directory: BorrowedHandle<'_>,
+        destination_name: &OsStr,
+        user: &Sid,
+    ) -> Result<File, PrivateDirectoryError> {
+        private_destination_name(destination_name)?;
+        let pair_kind = PrivateObjectKind::RegularFile(PrivateFileLinkState::PublicationPair);
+        verify_with_user(
+            destination_directory.as_raw_handle(),
+            user,
+            PrivateObjectKind::Directory,
+        )?;
+        verify_with_user(staging.as_raw_handle(), user, pair_kind)?;
+        verify_directory_entry_identity(
+            destination_directory.as_raw_handle(),
+            destination_name,
+            staging.as_raw_handle(),
+        )?;
+        let destination_path =
+            final_path_from_handle(destination_directory.as_raw_handle())?.join(destination_name);
+        let destination_path = wide_path(&destination_path)?;
+        let final_file = open_regular_file_with_access(
+            &destination_path,
+            FILE_GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_DELETE,
+        )?;
+        verify_with_user(final_file.as_raw_handle(), user, pair_kind)?;
+        verify_same_file(staging.as_raw_handle(), final_file.as_raw_handle())?;
+        verify_directory_entry_identity(
+            destination_directory.as_raw_handle(),
+            destination_name,
+            final_file.as_raw_handle(),
+        )?;
+        verify_with_user(staging.as_raw_handle(), user, pair_kind)?;
+        Ok(final_file)
+    }
+
+    fn verify_completed_publication(
+        final_file: &File,
+        destination_directory: BorrowedHandle<'_>,
+        destination_name: &OsStr,
+        user: &Sid,
+    ) -> Result<(), PrivateDirectoryError> {
+        verify_with_user(
+            final_file.as_raw_handle(),
+            user,
+            PrivateObjectKind::RegularFile(PrivateFileLinkState::Single),
+        )?;
+        verify_with_user(
+            destination_directory.as_raw_handle(),
+            user,
+            PrivateObjectKind::Directory,
+        )?;
+        verify_directory_entry_identity(
+            destination_directory.as_raw_handle(),
+            destination_name,
+            final_file.as_raw_handle(),
+        )
+    }
+
+    pub(super) fn seal_staging_file(file: File) -> Result<File, PrivateDirectoryError> {
+        seal_staging_file_with_transition(file, || {})
+    }
+
+    fn seal_staging_file_with_transition(
+        file: File,
+        after_writer_drop: impl FnOnce(),
+    ) -> Result<File, PrivateDirectoryError> {
+        let kind = PrivateObjectKind::RegularFile(PrivateFileLinkState::Single);
+        let user = match current_process_user_sid() {
+            Ok(user) => user,
+            Err(error) => {
+                drop(file);
+                return Err(error.with_cleanup(PrivateDirectoryCleanupStatus::Uncertain, None));
+            }
+        };
+        if let Err(error) = verify_with_user(file.as_raw_handle(), &user, kind) {
+            let cleanup = remove_verified_private(file.as_raw_handle(), &user, kind);
+            drop(file);
+            return Err(error_after_cleanup(error, cleanup));
+        }
+        let transient = match reopen_private_staging_file(
+            file.as_raw_handle(),
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        ) {
+            Ok(transient) => transient,
+            Err(error) => {
+                let cleanup = remove_verified_private(file.as_raw_handle(), &user, kind);
+                drop(file);
+                return Err(error_after_cleanup(error, cleanup));
+            }
+        };
+        drop(file);
+        after_writer_drop();
+
+        let sealed = match reopen_private_staging_file(
+            transient.as_raw_handle(),
+            FILE_SHARE_READ | FILE_SHARE_DELETE,
+        ) {
+            Ok(sealed) => sealed,
+            Err(error) => {
+                let cleanup = remove_verified_private(transient.as_raw_handle(), &user, kind);
+                drop(transient);
+                return Err(error_after_cleanup(error, cleanup));
+            }
+        };
+        drop(transient);
+        if let Err(error) = verify_with_user(sealed.as_raw_handle(), &user, kind) {
+            let cleanup = remove_verified_private(sealed.as_raw_handle(), &user, kind);
+            drop(sealed);
+            return Err(error_after_cleanup(error, cleanup));
+        }
+        Ok(sealed)
+    }
+
     pub(super) fn verify(handle: BorrowedHandle<'_>) -> Result<(), PrivateDirectoryError> {
         let user = current_process_user_sid()?;
         verify_with_user(handle.as_raw_handle(), &user, PrivateObjectKind::Directory)
     }
 
+    pub(super) fn sync_directory(
+        directory: BorrowedHandle<'_>,
+    ) -> Result<(), PrivateDirectoryError> {
+        let user = current_process_user_sid()?;
+        verify_with_user(
+            directory.as_raw_handle(),
+            &user,
+            PrivateObjectKind::Directory,
+        )?;
+
+        let mut io_status = IO_STATUS_BLOCK::default();
+        // SAFETY: `directory` is a retained, verified directory handle with directory-write access.
+        // Normal mode (`flags == 0`) synchronously requests cached data, metadata, and the backing
+        // storage cache; this mode accepts no optional parameter block.
+        let status = unsafe {
+            NtFlushBuffersFileEx(
+                directory.as_raw_handle(),
+                0,
+                ptr::null(),
+                0,
+                &raw mut io_status,
+            )
+        };
+        if status != 0 {
+            // SAFETY: `status` is the exact failure returned by `NtFlushBuffersFileEx`.
+            let code = i32::try_from(unsafe { RtlNtStatusToDosError(status) }).ok();
+            return Err(operation_error(
+                PrivateDirectoryOperation::FlushDirectory,
+                code,
+            ));
+        }
+
+        verify_with_user(
+            directory.as_raw_handle(),
+            &user,
+            PrivateObjectKind::Directory,
+        )
+    }
+
     pub(super) fn open_file(path: &Path) -> Result<File, PrivateDirectoryError> {
         let wide_path = wide_path(path)?;
         let file = open_regular_file(&wide_path)?;
+        let user = current_process_user_sid()?;
+        verify_with_user(
+            file.as_raw_handle(),
+            &user,
+            PrivateObjectKind::RegularFile(PrivateFileLinkState::Single),
+        )?;
+        Ok(file)
+    }
+
+    pub(super) fn open_file_for_sync(path: &Path) -> Result<File, PrivateDirectoryError> {
+        let wide_path = wide_path(path)?;
+        let file = open_regular_file_for_sync(&wide_path)?;
         let user = current_process_user_sid()?;
         verify_with_user(
             file.as_raw_handle(),
@@ -572,6 +1194,133 @@ mod platform {
         link_state: PrivateFileLinkState,
     ) -> Result<(), PrivateDirectoryError> {
         remove_private_object(file, PrivateObjectKind::RegularFile(link_state))
+    }
+
+    pub(super) fn remove_directory_tree(directory: File) -> Result<(), PrivateDirectoryError> {
+        remove_directory_tree_with_callback(directory, |_| {})
+    }
+
+    fn remove_directory_tree_with_callback(
+        directory: File,
+        before_removal: impl FnOnce(&Path),
+    ) -> Result<(), PrivateDirectoryError> {
+        let result = (|| {
+            let user = current_process_user_sid()?;
+            verify_with_user(
+                directory.as_raw_handle(),
+                &user,
+                PrivateObjectKind::Directory,
+            )?;
+            let path = final_path_from_handle(directory.as_raw_handle())?;
+            let children = bind_directory_children(&directory, &path)?;
+            before_removal(&path);
+            remove_bound_directory(directory, children)
+        })();
+        result.map_err(|error| {
+            let code = error.os_code();
+            error.with_cleanup(PrivateDirectoryCleanupStatus::Uncertain, code)
+        })
+    }
+
+    fn bind_directory_children(
+        directory: &File,
+        path: &Path,
+    ) -> Result<Vec<BoundTreeEntry>, PrivateDirectoryError> {
+        let entries = enumerate_directory(directory.as_raw_handle())?;
+        let mut children = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let child_path = path.join(&entry.name);
+            let child = open_tree_entry(&child_path)?;
+            let identity = query_file_identity(child.as_raw_handle())?;
+            if identity.FileId.Identifier != entry.file_id {
+                return Err(PrivateDirectoryError::new(
+                    PrivateDirectoryErrorKind::IdentityMismatch,
+                    None,
+                ));
+            }
+            let information = query_attributes(child.as_raw_handle())?;
+            if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(PrivateDirectoryError::new(
+                    PrivateDirectoryErrorKind::ReparsePoint,
+                    None,
+                ));
+            }
+            if information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+                let child_path = final_path_from_handle(child.as_raw_handle())?;
+                children.push(BoundTreeEntry::Directory {
+                    handle: child,
+                    path: child_path,
+                });
+            } else {
+                verify_regular_file_attributes(&information)?;
+                if information.nNumberOfLinks != 1 {
+                    return Err(PrivateDirectoryError::new(
+                        PrivateDirectoryErrorKind::MultipleLinks,
+                        None,
+                    ));
+                }
+                children.push(BoundTreeEntry::RegularFile(child));
+            }
+        }
+        Ok(children)
+    }
+
+    fn remove_bound_directory(
+        directory: File,
+        children: Vec<BoundTreeEntry>,
+    ) -> Result<(), PrivateDirectoryError> {
+        for child in children {
+            match child {
+                BoundTreeEntry::Directory { handle, path } => {
+                    let information = query_attributes(handle.as_raw_handle())?;
+                    if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                        return Err(PrivateDirectoryError::new(
+                            PrivateDirectoryErrorKind::ReparsePoint,
+                            None,
+                        ));
+                    }
+                    if information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+                        return Err(PrivateDirectoryError::new(
+                            PrivateDirectoryErrorKind::NotDirectory,
+                            None,
+                        ));
+                    }
+                    let grandchildren = bind_directory_children(&handle, &path)?;
+                    remove_bound_directory(handle, grandchildren)?;
+                }
+                BoundTreeEntry::RegularFile(file) => {
+                    let information = query_attributes(file.as_raw_handle())?;
+                    verify_regular_file_attributes(&information)?;
+                    if information.nNumberOfLinks != 1 {
+                        return Err(PrivateDirectoryError::new(
+                            PrivateDirectoryErrorKind::MultipleLinks,
+                            None,
+                        ));
+                    }
+                    remove_by_handle(
+                        file.as_raw_handle(),
+                        PrivateObjectKind::RegularFile(PrivateFileLinkState::Single),
+                    )?;
+                    drop(file);
+                }
+            }
+        }
+        let information = query_attributes(directory.as_raw_handle())?;
+        if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(PrivateDirectoryError::new(
+                PrivateDirectoryErrorKind::ReparsePoint,
+                None,
+            ));
+        }
+        if information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return Err(PrivateDirectoryError::new(
+                PrivateDirectoryErrorKind::NotDirectory,
+                None,
+            ));
+        }
+        remove_by_handle(directory.as_raw_handle(), PrivateObjectKind::Directory)?;
+        drop(directory);
+        Ok(())
     }
 
     fn remove_private_object(
@@ -669,6 +1418,193 @@ mod platform {
             )?;
         }
         Ok(information)
+    }
+
+    fn query_file_identity(handle: HANDLE) -> Result<FILE_ID_INFO, PrivateDirectoryError> {
+        let mut identity = FILE_ID_INFO::default();
+        let size = u32::try_from(size_of::<FILE_ID_INFO>())
+            .map_err(|_| operation_error(PrivateDirectoryOperation::QueryAttributes, None))?;
+        // SAFETY: `handle` is borrowed and `identity` is writable storage of the advertised size.
+        unsafe {
+            win_bool(
+                GetFileInformationByHandleEx(handle, FileIdInfo, (&raw mut identity).cast(), size),
+                PrivateDirectoryOperation::QueryAttributes,
+            )?;
+        }
+        Ok(identity)
+    }
+
+    fn verify_directory_entry_identity(
+        directory: HANDLE,
+        name: &OsStr,
+        file: HANDLE,
+    ) -> Result<(), PrivateDirectoryError> {
+        let directory_identity = query_file_identity(directory)?;
+        let file_identity = query_file_identity(file)?;
+        if directory_identity.VolumeSerialNumber != file_identity.VolumeSerialNumber {
+            return Err(directory_identity_error());
+        }
+        let entry = enumerate_directory(directory)?
+            .into_iter()
+            .find(|entry| entry.name == name)
+            .ok_or_else(directory_identity_error)?;
+        if entry.file_id != file_identity.FileId.Identifier {
+            return Err(directory_identity_error());
+        }
+        Ok(())
+    }
+
+    fn verify_directory_contains_file_identity(
+        directory: HANDLE,
+        file: HANDLE,
+    ) -> Result<(), PrivateDirectoryError> {
+        let directory_identity = query_file_identity(directory)?;
+        let file_identity = query_file_identity(file)?;
+        if directory_identity.VolumeSerialNumber != file_identity.VolumeSerialNumber {
+            return Err(directory_identity_error());
+        }
+        let matching_entries = enumerate_directory(directory)?
+            .into_iter()
+            .filter(|entry| entry.file_id == file_identity.FileId.Identifier)
+            .count();
+        if matching_entries != 1 {
+            return Err(directory_identity_error());
+        }
+        Ok(())
+    }
+
+    fn verify_same_file(left: HANDLE, right: HANDLE) -> Result<(), PrivateDirectoryError> {
+        let left = query_file_identity(left)?;
+        let right = query_file_identity(right)?;
+        if left.VolumeSerialNumber != right.VolumeSerialNumber
+            || left.FileId.Identifier != right.FileId.Identifier
+        {
+            return Err(directory_identity_error());
+        }
+        Ok(())
+    }
+
+    fn enumerate_directory(
+        handle: HANDLE,
+    ) -> Result<Vec<DirectoryEntryIdentity>, PrivateDirectoryError> {
+        let words = DIRECTORY_ENUMERATION_BUFFER_BYTES / size_of::<u64>();
+        let buffer_size = u32::try_from(DIRECTORY_ENUMERATION_BUFFER_BYTES)
+            .map_err(|_| operation_error(PrivateDirectoryOperation::EnumerateDirectory, None))?;
+        let mut buffer = vec![0_u64; words];
+        let mut entries = Vec::new();
+        let mut names = BTreeSet::new();
+        let mut restart = true;
+        loop {
+            let information_class = if restart {
+                FileIdExtdDirectoryRestartInfo
+            } else {
+                FileIdExtdDirectoryInfo
+            };
+            // SAFETY: `handle` is a retained directory handle and `buffer` is aligned writable
+            // storage of exactly `buffer_size` bytes for the requested directory records.
+            let succeeded = unsafe {
+                GetFileInformationByHandleEx(
+                    handle,
+                    information_class,
+                    buffer.as_mut_ptr().cast(),
+                    buffer_size,
+                )
+            };
+            if succeeded == 0 {
+                let code = last_os_code();
+                if is_win32_error(code, ERROR_NO_MORE_FILES) {
+                    break;
+                }
+                return Err(operation_error(
+                    PrivateDirectoryOperation::EnumerateDirectory,
+                    code,
+                ));
+            }
+            restart = false;
+            for entry in parse_directory_entries(&buffer)? {
+                if entry.name.as_os_str() == "." || entry.name.as_os_str() == ".." {
+                    continue;
+                }
+                let mut components = Path::new(&entry.name).components();
+                if !matches!(components.next(), Some(Component::Normal(_)))
+                    || components.next().is_some()
+                    || !names.insert(entry.name.clone())
+                {
+                    return Err(PrivateDirectoryError::new(
+                        PrivateDirectoryErrorKind::IdentityMismatch,
+                        None,
+                    ));
+                }
+                entries.push(entry);
+            }
+        }
+        Ok(entries)
+    }
+
+    fn parse_directory_entries(
+        buffer: &[u64],
+    ) -> Result<Vec<DirectoryEntryIdentity>, PrivateDirectoryError> {
+        let bytes = size_of_val(buffer);
+        // SAFETY: viewing initialized `u64` storage as bytes preserves its allocation and bounds.
+        let raw_buffer = unsafe { slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), bytes) };
+        let name_offset = offset_of!(FILE_ID_EXTD_DIR_INFO, FileName);
+        let mut cursor = 0_usize;
+        let mut entries = Vec::new();
+        loop {
+            let _header_end = cursor
+                .checked_add(size_of::<FILE_ID_EXTD_DIR_INFO>())
+                .filter(|end| *end <= bytes)
+                .ok_or_else(directory_identity_error)?;
+            // SAFETY: the bounds above cover one complete fixed record header. Windows aligns
+            // records, but `read_unaligned` also keeps this parser sound if an invalid offset does
+            // not preserve that alignment.
+            let information = unsafe {
+                ptr::read_unaligned(
+                    raw_buffer
+                        .as_ptr()
+                        .add(cursor)
+                        .cast::<FILE_ID_EXTD_DIR_INFO>(),
+                )
+            };
+            let name_bytes = usize::try_from(information.FileNameLength)
+                .map_err(|_| directory_identity_error())?;
+            if name_bytes % size_of::<u16>() != 0 {
+                return Err(directory_identity_error());
+            }
+            let name_start = cursor
+                .checked_add(name_offset)
+                .ok_or_else(directory_identity_error)?;
+            let name_end = name_start
+                .checked_add(name_bytes)
+                .filter(|end| *end <= bytes)
+                .ok_or_else(directory_identity_error)?;
+            let name = raw_buffer[name_start..name_end]
+                .chunks_exact(size_of::<u16>())
+                .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
+                .collect::<Vec<_>>();
+            entries.push(DirectoryEntryIdentity {
+                name: OsString::from_wide(&name),
+                file_id: information.FileId.Identifier,
+            });
+
+            if information.NextEntryOffset == 0 {
+                break;
+            }
+            let next = usize::try_from(information.NextEntryOffset)
+                .map_err(|_| directory_identity_error())?;
+            if next < name_end - cursor {
+                return Err(directory_identity_error());
+            }
+            cursor = cursor
+                .checked_add(next)
+                .filter(|next| *next < bytes)
+                .ok_or_else(directory_identity_error)?;
+        }
+        Ok(entries)
+    }
+
+    fn directory_identity_error() -> PrivateDirectoryError {
+        PrivateDirectoryError::new(PrivateDirectoryErrorKind::IdentityMismatch, None)
     }
 
     fn verify_regular_file_attributes(
@@ -1044,14 +1980,31 @@ mod platform {
     }
 
     fn open_directory(path: &[u16], write_dacl: bool) -> Result<File, PrivateDirectoryError> {
-        let desired_access = FILE_GENERIC_READ | DELETE | if write_dacl { WRITE_DAC } else { 0 };
+        let desired_access =
+            FILE_GENERIC_READ | FILE_WRITE_DATA | DELETE | if write_dacl { WRITE_DAC } else { 0 };
+        open_directory_with_access(path, desired_access, FILE_SHARE_READ | FILE_SHARE_WRITE)
+    }
+
+    fn open_directory_read_guard(path: &[u16]) -> Result<File, PrivateDirectoryError> {
+        open_directory_with_access(
+            path,
+            FILE_GENERIC_READ | FILE_WRITE_DATA,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+        )
+    }
+
+    fn open_directory_with_access(
+        path: &[u16],
+        desired_access: u32,
+        share_mode: u32,
+    ) -> Result<File, PrivateDirectoryError> {
         // SAFETY: `path` is NUL-terminated; null security/template pointers are permitted. Opening
         // with `OPEN_REPARSE_POINT` ensures verification observes the named object itself.
         let handle = unsafe {
             CreateFileW(
                 path.as_ptr(),
                 desired_access,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                share_mode,
                 ptr::null(),
                 OPEN_EXISTING,
                 FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
@@ -1068,8 +2021,69 @@ mod platform {
         Ok(unsafe { File::from_raw_handle(handle) })
     }
 
+    fn open_tree_entry(path: &Path) -> Result<File, PrivateDirectoryError> {
+        let wide_path = wide_path(path)?;
+        // SAFETY: `wide_path` is NUL-terminated. `OPEN_REPARSE_POINT` binds the named entry rather
+        // than its target, while omitting write/delete sharing keeps that entry stable until the
+        // retained handle is either discarded or used for exact disposition.
+        let handle = unsafe {
+            CreateFileW(
+                wide_path.as_ptr(),
+                FILE_GENERIC_READ | DELETE,
+                FILE_SHARE_READ,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+            return Err(operation_error(
+                PrivateDirectoryOperation::OpenTreeEntry,
+                last_os_code(),
+            ));
+        }
+        // SAFETY: `CreateFileW` returned one owned real handle, transferred exactly once to File.
+        Ok(unsafe { File::from_raw_handle(handle) })
+    }
+
+    fn final_path_from_handle(handle: HANDLE) -> Result<PathBuf, PrivateDirectoryError> {
+        let mut buffer = vec![0_u16; 512];
+        loop {
+            let capacity = u32::try_from(buffer.len())
+                .map_err(|_| operation_error(PrivateDirectoryOperation::ResolvePath, None))?;
+            // SAFETY: `handle` is retained and `buffer` is writable for `capacity` UTF-16 units.
+            let length =
+                unsafe { GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), capacity, 0) };
+            if length == 0 {
+                return Err(operation_error(
+                    PrivateDirectoryOperation::ResolvePath,
+                    last_os_code(),
+                ));
+            }
+            let length = usize::try_from(length)
+                .map_err(|_| operation_error(PrivateDirectoryOperation::ResolvePath, None))?;
+            if length < buffer.len() {
+                buffer.truncate(length);
+                return Ok(PathBuf::from(OsString::from_wide(&buffer)));
+            }
+            let required = length
+                .checked_add(1)
+                .ok_or_else(|| operation_error(PrivateDirectoryOperation::ResolvePath, None))?;
+            buffer.resize(required, 0);
+        }
+    }
+
     fn open_regular_file(path: &[u16]) -> Result<File, PrivateDirectoryError> {
         open_regular_file_with_access(path, FILE_GENERIC_READ, FILE_SHARE_READ)
+    }
+
+    fn open_regular_file_for_sync(path: &[u16]) -> Result<File, PrivateDirectoryError> {
+        open_regular_file_with_access(
+            path,
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+            FILE_SHARE_READ,
+        )
     }
 
     fn open_regular_file_for_removal(path: &[u16]) -> Result<File, PrivateDirectoryError> {
@@ -1078,6 +2092,38 @@ mod platform {
             FILE_GENERIC_READ | DELETE,
             FILE_SHARE_READ | FILE_SHARE_DELETE,
         )
+    }
+
+    fn reopen_private_staging_file(
+        original: HANDLE,
+        share_mode: u32,
+    ) -> Result<File, PrivateDirectoryError> {
+        reopen_private_file(original, FILE_GENERIC_READ | DELETE, share_mode)
+    }
+
+    fn reopen_private_file(
+        original: HANDLE,
+        desired_access: u32,
+        share_mode: u32,
+    ) -> Result<File, PrivateDirectoryError> {
+        // SAFETY: `original` is a retained verified file handle. `ReOpenFile` binds the new handle
+        // to that exact file object and performs no pathname lookup.
+        let handle = unsafe {
+            ReOpenFile(
+                original,
+                desired_access,
+                share_mode,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+            return Err(operation_error(
+                PrivateDirectoryOperation::OpenFile,
+                last_os_code(),
+            ));
+        }
+        // SAFETY: `ReOpenFile` returned one owned real handle, transferred exactly once to `File`.
+        Ok(unsafe { File::from_raw_handle(handle) })
     }
 
     fn open_regular_file_with_access(
@@ -1128,6 +2174,109 @@ mod platform {
         win_bool(succeeded, operation)
     }
 
+    fn remove_link_by_handle_posix(handle: HANDLE) -> Result<(), PrivateDirectoryError> {
+        let disposition = FILE_DISPOSITION_INFO_EX {
+            Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+        };
+        let size = u32::try_from(size_of::<FILE_DISPOSITION_INFO_EX>())
+            .map_err(|_| operation_error(PrivateDirectoryOperation::RemoveFile, None))?;
+        // SAFETY: `handle` is the verified publication-pair staging handle with DELETE access.
+        // POSIX disposition removes that exact opened link while other shared-delete handles live.
+        let succeeded = unsafe {
+            SetFileInformationByHandle(
+                handle,
+                FileDispositionInfoEx,
+                (&raw const disposition).cast(),
+                size,
+            )
+        };
+        win_bool(succeeded, PrivateDirectoryOperation::RemoveFile)
+    }
+
+    fn rename_file_handle_create_new(
+        file: HANDLE,
+        destination_directory: HANDLE,
+        destination_name: &[u16],
+    ) -> Result<(), PrivateDirectoryError> {
+        let name_bytes = destination_name
+            .len()
+            .checked_mul(size_of::<u16>())
+            .ok_or_else(|| operation_error(PrivateDirectoryOperation::RenameFile, None))?;
+        // Windows requires at least the fixed structure size plus the complete variable name,
+        // even though that fixed size already includes the first UTF-16 array element.
+        let total_bytes = size_of::<FILE_RENAME_INFORMATION>()
+            .checked_add(name_bytes)
+            .ok_or_else(|| operation_error(PrivateDirectoryOperation::RenameFile, None))?;
+        let name_bytes = u32::try_from(name_bytes)
+            .map_err(|_| operation_error(PrivateDirectoryOperation::RenameFile, None))?;
+        let total_bytes = u32::try_from(total_bytes)
+            .map_err(|_| operation_error(PrivateDirectoryOperation::RenameFile, None))?;
+        let mut buffer = AlignedBuffer::new(total_bytes as usize);
+        let information = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+        let mut io_status = IO_STATUS_BLOCK::default();
+        // SAFETY: `AlignedBuffer` is aligned for `FILE_RENAME_INFORMATION` and sized through the
+        // complete variable-length UTF-16 name. Both handles remain retained for the atomic native
+        // rename call, and `io_status` is writable for the synchronous result.
+        let status = unsafe {
+            information.write(FILE_RENAME_INFORMATION::default());
+            (*information).Anonymous.ReplaceIfExists = false;
+            (*information).RootDirectory = destination_directory;
+            (*information).FileNameLength = name_bytes;
+            ptr::copy_nonoverlapping(
+                destination_name.as_ptr(),
+                ptr::addr_of_mut!((*information).FileName).cast::<u16>(),
+                destination_name.len(),
+            );
+            NtSetInformationFile(
+                file,
+                &raw mut io_status,
+                buffer.as_ptr(),
+                total_bytes,
+                FileRenameInformation,
+            )
+        };
+        if status >= 0 {
+            return Ok(());
+        }
+        // SAFETY: `status` is the failure value returned directly by `NtSetInformationFile`.
+        let code = i32::try_from(unsafe { RtlNtStatusToDosError(status) }).ok();
+        Err(PrivateDirectoryError::new(
+            if is_win32_error(code, ERROR_ALREADY_EXISTS) || is_win32_error(code, ERROR_FILE_EXISTS)
+            {
+                PrivateDirectoryErrorKind::AlreadyExists
+            } else {
+                PrivateDirectoryErrorKind::WindowsApi(PrivateDirectoryOperation::RenameFile)
+            },
+            code,
+        ))
+    }
+
+    fn private_destination_name(name: &OsStr) -> Result<Vec<u16>, PrivateDirectoryError> {
+        const INVALID_ASCII: [u16; 9] = [0x22, 0x2a, 0x2f, 0x3a, 0x3c, 0x3e, 0x3f, 0x5c, 0x7c];
+
+        let mut components = Path::new(name).components();
+        if !matches!(components.next(), Some(Component::Normal(component)) if component == name)
+            || components.next().is_some()
+        {
+            return Err(PrivateDirectoryError::new(
+                PrivateDirectoryErrorKind::InvalidPath,
+                None,
+            ));
+        }
+        let encoded = name.encode_wide().collect::<Vec<_>>();
+        let invalid_ascii = |unit: u16| unit < 32 || INVALID_ASCII.contains(&unit);
+        if encoded.is_empty()
+            || encoded.iter().copied().any(invalid_ascii)
+            || matches!(encoded.last(), Some(unit) if *unit == u16::from(b'.') || *unit == u16::from(b' '))
+        {
+            return Err(PrivateDirectoryError::new(
+                PrivateDirectoryErrorKind::InvalidPath,
+                None,
+            ));
+        }
+        Ok(encoded)
+    }
+
     fn wide_path(path: &Path) -> Result<Vec<u16>, PrivateDirectoryError> {
         const BACKSLASH: u16 = b'\\' as u16;
         const FORWARD_SLASH: u16 = b'/' as u16;
@@ -1176,6 +2325,18 @@ mod platform {
 
     fn security_query_error(code: Option<i32>) -> PrivateDirectoryError {
         operation_error(PrivateDirectoryOperation::QuerySecurityDescriptor, code)
+    }
+
+    fn error_after_cleanup(
+        error: PrivateDirectoryError,
+        cleanup: Result<(), PrivateDirectoryError>,
+    ) -> PrivateDirectoryError {
+        match cleanup {
+            Ok(()) => error.with_cleanup(PrivateDirectoryCleanupStatus::Confirmed, None),
+            Err(cleanup) => {
+                error.with_cleanup(PrivateDirectoryCleanupStatus::Uncertain, cleanup.os_code())
+            }
+        }
     }
 
     fn operation_error(
@@ -1291,7 +2452,10 @@ mod platform {
     mod tests {
         use std::{
             fs,
-            os::windows::{fs::symlink_dir, io::AsHandle as _},
+            os::windows::{
+                fs::{symlink_dir, symlink_file},
+                io::AsHandle as _,
+            },
         };
 
         use super::*;
@@ -1299,7 +2463,8 @@ mod platform {
             SetKernelObjectSecurity, UNPROTECTED_DACL_SECURITY_INFORMATION, WinWorldSid,
         };
         use windows_sys::Win32::Storage::FileSystem::{
-            FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, READ_CONTROL,
+            FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, READ_CONTROL,
         };
 
         #[test]
@@ -1381,6 +2546,85 @@ mod platform {
         }
 
         #[test]
+        fn private_directory_read_guards_coexist_and_collectively_block_rename() {
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let child = temporary.path().join("private");
+            let renamed = temporary.path().join("renamed");
+            drop(create(&child).expect("protected private directory"));
+
+            let first = open_read_guard(&child).expect("first private read guard");
+            let second = open_read_guard(&child).expect("second private read guard");
+            verify(first.as_handle()).expect("first strict directory policy");
+            verify(second.as_handle()).expect("second strict directory policy");
+            assert!(fs::rename(&child, &renamed).is_err());
+
+            drop(first);
+            assert!(fs::rename(&child, &renamed).is_err());
+            drop(second);
+            fs::rename(&child, &renamed).expect("rename after all read guards drop");
+            fs::remove_dir(&renamed).expect("cleanup renamed directory");
+        }
+
+        #[test]
+        fn private_directory_metadata_flush_accepts_mutation_and_read_guards() {
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let directory_path = temporary.path().join("private");
+            let staging = directory_path.join("staging");
+            let final_path = directory_path.join("final");
+            let directory = create(&directory_path).expect("protected private directory");
+            fs::write(&staging, b"durable namespace").expect("write staging file");
+            fs::rename(&staging, &final_path).expect("publish final file");
+
+            crate::windows_private_directory::sync_private_directory_handle(directory.as_handle())
+                .expect("flush mutation guard");
+            verify(directory.as_handle()).expect("mutation guard remains strict");
+            drop(directory);
+
+            let read_guard = open_read_guard(&directory_path).expect("private read guard");
+            crate::windows_private_directory::sync_private_directory_handle(read_guard.as_handle())
+                .expect("flush read guard");
+            verify(read_guard.as_handle()).expect("read guard remains strict");
+            assert_eq!(
+                fs::read(&final_path).expect("read final file"),
+                b"durable namespace"
+            );
+
+            drop(read_guard);
+            fs::remove_file(&final_path).expect("remove final file");
+            fs::remove_dir(&directory_path).expect("remove private directory");
+        }
+
+        #[test]
+        fn private_directory_metadata_flush_fails_closed_without_write_access() {
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let directory_path = temporary.path().join("private");
+            drop(create(&directory_path).expect("protected private directory"));
+            let wide = wide_path(&directory_path).expect("wide directory path");
+            let read_only = open_directory_with_access(
+                &wide,
+                FILE_GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+            )
+            .expect("strict read-only directory handle");
+            verify(read_only.as_handle()).expect("read-only handle remains strict");
+
+            let error = crate::windows_private_directory::sync_private_directory_handle(
+                read_only.as_handle(),
+            )
+            .expect_err("Windows must reject a flush without directory-write access");
+            assert_eq!(
+                error.kind(),
+                PrivateDirectoryErrorKind::WindowsApi(PrivateDirectoryOperation::FlushDirectory)
+            );
+            assert_eq!(error.os_code(), Some(5));
+            verify(read_only.as_handle()).expect("failed flush leaves exact handle usable");
+            assert!(directory_path.is_dir());
+
+            drop(read_only);
+            fs::remove_dir(&directory_path).expect("remove private directory");
+        }
+
+        #[test]
         fn retained_handle_removes_the_exact_empty_directory() {
             let temporary = tempfile::tempdir().expect("temporary directory");
             let child = temporary.path().join("private");
@@ -1388,6 +2632,327 @@ mod platform {
 
             remove(handle).expect("handle-bound removal");
             assert!(!child.exists());
+        }
+
+        #[test]
+        fn private_lock_file_peers_coexist_and_fs2_arbitrates() {
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let root = temporary.path().join("private");
+            let moved_root = temporary.path().join("moved-private");
+            let lock_path = root.join("store.lock");
+            let directory = create(&root).expect("protected private directory");
+            let creator = create_lock_file(&lock_path).expect("create strict private lock file");
+            let peer = open_lock_file(&lock_path).expect("open compatible lock-file peer");
+
+            fs2::FileExt::try_lock_exclusive(&creator).expect("creator exclusive lock");
+            assert!(fs2::FileExt::try_lock_shared(&peer).is_err());
+            fs2::FileExt::unlock(&creator).expect("unlock creator");
+            fs2::FileExt::try_lock_shared(&creator).expect("creator shared lock");
+            fs2::FileExt::try_lock_shared(&peer).expect("peer shared lock");
+            let contender = open_lock_file(&lock_path).expect("open exclusive contender");
+            assert!(fs2::FileExt::try_lock_exclusive(&contender).is_err());
+
+            assert!(fs::remove_file(&lock_path).is_err());
+            assert!(fs::rename(&root, &moved_root).is_err());
+            assert!(!moved_root.exists());
+            fs2::FileExt::unlock(&peer).expect("unlock peer");
+            fs2::FileExt::unlock(&creator).expect("unlock creator shared lock");
+            drop(contender);
+            drop(peer);
+            drop(creator);
+
+            let removal = open_file_for_removal(&lock_path).expect("open exact lock removal");
+            remove_file(removal, PrivateFileLinkState::Single).expect("remove exact lock file");
+            remove(directory).expect("remove empty private directory");
+        }
+
+        #[test]
+        fn private_lock_file_creation_never_replaces_existing_peer() {
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let root = temporary.path().join("private");
+            let lock_path = root.join("store.lock");
+            let directory = create(&root).expect("protected private directory");
+            let existing = create_lock_file(&lock_path).expect("create strict private lock file");
+
+            let error = create_lock_file(&lock_path).expect_err("CREATE_NEW must reject peer");
+            assert_eq!(error.kind(), PrivateDirectoryErrorKind::AlreadyExists);
+            assert_eq!(
+                error.cleanup_status(),
+                PrivateDirectoryCleanupStatus::NotRequired
+            );
+            verify_file(existing.as_handle(), PrivateFileLinkState::Single)
+                .expect("existing peer remains strict");
+
+            drop(existing);
+            let removal = open_file_for_removal(&lock_path).expect("open exact lock removal");
+            remove_file(removal, PrivateFileLinkState::Single).expect("remove exact lock file");
+            remove(directory).expect("remove empty private directory");
+        }
+
+        #[test]
+        fn private_lock_file_post_create_policy_failure_is_uncertain() {
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let path = temporary.path().join("store.lock");
+
+            let error = create_lock_file_with_callback(&path, || set_world_writable(&path))
+                .expect_err("post-create DACL tamper must fail strict verification");
+            assert!(matches!(
+                error.kind(),
+                PrivateDirectoryErrorKind::DaclUnprotected
+                    | PrivateDirectoryErrorKind::DaclPolicy(_)
+            ));
+            assert_eq!(
+                error.cleanup_status(),
+                PrivateDirectoryCleanupStatus::Uncertain
+            );
+            assert!(path.is_file());
+            fs::remove_file(&path).expect("remove test-owned uncertain residue");
+        }
+
+        #[test]
+        fn handle_bound_publication_is_create_new_and_retains_final_guard() {
+            use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let root = temporary.path().join("private");
+            let staging_path = root.join("artifact.tmp");
+            let final_path = root.join("artifact.bin");
+            let renamed_path = root.join("renamed.bin");
+            let directory = create(&root).expect("protected private directory");
+            let mut staging = create_file(&staging_path, false).expect("protected staging file");
+            staging
+                .write_all(b"complete artifact\n")
+                .expect("write complete staging file");
+            staging.sync_all().expect("sync complete staging file");
+
+            let mut published = publish_file_create_new_with_callback(
+                staging,
+                directory.as_handle(),
+                OsStr::new("artifact.bin"),
+                || {
+                    assert!(fs::rename(&final_path, &renamed_path).is_err());
+                    assert!(fs::remove_file(&final_path).is_err());
+                },
+            )
+            .expect("atomic handle-bound publication");
+
+            assert!(!staging_path.exists());
+            assert!(final_path.is_file());
+            assert!(!renamed_path.exists());
+            verify_file(published.as_handle(), PrivateFileLinkState::Single)
+                .expect("retained strict final handle");
+            published
+                .seek(SeekFrom::Start(0))
+                .expect("rewind final handle");
+            let mut bytes = Vec::new();
+            published
+                .read_to_end(&mut bytes)
+                .expect("read final through retained handle");
+            assert_eq!(bytes, b"complete artifact\n");
+
+            remove_file(published, PrivateFileLinkState::Single)
+                .expect("remove exact published file");
+            remove(directory).expect("remove empty private directory");
+        }
+
+        #[test]
+        fn handle_bound_publication_preserves_occupied_destination() {
+            use std::io::Write as _;
+
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let root = temporary.path().join("private");
+            let staging_path = root.join("artifact.tmp");
+            let final_path = root.join("artifact.bin");
+            let directory = create(&root).expect("protected private directory");
+            let mut staging = create_file(&staging_path, false).expect("protected staging file");
+            staging
+                .write_all(b"new artifact\n")
+                .expect("write staging file");
+            staging.sync_all().expect("sync staging file");
+            let mut existing = create_file(&final_path, false).expect("existing private file");
+            existing
+                .write_all(b"existing artifact\n")
+                .expect("write existing file");
+            existing.sync_all().expect("sync existing file");
+            drop(existing);
+
+            let publication =
+                publish_file_create_new(staging, directory.as_handle(), OsStr::new("artifact.bin"))
+                    .expect_err("occupied destination must not be replaced");
+            assert_eq!(publication.phase(), PrivatePublicationPhase::Unpublished);
+            assert_eq!(
+                publication.error().kind(),
+                PrivateDirectoryErrorKind::AlreadyExists
+            );
+            let (_, staging, _) = publication.into_parts();
+            verify_file(staging.as_handle(), PrivateFileLinkState::Single)
+                .expect("exact staging handle retained");
+            assert_eq!(
+                fs::read(&final_path).expect("read existing destination"),
+                b"existing artifact\n"
+            );
+
+            remove_file(staging, PrivateFileLinkState::Single).expect("remove exact staging file");
+            let existing = open_file_for_removal(&final_path).expect("open existing destination");
+            remove_file(existing, PrivateFileLinkState::Single)
+                .expect("remove existing destination");
+            remove(directory).expect("remove empty private directory");
+        }
+
+        #[test]
+        fn handle_bound_publication_rejects_unsafe_names_before_mutation() {
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let root = temporary.path().join("private");
+            let staging_path = root.join("artifact.tmp");
+            let directory = create(&root).expect("protected private directory");
+            let mut staging = create_file(&staging_path, false).expect("protected staging file");
+
+            for name in ["", "..", r"nested\artifact", "artifact:stream", "artifact."] {
+                let error =
+                    publish_file_create_new(staging, directory.as_handle(), OsStr::new(name))
+                        .expect_err("unsafe destination name must be rejected");
+                assert_eq!(error.phase(), PrivatePublicationPhase::Unpublished);
+                assert_eq!(error.error().kind(), PrivateDirectoryErrorKind::InvalidPath);
+                let (_, retained, _) = error.into_parts();
+                staging = retained;
+                assert!(staging_path.is_file());
+            }
+
+            remove_file(staging, PrivateFileLinkState::Single).expect("remove exact staging file");
+            remove(directory).expect("remove empty private directory");
+        }
+
+        #[test]
+        fn post_rename_link_injection_returns_recoverable_exact_handle() {
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let root = temporary.path().join("private");
+            let staging_path = root.join("artifact.tmp");
+            let final_path = root.join("artifact.bin");
+            let injected_link = root.join("injected.bin");
+            let directory = create(&root).expect("protected private directory");
+            let staging = create_file(&staging_path, false).expect("protected staging file");
+
+            let publication = publish_file_create_new_with_callback(
+                staging,
+                directory.as_handle(),
+                OsStr::new("artifact.bin"),
+                || fs::hard_link(&final_path, &injected_link).expect("inject second hard link"),
+            )
+            .expect_err("post-rename link-state mismatch must fail closed");
+            assert_eq!(
+                publication.phase(),
+                PrivatePublicationPhase::CommitUncertain
+            );
+            assert_eq!(
+                publication.error().kind(),
+                PrivateDirectoryErrorKind::MultipleLinks
+            );
+            let (_, published, _) = publication.into_parts();
+            verify_file(published.as_handle(), PrivateFileLinkState::PublicationPair)
+                .expect("exact publication-pair handle retained");
+
+            remove_file(published, PrivateFileLinkState::PublicationPair)
+                .expect("remove exact final link");
+            assert!(!final_path.exists());
+            assert!(injected_link.is_file());
+            let injected =
+                open_file_for_removal(&injected_link).expect("open remaining exact link");
+            remove_file(injected, PrivateFileLinkState::Single)
+                .expect("remove remaining injected link");
+            remove(directory).expect("remove empty private directory");
+        }
+
+        #[test]
+        fn publication_pair_completion_returns_sealed_exact_final_handle() {
+            use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let root = temporary.path().join("private");
+            let staging_path = root.join("artifact.tmp");
+            let final_path = root.join("artifact.bin");
+            let moved_path = root.join("moved.bin");
+            let directory = create(&root).expect("protected private directory");
+            let mut writer = create_file(&staging_path, true).expect("protected staging file");
+            writer
+                .write_all(b"legacy artifact\n")
+                .expect("write complete staging file");
+            writer.sync_all().expect("sync complete staging file");
+            let staging = seal_staging_file(writer).expect("seal staging handle");
+            fs::hard_link(&staging_path, &final_path).expect("create legacy final hard link");
+
+            let mut published = complete_publication_pair(
+                staging,
+                directory.as_handle(),
+                OsStr::new("artifact.bin"),
+            )
+            .expect("collapse publication pair");
+
+            assert!(!staging_path.exists());
+            assert!(final_path.is_file());
+            assert!(fs::rename(&final_path, &moved_path).is_err());
+            assert!(fs::remove_file(&final_path).is_err());
+            verify_file(published.as_handle(), PrivateFileLinkState::Single)
+                .expect("strict single final handle");
+            published
+                .seek(SeekFrom::Start(0))
+                .expect("rewind final handle");
+            let mut bytes = Vec::new();
+            published
+                .read_to_end(&mut bytes)
+                .expect("read final through sealed handle");
+            assert_eq!(bytes, b"legacy artifact\n");
+
+            remove_file(published, PrivateFileLinkState::Single).expect("remove exact final link");
+            remove(directory).expect("remove empty private directory");
+        }
+
+        #[test]
+        fn publication_pair_boundary_replacement_is_preserved_and_reported() {
+            use std::io::Write as _;
+
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let root = temporary.path().join("private");
+            let staging_path = root.join("artifact.tmp");
+            let final_path = root.join("artifact.bin");
+            let moved_path = root.join("moved.bin");
+            let directory = create(&root).expect("protected private directory");
+            let mut writer = create_file(&staging_path, true).expect("protected staging file");
+            writer.write_all(b"original\n").expect("write staging file");
+            writer.sync_all().expect("sync staging file");
+            let staging = seal_staging_file(writer).expect("seal staging handle");
+            fs::hard_link(&staging_path, &final_path).expect("create legacy final hard link");
+
+            let recovery = complete_publication_pair_with_callback(
+                staging,
+                directory.as_handle(),
+                OsStr::new("artifact.bin"),
+                || {
+                    fs::rename(&final_path, &moved_path).expect("move original final link");
+                    fs::write(&final_path, b"replacement\n").expect("create replacement");
+                },
+            )
+            .expect_err("replacement boundary must fail closed");
+            assert_eq!(
+                recovery.phase(),
+                PrivatePublicationPairPhase::FinalSingleSealed
+            );
+            assert_eq!(
+                recovery.error().kind(),
+                PrivateDirectoryErrorKind::IdentityMismatch
+            );
+            let (_, original, _) = recovery.into_parts();
+            verify_file(original.as_handle(), PrivateFileLinkState::Single)
+                .expect("exact original retained and sealed");
+
+            remove_file(original, PrivateFileLinkState::Single)
+                .expect("remove exact moved original");
+            assert!(!moved_path.exists());
+            assert_eq!(
+                fs::read(&final_path).expect("read preserved replacement"),
+                b"replacement\n"
+            );
+            fs::remove_file(&final_path).expect("remove preserved replacement");
+            remove(directory).expect("remove empty private directory");
         }
 
         #[test]
@@ -1407,6 +2972,92 @@ mod platform {
             remove_file(handle, PrivateFileLinkState::Single)
                 .expect("handle-bound private-file removal");
             assert!(!path.exists());
+        }
+
+        #[test]
+        fn private_file_sync_handle_flushes_and_blocks_mutation_or_replacement() {
+            use std::io::{Read as _, Write as _};
+
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let path = temporary.path().join("revision.json");
+            let moved = temporary.path().join("moved.json");
+            let mut creator = create_file(&path, false).expect("protected private file");
+            creator
+                .write_all(b"published\n")
+                .expect("write final bytes");
+            creator.sync_all().expect("initial file sync");
+            drop(creator);
+
+            let sync = crate::windows_private_directory::open_private_file_for_sync(&path)
+                .expect("open strict sync handle");
+            sync.sync_all().expect("retry final file sync");
+            verify_file(sync.as_handle(), PrivateFileLinkState::Single)
+                .expect("sync handle remains strict");
+            let mut reader = fs::File::open(&path).expect("compatible read peer");
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).expect("read final bytes");
+            assert_eq!(bytes, b"published\n");
+
+            assert!(fs::OpenOptions::new().write(true).open(&path).is_err());
+            assert!(fs::rename(&path, &moved).is_err());
+            assert!(fs::remove_file(&path).is_err());
+            assert!(!moved.exists());
+
+            drop(reader);
+            drop(sync);
+            fs::rename(&path, &moved).expect("rename after sync guard drop");
+            fs::write(&path, b"replacement\n").expect("create replacement");
+            assert_eq!(fs::read(&moved).expect("read original"), b"published\n");
+            assert_eq!(fs::read(&path).expect("read replacement"), b"replacement\n");
+            fs::remove_file(&path).expect("remove replacement");
+            fs::remove_file(&moved).expect("remove original");
+        }
+
+        #[test]
+        fn private_file_sync_open_rejects_dacl_and_hardlink_policy_violations() {
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let dacl_path = temporary.path().join("dacl.json");
+            drop(create_file(&dacl_path, false).expect("protected private file"));
+            set_world_writable(&dacl_path);
+
+            let dacl_error =
+                crate::windows_private_directory::open_private_file_for_sync(&dacl_path)
+                    .expect_err("permissive DACL must be rejected");
+            assert!(matches!(
+                dacl_error.kind(),
+                PrivateDirectoryErrorKind::DaclUnprotected
+                    | PrivateDirectoryErrorKind::DaclPolicy(_)
+            ));
+            fs::remove_file(&dacl_path).expect("remove permissive test file");
+
+            let linked_path = temporary.path().join("linked.json");
+            let extra_link = temporary.path().join("extra-link.json");
+            drop(create_file(&linked_path, false).expect("protected private file"));
+            fs::hard_link(&linked_path, &extra_link).expect("create extra hard link");
+            let link_error =
+                crate::windows_private_directory::open_private_file_for_sync(&linked_path)
+                    .expect_err("multiple links must be rejected");
+            assert_eq!(link_error.kind(), PrivateDirectoryErrorKind::MultipleLinks);
+            fs::remove_file(&extra_link).expect("remove extra hard link");
+            fs::remove_file(&linked_path).expect("remove original hard link");
+        }
+
+        #[test]
+        fn private_file_sync_open_rejects_final_reparse_point_when_supported() {
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let target = temporary.path().join("target.json");
+            let link = temporary.path().join("link.json");
+            drop(create_file(&target, false).expect("protected private file"));
+            if symlink_file(&target, &link).is_err() {
+                fs::remove_file(&target).expect("remove target after skipped symlink test");
+                return;
+            }
+
+            let error = crate::windows_private_directory::open_private_file_for_sync(&link)
+                .expect_err("final reparse point must be rejected");
+            assert_eq!(error.kind(), PrivateDirectoryErrorKind::ReparsePoint);
+            fs::remove_file(&link).expect("remove test symlink");
+            fs::remove_file(&target).expect("remove target");
         }
 
         #[test]
@@ -1557,6 +3208,263 @@ mod platform {
         }
 
         #[test]
+        fn sealed_staging_handle_is_path_free_and_denies_new_writers() {
+            use std::{fs::OpenOptions, io::Write as _, os::windows::fs::OpenOptionsExt as _};
+
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let original = temporary.path().join("endpoint.tmp");
+            let renamed = temporary.path().join("renamed.tmp");
+            let mut writer = create_file(&original, true).expect("protected staging file");
+            writer.write_all(b"sealed\n").expect("write staging file");
+            writer.sync_all().expect("sync staging file");
+            fs::rename(&original, &renamed).expect("rename retained staging file");
+
+            let sealed = seal_staging_file(writer).expect("path-free staging seal");
+            verify_file(sealed.as_handle(), PrivateFileLinkState::Single)
+                .expect("sealed private-file policy");
+            assert!(
+                OpenOptions::new()
+                    .write(true)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                    .open(&renamed)
+                    .is_err()
+            );
+
+            remove_file(sealed, PrivateFileLinkState::Single).expect("remove sealed staging file");
+            assert!(!renamed.exists());
+        }
+
+        #[test]
+        fn sealed_staging_handle_supports_strict_dual_handle_publication() {
+            use std::io::Write as _;
+
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let staged = temporary.path().join("endpoint.tmp");
+            let published = temporary.path().join("endpoint.json");
+            let mut writer = create_file(&staged, true).expect("protected staging file");
+            writer.write_all(b"sealed\n").expect("write staging file");
+            writer.sync_all().expect("sync staging file");
+            let sealed = seal_staging_file(writer).expect("sealed staging handle");
+
+            fs::hard_link(&staged, &published).expect("publish final hard link");
+            verify_file(sealed.as_handle(), PrivateFileLinkState::PublicationPair)
+                .expect("staging publication pair");
+            let final_handle =
+                open_file_for_removal_in_state(&published, PrivateFileLinkState::PublicationPair)
+                    .expect("strict final publication handle");
+
+            remove_file(final_handle, PrivateFileLinkState::PublicationPair)
+                .expect("roll back exact final link");
+            remove_file(sealed, PrivateFileLinkState::Single).expect("remove exact staging link");
+            assert!(!staged.exists());
+            assert!(!published.exists());
+        }
+
+        #[test]
+        fn competing_writer_makes_seal_fail_with_confirmed_exact_cleanup() {
+            use std::{cell::RefCell, fs::OpenOptions, os::windows::fs::OpenOptionsExt as _};
+
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let staged = temporary.path().join("endpoint.tmp");
+            let writer = create_file(&staged, true).expect("protected staging file");
+            let competing = RefCell::new(None);
+
+            let error = seal_staging_file_with_transition(writer, || {
+                let writer = OpenOptions::new()
+                    .write(true)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                    .open(&staged)
+                    .expect("competing writer during transition");
+                competing.replace(Some(writer));
+            })
+            .expect_err("competing writer must prevent sealed reopen");
+
+            assert_eq!(
+                error.kind(),
+                PrivateDirectoryErrorKind::WindowsApi(PrivateDirectoryOperation::OpenFile)
+            );
+            assert_eq!(
+                error.cleanup_status(),
+                PrivateDirectoryCleanupStatus::Confirmed
+            );
+            drop(competing.take());
+            assert!(!staged.exists());
+        }
+
+        #[test]
+        fn closed_mutating_writer_requires_post_seal_content_revalidation() {
+            use std::{
+                fs::OpenOptions,
+                io::{Read as _, Write as _},
+                os::windows::fs::OpenOptionsExt as _,
+            };
+
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let staged = temporary.path().join("endpoint.tmp");
+            let mut writer = create_file(&staged, true).expect("protected staging file");
+            writer.write_all(b"trusted").expect("write trusted bytes");
+            writer.sync_all().expect("sync trusted bytes");
+
+            let mut sealed = seal_staging_file_with_transition(writer, || {
+                let mut competing = OpenOptions::new()
+                    .write(true)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                    .open(&staged)
+                    .expect("short-lived competing writer");
+                competing.set_len(0).expect("truncate staging file");
+                competing
+                    .write_all(b"mutated")
+                    .expect("mutate staging file");
+                competing.sync_all().expect("sync mutation");
+            })
+            .expect("closed writer does not block sealed reopen");
+            let mut bytes = Vec::new();
+            sealed
+                .read_to_end(&mut bytes)
+                .expect("read sealed staging bytes");
+            assert_eq!(bytes, b"mutated");
+
+            remove_file(sealed, PrivateFileLinkState::Single).expect("remove mutated staging file");
+            assert!(!staged.exists());
+        }
+
+        #[test]
+        fn private_tree_removal_accepts_ordinary_inherited_descendants() {
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let root = temporary.path().join("private");
+            let handle = create(&root).expect("strict private root");
+            let nested = root.join("Products/Applications/App.app");
+            fs::create_dir_all(&nested).expect("ordinary nested directories");
+            fs::write(nested.join("App"), b"ordinary inherited child")
+                .expect("ordinary nested file");
+
+            remove_directory_tree(handle).expect("exact recursive removal");
+            assert!(!root.exists());
+        }
+
+        #[test]
+        fn private_tree_removal_rejects_hard_linked_descendant() {
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let root = temporary.path().join("private");
+            let handle = create(&root).expect("strict private root");
+            let child = root.join("child.txt");
+            let linked = temporary.path().join("linked.txt");
+            fs::write(&child, b"preserve").expect("ordinary nested file");
+            fs::hard_link(&child, &linked).expect("additional hard link");
+
+            let error = remove_directory_tree(handle).expect_err("hard link must fail closed");
+            assert_eq!(error.kind(), PrivateDirectoryErrorKind::MultipleLinks);
+            assert_eq!(
+                error.cleanup_status(),
+                PrivateDirectoryCleanupStatus::Uncertain
+            );
+            assert_eq!(fs::read(&child).expect("original survives"), b"preserve");
+            assert_eq!(
+                fs::read(&linked).expect("linked copy survives"),
+                b"preserve"
+            );
+
+            fs::remove_file(&linked).expect("remove added link");
+            fs::remove_file(&child).expect("remove original link");
+            fs::remove_dir(&root).expect("remove root");
+        }
+
+        #[test]
+        fn private_tree_guard_blocks_root_replacement_at_removal_boundary() {
+            use std::cell::RefCell;
+
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let root = temporary.path().join("private");
+            let moved = temporary.path().join("moved");
+            let replacement = temporary.path().join("replacement");
+            let replacement_marker = replacement.join("preserve.txt");
+            let handle = create(&root).expect("strict private root");
+            fs::write(root.join("owned.txt"), b"owned").expect("owned nested file");
+            fs::create_dir(&replacement).expect("replacement candidate");
+            fs::write(&replacement_marker, b"preserve").expect("replacement marker");
+            let attempts = RefCell::new(None);
+
+            remove_directory_tree_with_callback(handle, |_| {
+                let move_owned = fs::rename(&root, &moved);
+                let install_replacement = fs::rename(&replacement, &root);
+                attempts.replace(Some((move_owned, install_replacement)));
+            })
+            .expect("remove retained original tree");
+
+            let (move_owned, install_replacement) = attempts
+                .into_inner()
+                .expect("replacement attempts recorded");
+            assert!(move_owned.is_err());
+            assert!(install_replacement.is_err());
+            assert!(!root.exists());
+            assert!(!moved.exists());
+            assert_eq!(
+                fs::read(&replacement_marker).expect("replacement survives"),
+                b"preserve"
+            );
+        }
+
+        #[test]
+        fn private_tree_cleanup_failure_is_reported_uncertain() {
+            use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt as _};
+
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let root = temporary.path().join("private");
+            let handle = create(&root).expect("strict private root");
+            let child = root.join("busy.txt");
+            fs::write(&child, b"busy").expect("ordinary nested file");
+            let busy = OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .open(&child)
+                .expect("non-delete-sharing competing handle");
+
+            let error = remove_directory_tree(handle).expect_err("busy child blocks cleanup");
+            assert_eq!(
+                error.kind(),
+                PrivateDirectoryErrorKind::WindowsApi(PrivateDirectoryOperation::OpenTreeEntry)
+            );
+            assert_eq!(
+                error.cleanup_status(),
+                PrivateDirectoryCleanupStatus::Uncertain
+            );
+            assert!(root.is_dir());
+            assert_eq!(fs::read(&child).expect("busy child survives"), b"busy");
+
+            drop(busy);
+            fs::remove_file(&child).expect("remove busy child");
+            fs::remove_dir(&root).expect("remove root");
+        }
+
+        #[test]
+        fn private_tree_removal_rejects_nested_reparse_without_touching_target() {
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let root = temporary.path().join("private");
+            let target = temporary.path().join("target");
+            let marker = target.join("preserve.txt");
+            let linked = root.join("linked");
+            let handle = create(&root).expect("strict private root");
+            fs::create_dir(&target).expect("external target");
+            fs::write(&marker, b"preserve").expect("external marker");
+            if symlink_dir(&target, &linked).is_err() {
+                drop(handle);
+                fs::remove_dir(&root).expect("remove unused root");
+                return;
+            }
+
+            let error = remove_directory_tree(handle).expect_err("reparse must fail closed");
+            assert_eq!(error.kind(), PrivateDirectoryErrorKind::ReparsePoint);
+            assert_eq!(
+                error.cleanup_status(),
+                PrivateDirectoryCleanupStatus::Uncertain
+            );
+            assert_eq!(fs::read(&marker).expect("target survives"), b"preserve");
+
+            fs::remove_file(&linked).expect("remove directory symlink");
+            fs::remove_dir(&root).expect("remove root");
+        }
+
+        #[test]
         fn private_objects_support_extended_length_absolute_paths() {
             let temporary = tempfile::tempdir().expect("temporary directory");
             let mut parent = temporary.path().to_path_buf();
@@ -1672,6 +3580,31 @@ pub fn open_private_directory(
     platform::open(path)
 }
 
+/// Open a strict private directory as a multi-reader, no-delete-sharing guard.
+///
+/// The handle requests read access plus the minimal directory-write right required by
+/// [`sync_private_directory_handle`], shares read/write access with equivalent guards, and omits
+/// delete sharing. Multiple readers can therefore coexist while every retained guard blocks
+/// directory rename, deletion, and pathname replacement. The handle has no DELETE access and
+/// cannot be consumed by [`remove_private_directory_handle`] or
+/// [`remove_private_directory_tree_handle`].
+///
+/// This sharing mode is intentionally incompatible with a live deletion-capable handle returned
+/// by [`create_private_directory`] or [`open_private_directory`]. Callers transitioning from a
+/// mutation/removal lifetime must release that handle only under a separate identity/lock protocol
+/// and revalidate the path-to-handle binding.
+///
+/// # Errors
+///
+/// Returns a typed failure if the path cannot be opened or the retained object fails the strict
+/// private directory, owner, protected-DACL, reparse, or ACL-filesystem policy.
+#[cfg(windows)]
+pub fn open_private_directory_read_guard(
+    path: &std::path::Path,
+) -> Result<std::fs::File, PrivateDirectoryError> {
+    platform::open_read_guard(path)
+}
+
 /// Atomically create one Windows regular file with the strict private ACL and return its verified
 /// no-delete-sharing handle.
 ///
@@ -1684,6 +3617,102 @@ pub fn open_private_directory(
 #[cfg(windows)]
 pub fn create_private_file(path: &std::path::Path) -> Result<std::fs::File, PrivateDirectoryError> {
     platform::create_file(path, false)
+}
+
+/// Atomically create a strict private lock file with peer-compatible Windows sharing.
+///
+/// The returned handle requests read/write access, shares read/write access with other lock peers,
+/// and omits delete sharing. Peers can therefore coexist at the filesystem layer while every live
+/// handle prevents pathname deletion or replacement; callers must use a byte-range/file-locking
+/// primitive such as `fs2` for shared/exclusive arbitration. The path uses `CREATE_NEW` and an
+/// existing entry is never replaced.
+///
+/// # Errors
+///
+/// Returns a typed error if atomic creation or strict private-file verification fails. Because this
+/// deliberately non-delete-capable handle cannot remove itself exactly, a post-create policy
+/// failure reports [`PrivateDirectoryCleanupStatus::Uncertain`]. Callers should clean the enclosing
+/// private directory through its retained exact directory capability.
+#[cfg(windows)]
+pub fn create_private_lock_file(
+    path: &std::path::Path,
+) -> Result<std::fs::File, PrivateDirectoryError> {
+    platform::create_lock_file(path)
+}
+
+/// Open an existing strict private lock file with peer-compatible Windows sharing.
+///
+/// The returned read/write handle shares read/write access, omits delete sharing, rejects reparse
+/// points and multiple links, and verifies the exact private owner/protected-DACL policy. It is
+/// suitable for acquiring an `fs2` lock before opening no-delete ancestor directory guards.
+///
+/// # Errors
+///
+/// Returns a typed failure if the path cannot be opened or the retained object fails strict
+/// private-file verification.
+#[cfg(windows)]
+pub fn open_private_lock_file(
+    path: &std::path::Path,
+) -> Result<std::fs::File, PrivateDirectoryError> {
+    platform::open_lock_file(path)
+}
+
+/// Atomically publish a completed private file under a new name in a retained private directory.
+///
+/// `staging` must be the strict single-link, no-delete-sharing handle returned by
+/// [`create_private_file`]. `destination_directory` must be a retained handle returned by
+/// [`create_private_directory`] or [`open_private_directory`], and `destination_name` must be one
+/// ordinary Windows filename component. The rename is handle-relative, does not consult the
+/// staging pathname, and never replaces an existing destination. Success is returned only after
+/// the same retained file handle still satisfies the strict single-link policy and its filesystem
+/// identity is bound to `destination_name` through retained-directory enumeration.
+///
+/// The returned handle continues to deny write and delete sharing. Callers should retain it and
+/// the directory handle through final readback, synchronization, and durable metadata commit.
+///
+/// # Errors
+///
+/// Every error owns the exact input file handle. [`PrivatePublicationPhase::Unpublished`] means
+/// the rename was not reported successful; [`PrivateDirectoryErrorKind::AlreadyExists`] in that
+/// phase guarantees the existing destination was not replaced. A
+/// [`PrivatePublicationPhase::CommitUncertain`] error means the rename succeeded but strict
+/// postconditions could not be confirmed. Callers must recover through the returned handle and
+/// must not delete either pathname speculatively.
+#[cfg(windows)]
+pub fn publish_private_file_handle_create_new(
+    staging: std::fs::File,
+    destination_directory: std::os::windows::io::BorrowedHandle<'_>,
+    destination_name: &std::ffi::OsStr,
+) -> Result<std::fs::File, PrivatePublicationError> {
+    platform::publish_file_create_new(staging, destination_directory, destination_name)
+}
+
+/// Collapse a verified legacy staging/final hard-link pair into one sealed final link.
+///
+/// `staging` must be an exact strict [`PrivateFileLinkState::PublicationPair`] removal handle.
+/// The destination directory must remain retained without delete sharing, and
+/// `destination_name` must be one safe filename component. This function opens the named final
+/// link while the pair exists, binds it to the staging handle by filesystem identity, removes the
+/// exact staging link with handle-bound POSIX disposition, and then uses `ReOpenFile` to acquire a
+/// final handle that denies write and delete sharing. Success requires strict single-link policy
+/// and a second retained-directory identity binding.
+///
+/// # Errors
+///
+/// Every failure owns an exact staging or final handle. [`PrivatePublicationPairPhase::PairIntact`]
+/// means staging-link removal was not reported successful. Later phases mean the staging link was
+/// removed; callers must inspect the phase and retain or consume the exact returned handle rather
+/// than deleting either pathname. In [`PrivatePublicationPairPhase::FinalSingleSharedDelete`], a
+/// competing same-user namespace operation may still be live. In
+/// [`PrivatePublicationPairPhase::FinalSingleSealed`], the exact original final object is stable,
+/// but its requested destination binding or strict policy was not confirmed.
+#[cfg(windows)]
+pub fn complete_private_publication_pair(
+    staging: std::fs::File,
+    destination_directory: std::os::windows::io::BorrowedHandle<'_>,
+    destination_name: &std::ffi::OsStr,
+) -> Result<std::fs::File, PrivatePublicationPairError> {
+    platform::complete_publication_pair(staging, destination_directory, destination_name)
 }
 
 /// Atomically create a private staging file whose handle permits delete sharing.
@@ -1703,6 +3732,30 @@ pub fn create_private_staging_file(
     platform::create_file(path, true)
 }
 
+/// Consume a writable private staging handle and return an exact read/delete handle that denies
+/// write sharing, without reopening the file by pathname.
+///
+/// The transition uses handle-relative Windows reopen operations. A short-lived intermediate
+/// handle admits the consumed writer, then a second reopen proves that no competing writer remains
+/// before the intermediate handle is dropped. The returned handle is suitable for create-only
+/// hard-link publication and strict [`PrivateFileLinkState::PublicationPair`] verification.
+/// A competing same-user writer can open, mutate, and close during that transition; callers whose
+/// integrity decision predates sealing must revalidate contents through the returned sealed handle
+/// before publication.
+///
+/// # Errors
+///
+/// Returns a typed, path-free failure if the input is not a strict single-link private file, an
+/// exact handle transition fails, a competing writer prevents the sealed reopen, or handle-bound
+/// cleanup cannot be confirmed. Once transition begins, every failure attempts deletion through a
+/// retained exact handle and reports its cleanup status.
+#[cfg(windows)]
+pub fn seal_private_staging_file(
+    file: std::fs::File,
+) -> Result<std::fs::File, PrivateDirectoryError> {
+    platform::seal_staging_file(file)
+}
+
 /// Open an existing private regular file without following reparse points.
 ///
 /// The retained handle permits concurrent readers but denies write and delete sharing, keeping
@@ -1715,6 +3768,27 @@ pub fn create_private_staging_file(
 #[cfg(windows)]
 pub fn open_private_file(path: &std::path::Path) -> Result<std::fs::File, PrivateDirectoryError> {
     platform::open_file(path)
+}
+
+/// Open an existing strict private file for a durability-only synchronization retry.
+///
+/// The retained handle requests read/write access so [`std::fs::File::sync_all`] can issue the
+/// Windows flush, shares only reads, and therefore denies competing writers, deletion, rename, and
+/// pathname replacement. It opens the final component without following reparse points and accepts
+/// only a strict, single-link private file. The function never creates or replaces a path.
+///
+/// Callers should use the write access only for `sync_all`; writing through this handle would mutate
+/// the already-published artifact whose durability is being retried.
+///
+/// # Errors
+///
+/// Returns a typed, path-free failure if the path cannot be opened or the file, filesystem, owner,
+/// single-link state, or protected DACL differs from the strict private-file policy.
+#[cfg(windows)]
+pub fn open_private_file_for_sync(
+    path: &std::path::Path,
+) -> Result<std::fs::File, PrivateDirectoryError> {
+    platform::open_file_for_sync(path)
 }
 
 /// Open an existing private regular file for identity-bound removal after a same-volume rename.
@@ -1767,6 +3841,32 @@ pub fn verify_private_directory_handle(
     handle: std::os::windows::io::BorrowedHandle<'_>,
 ) -> Result<(), PrivateDirectoryError> {
     platform::verify(handle)
+}
+
+/// Synchronize cached metadata for one retained strict private directory.
+///
+/// This operation performs no pathname lookup. It verifies the exact retained directory before
+/// and after issuing synchronous `NtFlushBuffersFileEx` normal mode, which requests cached data,
+/// filesystem metadata, and the underlying storage cache to be flushed. Handles returned by
+/// [`create_private_directory`], [`open_private_directory`], and
+/// [`open_private_directory_read_guard`] include the minimal directory-write access required by
+/// Windows while retaining their documented no-delete-sharing behavior.
+///
+/// A successful return means Windows reported completion of the flush request. Physical hardware
+/// can still fail to honor cache-flush commands; this API cannot strengthen the storage device's
+/// durability guarantees.
+///
+/// # Errors
+///
+/// Returns a typed, path-free failure if the retained object no longer satisfies strict private
+/// directory policy, its handle lacks directory-write access, or Windows does not report successful
+/// synchronous completion. The function never converts an unsupported or rejected flush into
+/// success.
+#[cfg(windows)]
+pub fn sync_private_directory_handle(
+    directory: std::os::windows::io::BorrowedHandle<'_>,
+) -> Result<(), PrivateDirectoryError> {
+    platform::sync_directory(directory)
 }
 
 /// Verify a retained Windows regular-file handle against the strict private-file policy.
@@ -1830,6 +3930,28 @@ pub fn remove_private_directory_handle(
     directory: std::fs::File,
 ) -> Result<(), PrivateDirectoryError> {
     platform::remove(directory)
+}
+
+/// Recursively remove the strict private root identified by a retained Windows directory handle.
+///
+/// The root path is resolved from the handle itself while its no-delete-sharing contract remains
+/// active. Every descendant is enumerated with a filesystem identifier, reopened without
+/// following reparse points and without delete sharing, matched to that identifier, and retained
+/// through exact handle disposition. Descendant directories may use ordinary inherited security
+/// descriptors; reparse points, non-regular files, and multiply linked regular files are rejected.
+/// Concurrently added entries are never traversed and make final directory disposition fail.
+///
+/// # Errors
+///
+/// Returns a typed failure if the root is not strict and private, a descendant cannot be bound or
+/// violates the tree policy, or Windows cannot remove an exact retained object. Because recursive
+/// cleanup may already have removed siblings, every failure reports
+/// [`PrivateDirectoryCleanupStatus::Uncertain`].
+#[cfg(windows)]
+pub fn remove_private_directory_tree_handle(
+    directory: std::fs::File,
+) -> Result<(), PrivateDirectoryError> {
+    platform::remove_directory_tree(directory)
 }
 
 /// Verify and remove the exact private regular file identified by a retained Windows handle.

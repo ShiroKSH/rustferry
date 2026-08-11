@@ -9,15 +9,34 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt, fs,
-    fs::{File, OpenOptions},
+    fs::File,
     io::{self, Read, Write},
 };
 
+#[cfg(windows)]
+use std::cell::Cell;
+#[cfg(not(windows))]
+use std::fs::OpenOptions;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt as _;
+#[cfg(windows)]
+use std::os::windows::io::AsHandle as _;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use goblin::mach::{Mach, SingleArch, load_command::CommandVariant};
+#[cfg(windows)]
+use rustferry_core::windows_private_directory::{
+    PrivateDirectoryCleanupStatus, PrivateDirectoryError, PrivateDirectoryErrorKind,
+    PrivateFileLinkState, create_private_file as create_windows_private_file,
+    open_private_directory as open_windows_private_directory,
+    open_private_file as open_windows_private_file,
+    open_private_file_for_removal as open_windows_private_file_for_removal,
+    open_private_file_for_removal_in_state as open_windows_private_file_for_removal_in_state,
+    remove_private_file_handle as remove_windows_private_file_handle,
+    remove_private_file_handle_in_state as remove_windows_private_file_handle_in_state,
+    verify_private_file_handle as verify_windows_private_file_handle,
+    verify_private_file_handle_in_state as verify_windows_private_file_handle_in_state,
+};
 use rustferry_remote::{
     ARTIFACT_MANIFEST_SCHEMA_VERSION, ArtifactKind, ArtifactManifest, ArtifactRecord, BuildProfile,
     COMPILE_PHASE_EVIDENCE_SCHEMA_VERSION, CleanupStatus, CompilePhaseEvidence,
@@ -648,8 +667,10 @@ pub fn ingest_github_actions_artifact(
 ) -> Result<PublishedGithubArtifact, GithubArtifactError> {
     validate_ipa_expectation(request.ipa_expectation)?;
     let required_files = required_artifact_files(request.expected);
-    let temporary_directory = bind_empty_directory(request.temporary_directory, true)?;
-    let output_directory = bind_empty_directory(request.output_directory, false)?;
+    let (temporary_directory, _temporary_directory_guard) =
+        bind_empty_directory(request.temporary_directory, true)?;
+    let (output_directory, _output_directory_guard) =
+        bind_empty_directory(request.output_directory, false)?;
     if temporary_directory == output_directory {
         return Err(GithubArtifactError::InvalidPath);
     }
@@ -782,8 +803,9 @@ pub fn ingest_github_actions_artifact(
                 return Err(error);
             }
         };
-    if cleanup_paths(staged_paths.values()).is_err() {
+    if finalize_published_links(published_links.values(), staged_paths.values()).is_err() {
         let _ = cleanup_published_links(published_links.values());
+        #[cfg(not(windows))]
         let _ = cleanup_paths(staged_paths.values());
         return Err(GithubArtifactError::CleanupFailed);
     }
@@ -824,10 +846,16 @@ pub fn ingest_github_actions_artifact(
     })
 }
 
+#[derive(Debug)]
+struct PrivateDirectoryGuard {
+    #[cfg(windows)]
+    _handle: File,
+}
+
 fn bind_empty_directory(
     path: &Utf8Path,
     require_empty: bool,
-) -> Result<Utf8PathBuf, GithubArtifactError> {
+) -> Result<(Utf8PathBuf, PrivateDirectoryGuard), GithubArtifactError> {
     if !path.is_absolute() {
         return Err(GithubArtifactError::InvalidPath);
     }
@@ -842,9 +870,24 @@ fn bind_empty_directory(
             return Err(GithubArtifactError::TemporaryDirectoryNotEmpty);
         }
     }
-    Ok(canonical)
+    #[cfg(windows)]
+    let guard = open_windows_private_directory(canonical.as_std_path())
+        .map(|handle| PrivateDirectoryGuard { _handle: handle })
+        .map_err(map_windows_private_path_error)?;
+    #[cfg(not(windows))]
+    let guard = PrivateDirectoryGuard {};
+    Ok((canonical, guard))
 }
 
+#[cfg(windows)]
+fn open_regular_archive(path: &Utf8Path) -> Result<File, GithubArtifactError> {
+    if !path.is_absolute() {
+        return Err(GithubArtifactError::InvalidPath);
+    }
+    open_windows_private_file(path.as_std_path()).map_err(map_windows_private_path_error)
+}
+
+#[cfg(not(windows))]
 fn open_regular_archive(path: &Utf8Path) -> Result<File, GithubArtifactError> {
     if !path.is_absolute() {
         return Err(GithubArtifactError::InvalidPath);
@@ -2074,41 +2117,276 @@ fn extract_entry_to_new_file(
     let mut entry = archive
         .by_index(metadata.index)
         .map_err(|_| GithubArtifactError::InvalidArchive)?;
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut output = options.open(path).map_err(io_error)?;
-    let copied = io::copy(
-        &mut entry.by_ref().take(metadata.size.saturating_add(1)),
-        &mut output,
-    )
-    .map_err(|_| GithubArtifactError::EntryIntegrityFailed(artifact))?;
-    if copied != metadata.size {
-        return Err(GithubArtifactError::EntryIntegrityFailed(artifact));
+    let mut output = create_new_artifact_file(path)?;
+    let result = (|| {
+        let copied = io::copy(
+            &mut entry.by_ref().take(metadata.size.saturating_add(1)),
+            &mut output,
+        )
+        .map_err(|_| GithubArtifactError::EntryIntegrityFailed(artifact))?;
+        if copied != metadata.size {
+            return Err(GithubArtifactError::EntryIntegrityFailed(artifact));
+        }
+        output.flush().map_err(io_error)?;
+        output.sync_all().map_err(io_error)
+    })();
+    if let Err(error) = result {
+        cleanup_created_file(path, output)?;
+        return Err(error);
     }
-    output.flush().map_err(io_error)?;
-    output.sync_all().map_err(io_error)?;
     Ok(())
 }
 
 fn write_new_file(path: &Utf8Path, bytes: &[u8]) -> Result<(), GithubArtifactError> {
+    let mut output = create_new_artifact_file(path)?;
+    let result = output
+        .write_all(bytes)
+        .and_then(|()| output.flush())
+        .and_then(|()| output.sync_all())
+        .map_err(io_error);
+    if let Err(error) = result {
+        cleanup_created_file(path, output)?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn create_new_artifact_file(path: &Utf8Path) -> Result<File, GithubArtifactError> {
+    create_windows_private_file(path.as_std_path()).map_err(map_windows_private_file_error)
+}
+
+#[cfg(not(windows))]
+fn create_new_artifact_file(path: &Utf8Path) -> Result<File, GithubArtifactError> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
-    let mut output = options.open(path).map_err(io_error)?;
-    output.write_all(bytes).map_err(io_error)?;
-    output.flush().map_err(io_error)?;
-    output.sync_all().map_err(io_error)?;
-    Ok(())
+    options.open(path).map_err(io_error)
+}
+
+#[cfg(windows)]
+fn cleanup_created_file(_path: &Utf8Path, file: File) -> Result<(), GithubArtifactError> {
+    remove_windows_private_file_handle(file).map_err(|_| GithubArtifactError::CleanupFailed)
+}
+
+#[cfg(not(windows))]
+fn cleanup_created_file(path: &Utf8Path, file: File) -> Result<(), GithubArtifactError> {
+    drop(file);
+    fs::remove_file(path).map_err(|_| GithubArtifactError::CleanupFailed)
 }
 
 struct PublishedLink {
     path: Utf8PathBuf,
     linked_file: File,
+    #[cfg(windows)]
+    staging_path: Utf8PathBuf,
+    #[cfg(windows)]
+    staging_file: File,
+    #[cfg(windows)]
+    staging_removed: Cell<bool>,
 }
 
+#[cfg(windows)]
+fn publish_no_replace(
+    staged: &BTreeMap<RequiredArtifactFile, Utf8PathBuf>,
+    output_directory: &Utf8Path,
+    required_files: &BTreeSet<RequiredArtifactFile>,
+) -> Result<BTreeMap<RequiredArtifactFile, PublishedLink>, GithubArtifactError> {
+    for file in required_files.iter().copied() {
+        ensure_output_absent(&output_directory.join(file.file_name()), file)?;
+    }
+    let mut published = BTreeMap::new();
+    let publication_order = required_files
+        .iter()
+        .copied()
+        .filter(|file| *file != RequiredArtifactFile::Ipa)
+        .chain(std::iter::once(RequiredArtifactFile::Ipa));
+    for file in publication_order {
+        let staging_path = staged[&file].clone();
+        let Ok(staging_file) = open_windows_private_file_for_removal(staging_path.as_std_path())
+        else {
+            cleanup_published_links(published.values())?;
+            return Err(GithubArtifactError::AtomicPublicationFailed);
+        };
+        let destination = output_directory.join(file.file_name());
+        if let Err(error) = fs::hard_link(&staging_path, &destination) {
+            cleanup_published_links(published.values())?;
+            return Err(if error.kind() == io::ErrorKind::AlreadyExists {
+                GithubArtifactError::OutputAlreadyExists(file)
+            } else {
+                GithubArtifactError::AtomicPublicationFailed
+            });
+        }
+        if verify_windows_private_file_handle_in_state(
+            staging_file.as_handle(),
+            PrivateFileLinkState::PublicationPair,
+        )
+        .is_err()
+        {
+            let _ = cleanup_published_links(published.values());
+            return Err(GithubArtifactError::CleanupFailed);
+        }
+        let Ok(linked_file) = open_windows_private_file_for_removal_in_state(
+            destination.as_std_path(),
+            PrivateFileLinkState::PublicationPair,
+        ) else {
+            let _ = remove_windows_private_file_handle_in_state(
+                staging_file,
+                PrivateFileLinkState::PublicationPair,
+            );
+            let _ = cleanup_published_links(published.values());
+            return Err(GithubArtifactError::CleanupFailed);
+        };
+        let link = PublishedLink {
+            path: destination,
+            linked_file,
+            staging_path,
+            staging_file,
+            staging_removed: Cell::new(false),
+        };
+        if published_link_matches(&link) != Ok(true) {
+            let _ = cleanup_published_links([&link]);
+            let _ = cleanup_published_links(published.values());
+            return Err(GithubArtifactError::CleanupFailed);
+        }
+        published.insert(file, link);
+    }
+    Ok(published)
+}
+
+#[cfg(windows)]
+fn published_link_matches(link: &PublishedLink) -> Result<bool, GithubArtifactError> {
+    let metadata = fs::symlink_metadata(&link.path).map_err(io_error)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Ok(false);
+    }
+    let expected_state = if link.staging_removed.get() {
+        PrivateFileLinkState::Single
+    } else {
+        PrivateFileLinkState::PublicationPair
+    };
+    if verify_windows_private_file_handle_in_state(link.linked_file.as_handle(), expected_state)
+        .is_err()
+        || (!link.staging_removed.get()
+            && verify_windows_private_file_handle_in_state(
+                link.staging_file.as_handle(),
+                PrivateFileLinkState::PublicationPair,
+            )
+            .is_err())
+        || !open_files_match(&link.linked_file, &link.staging_file)?
+        || !path_matches_file(&link.path, &link.linked_file)?
+        || (!link.staging_removed.get()
+            && !path_matches_file(&link.staging_path, &link.staging_file)?)
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn finalize_published_links<'a>(
+    links: impl IntoIterator<Item = &'a PublishedLink>,
+    _staged_paths: impl IntoIterator<Item = &'a Utf8PathBuf>,
+) -> Result<(), GithubArtifactError> {
+    for link in links {
+        if link.staging_removed.get() || published_link_matches(link) != Ok(true) {
+            return Err(GithubArtifactError::CleanupFailed);
+        }
+        remove_windows_private_file_handle_in_state(
+            link.staging_file.try_clone().map_err(io_error)?,
+            PrivateFileLinkState::PublicationPair,
+        )
+        .map_err(|_| GithubArtifactError::CleanupFailed)?;
+        link.staging_removed.set(true);
+        verify_windows_private_file_handle(link.linked_file.as_handle())
+            .map_err(|_| GithubArtifactError::CleanupFailed)?;
+        if published_link_matches(link) != Ok(true) {
+            return Err(GithubArtifactError::CleanupFailed);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn cleanup_published_links<'a>(
+    links: impl IntoIterator<Item = &'a PublishedLink>,
+) -> Result<(), GithubArtifactError> {
+    let mut failed = false;
+    for link in links {
+        let result = if link.staging_removed.get() {
+            remove_windows_private_file_handle(link.linked_file.try_clone().map_err(io_error)?)
+        } else {
+            let destination_cleanup = remove_windows_private_file_handle_in_state(
+                link.linked_file.try_clone().map_err(io_error)?,
+                PrivateFileLinkState::PublicationPair,
+            );
+            if destination_cleanup.is_err() {
+                failed = true;
+                continue;
+            }
+            link.staging_removed.set(true);
+            remove_windows_private_file_handle(link.staging_file.try_clone().map_err(io_error)?)
+        };
+        if result.is_err() {
+            failed = true;
+        }
+    }
+    if failed {
+        Err(GithubArtifactError::CleanupFailed)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn cleanup_paths<'a>(
+    paths: impl IntoIterator<Item = &'a Utf8PathBuf>,
+) -> Result<(), GithubArtifactError> {
+    let mut failed = false;
+    for path in paths {
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                failed = true;
+                continue;
+            }
+            Ok(_) => {}
+        }
+        match open_windows_private_file_for_removal(path.as_std_path()) {
+            Ok(file) => {
+                if remove_windows_private_file_handle(file).is_err() {
+                    failed = true;
+                }
+            }
+            Err(_) => failed = true,
+        }
+    }
+    if failed {
+        Err(GithubArtifactError::CleanupFailed)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn open_files_match(left: &File, right: &File) -> Result<bool, GithubArtifactError> {
+    let left =
+        FileIdentityHandle::from_file(left.try_clone().map_err(io_error)?).map_err(io_error)?;
+    let right =
+        FileIdentityHandle::from_file(right.try_clone().map_err(io_error)?).map_err(io_error)?;
+    Ok(left == right)
+}
+
+#[cfg(windows)]
+fn path_matches_file(path: &Utf8Path, file: &File) -> Result<bool, GithubArtifactError> {
+    let open =
+        FileIdentityHandle::from_file(file.try_clone().map_err(io_error)?).map_err(io_error)?;
+    let path = FileIdentityHandle::from_path(path).map_err(io_error)?;
+    Ok(open == path)
+}
+
+#[cfg(not(windows))]
 fn publish_no_replace(
     staged: &BTreeMap<RequiredArtifactFile, Utf8PathBuf>,
     output_directory: &Utf8Path,
@@ -2157,6 +2435,7 @@ fn publish_no_replace(
     Ok(published)
 }
 
+#[cfg(not(windows))]
 fn published_link_matches(link: &PublishedLink) -> Result<bool, GithubArtifactError> {
     let metadata = fs::symlink_metadata(&link.path).map_err(io_error)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -2177,6 +2456,7 @@ fn published_link_matches(link: &PublishedLink) -> Result<bool, GithubArtifactEr
     Ok(open_identity == final_identity)
 }
 
+#[cfg(not(windows))]
 fn cleanup_published_links<'a>(
     links: impl IntoIterator<Item = &'a PublishedLink>,
 ) -> Result<(), GithubArtifactError> {
@@ -2225,6 +2505,7 @@ fn ensure_output_absent(
     }
 }
 
+#[cfg(not(windows))]
 fn cleanup_paths<'a>(
     paths: impl IntoIterator<Item = &'a Utf8PathBuf>,
 ) -> Result<(), GithubArtifactError> {
@@ -2241,6 +2522,14 @@ fn cleanup_paths<'a>(
     } else {
         Ok(())
     }
+}
+
+#[cfg(not(windows))]
+fn finalize_published_links<'a>(
+    _links: impl IntoIterator<Item = &'a PublishedLink>,
+    staged_paths: impl IntoIterator<Item = &'a Utf8PathBuf>,
+) -> Result<(), GithubArtifactError> {
+    cleanup_paths(staged_paths)
 }
 
 fn validate_ipa_expectation(expectation: &IpaExpectation) -> Result<(), GithubArtifactError> {
@@ -2473,6 +2762,36 @@ fn io_error(error: io::Error) -> GithubArtifactError {
     GithubArtifactError::Io(error.kind())
 }
 
+#[cfg(windows)]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "used directly as a path-free Result::map_err adapter"
+)]
+fn map_windows_private_path_error(error: PrivateDirectoryError) -> GithubArtifactError {
+    if error.cleanup_status() == PrivateDirectoryCleanupStatus::Uncertain {
+        GithubArtifactError::CleanupFailed
+    } else if matches!(error.os_code(), Some(2 | 3)) {
+        GithubArtifactError::Io(io::ErrorKind::NotFound)
+    } else {
+        GithubArtifactError::InvalidPath
+    }
+}
+
+#[cfg(windows)]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "used directly as a path-free Result::map_err adapter"
+)]
+fn map_windows_private_file_error(error: PrivateDirectoryError) -> GithubArtifactError {
+    if error.cleanup_status() == PrivateDirectoryCleanupStatus::Uncertain {
+        GithubArtifactError::CleanupFailed
+    } else if error.kind() == PrivateDirectoryErrorKind::AlreadyExists {
+        GithubArtifactError::Io(io::ErrorKind::AlreadyExists)
+    } else {
+        GithubArtifactError::InvalidPath
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2552,7 +2871,7 @@ mod tests {
     fn signed_product_archive_requires_an_explicit_wrapper_directory() {
         let root = TempDir::new().unwrap();
         let path = Utf8PathBuf::from_path_buf(root.path().join("missing-root.zip")).unwrap();
-        let file = File::create(&path).unwrap();
+        let file = create_new_artifact_file(&path).unwrap();
         let mut writer = ZipWriter::new(file);
         let options = SimpleFileOptions::default()
             .compression_method(CompressionMethod::Stored)
@@ -2588,7 +2907,7 @@ mod tests {
         let app_path = root.join(APP_BUNDLE_ARCHIVE_NAME);
         let archive_path = root.join(SIGNED_XCARCHIVE_NAME);
         let tampered_path = root.join("tampered.app.zip");
-        fs::write(&ipa_path, test_ipa()).unwrap();
+        write_new_file(&ipa_path, &test_ipa()).unwrap();
         write_rewrapped_app_zip(&app_path, "", false);
         write_rewrapped_app_zip(&archive_path, "App.xcarchive/Products/Applications/", false);
         write_rewrapped_app_zip(&tampered_path, "", true);
@@ -2737,6 +3056,7 @@ mod tests {
         assert_eq!(fs::read_dir(&fixture.staging).unwrap().count(), 0);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn publication_cleanup_preserves_a_replaced_destination() {
         let root = TempDir::new().unwrap();
@@ -2757,6 +3077,41 @@ mod tests {
             Err(GithubArtifactError::CleanupFailed)
         );
         assert_eq!(fs::read(destination).unwrap(), b"foreign");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn publication_cleanup_removes_exact_original_and_preserves_replacement() {
+        let root = TempDir::new().unwrap();
+        let source = Utf8PathBuf::from_path_buf(root.path().join("source")).unwrap();
+        let destination = Utf8PathBuf::from_path_buf(root.path().join("destination")).unwrap();
+        let displaced = Utf8PathBuf::from_path_buf(root.path().join("displaced")).unwrap();
+        let mut output = create_new_artifact_file(&source).unwrap();
+        output.write_all(b"published").unwrap();
+        output.sync_all().unwrap();
+        drop(output);
+        let staging_file = open_windows_private_file_for_removal(source.as_std_path()).unwrap();
+        fs::hard_link(&source, &destination).unwrap();
+        let linked_file = open_windows_private_file_for_removal_in_state(
+            destination.as_std_path(),
+            PrivateFileLinkState::PublicationPair,
+        )
+        .unwrap();
+        let link = PublishedLink {
+            path: destination.clone(),
+            linked_file,
+            staging_path: source.clone(),
+            staging_file,
+            staging_removed: Cell::new(false),
+        };
+        fs::rename(&destination, &displaced).unwrap();
+        fs::write(&destination, b"foreign").unwrap();
+
+        cleanup_published_links([&link]).unwrap();
+        drop(link);
+        assert_eq!(fs::read(destination).unwrap(), b"foreign");
+        assert!(!source.exists());
+        assert!(!displaced.exists());
     }
 
     #[test]
@@ -2867,8 +3222,8 @@ mod tests {
             let archive = root_path.join("github-artifact.zip");
             let staging = root_path.join("staging");
             let output = root_path.join("output");
-            fs::create_dir(&staging).unwrap();
-            fs::create_dir(&output).unwrap();
+            create_test_private_directory(&staging);
+            create_test_private_directory(&output);
 
             let (request, compile) = test_request_and_compile();
             let ipa_bytes = test_ipa();
@@ -3330,7 +3685,7 @@ mod tests {
         validation_report: &[u8],
         sanitized_log: &[u8],
     ) {
-        let file = File::create(path).unwrap();
+        let file = create_new_artifact_file(path).unwrap();
         let mut writer = ZipWriter::new(file);
         let options = SimpleFileOptions::default()
             .compression_method(CompressionMethod::Stored)
@@ -3350,7 +3705,7 @@ mod tests {
 
     fn write_rewrapped_app_zip(path: &Utf8Path, prefix: &str, tamper_executable: bool) {
         let mut source = ZipArchive::new(Cursor::new(test_ipa())).unwrap();
-        let file = File::create(path).unwrap();
+        let file = create_new_artifact_file(path).unwrap();
         let mut writer = ZipWriter::new(file);
         let directory_options = SimpleFileOptions::default()
             .compression_method(CompressionMethod::Stored)
@@ -3386,5 +3741,18 @@ mod tests {
             writer.write_all(&bytes).unwrap();
         }
         writer.finish().unwrap();
+    }
+
+    #[cfg(windows)]
+    fn create_test_private_directory(path: &Utf8Path) {
+        drop(
+            rustferry_core::windows_private_directory::create_private_directory(path.as_std_path())
+                .unwrap(),
+        );
+    }
+
+    #[cfg(not(windows))]
+    fn create_test_private_directory(path: &Utf8Path) {
+        fs::create_dir(path).unwrap();
     }
 }

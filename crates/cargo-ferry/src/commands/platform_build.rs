@@ -10,7 +10,8 @@ use rustferry_apple::{
     discover_apple,
 };
 use rustferry_core::TargetPlatform;
-use serde::Serialize;
+use rustferry_remote::{BuildProfile, CancellationToken};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use toml_edit::DocumentMut;
 
@@ -28,6 +29,9 @@ use crate::output::Reporter;
 use crate::project::find_project_root;
 
 use super::{remote, ssh_remote};
+
+pub(in crate::commands) use super::github_snapshot::IdeSnapshotPreview;
+pub(in crate::commands) use super::remote::IdeSigningReadiness;
 
 #[derive(Debug, Serialize)]
 pub(crate) struct BuildOutput {
@@ -61,7 +65,94 @@ impl CargoTargets {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(in crate::commands) struct IdeSnapshotConsent {
+    pub(in crate::commands) token: String,
+    pub(in crate::commands) preview_sha256: String,
+    pub(in crate::commands) approved: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(in crate::commands) struct IdeSnapshotSubmission {
+    pub(in crate::commands) local_job_id: String,
+    pub(in crate::commands) revision: u64,
+    pub(in crate::commands) state: cargo_ferry::job_store::StoredJobState,
+    pub(in crate::commands) terminal_outcome: Option<cargo_ferry::job_store::StoredBuildOutcome>,
+    pub(in crate::commands) cleanup_status: cargo_ferry::job_store::StoredCleanupStatus,
+    pub(in crate::commands) profile: BuildProfile,
+    pub(in crate::commands) source_manifest_sha256: String,
+    pub(in crate::commands) preview_sha256: String,
+}
+
+pub(in crate::commands) fn ide_snapshot_preview(
+    workspace: &Utf8Path,
+    profile: BuildProfile,
+) -> Result<IdeSnapshotPreview, CliError> {
+    let (binding, config, targets) = ide_snapshot_project_context(workspace)?;
+    remote::ide_snapshot_preview(&binding, &config, &targets.binary, profile)
+}
+
+pub(in crate::commands) fn ide_snapshot_submit(
+    workspace: &Utf8Path,
+    consent: &IdeSnapshotConsent,
+    cancellation: &CancellationToken,
+) -> Result<IdeSnapshotSubmission, CliError> {
+    let (binding, config, targets) = ide_snapshot_project_context(workspace)?;
+    let (record, preview_sha256) = remote::ide_snapshot_submit(
+        &binding,
+        &config,
+        &targets.package,
+        &targets.binary,
+        &consent.token,
+        &consent.preview_sha256,
+        consent.approved,
+        cancellation,
+    )?;
+    Ok(IdeSnapshotSubmission {
+        local_job_id: record.local_job_id.as_str().to_owned(),
+        revision: record.revision,
+        state: record.state,
+        terminal_outcome: record.terminal_outcome,
+        cleanup_status: record.cleanup_status,
+        profile: record.profile,
+        source_manifest_sha256: record.source.manifest_sha256,
+        preview_sha256,
+    })
+}
+
+pub(in crate::commands) fn ide_signing_readiness(
+    workspace: &Utf8Path,
+) -> Result<IdeSigningReadiness, CliError> {
+    let root = find_project_root(Some(workspace))?;
+    let binding = remote::ProjectFilesystemBinding::capture(&root)?;
+    remote::ide_signing_readiness(&binding)
+}
+
+fn ide_snapshot_project_context(
+    workspace: &Utf8Path,
+) -> Result<
+    (
+        remote::ProjectFilesystemBinding,
+        rustferry_core::FerryConfig,
+        CargoTargets,
+    ),
+    CliError,
+> {
+    let root = find_project_root(Some(workspace))?;
+    let binding = remote::ProjectFilesystemBinding::capture(&root)?;
+    let config = with_github_project_binding(Some(&binding), || {
+        Ok(rustferry_core::FerryConfig::load(&root.join("ferry.toml"))?)
+    })?;
+    let targets = with_github_project_binding(Some(&binding), || read_cargo_targets(&root))?;
+    with_github_project_binding(Some(&binding), || {
+        require_platform(&config, TargetPlatform::Ios, "ios")
+    })?;
+    Ok((binding, config, targets))
+}
+
 pub fn run(arguments: BuildArgs, dry_run: bool, reporter: &Reporter) -> Result<(), CliError> {
+    validate_snapshot_options(&arguments)?;
     validate_artifact_options(&arguments)?;
     let route = build_route(&arguments);
     if route == BuildRoute::Local {
@@ -72,6 +163,42 @@ pub fn run(arguments: BuildArgs, dry_run: bool, reporter: &Reporter) -> Result<(
     }
     let output = execute(arguments, dry_run, reporter)?;
     report_build(&output, reporter);
+    Ok(())
+}
+
+fn validate_snapshot_options(arguments: &BuildArgs) -> Result<(), CliError> {
+    if arguments.yes && !arguments.snapshot {
+        return Err(CliError::Unsupported {
+            message: "`--yes` confirms only an exact GitHub snapshot plan".to_owned(),
+            help: "Remove `--yes`, or add the explicit `--snapshot` build mode.".to_owned(),
+        });
+    }
+    if !arguments.snapshot {
+        return Ok(());
+    }
+    if !matches!(arguments.platform, BuildPlatform::Iphone(_)) {
+        return Err(CliError::Unsupported {
+            message: "`--snapshot` is supported only by the physical-iPhone GitHub build"
+                .to_owned(),
+            help: "Use `cargo ferry build iphone --remote github --snapshot --unsigned`."
+                .to_owned(),
+        });
+    }
+    if arguments.remote != Some(BuildRemoteTarget::Github) {
+        return Err(CliError::Unsupported {
+            message: "`--snapshot` requires the explicit GitHub remote".to_owned(),
+            help: "Pass `--remote github`; named SSH remotes and implicit routing do not publish Git snapshots."
+                .to_owned(),
+        });
+    }
+    if !arguments.unsigned
+        || matches!(&arguments.platform, BuildPlatform::Iphone(iphone) if iphone.team.is_some())
+    {
+        return Err(CliError::Unsupported {
+            message: "GitHub snapshot builds are unsigned compile-only builds".to_owned(),
+            help: "Pass `--unsigned` and remove `--team` or other signing options.".to_owned(),
+        });
+    }
     Ok(())
 }
 
@@ -163,9 +290,20 @@ fn run_remote(arguments: BuildArgs, dry_run: bool, reporter: &Reporter) -> Resul
         });
     }
     let root = find_project_root(arguments.project_dir.as_deref())?;
-    let config = rustferry_core::FerryConfig::load(&root.join("ferry.toml"))?;
-    let targets = read_cargo_targets(&root)?;
-    require_platform(&config, TargetPlatform::Ios, "ios")?;
+    let github_project_binding = if remote_target == BuildRemoteTarget::Github {
+        Some(remote::ProjectFilesystemBinding::capture(&root)?)
+    } else {
+        None
+    };
+    let config = with_github_project_binding(github_project_binding.as_ref(), || {
+        Ok(rustferry_core::FerryConfig::load(&root.join("ferry.toml"))?)
+    })?;
+    let targets = with_github_project_binding(github_project_binding.as_ref(), || {
+        read_cargo_targets(&root)
+    })?;
+    with_github_project_binding(github_project_binding.as_ref(), || {
+        require_platform(&config, TargetPlatform::Ios, "ios")
+    })?;
 
     let team = match arguments.platform {
         BuildPlatform::Iphone(iphone) => iphone.team,
@@ -186,20 +324,28 @@ fn run_remote(arguments: BuildArgs, dry_run: bool, reporter: &Reporter) -> Resul
     let include_dsym = arguments.include_dsym;
 
     match remote_target {
-        BuildRemoteTarget::Github => remote::build_iphone(
-            &root,
-            &config,
-            &targets.package,
-            &targets.binary,
-            RemoteProviderChoice::Github,
-            team.as_deref(),
-            arguments.release,
-            arguments.unsigned,
-            artifact,
-            include_dsym,
-            dry_run,
-            reporter,
-        ),
+        BuildRemoteTarget::Github => {
+            let project_binding = github_project_binding
+                .as_ref()
+                .expect("GitHub remote branch creates the project filesystem binding");
+            project_binding.verify()?;
+            remote::build_iphone(
+                project_binding,
+                &config,
+                &targets.package,
+                &targets.binary,
+                RemoteProviderChoice::Github,
+                team.as_deref(),
+                arguments.release,
+                arguments.unsigned,
+                arguments.snapshot,
+                arguments.yes,
+                artifact,
+                include_dsym,
+                dry_run,
+                reporter,
+            )
+        }
         BuildRemoteTarget::SshMac(name) => {
             ssh_remote::validate_snapshot_build_mode(
                 team.as_deref(),
@@ -226,11 +372,26 @@ fn run_remote(arguments: BuildArgs, dry_run: bool, reporter: &Reporter) -> Resul
     }
 }
 
+fn with_github_project_binding<T>(
+    binding: Option<&remote::ProjectFilesystemBinding>,
+    step: impl FnOnce() -> Result<T, CliError>,
+) -> Result<T, CliError> {
+    if let Some(binding) = binding {
+        binding.verify()?;
+    }
+    let result = step()?;
+    if let Some(binding) = binding {
+        binding.verify()?;
+    }
+    Ok(result)
+}
+
 pub(crate) fn execute(
     arguments: BuildArgs,
     dry_run: bool,
     reporter: &Reporter,
 ) -> Result<BuildOutput, CliError> {
+    validate_snapshot_options(&arguments)?;
     validate_artifact_options(&arguments)?;
     validate_local_artifact_options(&arguments)?;
     let root = find_project_root(arguments.project_dir.as_deref())?;
@@ -820,8 +981,9 @@ mod tests {
     use super::{
         BuildRoute, ClientHost, build_route_for_host, canonical_developer_dir_override,
         intended_developer_dir, intended_xcrun_path, validate_artifact_options,
-        validate_local_artifact_options,
+        validate_local_artifact_options, validate_snapshot_options, with_github_project_binding,
     };
+    use crate::commands::remote::ProjectFilesystemBinding;
 
     fn ios_arguments(device: bool, remote: Option<BuildRemoteTarget>, unsigned: bool) -> BuildArgs {
         BuildArgs {
@@ -836,6 +998,8 @@ mod tests {
             remote,
             config_dir: None,
             unsigned,
+            snapshot: false,
+            yes: false,
             artifact: None,
             include_dsym: false,
             project_dir: None,
@@ -879,6 +1043,35 @@ mod tests {
     }
 
     #[test]
+    fn github_project_binding_rejects_or_blocks_a_pre_config_directory_swap() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let project = temporary.path().join("project");
+        let original = temporary.path().join("original-project");
+        std::fs::create_dir(&project).expect("project directory");
+        let root = camino::Utf8PathBuf::from_path_buf(
+            project.canonicalize().expect("canonical project directory"),
+        )
+        .expect("UTF-8 project directory");
+        let binding = ProjectFilesystemBinding::capture(&root).expect("project binding");
+
+        let result = with_github_project_binding(Some(&binding), || {
+            std::fs::rename(&project, &original).map_err(|source| crate::error::CliError::Io {
+                action: "swap bound project directory",
+                path: root.clone(),
+                source,
+            })?;
+            std::fs::create_dir(&project).map_err(|source| crate::error::CliError::Io {
+                action: "create replacement project directory",
+                path: root.clone(),
+                source,
+            })?;
+            Ok(())
+        });
+
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn remote_or_unsigned_ios_device_build_uses_remote_route() {
         for host in [ClientHost::MacOs, ClientHost::NonMacOs] {
             assert_eq!(
@@ -910,6 +1103,38 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_mode_requires_exact_unsigned_github_iphone_route() {
+        let mut arguments = BuildArgs {
+            platform: BuildPlatform::Iphone(IphoneBuildArgs { team: None }),
+            release: false,
+            remote: Some(BuildRemoteTarget::Github),
+            config_dir: None,
+            unsigned: true,
+            snapshot: true,
+            yes: false,
+            artifact: None,
+            include_dsym: false,
+            project_dir: None,
+        };
+        assert!(validate_snapshot_options(&arguments).is_ok());
+
+        arguments.remote = None;
+        assert!(validate_snapshot_options(&arguments).is_err());
+        arguments.remote = Some(BuildRemoteTarget::Github);
+        arguments.unsigned = false;
+        assert!(validate_snapshot_options(&arguments).is_err());
+        arguments.unsigned = true;
+        arguments.platform = BuildPlatform::Iphone(IphoneBuildArgs {
+            team: Some("TEAM123456".to_owned()),
+        });
+        assert!(validate_snapshot_options(&arguments).is_err());
+
+        let mut ios = ios_arguments(true, Some(BuildRemoteTarget::Github), true);
+        ios.snapshot = true;
+        assert!(validate_snapshot_options(&ios).is_err());
+    }
+
+    #[test]
     fn simulator_options_never_select_the_remote_route() {
         for host in [ClientHost::MacOs, ClientHost::NonMacOs] {
             assert_eq!(
@@ -937,6 +1162,8 @@ mod tests {
             remote: None,
             config_dir: None,
             unsigned: false,
+            snapshot: false,
+            yes: false,
             artifact: None,
             include_dsym: true,
             project_dir: None,
@@ -967,6 +1194,8 @@ mod tests {
             remote: None,
             config_dir: None,
             unsigned: false,
+            snapshot: false,
+            yes: false,
             artifact: None,
             include_dsym: false,
             project_dir: None,

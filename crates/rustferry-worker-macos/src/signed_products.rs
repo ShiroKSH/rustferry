@@ -851,6 +851,7 @@ fn copy_verified_file_to_capability(
         if total != planned.entry.size || hex::encode(digest.finalize()) != planned.entry.sha256 {
             return Err(SignedProductError::TreeChanged);
         }
+        #[cfg(unix)]
         set_capability_file_mode(&output, planned.entry.executable)?;
         output
             .sync_all()
@@ -1603,25 +1604,12 @@ fn set_capability_file_mode(
         .map_err(|source| io_error("set capability-copied product mode", source))
 }
 
-#[cfg(not(unix))]
-fn set_capability_file_mode(
-    _file: &cap_std::fs::File,
-    _is_executable: bool,
-) -> Result<(), SignedProductError> {
-    Ok(())
-}
-
 #[cfg(all(test, unix))]
 fn set_file_mode(file: &File, is_executable: bool) -> Result<(), SignedProductError> {
     use std::os::unix::fs::PermissionsExt as _;
     let mode = if is_executable { 0o755 } else { 0o644 };
     file.set_permissions(fs::Permissions::from_mode(mode))
         .map_err(|source| io_error("set copied product mode", source))
-}
-
-#[cfg(all(test, not(unix)))]
-fn set_file_mode(_file: &File, _is_executable: bool) -> Result<(), SignedProductError> {
-    Ok(())
 }
 
 #[cfg(unix)]
@@ -2074,10 +2062,12 @@ mod tests {
         create_private_directory(&source.join("Resources/Empty")).expect("empty");
         fs::write(source.join("Info.plist"), b"plist").expect("plist");
         fs::write(source.join("App"), b"app").expect("app");
+        #[cfg(unix)]
         let app_file = File::options()
             .write(true)
             .open(source.join("App"))
             .expect("open app");
+        #[cfg(unix)]
         set_file_mode(&app_file, true).expect("executable mode");
         let plan = plan_tree(&source, None).expect("tree plan");
         let first = root.join("first.zip");

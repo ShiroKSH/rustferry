@@ -8,7 +8,7 @@ manifest.
 Inspect the exact selection before creating anything:
 
 ```console
-cargo ferry remote bundle inspect --project ./weather
+cargo ferry remote bundle inspect --project-dir ./weather
 ```
 
 The report lists every portable path, byte size, executable bit, file SHA-256, resolved local path
@@ -28,7 +28,7 @@ Create new files without overwriting an existing path:
 
 ```console
 cargo ferry remote bundle create \
-  --project ./weather \
+  --project-dir ./weather \
   --output ../exports/weather-source.zip \
   --descriptor ../exports/weather-source.json
 ```
@@ -58,6 +58,23 @@ ratio, executable bits, and every content digest must match before success. Extr
 temporary directory and rejects traversal, symlinks, hard links, case/Unicode collisions, extra or
 missing entries, archive expansion abuse, and destination replacement.
 
-The commands are the transport foundation for SSH and future managed builders. The current GitHub
-provider still uses an exact committed Git revision; these commands do not silently upload a dirty
-working tree or enable GitHub snapshot submission.
+## GitHub GitSnapshot use
+
+The GitHub provider reuses the same canonical selection only after explicit snapshot selection:
+
+```console
+cargo ferry --dry-run build iphone --remote github --snapshot --unsigned
+cargo ferry build iphone --remote github --snapshot --unsigned
+```
+
+Dry-run is zero-write and invocation-bound. It reports the exact public repository/ref, source
+manifest, local path dependencies, included paths, exclusions, raw-byte totals, retention, and
+effects; the archive SHA-256 is computed only after consent. Interactive execution asks `[y/N]`;
+JSON/non-interactive execution requires `--yes`. Execution repeats source/config/filesystem checks,
+and any drift fails before staging, store mutation, or network access.
+
+The client builds a create-only operation-scoped GitSnapshot without switching the caller branch,
+staging the Git index, changing remotes, or running Git hooks. Source bytes enter a public Git object
+database; temporary-ref deletion is cleanup, not erasure. The remote ref is retained until terminal
+cleanup, and the local keepalive remains available for exact retry until explicit complete-lineage
+prune authorizes release.

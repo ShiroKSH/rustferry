@@ -19,11 +19,14 @@ use clap::{Args, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use rustferry_apple::{AppleBuildProfile, IosDeviceArchiveRequest, with_command_cancellation};
 use rustferry_core::{FerryConfig, TargetPlatform};
 use rustferry_remote::{
-    ArtifactKind, ArtifactRecord, CompileHandoff, IosArtifactType, IosDeviceBuildRequest,
-    PROTECTED_SIGNING_SANITIZED_LOG_V1, SealedUnsignedArchive, SecretBytes, SecretReference,
-    SecretReferenceKind, SigningMode, SourceBundleRequest, SourceManifest, SourceMode,
-    WorkerStdioCodecError, WorkerStdioRequestEnvelope, canonical_signing_target_graph_sha256,
-    decode_worker_stdio_request, verify_source_manifest,
+    ArtifactKind, ArtifactRecord, CompileHandoff, GIT_SNAPSHOT_ARCHIVE_PATH,
+    GIT_SNAPSHOT_DESCRIPTOR_PATH, GIT_SNAPSHOT_TREE_PATHS, GitSnapshotDescriptor, IosArtifactType,
+    IosDeviceBuildRequest, MAX_GIT_SNAPSHOT_DESCRIPTOR_BYTES, PROTECTED_SIGNING_SANITIZED_LOG_V1,
+    SealedUnsignedArchive, SecretBytes, SecretReference, SecretReferenceKind, SigningMode,
+    SourceBundleRequest, SourceManifest, SourceMode, WorkerStdioCodecError,
+    WorkerStdioRequestEnvelope, canonical_git_snapshot_descriptor_bytes, canonical_request_sha256,
+    canonical_signing_target_graph_sha256, decode_worker_stdio_request,
+    git_snapshot_archive_limits, verify_and_extract_source_bundle, verify_source_manifest,
 };
 #[cfg(target_os = "macos")]
 use rustferry_worker_macos::keychain::{KeychainOptions, garbage_collect_stale_keychains};
@@ -616,6 +619,7 @@ fn run_github_request(arguments: GithubRequestArgs) -> Result<(), CliFailure> {
     let event_object = event
         .as_object()
         .ok_or_else(|| CliFailure::input("invalid_event", "GitHub event payload is invalid"))?;
+    let event_kind = github_event_kind(exact_environment_string("GITHUB_EVENT_NAME")?.as_deref())?;
     let event_ref = required_object_string(event_object, "ref", "invalid_event")?;
     let expected_ref = format!(
         "{}/{}",
@@ -639,22 +643,15 @@ fn run_github_request(arguments: GithubRequestArgs) -> Result<(), CliFailure> {
     let dispatch_head = git_head(&dispatch_root)?;
     cross_check_exact_environment_value("GITHUB_SHA", &dispatch_head)?;
 
-    let is_workflow_dispatch = event_object.get("inputs").is_some_and(Value::is_object);
-    if is_workflow_dispatch {
-        validate_workflow_dispatch_event(
+    match event_kind {
+        GithubEventKind::WorkflowDispatch => validate_workflow_dispatch_event(
             event_object,
             request,
             source_revision,
+            &dispatch_head,
             &arguments.workflow_path,
-        )?;
-    } else {
-        let after = required_object_string(event_object, "after", "invalid_push_event")?;
-        if after != dispatch_head {
-            return Err(CliFailure::input(
-                "dispatch_revision_mismatch",
-                "push event revision differs from the dispatch checkout",
-            ));
-        }
+        )?,
+        GithubEventKind::Push => validate_push_event(event_object, &dispatch_head)?,
     }
 
     let execution_repository = event_object
@@ -697,7 +694,9 @@ fn run_github_request(arguments: GithubRequestArgs) -> Result<(), CliFailure> {
         "trusted_source_repository_mismatch",
         "trusted source checkout does not match the public source repository",
     )?;
-    ensure_revision_is_trusted(&trusted_root, source_revision)?;
+    if request.source_mode == SourceMode::Git {
+        ensure_revision_is_trusted(&trusted_root, source_revision)?;
+    }
 
     let normalized = serde_json::to_vec_pretty(request).map_err(|_| {
         CliFailure::execution(
@@ -718,7 +717,7 @@ fn run_github_request(arguments: GithubRequestArgs) -> Result<(), CliFailure> {
     write_json_stdout(&serde_json::json!({
         "schema_version": CLI_SCHEMA_VERSION,
         "status": "validated",
-        "event": if is_workflow_dispatch { "workflow_dispatch" } else { "push" },
+        "event": event_kind.as_str(),
     }))
 }
 
@@ -783,18 +782,11 @@ fn run_compile(arguments: RunJobArgs) -> Result<(), CliFailure> {
         "trusted_source_repository_mismatch",
         "trusted source checkout does not match the public source repository",
     )?;
-    ensure_revision_is_trusted(&trusted_root, source_revision)?;
+    if request.source_mode == SourceMode::Git {
+        ensure_revision_is_trusted(&trusted_root, source_revision)?;
+    }
 
-    let checkout_selection = source_selection(&source_root, &request.source)?;
-    verify_source_manifest(&checkout_selection, &request.source).map_err(|_| {
-        CliFailure::input(
-            "source_manifest_mismatch",
-            "source checkout does not match the request manifest",
-        )
-    })?;
-    let materialized_root = job_root.join("source");
-    create_private_directory(&materialized_root)?;
-    materialize_manifest(&source_root, &materialized_root, &request.source)?;
+    let materialized_root = materialize_github_source(&source_root, &job_root, &request)?;
     let metadata_job_id = request.operation_id.clone();
     let handoff = compile_materialized_source(
         request,
@@ -812,6 +804,159 @@ fn run_compile(arguments: RunJobArgs) -> Result<(), CliFailure> {
         "request_sha256": handoff.compile.request_sha256,
         "sealed_sha256": handoff.compile.sealed_archive.transport.sha256,
     }))
+}
+
+fn materialize_github_source(
+    source_root: &Utf8Path,
+    job_root: &Utf8Path,
+    request: &IosDeviceBuildRequest,
+) -> Result<Utf8PathBuf, CliFailure> {
+    let materialized_root = job_root.join("source");
+    match request.source_mode {
+        SourceMode::Git => {
+            let checkout_selection = source_selection(source_root, &request.source)?;
+            verify_source_manifest(&checkout_selection, &request.source).map_err(|_| {
+                CliFailure::input(
+                    "source_manifest_mismatch",
+                    "source checkout does not match the request manifest",
+                )
+            })?;
+            create_private_directory(&materialized_root)?;
+            materialize_manifest(source_root, &materialized_root, &request.source)?;
+        }
+        SourceMode::GitSnapshot => {
+            validate_git_snapshot_tree(source_root)?;
+            let descriptor_path =
+                resolve_regular_under(source_root, Utf8Path::new(GIT_SNAPSHOT_DESCRIPTOR_PATH))?;
+            let descriptor_bytes = read_bounded_file(
+                &descriptor_path,
+                usize::try_from(MAX_GIT_SNAPSHOT_DESCRIPTOR_BYTES).unwrap_or(usize::MAX),
+            )?;
+            let descriptor: GitSnapshotDescriptor = decode_strict_json(&descriptor_bytes)?;
+            descriptor
+                .validate_for_request(request, git_snapshot_archive_limits())
+                .map_err(|_| {
+                    CliFailure::input(
+                        "snapshot_descriptor_mismatch",
+                        "Git snapshot descriptor does not match the final request",
+                    )
+                })?;
+            if canonical_git_snapshot_descriptor_bytes(&descriptor).map_err(|_| {
+                CliFailure::input(
+                    "snapshot_descriptor_invalid",
+                    "Git snapshot descriptor is invalid",
+                )
+            })? != descriptor_bytes
+            {
+                return Err(CliFailure::input(
+                    "snapshot_descriptor_noncanonical",
+                    "Git snapshot descriptor bytes are not canonical",
+                ));
+            }
+            let archive_path =
+                resolve_regular_under(source_root, Utf8Path::new(GIT_SNAPSHOT_ARCHIVE_PATH))?;
+            verify_and_extract_source_bundle(
+                &archive_path,
+                &descriptor.bundle.archive,
+                &descriptor.bundle.manifest,
+                &materialized_root,
+                git_snapshot_archive_limits(),
+            )
+            .map_err(|_| {
+                CliFailure::input(
+                    "snapshot_archive_invalid",
+                    "Git snapshot archive failed strict verification",
+                )
+            })?;
+        }
+        SourceMode::Snapshot => {
+            return Err(CliFailure::input(
+                "unsupported_source_mode",
+                "GitHub worker does not accept interactive snapshot source mode",
+            ));
+        }
+    }
+    Ok(materialized_root)
+}
+
+fn validate_git_snapshot_tree(root: &Utf8Path) -> Result<(), CliFailure> {
+    let commit = run_git(root, &["cat-file", "-p", "HEAD^{commit}"])?;
+    if !commit.success || !is_orphan_git_snapshot_commit(&commit.stdout) {
+        return Err(CliFailure::input(
+            "invalid_snapshot_commit",
+            "Git snapshot revision is not one parentless orphan commit",
+        ));
+    }
+    let tree = run_git(root, &["ls-tree", "-r", "-z", "--full-tree", "HEAD"])?;
+    let objects = if tree.success {
+        exact_git_snapshot_tree_objects(&tree.stdout)
+    } else {
+        None
+    }
+    .ok_or_else(|| {
+        CliFailure::input(
+            "invalid_snapshot_tree",
+            "Git snapshot commit does not contain the exact two-file source contract",
+        )
+    })?;
+    for (path, object) in GIT_SNAPSHOT_TREE_PATHS.into_iter().zip(objects) {
+        let actual = run_git(root, &["hash-object", "--no-filters", "--", path])?;
+        if !actual.success || one_git_sha1_line(&actual.stdout) != Some(object.as_str()) {
+            return Err(CliFailure::input(
+                "snapshot_worktree_mismatch",
+                "Git snapshot checkout bytes do not match the immutable commit tree",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn one_git_sha1_line(output: &[u8]) -> Option<&str> {
+    let revision = std::str::from_utf8(output).ok()?.strip_suffix('\n')?;
+    if revision.contains(['\r', '\n']) || validate_sha1(revision).is_err() {
+        return None;
+    }
+    Some(revision)
+}
+
+fn is_orphan_git_snapshot_commit(output: &[u8]) -> bool {
+    let Some(header_end) = output.windows(2).position(|window| window == b"\n\n") else {
+        return false;
+    };
+    let mut headers = output[..header_end].split(|byte| *byte == b'\n');
+    let Some(tree) = headers.next().and_then(|line| line.strip_prefix(b"tree ")) else {
+        return false;
+    };
+    validate_sha1(std::str::from_utf8(tree).unwrap_or_default()).is_ok()
+        && !headers.any(|line| line.starts_with(b"parent "))
+}
+
+fn exact_git_snapshot_tree_objects(output: &[u8]) -> Option<Vec<String>> {
+    if output.last() != Some(&0) {
+        return None;
+    }
+    let records = output[..output.len().saturating_sub(1)]
+        .split(|byte| *byte == 0)
+        .collect::<Vec<_>>();
+    if records.len() != GIT_SNAPSHOT_TREE_PATHS.len() {
+        return None;
+    }
+    let mut objects = Vec::with_capacity(records.len());
+    for (record, expected_path) in records.iter().zip(GIT_SNAPSHOT_TREE_PATHS) {
+        let tab = record.iter().position(|byte| *byte == b'\t')?;
+        let header = std::str::from_utf8(&record[..tab]).ok()?;
+        let object = header.strip_prefix("100644 blob ")?;
+        if validate_sha1(object).is_err() || &record[tab + 1..] != expected_path.as_bytes() {
+            return None;
+        }
+        objects.push(object.to_owned());
+    }
+    Some(objects)
+}
+
+#[cfg(test)]
+fn is_exact_git_snapshot_tree(output: &[u8]) -> bool {
+    exact_git_snapshot_tree_objects(output).is_some()
 }
 
 fn compile_materialized_source(
@@ -1201,10 +1346,57 @@ fn remove_owned_job_root(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GithubEventKind {
+    Push,
+    WorkflowDispatch,
+}
+
+impl GithubEventKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Push => "push",
+            Self::WorkflowDispatch => "workflow_dispatch",
+        }
+    }
+}
+
+fn github_event_kind(value: Option<&str>) -> Result<GithubEventKind, CliFailure> {
+    match value {
+        Some("push") => Ok(GithubEventKind::Push),
+        Some("workflow_dispatch") => Ok(GithubEventKind::WorkflowDispatch),
+        _ => Err(CliFailure::input(
+            "invalid_event_name",
+            "required GitHub event name is missing or unsupported",
+        )),
+    }
+}
+
+fn validate_push_event(
+    event: &serde_json::Map<String, Value>,
+    dispatch_revision: &str,
+) -> Result<(), CliFailure> {
+    if event.contains_key("inputs") {
+        return Err(CliFailure::input(
+            "invalid_push_event",
+            "push event contains workflow dispatch inputs",
+        ));
+    }
+    let after = required_object_string(event, "after", "invalid_push_event")?;
+    if after != dispatch_revision {
+        return Err(CliFailure::input(
+            "dispatch_revision_mismatch",
+            "push event revision differs from the dispatch checkout",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_workflow_dispatch_event(
     event: &serde_json::Map<String, Value>,
     request: &IosDeviceBuildRequest,
     source_revision: &str,
+    dispatch_revision: &str,
     workflow_path: &str,
 ) -> Result<(), CliFailure> {
     let inputs = event
@@ -1217,9 +1409,9 @@ fn validate_workflow_dispatch_event(
             )
         })?;
     let expected_keys = BTreeSet::from([
-        "device_udid_sha256",
+        "dispatch_revision",
         "operation_id",
-        "project_path",
+        "request_sha256",
         "source_revision",
     ]);
     if inputs.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected_keys {
@@ -1228,35 +1420,27 @@ fn validate_workflow_dispatch_event(
             "workflow dispatch input set is invalid",
         ));
     }
-    let device_udid_sha256 = request
-        .signing
-        .device
-        .as_ref()
-        .map(rustferry_remote::DevicePlan::udid_sha256)
-        .ok_or_else(|| {
-            CliFailure::input(
-                "missing_device",
-                "manual-development request has no physical device",
-            )
-        })?;
+    let request_sha256 = canonical_request_sha256(request).map_err(|_| {
+        CliFailure::input(
+            "invalid_workflow_dispatch",
+            "workflow dispatch request is invalid",
+        )
+    })?;
     for (name, expected) in [
         ("source_revision", source_revision),
         ("operation_id", request.operation_id.as_str()),
-        ("project_path", request.source.project_path.as_str()),
-        ("device_udid_sha256", device_udid_sha256),
+        ("request_sha256", request_sha256.as_str()),
+        ("dispatch_revision", dispatch_revision),
     ] {
         if inputs.get(name).and_then(Value::as_str) != Some(expected) {
             return Err(CliFailure::input(
                 "workflow_dispatch_mismatch",
-                "workflow dispatch input differs from the signed request",
+                "workflow dispatch input differs from the validated request",
             ));
         }
     }
-    if event
-        .get("workflow")
-        .and_then(Value::as_str)
-        .is_some_and(|workflow| workflow != workflow_path)
-    {
+    let workflow = required_object_string(event, "workflow", "invalid_workflow_dispatch")?;
+    if workflow != workflow_path {
         return Err(CliFailure::input(
             "workflow_path_mismatch",
             "workflow dispatch path differs from the trusted workflow",
@@ -1272,10 +1456,13 @@ fn validate_github_artifact_contract(request: &IosDeviceBuildRequest) -> Result<
             "physical-iPhone build request is invalid",
         )
     })?;
-    if request.source_mode != SourceMode::Git {
+    if !matches!(
+        request.source_mode,
+        SourceMode::Git | SourceMode::GitSnapshot
+    ) {
         return Err(CliFailure::input(
             "unsupported_source_mode",
-            "GitHub worker requires immutable Git source mode",
+            "GitHub worker requires immutable Git or Git snapshot source mode",
         ));
     }
     let valid = match request.signing.mode {
@@ -1802,6 +1989,7 @@ fn materialize_manifest(
                 "source changed during materialization",
             ));
         }
+        #[cfg(unix)]
         set_executable(&destination, entry.executable)?;
         File::open(&destination)
             .and_then(|file| file.sync_all())
@@ -2926,24 +3114,24 @@ fn sync_directory(path: &Utf8Path) -> Result<(), CliFailure> {
 }
 
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "directory sync is a durability operation with no Windows equivalent"
+)]
 const fn sync_directory(_path: &Utf8Path) -> Result<(), CliFailure> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn set_executable(path: &Utf8Path, executable: bool) -> Result<(), CliFailure> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let mode = if executable { 0o755 } else { 0o644 };
-        fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|_| {
-            CliFailure::execution(
-                "source_permissions_failed",
-                "source permissions could not be set",
-            )
-        })?;
-    }
-    #[cfg(not(unix))]
-    let _ = executable;
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = if executable { 0o755 } else { 0o644 };
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|_| {
+        CliFailure::execution(
+            "source_permissions_failed",
+            "source permissions could not be set",
+        )
+    })?;
     Ok(())
 }
 
@@ -3074,6 +3262,9 @@ fn validate_private_owned_directory(
     worker_root: &Utf8Path,
     directory: &Utf8Path,
 ) -> Result<(), CliFailure> {
+    #[cfg(not(unix))]
+    let _ = worker_root;
+    #[cfg(unix)]
     let root_metadata = fs::symlink_metadata(worker_root).map_err(|_| {
         CliFailure::input(
             "invalid_worker_root",
@@ -3139,6 +3330,9 @@ fn validate_owned_job_root(
 }
 
 fn validate_private_marker(job_root: &Utf8Path, marker: &Utf8Path) -> Result<(), CliFailure> {
+    #[cfg(not(unix))]
+    let _ = job_root;
+    #[cfg(unix)]
     let job_metadata = fs::symlink_metadata(job_root).map_err(|_| {
         CliFailure::cleanup("cleanup_marker_invalid", "worker cleanup marker is invalid")
     })?;
@@ -3451,6 +3645,7 @@ fn run_git(root: &Utf8Path, arguments: &[&str]) -> Result<GitResult, CliFailure>
         .env("LC_ALL", "C")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -3848,8 +4043,11 @@ fn map_pipeline_error(error: PipelineError) -> CliFailure {
 #[cfg(test)]
 mod tests {
     use rustferry_remote::{
-        BuildProfile, BundleIdentifier, CURRENT_PROTOCOL_VERSION, DevicePlan, SigningPlan,
-        SigningTarget, SigningTargetKind,
+        BuildProfile, BundleIdentifier, CURRENT_PROTOCOL_VERSION, DevelopmentTeam,
+        DevelopmentTeamPlan, DevicePlan, EntitlementPlan, EntitlementSet, ProvisioningPlan,
+        ProvisioningProfileType, SigningCertificate, SigningIdentity, SigningPlan,
+        SigningPrivateKeyReference, SigningReference, SigningTarget, SigningTargetKind,
+        SourceArchive, SourceBundleDescriptor,
     };
     use sha2::Digest as _;
 
@@ -3924,6 +4122,61 @@ mod tests {
             },
             requested_artifacts: BTreeSet::from([IosArtifactType::Xcarchive]),
         }
+    }
+
+    fn valid_signed_github_request(raw_udid: &str) -> IosDeviceBuildRequest {
+        let mut request = valid_github_request();
+        let team = DevelopmentTeam::new("ABCDE12345", None).expect("team");
+        let secret =
+            |name| SecretReference::new(SecretReferenceKind::GithubActions, name).expect("secret");
+        request.signing = SigningPlan {
+            mode: SigningMode::ManualDevelopment,
+            signing: Some(SigningReference {
+                identity: SigningIdentity {
+                    certificate: SigningCertificate {
+                        common_name: "Apple Development".to_owned(),
+                        sha256_fingerprint: "a".repeat(64),
+                        team: team.clone(),
+                        expires_at_unix_seconds: u64::MAX,
+                    },
+                    private_key: SigningPrivateKeyReference {
+                        reference: secret("RUSTFERRY_GOAL3_IOS_CERTIFICATE_P12"),
+                    },
+                },
+                password: Some(secret("RUSTFERRY_GOAL3_IOS_CERTIFICATE_PASSWORD")),
+            }),
+            team: Some(DevelopmentTeamPlan {
+                expected: team.clone(),
+            }),
+            device: Some(DevicePlan::new(raw_udid, None).expect("device")),
+            targets: request.signing.targets.clone(),
+            provisioning: vec![ProvisioningPlan {
+                target: "App".to_owned(),
+                profile: secret("RUSTFERRY_GOAL3_IOS_PROVISIONING_PROFILE"),
+                profile_type: ProvisioningProfileType::Development,
+            }],
+            entitlements: vec![EntitlementPlan {
+                target: "App".to_owned(),
+                required: EntitlementSet::new(BTreeMap::new()).expect("entitlements"),
+            }],
+            allow_provisioning_updates: false,
+        };
+        request
+            .requested_artifacts
+            .extend([IosArtifactType::Ipa, IosArtifactType::SigningReport]);
+        request
+    }
+
+    fn workflow_dispatch_event(request: &IosDeviceBuildRequest, dispatch_revision: &str) -> Value {
+        serde_json::json!({
+            "inputs": {
+                "operation_id": request.operation_id,
+                "request_sha256": canonical_request_sha256(request).expect("request digest"),
+                "source_revision": request.source_revision.as_deref().expect("source revision"),
+                "dispatch_revision": dispatch_revision
+            },
+            "workflow": TEST_WORKFLOW_PATH
+        })
     }
 
     fn valid_dispatch_manifest() -> GithubDispatchManifest {
@@ -4261,55 +4514,176 @@ unsafe_code = "deny"
     }
 
     #[test]
-    fn workflow_dispatch_binds_only_the_device_udid_sha256() {
+    fn workflow_dispatch_binds_unsigned_signed_and_git_snapshot_requests() {
         const RAW_UDID: &str = "00008110-001234567890801E";
-        const UDID_SHA256: &str =
-            "4a5f50907ec074080957ea89dd35b48051f861d4e0db99a4ab391acd90fefc6d";
+        const DISPATCH_REVISION: &str = "fedcba9876543210fedcba9876543210fedcba98";
 
-        let mut request = valid_github_request();
-        request.signing.device =
-            Some(DevicePlan::new(RAW_UDID, None).expect("valid device identifier"));
-        let source_revision = request.source_revision.as_deref().expect("Git revision");
-        let event = serde_json::json!({
-            "inputs": {
-                "device_udid_sha256": UDID_SHA256,
-                "operation_id": request.operation_id.as_str(),
-                "project_path": request.source.project_path.as_str(),
-                "source_revision": source_revision
-            },
-            "workflow": TEST_WORKFLOW_PATH
-        });
-        validate_workflow_dispatch_event(
-            event.as_object().expect("event object"),
-            &request,
-            source_revision,
-            TEST_WORKFLOW_PATH,
-        )
-        .expect("hash-only workflow inputs should bind");
-        assert!(
-            !serde_json::to_string(&request)
-                .expect("request should serialize")
-                .contains(RAW_UDID)
+        let unsigned = valid_github_request();
+        let signed = valid_signed_github_request(RAW_UDID);
+        let mut git_snapshot = valid_github_request();
+        git_snapshot.source_mode = SourceMode::GitSnapshot;
+
+        for request in [&unsigned, &signed, &git_snapshot] {
+            let source_revision = request.source_revision.as_deref().expect("Git revision");
+            let event = workflow_dispatch_event(request, DISPATCH_REVISION);
+            validate_workflow_dispatch_event(
+                event.as_object().expect("event object"),
+                request,
+                source_revision,
+                DISPATCH_REVISION,
+                TEST_WORKFLOW_PATH,
+            )
+            .expect("exact public dispatch inputs bind the complete request");
+        }
+
+        let signed_event = workflow_dispatch_event(&signed, DISPATCH_REVISION);
+        let serialized_event = serde_json::to_string(&signed_event).expect("event serialization");
+        assert!(!serialized_event.contains(RAW_UDID));
+        assert_eq!(
+            signed_event["inputs"]
+                .as_object()
+                .expect("inputs")
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "dispatch_revision",
+                "operation_id",
+                "request_sha256",
+                "source_revision",
+            ])
         );
 
-        let raw_event = serde_json::json!({
-            "inputs": {
-                "device_udid": RAW_UDID,
-                "operation_id": request.operation_id.as_str(),
-                "project_path": request.source.project_path.as_str(),
-                "source_revision": source_revision
-            },
-            "workflow": TEST_WORKFLOW_PATH
-        });
+        let mut changed_device = signed.clone();
+        changed_device.signing.device =
+            Some(DevicePlan::from_sha256("b".repeat(64), None).expect("changed device"));
         let error = validate_workflow_dispatch_event(
-            raw_event.as_object().expect("event object"),
-            &request,
-            source_revision,
+            signed_event.as_object().expect("event object"),
+            &changed_device,
+            changed_device
+                .source_revision
+                .as_deref()
+                .expect("source revision"),
+            DISPATCH_REVISION,
             TEST_WORKFLOW_PATH,
         )
-        .expect_err("raw device input must be rejected");
-        assert!(!error.code.contains(RAW_UDID));
+        .expect_err("device binding inside the request hash must be immutable");
+        assert_eq!(error.code, "workflow_dispatch_mismatch");
         assert!(!error.message.contains(RAW_UDID));
+    }
+
+    #[test]
+    fn workflow_dispatch_rejects_missing_extra_and_mismatched_inputs() {
+        const DISPATCH_REVISION: &str = "fedcba9876543210fedcba9876543210fedcba98";
+        const RAW_DEVICE_INPUT: &str = "00008110-001234567890801E";
+        let request = valid_github_request();
+        let source_revision = request.source_revision.as_deref().expect("source revision");
+        let event = workflow_dispatch_event(&request, DISPATCH_REVISION);
+
+        let mut missing = event.clone();
+        missing["inputs"]
+            .as_object_mut()
+            .expect("inputs")
+            .remove("request_sha256");
+        let mut extra = event.clone();
+        extra["inputs"].as_object_mut().expect("inputs").insert(
+            "device_udid".to_owned(),
+            Value::String(RAW_DEVICE_INPUT.to_owned()),
+        );
+        for invalid in [&missing, &extra] {
+            let error = validate_workflow_dispatch_event(
+                invalid.as_object().expect("event object"),
+                &request,
+                source_revision,
+                DISPATCH_REVISION,
+                TEST_WORKFLOW_PATH,
+            )
+            .expect_err("non-exact input set must fail");
+            assert_eq!(error.code, "invalid_workflow_dispatch");
+            assert!(!error.message.contains(RAW_DEVICE_INPUT));
+        }
+
+        for name in [
+            "operation_id",
+            "request_sha256",
+            "source_revision",
+            "dispatch_revision",
+        ] {
+            let mut mismatch = event.clone();
+            mismatch["inputs"]
+                .as_object_mut()
+                .expect("inputs")
+                .insert(name.to_owned(), Value::String("mismatch".to_owned()));
+            let error = validate_workflow_dispatch_event(
+                mismatch.as_object().expect("event object"),
+                &request,
+                source_revision,
+                DISPATCH_REVISION,
+                TEST_WORKFLOW_PATH,
+            )
+            .expect_err("mismatched input must fail");
+            assert_eq!(error.code, "workflow_dispatch_mismatch");
+        }
+
+        let mut missing_workflow = event.clone();
+        missing_workflow
+            .as_object_mut()
+            .expect("event object")
+            .remove("workflow");
+        let error = validate_workflow_dispatch_event(
+            missing_workflow.as_object().expect("event object"),
+            &request,
+            source_revision,
+            DISPATCH_REVISION,
+            TEST_WORKFLOW_PATH,
+        )
+        .expect_err("workflow identity is required");
+        assert_eq!(error.code, "invalid_workflow_dispatch");
+
+        let mut wrong_workflow = event;
+        wrong_workflow["workflow"] = Value::String(".github/workflows/other.yml".to_owned());
+        let error = validate_workflow_dispatch_event(
+            wrong_workflow.as_object().expect("event object"),
+            &request,
+            source_revision,
+            DISPATCH_REVISION,
+            TEST_WORKFLOW_PATH,
+        )
+        .expect_err("workflow identity must be exact");
+        assert_eq!(error.code, "workflow_path_mismatch");
+    }
+
+    #[test]
+    fn github_event_name_classifies_exactly_and_push_rejects_dispatch_inputs() {
+        const DISPATCH_REVISION: &str = "fedcba9876543210fedcba9876543210fedcba98";
+
+        assert_eq!(
+            github_event_kind(Some("push")).expect("push event"),
+            GithubEventKind::Push
+        );
+        assert_eq!(
+            github_event_kind(Some("workflow_dispatch")).expect("dispatch event"),
+            GithubEventKind::WorkflowDispatch
+        );
+        for value in [None, Some(""), Some("schedule"), Some("Workflow_Dispatch")] {
+            let error = github_event_kind(value).expect_err("event name must be exact");
+            assert_eq!(error.code, "invalid_event_name");
+        }
+
+        let push = serde_json::json!({ "after": DISPATCH_REVISION });
+        validate_push_event(push.as_object().expect("push object"), DISPATCH_REVISION)
+            .expect("exact push event");
+
+        let push_with_inputs = serde_json::json!({
+            "after": DISPATCH_REVISION,
+            "inputs": {}
+        });
+        let error = validate_push_event(
+            push_with_inputs.as_object().expect("push object"),
+            DISPATCH_REVISION,
+        )
+        .expect_err("push event must not carry dispatch inputs");
+        assert_eq!(error.code, "invalid_push_event");
     }
 
     #[test]
@@ -4403,6 +4777,81 @@ unsafe_code = "deny"
         assert!(!safe_ref_operation("job:unsafe"));
         assert!(!safe_ref_operation("../job"));
         assert!(!safe_ref_operation("job.lock"));
+    }
+
+    #[test]
+    fn github_git_snapshot_descriptor_binds_every_request_field_except_commit_sha() {
+        let mut request = valid_github_request();
+        request.source_mode = SourceMode::GitSnapshot;
+        let descriptor = GitSnapshotDescriptor::from_request(
+            &request,
+            SourceBundleDescriptor::new(
+                SourceArchive {
+                    size: 1,
+                    sha256: "a".repeat(64),
+                },
+                request.source.clone(),
+            ),
+        )
+        .expect("snapshot descriptor");
+        descriptor
+            .validate_for_request(&request, git_snapshot_archive_limits())
+            .expect("final request binding");
+        validate_github_artifact_contract(&request).expect("Git snapshot source mode");
+
+        let mut another_revision = request.clone();
+        another_revision.source_revision = Some("f".repeat(40));
+        descriptor
+            .validate_for_request(&another_revision, git_snapshot_archive_limits())
+            .expect("commit SHA is deliberately outside the circular template");
+
+        let mut changed_product = request.clone();
+        changed_product.product_name = "Other App".to_owned();
+        assert!(
+            descriptor
+                .validate_for_request(&changed_product, git_snapshot_archive_limits())
+                .is_err()
+        );
+
+        let mut changed_repository = request;
+        changed_repository.source_repository = Some("https://github.com/example/other".to_owned());
+        assert!(
+            descriptor
+                .validate_for_request(&changed_repository, git_snapshot_archive_limits())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn git_snapshot_tree_requires_exact_regular_two_file_shape() {
+        let sha = "1".repeat(40);
+        let orphan = format!(
+            "tree {sha}\nauthor Ferry <ferry@example.invalid> 0 +0000\n\
+             committer Ferry <ferry@example.invalid> 0 +0000\n\nsource snapshot\n"
+        );
+        assert!(is_orphan_git_snapshot_commit(orphan.as_bytes()));
+        for invalid in [
+            format!("tree {sha}\nauthor Ferry <ferry@example.invalid> 0 +0000\n"),
+            orphan.replacen("tree ", "blob ", 1),
+            orphan.replacen("author ", &format!("parent {}\nauthor ", "2".repeat(40)), 1),
+        ] {
+            assert!(!is_orphan_git_snapshot_commit(invalid.as_bytes()));
+        }
+
+        let exact = format!(
+            "100644 blob {sha}\t{GIT_SNAPSHOT_DESCRIPTOR_PATH}\0\
+             100644 blob {sha}\t{GIT_SNAPSHOT_ARCHIVE_PATH}\0"
+        );
+        assert!(is_exact_git_snapshot_tree(exact.as_bytes()));
+
+        for invalid in [
+            exact.replace("100644", "120000"),
+            exact.replace(GIT_SNAPSHOT_ARCHIVE_PATH, ".rustferry/goal3/other.zip"),
+            format!("{exact}100644 blob {sha}\textra\0"),
+            exact.trim_end_matches('\0').to_owned(),
+        ] {
+            assert!(!is_exact_git_snapshot_tree(invalid.as_bytes()));
+        }
     }
 
     #[test]

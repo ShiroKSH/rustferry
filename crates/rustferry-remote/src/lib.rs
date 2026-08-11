@@ -72,8 +72,8 @@ pub use protocol::{
     IOS_DEVICE_RUST_TARGET, IOS_DEVICE_SDK, IosArtifactType, IosDeviceBuildRequest,
     IosDeviceBuildResult, JobState, ProtocolPath, ProtocolPathSemantics, ProtocolVersion,
     REMOTE_BUILD_EVENT_TYPES, RemoteBuildEvent, RemoteBuildEventKind, RemoteDiagnostic,
-    RemoteErrorInfo, canonical_request_bytes, canonical_request_sha256,
-    canonical_retry_template_sha256_v1,
+    RemoteErrorInfo, canonical_git_snapshot_request_template_sha256, canonical_request_bytes,
+    canonical_request_sha256, canonical_retry_template_sha256_v1,
 };
 pub use provider::{
     ArtifactDownloadRequest, ArtifactDownloadResult, ArtifactListRequest, BuildProvider,
@@ -102,11 +102,16 @@ pub use snapshot_session::{
     SnapshotBuildParameters, SnapshotBuildStart, SnapshotJobAccepted, SnapshotSessionError,
 };
 pub use source::{
-    IgnoreRuleReason, MAX_SOURCE_BUNDLE_DESCRIPTOR_BYTES, PlannedSourceFile, PortablePathReason,
-    SOURCE_BUNDLE_DESCRIPTOR_SCHEMA_VERSION, SourceArchive, SourceArchiveLimits,
-    SourceBundleDescriptor, SourceBundlePlan, SourceBundleRequest, SourceError, SourceLimitKind,
-    SourceLimits, SourceManifest, SourceManifestEntry, SourceMode, create_source_bundle_archive,
-    plan_source_bundle, validate_source_manifest, verify_and_extract_source_bundle,
+    GIT_SNAPSHOT_ARCHIVE_PATH, GIT_SNAPSHOT_DESCRIPTOR_PATH,
+    GIT_SNAPSHOT_DESCRIPTOR_SCHEMA_VERSION, GIT_SNAPSHOT_REF_PREFIX, GIT_SNAPSHOT_TREE_PATHS,
+    GitSnapshotDescriptor, IgnoreRuleReason, MAX_GIT_SNAPSHOT_BYTES,
+    MAX_GIT_SNAPSHOT_DESCRIPTOR_BYTES, MAX_SOURCE_BUNDLE_DESCRIPTOR_BYTES, PlannedSourceFile,
+    PortablePathReason, SOURCE_BUNDLE_DESCRIPTOR_SCHEMA_VERSION, SourceArchive,
+    SourceArchiveLimits, SourceBundleDescriptor, SourceBundlePlan, SourceBundleRequest,
+    SourceError, SourceLimitKind, SourceLimits, SourceManifest, SourceManifestEntry, SourceMode,
+    canonical_git_snapshot_descriptor_bytes, create_source_bundle_archive,
+    git_snapshot_archive_limits, git_snapshot_ref, plan_source_bundle, validate_source_manifest,
+    verify_and_extract_source_bundle, verify_and_extract_source_bundle_with_parent_handle,
     verify_materialized_bundle, verify_source_bundle_plan, verify_source_manifest,
     write_source_bundle_descriptor_file,
 };

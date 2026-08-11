@@ -361,13 +361,13 @@ pub struct IosDeviceBuildRequest {
     pub profile: BuildProfile,
     /// How the provider obtains the source.
     pub source_mode: SourceMode,
-    /// Normalized HTTPS GitHub repository URL in Git mode.
+    /// Normalized HTTPS GitHub repository URL in Git-backed source modes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_repository: Option<String>,
-    /// Exact lowercase 40-hex commit SHA in Git mode.
+    /// Exact lowercase 40-hex commit SHA in Git-backed source modes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_revision: Option<String>,
-    /// Required deterministic integrity and shape manifest for either source mode.
+    /// Required deterministic integrity and shape manifest for every source mode.
     pub source: SourceManifest,
     /// Complete declarative signing plan containing opaque references, never secret bytes.
     pub signing: SigningPlan,
@@ -414,7 +414,7 @@ impl IosDeviceBuildRequest {
         }
         validate_requested_artifact_selection(self.signing.mode, &self.requested_artifacts)?;
         match self.source_mode {
-            SourceMode::Git => {
+            SourceMode::Git | SourceMode::GitSnapshot => {
                 let repository = self.source_repository.as_deref().ok_or(
                     RemoteBuildError::InvalidEventPayload {
                         event: "ios_device_build_request",
@@ -519,6 +519,41 @@ pub fn canonical_request_sha256(request: &IosDeviceBuildRequest) -> RemoteBuildR
     Ok(hex::encode(Sha256::digest(canonical_request_bytes(
         request,
     )?)))
+}
+
+/// Return the canonical request-template SHA-256 embedded in a Git snapshot descriptor.
+///
+/// The template removes only `source_revision`, whose orphan commit SHA cannot exist until after
+/// the descriptor itself has been written into that commit. Every other request field remains
+/// covered. Callers may pass either the pre-publication request with no revision or the final
+/// request containing the exact published commit SHA.
+///
+/// # Errors
+///
+/// Returns a typed validation or serialization failure for a non-Git-snapshot request or an
+/// otherwise invalid request template.
+pub fn canonical_git_snapshot_request_template_sha256(
+    request: &IosDeviceBuildRequest,
+) -> RemoteBuildResult<String> {
+    if request.source_mode != SourceMode::GitSnapshot {
+        return Err(RemoteBuildError::InvalidEventPayload {
+            event: "ios_device_build_request",
+            reason: "Git snapshot template requires Git snapshot source mode",
+        });
+    }
+
+    let mut validated = request.clone();
+    if request.source_revision.is_none() {
+        validated.source_revision = Some("0".repeat(40));
+    }
+    validated.validate()?;
+
+    validated.source_revision = None;
+    let bytes =
+        serde_json::to_vec(&validated).map_err(|error| RemoteBuildError::Serialization {
+            message: error.to_string(),
+        })?;
+    Ok(hex::encode(Sha256::digest(bytes)))
 }
 
 /// Return the version-1 semantic retry SHA-256 for one validated request.
@@ -1315,7 +1350,7 @@ fn has_exact_extension(value: &str, expected: &str) -> bool {
         .is_some_and(|(_, extension)| extension == expected)
 }
 
-fn validate_github_repository(value: &str) -> RemoteBuildResult<()> {
+pub(crate) fn validate_github_repository(value: &str) -> RemoteBuildResult<()> {
     validate_safe_text("source_repository", value, 2048)?;
     let repository = url::Url::parse(value).map_err(|_| RemoteBuildError::InvalidIdentifier {
         field: "source_repository",

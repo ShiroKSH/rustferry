@@ -2,11 +2,26 @@
 
 use std::collections::BTreeMap;
 use std::io::Read as _;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+use cargo_ferry::job_store::{JobStore, LocalJobId};
+use rustferry_remote::{BuildProfile as RemoteBuildProfile, CancellationToken};
 
 use crate::cli::{
     AndroidBuildArgs, BuildArgs, BuildPlatform, DoctorArgs, IdeArgs, IdeBuildArgs, IdeCheckArgs,
-    IdeCommand, IdeDeploymentArgs, IdeDevicePlatform, IdeDevicesArgs, IdePlatform, IdeProfile,
-    IosBuildArgs,
+    IdeCommand, IdeDeploymentArgs, IdeDevicePlatform, IdeDevicesArgs, IdeJobArgs,
+    IdeJobArtifactArgs, IdeJobArtifactRemoveArgs, IdeJobLogsArgs, IdeJobLogsPageArgs, IdePlatform,
+    IdeProfile, IdeSigningReadinessArgs, IosBuildArgs,
+};
+use crate::commands::artifact::{
+    IdeArtifactContainerReceipt, IdeArtifactEvidenceLevel, IdeArtifactProductKind,
+    IdeArtifactProductReceipt, IdeArtifactRemoveResult, IdeArtifactSelectionReceipt,
+    IdeArtifactVerifyOutcome,
 };
 use crate::error::CliError;
 use crate::ide::protocol::{
@@ -55,6 +70,27 @@ pub fn run(arguments: IdeArgs, dry_run: bool, reporter: &Reporter) -> Result<(),
         IdeCommand::Devices(arguments) if arguments.watch => watch_devices(arguments),
         IdeCommand::Devices(arguments) => unary(discover_devices(arguments.platform)),
         IdeCommand::SigningTeams(arguments) => unary(service::signing_teams(&arguments.workspace)),
+        IdeCommand::JobsList(arguments) => {
+            unary(service::jobs_list(&arguments.workspace, arguments.limit))
+        }
+        IdeCommand::JobsShow(arguments) => {
+            unary(service::job_show(&arguments.workspace, &arguments.job))
+        }
+        IdeCommand::JobsArtifacts(arguments) => direct_unary(|| job_artifacts(&arguments)),
+        IdeCommand::JobsLogs(arguments) => direct_unary(|| job_logs(&arguments)),
+        IdeCommand::JobsLogsPage(arguments) => direct_unary(|| job_logs_page(&arguments)),
+        IdeCommand::JobsCancel(arguments) => direct_unary(|| job_cancel(&arguments)),
+        IdeCommand::JobsRetry(arguments) => direct_unary(|| job_retry(&arguments)),
+        IdeCommand::JobsArtifactVerify(arguments) => direct_unary(|| artifact_verify(&arguments)),
+        IdeCommand::JobsArtifactReveal(arguments) => direct_unary(|| artifact_reveal(&arguments)),
+        IdeCommand::JobsArtifactRemove(arguments) => direct_unary(|| artifact_remove(&arguments)),
+        IdeCommand::RemoteBuildPreview(arguments) => {
+            direct_unary(|| remote_build_preview(&arguments))
+        }
+        IdeCommand::RemoteBuildSubmit(arguments) => {
+            direct_unary(|| remote_build_submit(&arguments))
+        }
+        IdeCommand::SigningReadiness(arguments) => direct_unary(|| signing_readiness(&arguments)),
         IdeCommand::Check(arguments) => check(arguments, dry_run, reporter),
         IdeCommand::Build(arguments) => build(arguments, dry_run, reporter),
         IdeCommand::Install(arguments) => install(&arguments, dry_run, reporter),
@@ -71,7 +107,726 @@ pub fn run(arguments: IdeArgs, dry_run: bool, reporter: &Reporter) -> Result<(),
     }
 }
 
+fn job_logs_page(arguments: &IdeJobLogsPageArgs) -> Result<(), CliError> {
+    let binding = service::IdeJobWorkspaceBinding::capture(&arguments.workspace)?;
+    let store = JobStore::open_default_read_only()?;
+    let cancellation = ProcessCancellation::new()?;
+    let page = super::jobs::logs_page_for_project(
+        &store,
+        &arguments.job,
+        binding.canonical_root(),
+        binding.filesystem_identity(),
+        arguments.after_sequence,
+        arguments.limit,
+        arguments.phase.as_deref(),
+        arguments.refresh,
+        arguments.wait,
+        cancellation.token(),
+    )?;
+    if page.local_job_id != arguments.job.as_str()
+        || page.after_sequence != arguments.after_sequence
+        || page.limit != arguments.limit
+        || page.phase != arguments.phase
+        || page.returned != page.events.len()
+        || page.returned > page.limit
+        || !matches!(
+            page.log_scope.as_str(),
+            "durable_sanitized_lifecycle_events" | "durable_sanitized_job_events"
+        )
+        || (page.log_scope == "durable_sanitized_lifecycle_events" && page.provider_full_logs)
+    {
+        return Err(ide_jobs_contract_error(
+            "job_log_page_binding_invalid",
+            "the bounded job log page does not bind the exact request and journal scope",
+        ));
+    }
+    let mut previous = arguments.after_sequence;
+    let mut events = Vec::with_capacity(page.events.len());
+    for event in page.events {
+        if event.sequence <= previous {
+            return Err(ide_jobs_contract_error(
+                "job_log_page_sequence_invalid",
+                "job log event sequences do not strictly advance after the request cursor",
+            ));
+        }
+        previous = event.sequence;
+        events.push(service::job_log_event(event)?);
+    }
+    if page.next_after_sequence != previous || (page.has_more && events.is_empty()) {
+        return Err(ide_jobs_contract_error(
+            "job_log_page_cursor_invalid",
+            "the bounded job log page returned an inconsistent next cursor",
+        ));
+    }
+    binding.verify()?;
+    unary(Ok(crate::ide::protocol::JobLogsPageResponse {
+        protocol_version: PROTOCOL_VERSION,
+        workspace: binding.requested().to_owned(),
+        local_job_id: page.local_job_id,
+        log_scope: page.log_scope,
+        provider_full_logs: page.provider_full_logs,
+        after_sequence: page.after_sequence.to_string(),
+        phase: page.phase,
+        limit: page.limit,
+        returned: events.len(),
+        next_after_sequence: page.next_after_sequence.to_string(),
+        has_more: page.has_more,
+        terminal: page.terminal,
+        events,
+    }))
+}
+
+fn job_cancel(arguments: &IdeJobArgs) -> Result<(), CliError> {
+    let binding = service::IdeJobWorkspaceBinding::capture(&arguments.workspace)?;
+    let store = JobStore::open_default()?;
+    let cancellation = ProcessCancellation::new()?;
+    let result = super::jobs::cancel_for_project(
+        &store,
+        &arguments.job,
+        binding.canonical_root(),
+        binding.filesystem_identity(),
+        cancellation.token().clone(),
+    )?;
+    if !result.durable || result.parent.local_job_id != arguments.job.as_str() {
+        return Err(ide_jobs_contract_error(
+            "job_cancellation_receipt_invalid",
+            "the cancellation result does not bind one durable exact-parent mutation",
+        ));
+    }
+    let eligibility = service::job_action_eligibility_for_project(
+        &store,
+        &arguments.job,
+        &binding,
+        result.parent.revision,
+    )?;
+    binding.verify()?;
+    let parent = service::job_details(result.parent, eligibility)?;
+    unary(Ok(crate::ide::protocol::JobCancelResponse {
+        protocol_version: PROTOCOL_VERSION,
+        workspace: binding.requested().to_owned(),
+        receipt: crate::ide::protocol::JobCancellationReceipt {
+            kind: "cancellation_requested".to_owned(),
+            parent_local_job_id: parent.local_job_id.clone(),
+            durable: true,
+            revision: parent.revision,
+        },
+        parent,
+    }))
+}
+
+fn job_retry(arguments: &IdeJobArgs) -> Result<(), CliError> {
+    let binding = service::IdeJobWorkspaceBinding::capture(&arguments.workspace)?;
+    let store = JobStore::open_default()?;
+    let cancellation = ProcessCancellation::new()?;
+    let result = super::jobs::retry_for_project(
+        &store,
+        &arguments.job,
+        binding.canonical_root(),
+        binding.filesystem_identity(),
+        cancellation.token().clone(),
+    )?;
+    let parent_attempt = result.parent.retry.attempt;
+    let child_attempt = result.child.retry.attempt;
+    if !result.durable
+        || result.parent.local_job_id != arguments.job.as_str()
+        || result.parent.local_job_id == result.child.local_job_id
+        || result.parent.revision != result.parent_revision
+        || result.child.revision != result.child_revision
+        || result.child.retry.parent_job_id.as_deref() != Some(result.parent.local_job_id.as_str())
+        || !retry_attempt_advances(parent_attempt, child_attempt)
+        || result.parent.semantic_retry_sha256 != result.child.semantic_retry_sha256
+        || result.parent.source_manifest_sha256 != result.child.source_manifest_sha256
+        || !result
+            .parent
+            .retry
+            .child_job_ids
+            .contains(&result.child.local_job_id)
+        || result.child_created == result.resumed_existing_child
+    {
+        return Err(ide_jobs_contract_error(
+            "job_retry_receipt_invalid",
+            "the retry result does not bind one distinct exact parent/child lineage",
+        ));
+    }
+    let child_local_job_id = LocalJobId::new(result.child.local_job_id.clone()).map_err(|_| {
+        ide_jobs_contract_error(
+            "job_retry_child_identity_invalid",
+            "the durable retry returned an invalid child job identity",
+        )
+    })?;
+    let parent_eligibility = service::job_action_eligibility_for_project(
+        &store,
+        &arguments.job,
+        &binding,
+        result.parent.revision,
+    )?;
+    let child_eligibility = service::job_action_eligibility_for_project(
+        &store,
+        &child_local_job_id,
+        &binding,
+        result.child.revision,
+    )?;
+    binding.verify()?;
+    let parent = service::job_details(result.parent, parent_eligibility)?;
+    let child = service::job_details(result.child, child_eligibility)?;
+    let disposition = if result.child_created {
+        "created"
+    } else {
+        "resumed_existing"
+    };
+    unary(Ok(crate::ide::protocol::JobRetryResponse {
+        protocol_version: PROTOCOL_VERSION,
+        workspace: binding.requested().to_owned(),
+        lineage: crate::ide::protocol::JobRetryBinding {
+            parent_local_job_id: parent.local_job_id.clone(),
+            child_local_job_id: child.local_job_id.clone(),
+            attempt: child.retry.attempt,
+        },
+        receipt: crate::ide::protocol::JobRetryReceipt {
+            kind: "retry_created".to_owned(),
+            durable: true,
+            disposition: disposition.to_owned(),
+        },
+        parent,
+        child,
+    }))
+}
+
+const fn retry_attempt_advances(parent_attempt: u32, child_attempt: u32) -> bool {
+    matches!(parent_attempt.checked_add(1), Some(expected) if expected == child_attempt)
+}
+
+fn ide_jobs_contract_error(code: &'static str, message: &'static str) -> CliError {
+    CliError::JobsLifecycle {
+        code,
+        message: message.to_owned(),
+        help: "Preserve the durable job state and retry the exact workspace-bound operation."
+            .to_owned(),
+        details: Vec::new(),
+    }
+}
+
+fn signing_readiness(arguments: &IdeSigningReadinessArgs) -> Result<(), CliError> {
+    let binding = service::IdeJobWorkspaceBinding::capture(&arguments.workspace)?;
+    let readiness = super::platform_build::ide_signing_readiness(camino::Utf8Path::new(
+        binding.canonical_root(),
+    ))?;
+    if readiness.checks.is_empty() || readiness.checks.len() > 64 {
+        return Err(CliError::JobsLifecycle {
+            code: "signing_readiness_checks_invalid",
+            message: "signing readiness returned an invalid number of sanitized checks".to_owned(),
+            help: "Keep the project configuration stable and retry with a compatible server."
+                .to_owned(),
+            details: Vec::new(),
+        });
+    }
+    let checks = readiness
+        .checks
+        .into_iter()
+        .map(|check| {
+            Ok(crate::ide::protocol::SigningReadinessCheck {
+                code: service::protocol_reason_code(check.code, "signing readiness check code")?,
+                required: check.required,
+                ready: check.ready,
+                reason_code: service::eligibility_reason(
+                    check.ready,
+                    check.reason_code.map(ToOwned::to_owned),
+                    "signing readiness check",
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>, CliError>>()?;
+    let computed_ready = checks.iter().all(|check| !check.required || check.ready);
+    if readiness.ready != computed_ready {
+        return Err(CliError::JobsLifecycle {
+            code: "signing_readiness_summary_invalid",
+            message: "signing readiness does not match its required sanitized checks".to_owned(),
+            help: "Keep the project configuration stable and retry with a compatible server."
+                .to_owned(),
+            details: Vec::new(),
+        });
+    }
+    binding.verify()?;
+    unary(Ok(crate::ide::protocol::SigningReadinessResponse {
+        protocol_version: PROTOCOL_VERSION,
+        workspace: binding.requested().to_owned(),
+        provider: "github".to_owned(),
+        target: "ios-device".to_owned(),
+        mode: "github_actions_ios_signing".to_owned(),
+        ready: readiness.ready,
+        checks,
+    }))
+}
+
+fn job_artifacts(arguments: &IdeJobArgs) -> Result<(), CliError> {
+    let binding = service::IdeJobWorkspaceBinding::capture(&arguments.workspace)?;
+    let store = JobStore::open_default_read_only()?;
+    let result = super::jobs::artifacts_for_project(
+        &store,
+        &arguments.job,
+        binding.canonical_root(),
+        binding.filesystem_identity(),
+    )?;
+    if result.local_job_id != arguments.job.as_str() {
+        return Err(ide_jobs_contract_error(
+            "artifact_job_binding_invalid",
+            "the artifact list does not bind the exact requested job",
+        ));
+    }
+    let mut artifacts = Vec::with_capacity(result.artifacts.len());
+    for artifact in result.artifacts {
+        let eligibility = super::artifact::ide_artifact_eligibility_for_project(
+            binding.canonical_root(),
+            binding.filesystem_identity(),
+            &arguments.job,
+            &artifact.artifact_id,
+        )?;
+        let eligibility = service::artifact_action_eligibility(
+            eligibility.can_verify,
+            eligibility.verify_reason_code,
+            eligibility.can_reveal,
+            eligibility.reveal_reason_code,
+            eligibility.can_remove,
+            eligibility.remove_reason_code,
+        )?;
+        artifacts.push(service::job_artifact(artifact, eligibility)?);
+    }
+    let latest = super::jobs::show_for_project(
+        &store,
+        &arguments.job,
+        binding.canonical_root(),
+        binding.filesystem_identity(),
+    )?;
+    if latest.local_job_id != arguments.job.as_str() || latest.revision != result.revision {
+        return Err(CliError::JobsLifecycle {
+            code: "artifact_job_revision_changed",
+            message: "the selected job changed while artifact eligibility was inspected".to_owned(),
+            help:
+                "Retry the exact workspace and job selector to read one stable artifact snapshot."
+                    .to_owned(),
+            details: Vec::new(),
+        });
+    }
+    binding.verify()?;
+    unary(Ok(crate::ide::protocol::JobArtifactsResponse {
+        protocol_version: PROTOCOL_VERSION,
+        workspace: binding.requested().to_owned(),
+        local_job_id: result.local_job_id,
+        revision: service::safe_number(result.revision, "job revision")?,
+        artifacts,
+    }))
+}
+
+fn remote_build_preview(arguments: &crate::cli::IdeRemoteBuildPreviewArgs) -> Result<(), CliError> {
+    let binding = service::IdeJobWorkspaceBinding::capture(&arguments.workspace)?;
+    let profile = remote_build_profile(arguments.profile);
+    let preview = super::platform_build::ide_snapshot_preview(
+        camino::Utf8Path::new(binding.canonical_root()),
+        profile,
+    )?;
+    let valid_token = (32..=512).contains(&preview.consent_token.len())
+        && preview
+            .consent_token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    if !valid_token
+        || !service::valid_sha256(&preview.preview_sha256)
+        || !service::valid_sha256(&preview.source_manifest_sha256)
+        || preview.effects.is_empty()
+        || preview.effects.len() > 64
+        || preview
+            .effects
+            .iter()
+            .any(|effect| !service::valid_bounded_protocol_text(effect, 4_096))
+    {
+        return Err(ide_consent_error(
+            "remote_build_preview_invalid",
+            "the zero-write preview does not satisfy the frozen IDE contract",
+        ));
+    }
+    binding.verify()?;
+    unary(Ok(crate::ide::protocol::RemoteBuildPreviewResponse {
+        protocol_version: PROTOCOL_VERSION,
+        workspace: binding.requested().to_owned(),
+        provider: "github".to_owned(),
+        target: "ios-device".to_owned(),
+        profile: remote_build_profile_name(profile).to_owned(),
+        signing_mode: "unsigned".to_owned(),
+        source_mode: "snapshot".to_owned(),
+        preview_sha256: preview.preview_sha256,
+        consent_token: preview.consent_token,
+        source: crate::ide::protocol::RemoteBuildPreviewSource {
+            manifest_sha256: preview.source_manifest_sha256,
+            file_count: preview.file_count.to_string(),
+            total_bytes: preview.total_bytes.to_string(),
+        },
+        effects: preview.effects,
+        consent_required: true,
+    }))
+}
+
+fn remote_build_submit(arguments: &crate::cli::IdeRemoteBuildSubmitArgs) -> Result<(), CliError> {
+    let consent = read_remote_build_consent()?;
+    let binding = service::IdeJobWorkspaceBinding::capture(&arguments.workspace)?;
+    let cancellation = ProcessCancellation::new()?;
+    let submission = super::platform_build::ide_snapshot_submit(
+        camino::Utf8Path::new(binding.canonical_root()),
+        &super::platform_build::IdeSnapshotConsent {
+            token: consent.consent_token,
+            preview_sha256: consent.preview_sha256.clone(),
+            approved: consent.approved,
+        },
+        cancellation.token(),
+    )?;
+    binding.verify()?;
+    if submission.preview_sha256 != consent.preview_sha256 {
+        return Err(ide_consent_error(
+            "remote_build_consent_mismatch",
+            "the durable snapshot submission does not bind the approved preview digest",
+        ));
+    }
+    let local_job_id = LocalJobId::new(submission.local_job_id.clone()).map_err(|_| {
+        ide_consent_error(
+            "remote_build_job_identity_invalid",
+            "the durable snapshot submission returned an invalid local job identity",
+        )
+    })?;
+    let store = JobStore::open_default_read_only()?;
+    let job = super::jobs::show_for_project(
+        &store,
+        &local_job_id,
+        binding.canonical_root(),
+        binding.filesystem_identity(),
+    )?;
+    let eligibility =
+        service::job_action_eligibility_for_project(&store, &local_job_id, &binding, job.revision)?;
+    binding.verify()?;
+    if job.local_job_id != submission.local_job_id
+        || job.revision != submission.revision
+        || job.source_manifest_sha256 != submission.source_manifest_sha256
+        || job.profile != remote_build_profile_name(submission.profile)
+    {
+        return Err(ide_consent_error(
+            "remote_build_job_identity_mismatch",
+            "the durable snapshot job changed before its IDE receipt was bound",
+        ));
+    }
+    let job = service::job_details(job, eligibility)?;
+    if job.provider.name != "github"
+        || job.target != "iphone"
+        || job.signing_mode != "unsigned-compile-only"
+    {
+        return Err(ide_consent_error(
+            "remote_build_job_identity_mismatch",
+            "the durable snapshot job does not match the approved provider, target, and signing mode",
+        ));
+    }
+    unary(Ok(crate::ide::protocol::RemoteBuildSubmissionResponse {
+        protocol_version: PROTOCOL_VERSION,
+        workspace: binding.requested().to_owned(),
+        job,
+        receipt: crate::ide::protocol::RemoteBuildSubmissionReceipt {
+            kind: "remote_build_submitted".to_owned(),
+            durable: true,
+            source_mode: "snapshot".to_owned(),
+            preview_sha256: submission.preview_sha256,
+        },
+    }))
+}
+
+const fn remote_build_profile(profile: IdeProfile) -> RemoteBuildProfile {
+    match profile {
+        IdeProfile::Debug => RemoteBuildProfile::Debug,
+        IdeProfile::Release => RemoteBuildProfile::Release,
+    }
+}
+
+const fn remote_build_profile_name(profile: RemoteBuildProfile) -> &'static str {
+    match profile {
+        RemoteBuildProfile::Debug => "debug",
+        RemoteBuildProfile::Release => "release",
+    }
+}
+
+struct ProcessCancellation {
+    token: CancellationToken,
+    stopped: Arc<AtomicBool>,
+    monitor: Option<JoinHandle<()>>,
+}
+
+impl ProcessCancellation {
+    fn new() -> Result<Self, CliError> {
+        let token = CancellationToken::new();
+        if rustferry_core::process_control::interrupt_requested() {
+            token.cancel();
+        }
+        let stopped = Arc::new(AtomicBool::new(false));
+        let monitor_token = token.clone();
+        let monitor_stopped = Arc::clone(&stopped);
+        let monitor = std::thread::Builder::new()
+            .name("rustferry-ide-cancellation".to_owned())
+            .spawn(move || {
+                while !monitor_stopped.load(Ordering::Acquire) {
+                    if rustferry_core::process_control::interrupt_requested() {
+                        monitor_token.cancel();
+                        break;
+                    }
+                    std::thread::park_timeout(Duration::from_millis(25));
+                }
+            })
+            .map_err(|source| CliError::Io {
+                action: "start IDE cancellation monitor",
+                path: camino::Utf8PathBuf::from("<process>"),
+                source,
+            })?;
+        Ok(Self {
+            token,
+            stopped,
+            monitor: Some(monitor),
+        })
+    }
+
+    const fn token(&self) -> &CancellationToken {
+        &self.token
+    }
+}
+
+impl Drop for ProcessCancellation {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Release);
+        if let Some(monitor) = self.monitor.take() {
+            monitor.thread().unpark();
+            let _ = monitor.join();
+        }
+    }
+}
+
+fn artifact_verify(arguments: &IdeJobArtifactArgs) -> Result<(), CliError> {
+    let binding = service::IdeJobWorkspaceBinding::capture(&arguments.workspace)?;
+    let receipt = super::artifact::ide_verify_for_project(
+        binding.canonical_root(),
+        binding.filesystem_identity(),
+        &arguments.job,
+        &arguments.artifact,
+    )?;
+    validate_artifact_selection(&receipt.artifact, &arguments.job, &arguments.artifact)?;
+    let product_evidence_unavailable = matches!(
+        &receipt.product,
+        IdeArtifactProductReceipt::EvidenceUnavailable { .. }
+    );
+    if matches!(
+        receipt.outcome,
+        IdeArtifactVerifyOutcome::EvidenceUnavailable
+    ) != product_evidence_unavailable
+        || !service::valid_sha256(&receipt.integrity.sha256)
+        || !service::valid_bounded_protocol_text(&receipt.integrity.filesystem_identity, 4_096)
+        || receipt
+            .validation_levels
+            .iter()
+            .any(|level| !service::valid_bounded_protocol_text(level, 4_096))
+    {
+        return Err(ide_artifact_contract_error(
+            "artifact verification evidence does not satisfy the frozen IDE contract",
+        ));
+    }
+    binding.verify()?;
+    let identity = crate::ide::protocol::ArtifactActionIdentity {
+        protocol_version: PROTOCOL_VERSION,
+        workspace: binding.requested().to_owned(),
+        local_job_id: receipt.artifact.local_job_id,
+        artifact_id: receipt.artifact.artifact_id,
+        revision: service::safe_number(receipt.artifact.revision, "artifact job revision")?,
+    };
+    let outcome = match receipt.outcome {
+        IdeArtifactVerifyOutcome::Verified => "verified",
+        IdeArtifactVerifyOutcome::EvidenceUnavailable => "evidence_unavailable",
+    }
+    .to_owned();
+    let evidence_level = match receipt.evidence_level {
+        IdeArtifactEvidenceLevel::Integrity => "integrity",
+        IdeArtifactEvidenceLevel::ArchiveSafety => "archive_safety",
+        IdeArtifactEvidenceLevel::Product => "product",
+        IdeArtifactEvidenceLevel::CrossValidated => "cross_validated",
+    }
+    .to_owned();
+    let container = match receipt.integrity.container {
+        IdeArtifactContainerReceipt::Opaque => {
+            crate::ide::protocol::ArtifactContainerEvidence::Opaque
+        }
+        IdeArtifactContainerReceipt::Zip {
+            entry_count,
+            expanded_size,
+        } => crate::ide::protocol::ArtifactContainerEvidence::Zip {
+            entry_count: entry_count.to_string(),
+            expanded_size: expanded_size.to_string(),
+        },
+    };
+    let product = match receipt.product {
+        IdeArtifactProductReceipt::Verified { kind } => {
+            crate::ide::protocol::ArtifactProductEvidence::Verified {
+                kind: match kind {
+                    IdeArtifactProductKind::UnsignedXcarchive => "unsigned_xcarchive",
+                    IdeArtifactProductKind::Ipa => "ipa",
+                    IdeArtifactProductKind::SignedArtifactSet => "signed_artifact_set",
+                }
+                .to_owned(),
+            }
+        }
+        IdeArtifactProductReceipt::NotApplicable => {
+            crate::ide::protocol::ArtifactProductEvidence::NotApplicable
+        }
+        IdeArtifactProductReceipt::EvidenceUnavailable { reason_code } => {
+            crate::ide::protocol::ArtifactProductEvidence::EvidenceUnavailable {
+                reason_code: service::protocol_reason_code(
+                    reason_code.to_owned(),
+                    "artifact evidence reason",
+                )?,
+            }
+        }
+    };
+    unary(Ok(crate::ide::protocol::ArtifactVerifyResponse {
+        identity,
+        status: outcome.clone(),
+        outcome,
+        evidence_level,
+        integrity: crate::ide::protocol::ArtifactIntegrityEvidence {
+            size: receipt.integrity.size.to_string(),
+            sha256: receipt.integrity.sha256,
+            filesystem_identity: receipt.integrity.filesystem_identity,
+            container,
+        },
+        product,
+        validation_levels: receipt.validation_levels,
+        signed_cleanup_evidence_bound: receipt.signed_cleanup_evidence_bound,
+    }))
+}
+
+fn artifact_reveal(arguments: &IdeJobArtifactArgs) -> Result<(), CliError> {
+    let binding = service::IdeJobWorkspaceBinding::capture(&arguments.workspace)?;
+    let receipt = super::artifact::ide_reveal_for_project(
+        binding.canonical_root(),
+        binding.filesystem_identity(),
+        &arguments.job,
+        &arguments.artifact,
+    )?;
+    validate_artifact_selection(&receipt.artifact, &arguments.job, &arguments.artifact)?;
+    if receipt.environment_policy != "fixed_no_inheritance"
+        || !receipt.launch_requested
+        || receipt.post_launch_revalidation != "passed"
+        || !service::valid_bounded_protocol_text(&receipt.launcher, 4_096)
+    {
+        return Err(ide_artifact_contract_error(
+            "artifact reveal receipt does not satisfy the frozen IDE contract",
+        ));
+    }
+    binding.verify()?;
+    unary(Ok(crate::ide::protocol::ArtifactRevealResponse {
+        identity: crate::ide::protocol::ArtifactActionIdentity {
+            protocol_version: PROTOCOL_VERSION,
+            workspace: binding.requested().to_owned(),
+            local_job_id: receipt.artifact.local_job_id,
+            artifact_id: receipt.artifact.artifact_id,
+            revision: service::safe_number(receipt.artifact.revision, "artifact job revision")?,
+        },
+        receipt: crate::ide::protocol::ArtifactRevealReceipt {
+            launcher: receipt.launcher,
+            environment_policy: receipt.environment_policy.to_owned(),
+            launch_requested: receipt.launch_requested,
+            exact_path_bound_during_launch: receipt.exact_path_bound_during_launch,
+            post_launch_revalidation: receipt.post_launch_revalidation.to_owned(),
+        },
+        status: "revealed".to_owned(),
+    }))
+}
+
+fn artifact_remove(arguments: &IdeJobArtifactRemoveArgs) -> Result<(), CliError> {
+    let binding = service::IdeJobWorkspaceBinding::capture(&arguments.workspace)?;
+    let receipt = super::artifact::ide_remove_for_project(
+        binding.canonical_root(),
+        binding.filesystem_identity(),
+        &arguments.job,
+        &arguments.artifact,
+        arguments.yes,
+    )?;
+    validate_artifact_selection(&receipt.artifact, &arguments.job, &arguments.artifact)?;
+    let consistent = match receipt.result_state {
+        IdeArtifactRemoveResult::Removed => {
+            receipt.executed && !receipt.already_complete && !receipt.replacement_preserved
+        }
+        IdeArtifactRemoveResult::AlreadyRemoved => {
+            !receipt.executed && receipt.already_complete && !receipt.replacement_preserved
+        }
+        IdeArtifactRemoveResult::ReplacementPreserved => {
+            !receipt.executed && !receipt.already_complete && receipt.replacement_preserved
+        }
+    };
+    if !receipt.confirmation_provided || !consistent {
+        return Err(ide_artifact_contract_error(
+            "artifact removal receipt does not satisfy the frozen IDE contract",
+        ));
+    }
+    binding.verify()?;
+    let status = match receipt.result_state {
+        IdeArtifactRemoveResult::Removed => "removed",
+        IdeArtifactRemoveResult::AlreadyRemoved => "already_removed",
+        IdeArtifactRemoveResult::ReplacementPreserved => "replacement_preserved",
+    }
+    .to_owned();
+    unary(Ok(crate::ide::protocol::ArtifactRemoveResponse {
+        identity: crate::ide::protocol::ArtifactActionIdentity {
+            protocol_version: PROTOCOL_VERSION,
+            workspace: binding.requested().to_owned(),
+            local_job_id: receipt.artifact.local_job_id,
+            artifact_id: receipt.artifact.artifact_id,
+            revision: service::safe_number(receipt.artifact.revision, "artifact job revision")?,
+        },
+        receipt: crate::ide::protocol::ArtifactRemoveReceipt {
+            confirmation_provided: receipt.confirmation_provided,
+            executed: receipt.executed,
+            result_state: status.clone(),
+            already_complete: receipt.already_complete,
+            replacement_preserved: receipt.replacement_preserved,
+        },
+        status,
+        replacement_preserved: receipt.replacement_preserved,
+    }))
+}
+
+fn validate_artifact_selection(
+    selection: &IdeArtifactSelectionReceipt,
+    local_job_id: &LocalJobId,
+    artifact_id: &str,
+) -> Result<(), CliError> {
+    if selection.local_job_id == local_job_id.as_str() && selection.artifact_id == artifact_id {
+        Ok(())
+    } else {
+        Err(ide_artifact_contract_error(
+            "artifact action receipt does not bind the exact job and artifact selector",
+        ))
+    }
+}
+
+fn ide_artifact_contract_error(message: &'static str) -> CliError {
+    CliError::JobsLifecycle {
+        code: "artifact_action_receipt_invalid",
+        message: message.to_owned(),
+        help: "Preserve the retained artifact and retry the exact workspace, job, and artifact selector."
+            .to_owned(),
+        details: Vec::new(),
+    }
+}
+
+fn job_logs(arguments: &IdeJobLogsArgs) -> Result<(), CliError> {
+    unary(service::job_logs(
+        &arguments.workspace,
+        &arguments.job,
+        arguments.since,
+        arguments.phase.as_deref(),
+    ))
+}
+
 const IDE_MANIFEST_STDIN_LIMIT: usize = 1024 * 1024;
+const IDE_CONSENT_STDIN_LIMIT: usize = 16 * 1024;
 
 fn read_manifest_stdin() -> Result<String, CliError> {
     let mut bytes = Vec::new();
@@ -90,6 +845,59 @@ fn read_manifest_stdin() -> Result<String, CliError> {
         });
     }
     String::from_utf8(bytes).map_err(|_| CliError::IdeManifestInputInvalidUtf8)
+}
+
+fn read_remote_build_consent() -> Result<crate::ide::protocol::RemoteBuildConsent, CliError> {
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .lock()
+        .take((IDE_CONSENT_STDIN_LIMIT + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|source| CliError::Io {
+            action: "read IDE remote-build consent",
+            path: camino::Utf8PathBuf::from("<stdin>"),
+            source,
+        })?;
+    if bytes.len() > IDE_CONSENT_STDIN_LIMIT {
+        return Err(ide_consent_error(
+            "remote_build_consent_too_large",
+            "the IDE remote-build consent exceeds the bounded input size",
+        ));
+    }
+    let consent = serde_json::from_slice::<crate::ide::protocol::RemoteBuildConsent>(&bytes)
+        .map_err(|_| {
+            ide_consent_error(
+                "remote_build_consent_invalid",
+                "the IDE remote-build consent is not the exact versioned JSON object",
+            )
+        })?;
+    let valid_token = (32..=512).contains(&consent.consent_token.len())
+        && consent
+            .consent_token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    let valid_sha = consent.preview_sha256.len() == 64
+        && consent
+            .preview_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'));
+    if !consent.approved || !valid_token || !valid_sha {
+        return Err(ide_consent_error(
+            "remote_build_consent_invalid",
+            "the IDE remote-build consent is missing its exact approval, token, or preview digest",
+        ));
+    }
+    Ok(consent)
+}
+
+fn ide_consent_error(code: &'static str, message: &'static str) -> CliError {
+    CliError::JobsLifecycle {
+        code,
+        message: message.to_owned(),
+        help: "Request a new zero-write preview and approve only its exact current consent object."
+            .to_owned(),
+        details: Vec::new(),
+    }
 }
 
 fn discover_devices(platform: IdeDevicePlatform) -> Result<DeviceSnapshotResponse, CliError> {
@@ -336,6 +1144,13 @@ fn unary<T: serde::Serialize>(result: Result<T, CliError>) -> Result<(), CliErro
             write_compact(&service::error_response(&error)).map_err(stdout_error)?;
             Err(CliError::AlreadyReported { exit_code })
         }
+    }
+}
+
+fn direct_unary(operation: impl FnOnce() -> Result<(), CliError>) -> Result<(), CliError> {
+    match operation() {
+        Err(error) if !error.is_already_reported() => unary::<serde_json::Value>(Err(error)),
+        result => result,
     }
 }
 
@@ -605,6 +1420,8 @@ fn build(arguments: IdeBuildArgs, dry_run: bool, reporter: &Reporter) -> Result<
             remote: None,
             config_dir: None,
             unsigned: false,
+            snapshot: false,
+            yes: false,
             artifact: None,
             include_dsym: false,
             project_dir: Some(root.clone()),
@@ -1170,6 +1987,8 @@ fn build_deployment_artifact(
             remote: None,
             config_dir: None,
             unsigned: false,
+            snapshot: false,
+            yes: false,
             artifact: None,
             include_dsym: false,
             project_dir: Some(root.to_owned()),
@@ -1808,16 +2627,41 @@ fn stdout_error(source: std::io::Error) -> CliError {
 
 fn absolute_display_path(path: &camino::Utf8Path) -> String {
     if let Ok(canonical) = path.canonicalize_utf8() {
-        return canonical.to_string();
+        return service::protocol_display_path(&canonical);
     }
     if path.is_absolute() {
-        return path.to_string();
+        return service::protocol_display_path(path);
     }
     std::env::current_dir()
         .ok()
         .and_then(|directory| camino::Utf8PathBuf::from_path_buf(directory).ok())
         .map_or_else(
             || path.to_string(),
-            |directory| directory.join(path).to_string(),
+            |directory| service::protocol_display_path(&directory.join(path)),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use cargo_ferry::job_store::LocalJobId;
+
+    use super::{IdeArtifactSelectionReceipt, retry_attempt_advances, validate_artifact_selection};
+
+    #[test]
+    fn retry_attempt_increment_fails_closed_on_overflow() {
+        assert!(retry_attempt_advances(0, 1));
+        assert!(!retry_attempt_advances(u32::MAX, 0));
+    }
+
+    #[test]
+    fn artifact_receipt_must_echo_both_exact_selectors() {
+        let job = LocalJobId::new("job-contract-1".to_owned()).expect("valid job ID");
+        let selection = IdeArtifactSelectionReceipt {
+            local_job_id: job.as_str().to_owned(),
+            artifact_id: "artifact:1".to_owned(),
+            revision: 1,
+        };
+        assert!(validate_artifact_selection(&selection, &job, "artifact:1").is_ok());
+        assert!(validate_artifact_selection(&selection, &job, "artifact:2").is_err());
+    }
 }

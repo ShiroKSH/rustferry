@@ -16,13 +16,13 @@ step environment and an ephemeral keychain/private workspace.
 
 ## Temporary ref
 
-Submission reads the trusted ref and workflow only from the public source remote, then creates one
+Push-mode submission reads the trusted ref and workflow only from the public source remote, then creates one
 operation-scoped branch below the configured RustFerry namespace in the execution remote. Git
 plumbing does not switch the caller's branch or modify the index/worktree. The dispatch commit is an
 orphan root containing exactly the approved generated workflow and request envelope; it has no
 source files, inherited workflows, parent, or imported source history. Publication is create-only.
 Run lookup and artifact APIs target only the execution repository and bind workflow ID, dispatch
-commit, branch, and `push` event.
+commit, branch, and exact `push` event.
 
 Cleanup may delete only the exact operation ref and only while its remote tip still equals the
 recorded dispatch commit. An absent, moved, ambiguous, or unowned ref fails closed.
@@ -30,14 +30,25 @@ recorded dispatch commit. An absent, moved, ambiguous, or unowned ref fails clos
 ## Workflow
 
 The generated workflow uses immutable first-party action SHAs, fixed permissions, timeouts,
-retention, and concurrency. Manual `workflow_dispatch` is not advertised: the current protocol
-requires the immutable request envelope committed to the operation ref. The worker rejects a raw
-request, duplicate or unknown JSON fields, repository/ref/workflow mismatches, and a workflow digest
-that differs from the trusted checkout.
+retention, and concurrency. Push remains the compatible/default provider trigger and carries the
+immutable request envelope on the operation ref. The worker rejects a raw request, duplicate or
+unknown JSON fields, repository/ref/workflow mismatches, and a workflow digest that differs from the
+trusted checkout.
 
-The trusted workflow must already exist with identical bytes on the configured trusted ref. Run
-discovery binds the exact workflow path, branch, event, dispatch commit, run ID, and attempt; it does
-not depend on default-branch numeric workflow registration.
+For Push, the trusted workflow must already exist with identical bytes on the configured trusted
+ref. Run discovery binds the exact workflow path, branch, event, dispatch commit, run ID, and
+attempt; it does not depend on default-branch numeric workflow registration.
+
+An additive WorkflowDispatch foundation accepts exactly four required string inputs:
+`operation_id`, `request_sha256`, `source_revision`, and `dispatch_revision`. It uses a fixed-origin
+direct HTTPS POST with no redirects, exact headers and body, an exact HTTP 200 JSON receipt with a
+positive run ID, then run-by-ID repository/workflow/path/ref/SHA/event validation. The worker binds
+the whole canonical request and rejects Push/WorkflowDispatch input crossover.
+
+No provider/controller consumer or live WorkflowDispatch run is claimed. Live use requires an
+active workflow whose default-branch and dispatched-ref definitions both declare the exact input
+contract; active registration alone is insufficient. The current default-branch definition is
+push-only, so WorkflowDispatch is not currently runnable evidence.
 
 GitHub does not enforce the client's workflow digest when a workflow is loaded from a temporary
 push branch. Until phase B moves into a fully-qualified, full-SHA reusable workflow, signed readiness

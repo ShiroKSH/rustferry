@@ -2856,6 +2856,7 @@ mod tests {
         transcript
     }
 
+    #[cfg(unix)]
     fn artifact_prefix_with_event(fixture: &Fixture) -> Vec<u8> {
         let mut transcript = Vec::new();
         write_json_frame(

@@ -1,23 +1,35 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read as _, Write as _};
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::task::{Context, Poll, Waker};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use camino::{Utf8Path, Utf8PathBuf};
+use rustferry_core::{
+    DirectoryFilesystemIdentity, RegularFileFilesystemIdentity, RetainedDirectoryIdentity,
+    regular_file_identity_from_file, verify_directory_identity, verify_regular_file_identity,
+};
+#[cfg(windows)]
+use rustferry_core::{ExactRegularFileRemoval, open_regular_file_for_exact_removal};
+#[cfg(unix)]
+use rustferry_github::git_endpoint::GithubGitTransport;
+use rustferry_github::git_endpoint::{GithubGitEndpoint, GithubRemoteSnapshot};
 use rustferry_github::provider::{
-    GitProcessRunner, GitTemporaryRefPublisher, GithubBuildProvider, GithubMutationAuthorization,
-    GithubPollingPolicy, GithubProviderConfig, SystemProviderClock, WorkflowFingerprint,
+    CallerGitOutput, CallerGitRepository, GITHUB_PROVIDER_ID, GitExecutionError, GitProcessRunner,
+    GitPublisherConfigError, GitTemporaryRefPublisher, GithubBuildProvider,
+    GithubDurableIdentityV1, GithubGitSnapshotRecoveryCandidateV1, GithubGitSnapshotSubmissionV1,
+    GithubJobReconciliation, GithubMutationAuthorization, GithubPollingPolicy,
+    GithubProviderConfig, SystemProviderClock, WorkflowFingerprint,
 };
 use rustferry_github::transport::{
     EnvironmentSecretWriteRequest, GhAuthentication, GhProcessRunner, GithubTransport,
     MAX_ENVIRONMENT_SECRET_BYTES, Repository, TokenEnvironmentVariable, TransportError,
     TransportLimits,
 };
-use rustferry_github::workflow::PublicSourceRepository;
+use rustferry_github::workflow::{PublicSourceRepository, WorkflowRunTrigger};
 use rustferry_github::{
     GithubVerifiedArtifactStore, MAX_SIGNING_PROFILES, ProtectedEnvironment, SigningSecretNames,
     TemporaryBranchNamespace, TrustedSourceRef, WorkerDistribution, WorkflowConfig,
@@ -32,8 +44,10 @@ use rustferry_remote::{
     RemoteBuildEvent, RemoteBuildEventKind, SecretBytes, SigningMode, SigningPlan, SigningTarget,
     SigningTargetKind, SourceArchive, SourceArchiveLimits, SourceBundleDescriptor,
     SourceBundlePlan, SourceBundleRequest, SourceLimits, SourceManifest, SourceManifestEntry,
-    SourceMode, UnsignedNestedBundleKind, ValidationLevel, create_source_bundle_archive,
-    plan_source_bundle, validate_source_manifest, verify_and_extract_source_bundle,
+    SourceMode, UnsignedNestedBundleKind, ValidationLevel,
+    canonical_git_snapshot_request_template_sha256, canonical_request_sha256,
+    canonical_retry_template_sha256_v1, create_source_bundle_archive, plan_source_bundle,
+    validate_source_manifest, verify_and_extract_source_bundle,
     write_source_bundle_descriptor_file,
 };
 use same_file::Handle as FileIdentityHandle;
@@ -43,18 +57,39 @@ use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use crate::cli::{
-    BuildArtifactSelection, RemoteArgs, RemoteBundleArgs, RemoteBundleCommand,
-    RemoteBundleCreateArgs, RemoteBundleInspectArgs, RemoteBundleVerifyArgs, RemoteCommand,
-    RemoteDoctorArgs, RemoteProviderChoice, RemoteSetupArgs, RemoteStatusArgs,
+    BuildArtifactSelection, GithubWorkflowTriggerChoice, RemoteArgs, RemoteBundleArgs,
+    RemoteBundleCommand, RemoteBundleCreateArgs, RemoteBundleInspectArgs, RemoteBundleVerifyArgs,
+    RemoteCommand, RemoteDoctorArgs, RemoteProviderChoice, RemoteSetupArgs, RemoteStatusArgs,
 };
 use crate::error::CliError;
 use crate::output::Reporter;
 use crate::project::{
-    find_in_path, find_project_root, run_captured_bounded, run_captured_bounded_isolated,
+    capture_project_directory_identity, find_in_path, find_project_root, run_captured_bounded,
+    verify_project_directory_identity,
+};
+use cargo_ferry::job_store::{
+    GithubJobStoreCheckpointSink, JOB_STORE_SCHEMA_VERSION, JobOperationKind, JobOperationLease,
+    JobStore, JobStoreError, LocalJobId, MAX_LISTED_JOBS, RetryLineageBindingV1,
+    RetryLineageOptionsV1, RetryParentPolicyV1, RetrySourcePolicyV1, SnapshotOperationVacancyV1,
+    StoredArtifactV1, StoredBuildOutcome, StoredCancellationStatus, StoredCleanupStatus,
+    StoredFailureV1, StoredJobState, StoredJobV1, StoredProjectIdentityV1,
+    StoredProviderIdentityV1, StoredRetryLineageV1, StoredSourceIdentityV1,
+    VacantSnapshotOperationLease, retry_recapture_confirmation_sha256,
 };
 
-const CONFIG_SCHEMA_VERSION: u32 = 3;
-const LEGACY_CONFIG_SCHEMA_VERSION: u32 = 2;
+#[path = "github_job_session.rs"]
+mod github_job_session;
+
+#[cfg(test)]
+pub(super) use github_job_session::test_retry_completion_receipt;
+pub(super) use github_job_session::{
+    BoundGithubJobSession, BoundGithubRetrySession, DurableGithubCancellationSession,
+    GithubCancellationSessionReceipt, GithubRetryChildDisposition, GithubRetryChildSession,
+    GithubRetryCompletionReceipt, PreparedGithubJobSession, PreparedGithubRetrySession,
+    ingest_github_job_logs_once, ingest_github_job_logs_once_in_store,
+};
+
+const CONFIG_SCHEMA_VERSION: u32 = 4;
 const CONFIG_RELATIVE_PATH: &str = "target/ferry/github/provider.json";
 const CONFIG_LOCK_RELATIVE_PATH: &str = "target/ferry/github/.provider.lock";
 const CONFIG_BACKUP_PREFIX: &str = ".provider-backup-";
@@ -72,8 +107,51 @@ const GIT_BLOB_BATCH_COUNT: usize = 128;
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const BUILD_TIMEOUT: Duration = Duration::from_hours(2);
 const CANCELLATION_TIMEOUT: Duration = Duration::from_mins(10);
+const BUILD_LEASE_REACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
+const BUILD_LEASE_REACQUIRE_POLL: Duration = Duration::from_millis(50);
+const SUBMIT_RECONCILIATION_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const SUBMIT_RECONCILIATION_MAX_BACKOFF: Duration = Duration::from_mins(1);
+const SUBMIT_RECONCILIATION_POST_DEADLINE_ATTEMPTS: u8 = 3;
 const ARTIFACT_LIST_ATTEMPTS: usize = 6;
 const ARTIFACT_LIST_BACKOFF: Duration = Duration::from_secs(2);
+const MAX_CURRENT_SNAPSHOT_DIFF_PATHS: usize = 128;
+const MAX_CURRENT_SNAPSHOT_DIFF_PATH_BYTES: usize = 16 * 1024;
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StoredGithubWorkflowTrigger {
+    #[default]
+    Push,
+    WorkflowDispatch,
+}
+
+impl StoredGithubWorkflowTrigger {
+    #[allow(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde skip_serializing_if callbacks receive a shared reference"
+    )]
+    const fn is_push(value: &Self) -> bool {
+        matches!(value, Self::Push)
+    }
+}
+
+impl From<GithubWorkflowTriggerChoice> for StoredGithubWorkflowTrigger {
+    fn from(value: GithubWorkflowTriggerChoice) -> Self {
+        match value {
+            GithubWorkflowTriggerChoice::Push => Self::Push,
+            GithubWorkflowTriggerChoice::WorkflowDispatch => Self::WorkflowDispatch,
+        }
+    }
+}
+
+impl From<StoredGithubWorkflowTrigger> for WorkflowRunTrigger {
+    fn from(value: StoredGithubWorkflowTrigger) -> Self {
+        match value {
+            StoredGithubWorkflowTrigger::Push => Self::Push,
+            StoredGithubWorkflowTrigger::WorkflowDispatch => Self::WorkflowDispatch,
+        }
+    }
+}
 
 type GithubProvider = GithubBuildProvider<
     GhProcessRunner,
@@ -90,8 +168,10 @@ pub(super) struct StoredGithubConfig {
     repository: String,
     /// Public project-source repository as a canonical HTTPS URL.
     source_repository: String,
-    source_remote_name: String,
-    execution_remote_name: String,
+    source_fetch_endpoint: GithubGitEndpoint,
+    source_push_endpoint: GithubGitEndpoint,
+    execution_fetch_endpoint: GithubGitEndpoint,
+    execution_push_endpoint: GithubGitEndpoint,
     trusted_source_ref: String,
     workflow_file: String,
     protected_environment: String,
@@ -99,6 +179,8 @@ pub(super) struct StoredGithubConfig {
     worker_repository: String,
     worker_revision: String,
     worker_version: String,
+    #[serde(default, skip_serializing_if = "StoredGithubWorkflowTrigger::is_push")]
+    run_trigger: StoredGithubWorkflowTrigger,
     /// Public target graph used to render static protected-secret expressions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     signing_targets: Vec<SigningTarget>,
@@ -131,10 +213,13 @@ impl GithubPaths {
 
 #[derive(Debug)]
 struct GitContext {
+    caller_git: CallerGitRepository,
     root: Utf8PathBuf,
     repository: Repository,
     repository_slug: String,
     source_repository: String,
+    fetch_endpoint: GithubGitEndpoint,
+    push_endpoint: GithubGitEndpoint,
     revision: String,
 }
 
@@ -143,6 +228,8 @@ struct GitRemoteContext {
     repository: Repository,
     repository_slug: String,
     source_repository: String,
+    fetch_endpoint: GithubGitEndpoint,
+    push_endpoint: GithubGitEndpoint,
 }
 
 #[derive(Debug, Deserialize)]
@@ -204,6 +291,21 @@ struct DoctorOutput {
     ready: bool,
     checks: Vec<rustferry_remote::ProviderCheck>,
     signing_mode: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(in crate::commands) struct IdeSigningReadinessCheck {
+    pub(in crate::commands) code: String,
+    pub(in crate::commands) required: bool,
+    pub(in crate::commands) ready: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::commands) reason_code: Option<&'static str>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(in crate::commands) struct IdeSigningReadiness {
+    pub(in crate::commands) ready: bool,
+    pub(in crate::commands) checks: Vec<IdeSigningReadinessCheck>,
 }
 
 #[derive(Debug, Serialize)]
@@ -658,6 +760,7 @@ struct RemoteBuildOutput {
     artifact: Option<String>,
     artifact_sha256: Option<String>,
     supporting_artifacts: Vec<String>,
+    local_job_id: Option<String>,
     job_id: Option<String>,
     validated: bool,
     cleanup_confirmed: bool,
@@ -668,6 +771,512 @@ struct RemoteBuildOutput {
 struct ExpectedDownload {
     kind: ArtifactKind,
     path: Utf8PathBuf,
+}
+
+#[derive(Debug)]
+struct ValidatedLocalArtifact {
+    path: String,
+    file_identity: RegularFileFilesystemIdentity,
+}
+
+#[derive(Debug)]
+struct RetainedArtifactValidation {
+    path: Utf8PathBuf,
+    identity: RegularFileFilesystemIdentity,
+    file: File,
+    expected_size: u64,
+    expected_sha256: String,
+    #[cfg(windows)]
+    exact: ExactRegularFileRemoval,
+}
+
+impl RetainedArtifactValidation {
+    fn capture(
+        path: &Utf8Path,
+        identity: &RegularFileFilesystemIdentity,
+        artifact: &rustferry_remote::ArtifactRecord,
+    ) -> Result<Self, CliError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .open(path)
+            .map_err(|source| CliError::Io {
+                action: "retain validated artifact identity",
+                path: path.to_owned(),
+                source,
+            })?;
+        let handle_identity = regular_file_identity_from_file(&file).map_err(|error| {
+            remote_error_with_details(
+                "artifact_validation_guard_failed",
+                "a validated artifact could not be retained as its exact filesystem object",
+                "Do not report success; preserve the local job and reconcile the exact artifact path.",
+                vec![error.to_string()],
+            )
+        })?;
+        if &handle_identity != identity {
+            return Err(remote_error(
+                "artifact_validation_guard_failed",
+                "a validated artifact changed before its exact filesystem object could be retained",
+                "Do not report success; preserve the local job and reconcile the exact artifact path.",
+            ));
+        }
+        #[cfg(windows)]
+        let exact = {
+            let exact = open_regular_file_for_exact_removal(path.as_std_path()).map_err(|error| {
+                remote_error_with_details(
+                    "artifact_validation_guard_failed",
+                    "a validated artifact could not be retained against replacement",
+                    "Do not report success; preserve the local job and reconcile the exact artifact path.",
+                    vec![error.to_string()],
+                )
+            })?;
+            if exact.identity() != identity {
+                return Err(remote_error(
+                    "artifact_validation_guard_failed",
+                    "a validated artifact changed while its replacement guard was opened",
+                    "Do not report success; preserve the local job and reconcile the exact artifact path.",
+                ));
+            }
+            exact
+        };
+        let retained = Self {
+            path: path.to_owned(),
+            identity: identity.clone(),
+            file,
+            expected_size: artifact.size,
+            expected_sha256: artifact.sha256.clone(),
+            #[cfg(windows)]
+            exact,
+        };
+        retained.verify()?;
+        Ok(retained)
+    }
+
+    fn verify(&self) -> Result<(), CliError> {
+        let handle_identity = regular_file_identity_from_file(&self.file).map_err(|error| {
+            remote_error_with_details(
+                "artifact_validation_guard_failed",
+                "a retained artifact handle no longer has its validated filesystem identity",
+                "Do not report success; preserve the local job and reconcile the exact artifact path.",
+                vec![error.to_string()],
+            )
+        })?;
+        if handle_identity != self.identity {
+            return Err(remote_error(
+                "artifact_validation_guard_failed",
+                "a retained artifact handle changed filesystem identity",
+                "Do not report success; preserve the local job and reconcile the exact artifact path.",
+            ));
+        }
+        #[cfg(windows)]
+        if self.exact.identity() != &self.identity {
+            return Err(remote_error(
+                "artifact_validation_guard_failed",
+                "an artifact replacement guard differs from its validated filesystem identity",
+                "Do not report success; preserve the local job and reconcile the exact artifact path.",
+            ));
+        }
+        verify_regular_file_identity(self.path.as_std_path(), &self.identity).map_err(|error| {
+            remote_error_with_details(
+                "artifact_validation_guard_failed",
+                "a validated artifact path changed before durable success was committed",
+                "Do not report success; preserve the local job and reconcile the exact artifact path.",
+                vec![error.to_string()],
+            )
+        })?;
+        if regular_file_identity_from_file(&self.file).map_err(|error| {
+            remote_error_with_details(
+                "artifact_validation_guard_failed",
+                "a retained artifact handle could not be revalidated",
+                "Do not report success; preserve the local job and reconcile the exact artifact path.",
+                vec![error.to_string()],
+            )
+        })? != self.identity
+        {
+            return Err(remote_error(
+                "artifact_validation_guard_failed",
+                "a retained artifact handle changed during path revalidation",
+                "Do not report success; preserve the local job and reconcile the exact artifact path.",
+            ));
+        }
+        self.verify_bytes()?;
+        Ok(())
+    }
+
+    fn verify_bytes(&self) -> Result<(), CliError> {
+        let mut file = self.file.try_clone().map_err(|source| CliError::Io {
+            action: "clone retained artifact handle for final validation",
+            path: self.path.clone(),
+            source,
+        })?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|source| CliError::Io {
+                action: "rewind retained artifact for final validation",
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut digest = Sha256::new();
+        let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+        let mut bytes_read = 0_u64;
+        loop {
+            let count = file.read(buffer.as_mut()).map_err(|source| CliError::Io {
+                action: "rehash retained artifact before reporting success",
+                path: self.path.clone(),
+                source,
+            })?;
+            if count == 0 {
+                break;
+            }
+            bytes_read = bytes_read.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+            if bytes_read > self.expected_size {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+        if bytes_read != self.expected_size || sha256_hex(digest.finalize()) != self.expected_sha256
+        {
+            return Err(remote_error(
+                "artifact_validation_guard_failed",
+                "a retained artifact changed bytes before durable success was reported",
+                "Do not report success; preserve the local job and reconcile the exact artifact path.",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct CompletedArtifactDownloads {
+    primary_sha256: String,
+    destinations: BTreeMap<String, DownloadDestinationBinding>,
+    validation_guards: Vec<RetainedArtifactValidation>,
+}
+
+#[derive(Debug)]
+pub(super) struct ProjectFilesystemBinding {
+    root: Utf8PathBuf,
+    identity: DirectoryFilesystemIdentity,
+    retained: RetainedDirectoryIdentity,
+}
+
+#[derive(Debug)]
+struct DownloadDestinationBinding {
+    path: String,
+    managed_root: Utf8PathBuf,
+    managed_root_identity: DirectoryFilesystemIdentity,
+    managed_root_retained: RetainedDirectoryIdentity,
+    parent: Utf8PathBuf,
+    parent_identity: DirectoryFilesystemIdentity,
+    parent_retained: RetainedDirectoryIdentity,
+}
+
+impl DownloadDestinationBinding {
+    fn capture(
+        path: &Utf8Path,
+        project_binding: &ProjectFilesystemBinding,
+    ) -> Result<Self, CliError> {
+        project_binding.verify()?;
+        let canonical_project_root =
+            project_binding
+                .root
+                .canonicalize_utf8()
+                .map_err(|source| CliError::Io {
+                    action: "resolve the durable project root for artifact download",
+                    path: project_binding.root.clone(),
+                    source,
+                })?;
+        if canonical_project_root != project_binding.root {
+            return Err(remote_error(
+                "artifact_project_alias_rejected",
+                "the durable project root resolves through a link, junction, or path alias",
+                "Restore the exact canonical project directory before reconciling artifact downloads.",
+            ));
+        }
+        let parent = path.parent().ok_or_else(|| {
+            remote_error(
+                "artifact_destination_invalid",
+                "an artifact destination has no parent directory",
+                "Use the standard project-local target directory.",
+            )
+        })?;
+        let managed_root = canonical_project_root.join("target").join("ferry");
+        let canonical_managed_root =
+            managed_root
+                .canonicalize_utf8()
+                .map_err(|source| CliError::Io {
+                    action: "resolve the managed artifact root",
+                    path: managed_root.clone(),
+                    source,
+                })?;
+        let canonical_parent = parent.canonicalize_utf8().map_err(|source| CliError::Io {
+            action: "resolve an artifact destination parent",
+            path: parent.to_owned(),
+            source,
+        })?;
+        if canonical_managed_root != managed_root
+            || canonical_parent != parent
+            || !canonical_parent.starts_with(&canonical_managed_root)
+        {
+            return Err(remote_error(
+                "artifact_parent_alias_rejected",
+                "an artifact destination parent resolves through a link, junction, or path alias",
+                "Restore a plain project-local target/ferry directory tree before retrying.",
+            ));
+        }
+        let file_name = path.file_name().ok_or_else(|| {
+            remote_error(
+                "artifact_destination_invalid",
+                "an artifact destination has no final file name",
+                "Use the standard project-local artifact destination.",
+            )
+        })?;
+        let canonical_path = canonical_parent.join(file_name);
+        if canonical_path != path {
+            return Err(remote_error(
+                "artifact_destination_alias_rejected",
+                "an artifact destination is not the exact canonical project-local path",
+                "Use the standard project-local artifact destination without aliases.",
+            ));
+        }
+        let parent_retained = RetainedDirectoryIdentity::open(canonical_parent.as_std_path())
+            .map_err(|error| {
+                remote_error_with_details(
+                    "artifact_parent_identity_unavailable",
+                    "an artifact destination parent could not be bound to a durable filesystem identity",
+                    "Preserve the local job and restore the exact project target directory before retrying.",
+                    vec![error.to_string()],
+                )
+            })?;
+        let parent_identity = parent_retained.identity().clone();
+        let managed_root_retained =
+            RetainedDirectoryIdentity::open(canonical_managed_root.as_std_path()).map_err(
+                |error| {
+                    remote_error_with_details(
+                        "artifact_root_identity_unavailable",
+                        "the managed artifact root could not be bound to a filesystem identity",
+                        "Preserve the local job and restore the exact project target directory before retrying.",
+                        vec![error.to_string()],
+                    )
+                },
+            )?;
+        let managed_root_identity = managed_root_retained.identity().clone();
+        let binding = Self {
+            path: canonical_path.to_string(),
+            managed_root: canonical_managed_root,
+            managed_root_identity,
+            managed_root_retained,
+            parent: canonical_parent,
+            parent_identity,
+            parent_retained,
+        };
+        project_binding.verify()?;
+        binding.verify(project_binding)?;
+        Ok(binding)
+    }
+
+    fn verify_canonical_namespace(
+        &self,
+        project_binding: &ProjectFilesystemBinding,
+    ) -> Result<(), CliError> {
+        let canonical_project_root =
+            project_binding
+                .root
+                .canonicalize_utf8()
+                .map_err(|source| CliError::Io {
+                    action: "re-resolve the durable project root for artifact download",
+                    path: project_binding.root.clone(),
+                    source,
+                })?;
+        let expected_managed_root = canonical_project_root.join("target").join("ferry");
+        let canonical_managed_root =
+            self.managed_root
+                .canonicalize_utf8()
+                .map_err(|source| CliError::Io {
+                    action: "re-resolve the managed artifact root",
+                    path: self.managed_root.clone(),
+                    source,
+                })?;
+        let canonical_parent = self
+            .parent
+            .canonicalize_utf8()
+            .map_err(|source| CliError::Io {
+                action: "re-resolve the artifact destination parent",
+                path: self.parent.clone(),
+                source,
+            })?;
+        let path = Utf8Path::new(&self.path);
+        if canonical_project_root != project_binding.root
+            || expected_managed_root != self.managed_root
+            || canonical_managed_root != self.managed_root
+            || canonical_parent != self.parent
+            || !canonical_parent.starts_with(&canonical_managed_root)
+            || path.parent() != Some(self.parent.as_path())
+        {
+            return Err(remote_error(
+                "artifact_namespace_changed",
+                "the project, managed artifact root, or destination parent changed namespace binding",
+                "Preserve the local job and reconcile the exact canonical destination before retrying.",
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify(&self, project_binding: &ProjectFilesystemBinding) -> Result<(), CliError> {
+        project_binding.verify()?;
+        self.verify_canonical_namespace(project_binding)?;
+        self.managed_root_retained
+            .verify_path(self.managed_root.as_std_path())
+            .map_err(|error| {
+                remote_error_with_details(
+                    "artifact_root_identity_changed",
+                    "the managed artifact root changed filesystem identity",
+                    "Preserve the local job and reconcile its exact intended destination before retrying.",
+                    vec![error.to_string()],
+                )
+            })?;
+        verify_directory_identity(
+            self.managed_root.as_std_path(),
+            &self.managed_root_identity,
+        )
+        .map_err(|error| {
+            remote_error_with_details(
+                "artifact_root_identity_changed",
+                "the managed artifact root changed filesystem identity",
+                "Preserve the local job and reconcile its exact intended destination before retrying.",
+                vec![error.to_string()],
+            )
+        })?;
+        self.parent_retained
+            .verify_path(self.parent.as_std_path())
+            .map_err(|error| {
+                remote_error_with_details(
+                    "artifact_parent_identity_changed",
+                    "an artifact destination parent changed filesystem identity",
+                    "Preserve the local job and reconcile its exact intended destination before retrying.",
+                    vec![error.to_string()],
+                )
+            })?;
+        verify_directory_identity(self.parent.as_std_path(), &self.parent_identity).map_err(
+            |error| {
+                remote_error_with_details(
+                    "artifact_parent_identity_changed",
+                    "an artifact destination parent changed filesystem identity",
+                    "Preserve the local job and reconcile its exact intended destination before retrying.",
+                    vec![error.to_string()],
+                )
+            },
+        )?;
+        self.verify_canonical_namespace(project_binding)?;
+        project_binding.verify()
+    }
+}
+
+impl ProjectFilesystemBinding {
+    pub(super) fn capture(root: &Utf8Path) -> Result<Self, CliError> {
+        let canonical_root = root.canonicalize_utf8().map_err(|source| CliError::Io {
+            action: "resolve project directory for durable job identity",
+            path: root.to_owned(),
+            source,
+        })?;
+        if canonical_root != root {
+            return Err(remote_error(
+                "project_path_alias_rejected",
+                "the selected project path is not its exact canonical directory",
+                "Use the canonical project directory without links, junctions, or path aliases.",
+            ));
+        }
+        let identity = capture_project_directory_identity(&canonical_root).map_err(|error| {
+            remote_error_with_details(
+                "project_identity_unavailable",
+                "the project directory could not be bound to a durable filesystem identity",
+                "Keep the project on a local filesystem that supports stable directory identity, then retry.",
+                vec![error.to_string()],
+            )
+        })?;
+        let retained = RetainedDirectoryIdentity::open(canonical_root.as_std_path()).map_err(
+            |error| {
+                remote_error_with_details(
+                    "project_identity_unavailable",
+                    "the project directory could not be retained as an exact filesystem object",
+                    "Keep the project on a local filesystem that supports stable directory identity, then retry.",
+                    vec![error.to_string()],
+                )
+            },
+        )?;
+        if retained.identity() != &identity {
+            return Err(remote_error(
+                "project_identity_changed",
+                "the project directory changed while its durable filesystem identity was captured",
+                "Retry only after restoring the exact canonical project directory.",
+            ));
+        }
+        let binding = Self {
+            root: canonical_root,
+            identity,
+            retained,
+        };
+        binding.verify()?;
+        Ok(binding)
+    }
+
+    pub(super) fn root(&self) -> &Utf8Path {
+        &self.root
+    }
+
+    pub(super) fn identity_string(&self) -> String {
+        self.identity.to_string()
+    }
+
+    pub(super) fn verify(&self) -> Result<(), CliError> {
+        self.verify_canonical_root()?;
+        self.retained
+            .verify_path(self.root.as_std_path())
+            .map_err(|error| {
+                remote_error_with_details(
+                    "project_identity_changed",
+                    "the durable project directory identity changed during the remote build",
+                    "Stop using this result; restore the exact original project directory before reconciling the local job.",
+                    vec![error.to_string()],
+                )
+            })?;
+        verify_project_directory_identity(&self.root, &self.identity).map_err(|error| {
+            remote_error_with_details(
+                "project_identity_changed",
+                "the durable project directory identity changed during the remote build",
+                "Stop using this result; restore the exact original project directory before reconciling the local job.",
+                vec![error.to_string()],
+            )
+        })?;
+        self.retained
+            .verify_path(self.root.as_std_path())
+            .map_err(|error| {
+                remote_error_with_details(
+                    "project_identity_changed",
+                    "the durable project directory identity changed during the remote build",
+                    "Stop using this result; restore the exact original project directory before reconciling the local job.",
+                    vec![error.to_string()],
+                )
+            })?;
+        self.verify_canonical_root()
+    }
+
+    fn verify_canonical_root(&self) -> Result<(), CliError> {
+        let canonical_root = self
+            .root
+            .canonicalize_utf8()
+            .map_err(|source| CliError::Io {
+                action: "re-resolve the durable project directory",
+                path: self.root.clone(),
+                source,
+            })?;
+        if canonical_root != self.root {
+            return Err(remote_error(
+                "project_namespace_changed",
+                "the durable project directory now resolves through a link, junction, or path alias",
+                "Stop using this result; restore the exact original canonical project directory before reconciling the local job.",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -710,6 +1319,10 @@ impl ArtifactFileIdentity {
 struct CreatedArtifact {
     path: Utf8PathBuf,
     identity: ArtifactFileIdentity,
+    #[cfg(windows)]
+    persistent_identity: Option<RegularFileFilesystemIdentity>,
+    #[cfg(windows)]
+    exact_removal: Option<ExactRegularFileRemoval>,
 }
 
 #[derive(Default)]
@@ -719,10 +1332,29 @@ pub(super) struct ArtifactDownloadRollback {
 }
 
 impl ArtifactDownloadRollback {
+    #[cfg(test)]
     pub(super) fn record(&mut self, path: &Utf8Path) -> std::io::Result<()> {
+        #[cfg(windows)]
+        let exact_removal = {
+            let persistent_identity = RegularFileFilesystemIdentity::capture(path.as_std_path())
+                .map_err(std::io::Error::other)?;
+            let removal = open_regular_file_for_exact_removal(path.as_std_path())
+                .map_err(std::io::Error::other)?;
+            if removal.identity() != &persistent_identity {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "exact removal handle differs from the captured artifact identity",
+                ));
+            }
+            (persistent_identity, Some(removal))
+        };
         self.created.push(CreatedArtifact {
             path: path.to_owned(),
             identity: ArtifactFileIdentity::capture(path)?,
+            #[cfg(windows)]
+            persistent_identity: Some(exact_removal.0),
+            #[cfg(windows)]
+            exact_removal: exact_removal.1,
         });
         Ok(())
     }
@@ -736,6 +1368,10 @@ impl ArtifactDownloadRollback {
         self.created.push(CreatedArtifact {
             path: path.to_owned(),
             identity,
+            #[cfg(windows)]
+            persistent_identity: None,
+            #[cfg(windows)]
+            exact_removal: None,
         });
         let published = ArtifactFileIdentity::capture(path)?;
         if self
@@ -790,6 +1426,29 @@ fn rollback_created_artifact(artifact: CreatedArtifact) -> std::io::Result<()> {
     rollback_created_artifact_with(artifact, |_| {})
 }
 
+#[cfg(windows)]
+fn rollback_created_artifact_with(
+    mut artifact: CreatedArtifact,
+    before_exact_removal: impl FnOnce(&Utf8Path),
+) -> std::io::Result<()> {
+    before_exact_removal(&artifact.path);
+    let removal = artifact.exact_removal.take().ok_or_else(|| {
+        std::io::Error::other(
+            "artifact has no retained single-link handle for exact Windows rollback",
+        )
+    })?;
+    let expected = artifact.persistent_identity.as_ref().ok_or_else(|| {
+        std::io::Error::other("artifact has no persistent identity for exact Windows rollback")
+    })?;
+    if removal.identity() != expected {
+        return Err(std::io::Error::other(
+            "retained Windows rollback handle changed artifact identity",
+        ));
+    }
+    removal.remove().map_err(std::io::Error::other)
+}
+
+#[cfg(not(windows))]
 fn rollback_created_artifact_with(
     artifact: CreatedArtifact,
     after_quarantine: impl FnOnce(&Utf8Path),
@@ -1175,6 +1834,24 @@ pub(super) fn snapshot_source_bundle_plan(
     explicit_executables: &[Utf8PathBuf],
     reporter: &Reporter,
 ) -> Result<(Utf8PathBuf, SourceBundlePlan, Vec<String>), CliError> {
+    snapshot_source_bundle_plan_with_git_modes(project, explicit_executables, reporter, true)
+}
+
+fn snapshot_build_source_bundle_plan(
+    project: &Utf8Path,
+    reporter: &Reporter,
+) -> Result<(Utf8PathBuf, SourceBundlePlan, Vec<String>), CliError> {
+    snapshot_source_bundle_plan_with_git_modes(project, &[], reporter, false)
+}
+
+fn snapshot_source_bundle_plan_with_git_modes(
+    project: &Utf8Path,
+    explicit_executables: &[Utf8PathBuf],
+    reporter: &Reporter,
+    read_git_index_modes: bool,
+) -> Result<(Utf8PathBuf, SourceBundlePlan, Vec<String>), CliError> {
+    #[cfg(unix)]
+    let _ = read_git_index_modes;
     let project = project.canonicalize_utf8().map_err(|source| CliError::Io {
         action: "resolve RustFerry project root",
         path: project.to_owned(),
@@ -1202,11 +1879,13 @@ pub(super) fn snapshot_source_bundle_plan(
             .iter()
             .map(|entry| entry.path.as_str())
             .collect::<HashSet<_>>();
-        executable_modes.extend(
-            git_index_executable_paths(&workspace, reporter)?
-                .into_iter()
-                .filter(|path| selected.contains(path.as_str())),
-        );
+        if read_git_index_modes {
+            executable_modes.extend(
+                git_index_executable_paths(&workspace, reporter)?
+                    .into_iter()
+                    .filter(|path| selected.contains(path.as_str())),
+            );
+        }
     }
     if executable_modes.is_empty() {
         return Ok((workspace, baseline, path_dependencies));
@@ -1224,6 +1903,20 @@ fn source_bundle_cargo_metadata(
     reporter: &Reporter,
 ) -> Result<CargoMetadata, CliError> {
     let cargo = executable("cargo")?;
+    let metadata_target_directory = tempfile::Builder::new()
+        .prefix("rustferry-cargo-metadata-")
+        .tempdir()
+        .map_err(|source| CliError::Io {
+            action: "create isolated Cargo metadata directory",
+            path: Utf8PathBuf::from("temporary directory"),
+            source,
+        })?;
+    let metadata_target = Utf8PathBuf::from_path_buf(metadata_target_directory.path().to_owned())
+        .map_err(CliError::NonUtf8Path)?;
+    let target_config = format!(
+        "build.target-dir={}",
+        serde_json::to_string(metadata_target.as_str()).expect("UTF-8 path is JSON encodable")
+    );
     let output = checked_output(
         &cargo,
         &[
@@ -1231,6 +1924,9 @@ fn source_bundle_cargo_metadata(
             OsString::from("--format-version"),
             OsString::from("1"),
             OsString::from("--locked"),
+            OsString::from("--offline"),
+            OsString::from("--config"),
+            OsString::from(target_config),
         ],
         project,
         "read Cargo metadata for source bundle",
@@ -1802,16 +2498,8 @@ pub(super) fn prepare_manual_github_signing(
             "Rerun GitHub remote setup, review and commit the workflow, then rerun signing setup without changing targets.",
         ));
     }
-    let git = git_context(
-        root,
-        &stored.source_remote_name,
-        &Reporter::new(false, true, false),
-    )?;
-    let execution = git_remote_context(
-        &git.root,
-        &stored.execution_remote_name,
-        &Reporter::new(false, true, false),
-    )?;
+    let (git, execution) =
+        git_context_from_stored(root, &stored, &Reporter::new(false, true, false))?;
     ensure_configured_repositories(&stored, &git, &execution)?;
     if git
         .repository_slug
@@ -2404,13 +3092,2136 @@ fn select_requested_artifacts(
     Ok(requested)
 }
 
+enum SnapshotConsentAuthority {
+    Cli { yes: bool },
+    Ide(super::github_snapshot::DecodedIdeSnapshotConsent),
+}
+
+impl SnapshotConsentAuthority {
+    const fn is_ide(&self) -> bool {
+        matches!(self, Self::Ide(_))
+    }
+
+    fn operation_identity(&self) -> Result<(String, u64), CliError> {
+        match self {
+            Self::Cli { .. } => Ok((operation_id(), unix_timestamp_ms()?)),
+            Self::Ide(consent) => Ok((consent.operation_id.clone(), consent.source_created_at_ms)),
+        }
+    }
+
+    fn validate_context(
+        &self,
+        profile: BuildProfile,
+        source_repository: &str,
+    ) -> Result<(), CliError> {
+        let Self::Ide(consent) = self else {
+            return Ok(());
+        };
+        if consent.profile != profile
+            || !super::github_snapshot::ide_source_repository_matches(consent, source_repository)
+        {
+            return Err(remote_error(
+                "snapshot_consent_context_changed",
+                "the IDE snapshot consent no longer matches the exact build profile or source repository",
+                "Request and approve a new zero-write snapshot preview for this workspace.",
+            ));
+        }
+        Ok(())
+    }
+
+    fn approve(
+        &self,
+        preview: &super::github_snapshot::GithubSnapshotPreviewV1,
+        reporter: &Reporter,
+        cancellation: &CancellationToken,
+    ) -> Result<(), CliError> {
+        match self {
+            Self::Cli { yes } => {
+                super::github_snapshot::require_snapshot_consent(preview, *yes, reporter)
+            }
+            Self::Ide(_) => {
+                cancellation.check().map_err(|error| {
+                    provider_failure(
+                        &error,
+                        "snapshot_consent_cancelled",
+                        "the IDE snapshot submission was cancelled before mutation",
+                    )
+                })?;
+                self.validate_existing_preview(preview)
+            }
+        }
+    }
+
+    fn validate_existing_preview(
+        &self,
+        preview: &super::github_snapshot::GithubSnapshotPreviewV1,
+    ) -> Result<(), CliError> {
+        let Self::Ide(consent) = self else {
+            return Ok(());
+        };
+        if consent.operation_id != preview.plan.operation_id
+            || consent.source_created_at_ms != preview.plan.source_created_at_ms
+            || consent.preview_sha256 != preview.consent_sha256
+            || !super::github_snapshot::ide_source_repository_matches(
+                consent,
+                &preview.plan.source_repository,
+            )
+        {
+            return Err(remote_error(
+                "snapshot_consent_changed",
+                "the IDE snapshot consent does not authorize this exact operation-bound plan",
+                "Request and approve a new zero-write snapshot preview; no source archive was created.",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct SnapshotBuildCompletion {
+    record: StoredJobV1,
+    preview_sha256: String,
+}
+
+/// Deterministic path-level change summary for an explicit current-source retry preview.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(in crate::commands) struct CurrentSnapshotManifestDiffV1 {
+    pub(in crate::commands) added_count: u64,
+    pub(in crate::commands) modified_count: u64,
+    pub(in crate::commands) removed_count: u64,
+    pub(in crate::commands) added_paths: Vec<String>,
+    pub(in crate::commands) modified_paths: Vec<String>,
+    pub(in crate::commands) removed_paths: Vec<String>,
+    pub(in crate::commands) unchanged: u64,
+    pub(in crate::commands) project_path_changed: bool,
+    pub(in crate::commands) paths_truncated: bool,
+}
+
+/// Secret-free zero-write preview for one operation-bound current-source retry.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(in crate::commands) struct CurrentSnapshotRetryPreviewV1 {
+    pub(in crate::commands) parent_job_id: LocalJobId,
+    pub(in crate::commands) parent_revision: u64,
+    pub(in crate::commands) operation_id: String,
+    pub(in crate::commands) source_created_at_ms: u64,
+    pub(in crate::commands) snapshot_consent_sha256: String,
+    pub(in crate::commands) request_template_sha256: String,
+    pub(in crate::commands) source_manifest_sha256: String,
+    pub(in crate::commands) file_count: u64,
+    pub(in crate::commands) total_bytes: u64,
+    pub(in crate::commands) source_repository: String,
+    pub(in crate::commands) source_repository_visibility: &'static str,
+    pub(in crate::commands) source_ref: String,
+    pub(in crate::commands) archive_status: &'static str,
+    pub(in crate::commands) archive_size: Option<u64>,
+    pub(in crate::commands) archive_sha256: Option<String>,
+    pub(in crate::commands) remote_source_ref_retention: &'static str,
+    pub(in crate::commands) local_keepalive_retention: &'static str,
+    pub(in crate::commands) ref_deletion_erases_objects: bool,
+    pub(in crate::commands) secret_scan_residual: &'static str,
+    pub(in crate::commands) public_object_warning: &'static str,
+    pub(in crate::commands) recovery: CurrentSnapshotRetryRecoveryV1,
+    pub(in crate::commands) diff: CurrentSnapshotManifestDiffV1,
+    pub(in crate::commands) effects: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(in crate::commands) enum CurrentSnapshotRetryRecoveryV1 {
+    #[serde(rename = "new_stage")]
+    New,
+    #[serde(rename = "orphan_stage")]
+    Orphan,
+    #[serde(rename = "existing_child_stage")]
+    ExistingChild,
+}
+
+/// Local-only exact current-source plan retained across explicit retry consent.
+pub(in crate::commands) struct PreparedCurrentSnapshotRetry {
+    parent: StoredJobV1,
+    project: ProjectFilesystemBinding,
+    config_path: Utf8PathBuf,
+    config_identity: ArtifactFileIdentity,
+    config_bytes: Vec<u8>,
+    stored: StoredGithubConfig,
+    approved_source: SourceBundlePlan,
+    approved_path_dependencies: Vec<String>,
+    approved: super::github_snapshot::GithubSnapshotPreviewV1,
+    request_template: IosDeviceBuildRequest,
+    preview: CurrentSnapshotRetryPreviewV1,
+    durable_owner: Option<LocalJobId>,
+}
+
+/// Explicit-consent typestate; no stage write is reachable from an unconfirmed preview.
+pub(in crate::commands) struct ConfirmedCurrentSnapshotRetry {
+    prepared: PreparedCurrentSnapshotRetry,
+}
+
+/// Continuously held store authority required while writing or adopting a private retry stage.
+pub(in crate::commands) enum CurrentSnapshotRetryOperationGuard<'lease> {
+    Vacant(&'lease VacantSnapshotOperationLease),
+    ExistingChild(&'lease JobOperationLease),
+}
+
+#[derive(Debug)]
+enum CurrentSnapshotRetryStageAuthority {
+    SameInvocation(Box<super::github_snapshot::StagedGithubSnapshotV1>),
+    FreshReconsent,
+}
+
+/// Complete private stage plus the only specialized provider submission authority it permits.
+#[derive(Debug)]
+pub(in crate::commands) struct StagedCurrentSnapshotRetry {
+    parent_job_id: LocalJobId,
+    parent_revision: u64,
+    parent_request_sha256: String,
+    parent_provider: StoredProviderIdentityV1,
+    request: IosDeviceBuildRequest,
+    source_created_at_ms: u64,
+    snapshot_consent_sha256: String,
+    source_archive_sha256: String,
+    authority: CurrentSnapshotRetryStageAuthority,
+}
+
+fn check_snapshot_cancellation(cancellation: &CancellationToken) -> Result<(), CliError> {
+    cancellation.check().map_err(|error| {
+        provider_failure(
+            &error,
+            "snapshot_operation_cancelled",
+            "the GitHub snapshot operation was cancelled",
+        )
+    })
+}
+
+/// Capture one current-source retry plan without writing source, stage, provider, or `JobStore`
+/// state and without accessing GitHub.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the preview binds the parent, project, provider, source, request, and public effects explicitly"
+)]
+pub(in crate::commands) fn prepare_current_snapshot_retry(
+    parent: &StoredJobV1,
+    operation_id: String,
+    proposed_source_created_at_ms: u64,
+) -> Result<PreparedCurrentSnapshotRetry, CliError> {
+    parent.validate()?;
+    let source_created_at_ms = proposed_source_created_at_ms
+        .max(parent.updated_at_ms)
+        .max(1);
+    if parent.provider.provider != GITHUB_PROVIDER_ID
+        || parent.target != "iphone"
+        || operation_id == parent.operation_id
+    {
+        return Err(remote_error(
+            "retry_snapshot_parent_invalid",
+            "the selected parent cannot authorize a current-source GitHub snapshot retry",
+            "Retry an exact GitHub physical-iPhone job with a new operation identifier.",
+        ));
+    }
+    let root = Utf8Path::new(&parent.project.canonical_root);
+    let project = ProjectFilesystemBinding::capture(root)?;
+    if project.identity_string() != parent.project.filesystem_identity
+        || parent.project.application_identifier != parent.request.bundle_identifier
+    {
+        return Err(remote_error(
+            "retry_project_identity_changed",
+            "the retry parent no longer matches the exact local project directory",
+            "Restore the original project directory or retry from its current durable child.",
+        ));
+    }
+    let config_path = root.join(CONFIG_RELATIVE_PATH);
+    let (config_identity, config_bytes) = read_private_config_snapshot(root, &config_path)?;
+    let stored = decode_stored_config(&config_bytes)?;
+    validate_stored_config(&stored)?;
+    let (_, _, execution_repository) = parse_repository_spec(&stored.repository)?;
+    if execution_repository != parent.provider.execution_repository {
+        return Err(remote_error(
+            "retry_provider_identity_changed",
+            "the current GitHub execution repository differs from the durable retry parent",
+            "Restore the exact provider configuration before recapturing current source.",
+        ));
+    }
+
+    let reporter = Reporter::new(false, true, false);
+    let (_workspace, approved_source, approved_path_dependencies) =
+        snapshot_build_source_bundle_plan(root, &reporter)?;
+    project.verify()?;
+    let approved = super::github_snapshot::GithubSnapshotPreviewV1::new(
+        &operation_id,
+        source_created_at_ms,
+        &stored.source_repository,
+        &approved_source,
+        &approved_path_dependencies,
+    )?;
+    let request_template = current_snapshot_retry_request_template(
+        parent,
+        &operation_id,
+        &stored.source_repository,
+        approved_source.manifest().clone(),
+    )?;
+    let request_template_sha256 = canonical_git_snapshot_request_template_sha256(&request_template)
+        .map_err(|error| {
+            provider_failure(
+                &error,
+                "retry_snapshot_request_invalid",
+                "the current-source retry request template could not be bound canonically",
+            )
+        })?;
+    ensure_config_snapshot_unchanged(root, &config_path, &config_identity, &config_bytes)?;
+    project.verify()?;
+    let preview = CurrentSnapshotRetryPreviewV1 {
+        parent_job_id: parent.local_job_id.clone(),
+        parent_revision: parent.revision,
+        operation_id,
+        source_created_at_ms,
+        snapshot_consent_sha256: approved.consent_sha256.clone(),
+        request_template_sha256,
+        source_manifest_sha256: approved_source.manifest().sha256.clone(),
+        file_count: u64::try_from(approved_source.manifest().entries.len()).map_err(|_| {
+            remote_error(
+                "snapshot_plan_bound_exceeded",
+                "the current-source retry contains too many source entries",
+                "Reduce the source set before approving this retry.",
+            )
+        })?,
+        total_bytes: approved_source.manifest().total_size,
+        source_repository: approved.plan.source_repository.clone(),
+        source_repository_visibility: approved.plan.source_repository_visibility,
+        source_ref: approved.plan.source_ref.clone(),
+        archive_status: approved.plan.archive.status,
+        archive_size: approved.plan.archive.size,
+        archive_sha256: approved.plan.archive.sha256.clone(),
+        remote_source_ref_retention: approved.plan.remote_source_ref_retention,
+        local_keepalive_retention: approved.plan.local_keepalive_retention,
+        ref_deletion_erases_objects: approved.plan.ref_deletion_erases_objects,
+        secret_scan_residual: approved.plan.secret_scan_residual,
+        public_object_warning: approved.plan.public_object_warning,
+        recovery: CurrentSnapshotRetryRecoveryV1::New,
+        diff: current_snapshot_manifest_diff(&parent.request.source, approved_source.manifest())?,
+        effects: vec![
+            "upload_current_source_snapshot_to_public_github_object_database".to_owned(),
+            "create_custom_source_ref_until_terminal_cleanup".to_owned(),
+            "retain_local_keepalive_until_explicit_complete_lineage_prune".to_owned(),
+            "create_one_atomic_retry_child_before_provider_submission".to_owned(),
+        ],
+    };
+    Ok(PreparedCurrentSnapshotRetry {
+        parent: parent.clone(),
+        project,
+        config_path,
+        config_identity,
+        config_bytes,
+        stored,
+        approved_source,
+        approved_path_dependencies,
+        approved,
+        request_template,
+        preview,
+        durable_owner: None,
+    })
+}
+
+/// Select one exact durable-child or orphan private stage before allocating a fresh retry
+/// operation. This entrypoint reads the `JobStore` and private stage directory but performs no
+/// mutation or GitHub request.
+pub(in crate::commands) fn prepare_current_snapshot_retry_in_store(
+    store: &JobStore,
+    parent: &StoredJobV1,
+    fresh_operation_id: String,
+    fresh_source_created_at_ms: u64,
+    cancellation: &CancellationToken,
+) -> Result<PreparedCurrentSnapshotRetry, CliError> {
+    let fresh =
+        prepare_current_snapshot_retry(parent, fresh_operation_id, fresh_source_created_at_ms)?;
+    check_snapshot_cancellation(cancellation)?;
+    let provider = build_provider(fresh.project.root(), fresh.project.root(), &fresh.stored)?;
+    let mut selected = None;
+    for candidate in provider
+        .discover_uncheckpointed_git_snapshot_stages()
+        .map_err(|error| {
+            provider_failure(
+                &error,
+                "snapshot_recovery_discovery_failed",
+                "private current-source retry stages could not be inspected safely",
+            )
+        })?
+    {
+        let Some(candidate_preview) = current_snapshot_candidate_preview(&fresh, &candidate)?
+        else {
+            continue;
+        };
+        let owner = store.snapshot_operation_owner(&candidate.final_request.operation_id)?;
+        let durable_owner = if let Some(owner) = owner {
+            validate_current_snapshot_retry_owner(parent, &owner.record, &candidate)?;
+            Some(owner.local_job_id)
+        } else {
+            None
+        };
+        if selected
+            .replace((
+                candidate.final_request.operation_id.clone(),
+                candidate.stage.source_created_at_ms,
+                candidate_preview.consent_sha256,
+                durable_owner,
+            ))
+            .is_some()
+        {
+            return Err(remote_error(
+                "snapshot_recovery_ambiguous",
+                "more than one complete private stage matches the current-source retry",
+                "Preserve the stages and resolve their exact JobStore ownership before retrying.",
+            ));
+        }
+    }
+    ensure_config_snapshot_unchanged(
+        fresh.project.root(),
+        &fresh.config_path,
+        &fresh.config_identity,
+        &fresh.config_bytes,
+    )?;
+    fresh.project.verify()?;
+    check_snapshot_cancellation(cancellation)?;
+    let Some((operation_id, source_created_at_ms, expected_consent_sha256, durable_owner)) =
+        selected
+    else {
+        return Ok(fresh);
+    };
+    let mut recovered = prepare_current_snapshot_retry(parent, operation_id, source_created_at_ms)?;
+    if recovered.preview.snapshot_consent_sha256 != expected_consent_sha256 {
+        return Err(remote_error(
+            "snapshot_recovery_plan_changed",
+            "the recovered private retry stage changed while its exact preview was reconstructed",
+            "Preserve the stage and request a new current-source retry preview.",
+        ));
+    }
+    recovered.durable_owner = durable_owner;
+    recovered.preview.recovery = if recovered.durable_owner.is_some() {
+        CurrentSnapshotRetryRecoveryV1::ExistingChild
+    } else {
+        CurrentSnapshotRetryRecoveryV1::Orphan
+    };
+    Ok(recovered)
+}
+
+impl PreparedCurrentSnapshotRetry {
+    pub(in crate::commands) const fn preview(&self) -> &CurrentSnapshotRetryPreviewV1 {
+        &self.preview
+    }
+
+    pub(in crate::commands) fn confirm(
+        self,
+        yes: bool,
+        reporter: &Reporter,
+    ) -> Result<ConfirmedCurrentSnapshotRetry, CliError> {
+        super::github_snapshot::require_snapshot_consent(&self.approved, yes, reporter)?;
+        Ok(ConfirmedCurrentSnapshotRetry { prepared: self })
+    }
+}
+
+impl ConfirmedCurrentSnapshotRetry {
+    pub(in crate::commands) fn operation_id(&self) -> &str {
+        &self.prepared.preview.operation_id
+    }
+
+    pub(in crate::commands) fn parent_job_id(&self) -> &LocalJobId {
+        &self.prepared.parent.local_job_id
+    }
+
+    pub(in crate::commands) const fn parent_revision(&self) -> u64 {
+        self.prepared.parent.revision
+    }
+
+    /// Replan after exact consent, then create or classify one complete private stage.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "staging keeps consent, operation authority, config identity, source replan, and stage adoption in one ordered boundary"
+    )]
+    pub(in crate::commands) fn stage(
+        self,
+        parent_retry_lease: &JobOperationLease,
+        operation_guard: CurrentSnapshotRetryOperationGuard<'_>,
+        cancellation: &CancellationToken,
+    ) -> Result<StagedCurrentSnapshotRetry, CliError> {
+        let self_ = self.prepared;
+        check_snapshot_cancellation(cancellation)?;
+        validate_current_snapshot_operation_guard(&self_, parent_retry_lease, operation_guard)?;
+        self_.project.verify()?;
+        let reporter = Reporter::new(false, true, false);
+        let (_workspace, current_source, current_path_dependencies) =
+            snapshot_build_source_bundle_plan(self_.project.root(), &reporter)?;
+        check_snapshot_cancellation(cancellation)?;
+        let revalidated = super::github_snapshot::GithubSnapshotPreviewV1::new(
+            &self_.preview.operation_id,
+            self_.preview.source_created_at_ms,
+            &self_.stored.source_repository,
+            &current_source,
+            &current_path_dependencies,
+        )?;
+        super::github_snapshot::ensure_same_snapshot_plan(&self_.approved, &revalidated)?;
+        if current_source != self_.approved_source
+            || current_path_dependencies != self_.approved_path_dependencies
+        {
+            return Err(remote_error(
+                "snapshot_plan_changed",
+                "the current-source retry inputs changed after consent",
+                "Review a new zero-write retry preview before creating a private stage.",
+            ));
+        }
+        ensure_config_snapshot_unchanged(
+            self_.project.root(),
+            &self_.config_path,
+            &self_.config_identity,
+            &self_.config_bytes,
+        )?;
+        self_.project.verify()?;
+        let current_template = current_snapshot_retry_request_template(
+            &self_.parent,
+            &self_.preview.operation_id,
+            &self_.stored.source_repository,
+            current_source.manifest().clone(),
+        )?;
+        if current_template != self_.request_template {
+            return Err(remote_error(
+                "snapshot_request_changed",
+                "the current-source retry request changed after consent",
+                "Review a new retry preview before creating or adopting a private stage.",
+            ));
+        }
+        let provider = build_provider(self_.project.root(), self_.project.root(), &self_.stored)?;
+        let existing =
+            exact_current_snapshot_stage(&provider, &current_template, &revalidated, cancellation)?;
+        let recovery_matches = matches!(
+            (self_.preview.recovery, existing.is_some()),
+            (CurrentSnapshotRetryRecoveryV1::New, false)
+                | (
+                    CurrentSnapshotRetryRecoveryV1::Orphan
+                        | CurrentSnapshotRetryRecoveryV1::ExistingChild,
+                    true
+                )
+        );
+        if !recovery_matches {
+            return Err(remote_error(
+                "snapshot_recovery_changed",
+                "the private current-source retry stage changed after its zero-write preview",
+                "Preserve the operation and review a new exact retry preview before staging.",
+            ));
+        }
+        let (request, source_archive_sha256, authority) = if let Some(candidate) = existing {
+            (
+                candidate.final_request,
+                candidate.stage.archive.sha256,
+                CurrentSnapshotRetryStageAuthority::FreshReconsent,
+            )
+        } else {
+            let staged = super::github_snapshot::stage_same_invocation_snapshot(
+                &GithubPaths::new(self_.project.root(), self_.project.root()).git_isolation,
+                &current_source,
+                current_template,
+                self_.preview.source_created_at_ms,
+                &revalidated.consent_sha256,
+                |inputs, operation_id, created_at_ms| {
+                    provider
+                        .precompute_git_snapshot_graph(
+                            inputs,
+                            operation_id,
+                            created_at_ms,
+                            cancellation,
+                        )
+                        .map_err(|error| {
+                            provider_failure(
+                                &error,
+                                "snapshot_graph_precompute_failed",
+                                "the current-source retry object graph could not be verified without mutation",
+                            )
+                        })
+                },
+            )?;
+            let archive_sha256 = staged.stage.archive.sha256.clone();
+            let request = staged.request.clone();
+            (
+                request,
+                archive_sha256,
+                CurrentSnapshotRetryStageAuthority::SameInvocation(Box::new(staged)),
+            )
+        };
+        ensure_config_snapshot_unchanged(
+            self_.project.root(),
+            &self_.config_path,
+            &self_.config_identity,
+            &self_.config_bytes,
+        )?;
+        self_.project.verify()?;
+        Ok(StagedCurrentSnapshotRetry {
+            parent_job_id: self_.parent.local_job_id,
+            parent_revision: self_.parent.revision,
+            parent_request_sha256: self_.parent.request_sha256,
+            parent_provider: self_.parent.provider,
+            request,
+            source_created_at_ms: self_.preview.source_created_at_ms,
+            snapshot_consent_sha256: revalidated.consent_sha256,
+            source_archive_sha256,
+            authority,
+        })
+    }
+}
+
+impl StagedCurrentSnapshotRetry {
+    pub(in crate::commands) const fn request(&self) -> &IosDeviceBuildRequest {
+        &self.request
+    }
+
+    pub(in crate::commands) const fn source_created_at_ms(&self) -> u64 {
+        self.source_created_at_ms
+    }
+
+    pub(in crate::commands) fn retry_lineage_options(
+        &self,
+        parent_policy: RetryParentPolicyV1,
+        parent_before_lineage: &StoredJobV1,
+        child_initial: &StoredJobV1,
+    ) -> Result<RetryLineageOptionsV1, CliError> {
+        if parent_before_lineage.local_job_id != self.parent_job_id
+            || parent_before_lineage.revision != self.parent_revision
+            || parent_before_lineage.request_sha256 != self.parent_request_sha256
+            || child_initial.revision != 1
+            || child_initial.provider_resume.is_some()
+            || child_initial.provider != self.parent_provider
+            || child_initial.request != self.request
+            || child_initial.created_at_ms != self.source_created_at_ms
+        {
+            return Err(remote_error(
+                "retry_snapshot_child_mismatch",
+                "the proposed current-source retry child differs from its consented private stage",
+                "Preserve the stage and rebuild the exact initial child before publishing lineage.",
+            ));
+        }
+        let confirmation_sha256 =
+            retry_recapture_confirmation_sha256(parent_before_lineage, child_initial)?;
+        Ok(RetryLineageOptionsV1 {
+            parent_policy,
+            source_policy: RetrySourcePolicyV1::RecapturedGitSnapshot {
+                confirmation_sha256,
+                snapshot_consent_sha256: self.snapshot_consent_sha256.clone(),
+                source_archive_sha256: self.source_archive_sha256.clone(),
+            },
+        })
+    }
+
+    /// Convert only after the caller has durably published the exact child lineage and retained
+    /// its Build lease. No generic `BuildProvider::submit` authority is exposed.
+    pub(in crate::commands) fn into_provider_submission(
+        self,
+        parent_before_lineage: &StoredJobV1,
+        child_initial: &StoredJobV1,
+        binding: &RetryLineageBindingV1,
+        durable_identity: GithubDurableIdentityV1,
+    ) -> Result<GithubGitSnapshotSubmissionV1, CliError> {
+        if StoredProviderIdentityV1::from(durable_identity.clone()) != self.parent_provider {
+            return Err(remote_error(
+                "retry_provider_identity_changed",
+                "the live GitHub provider identity differs from the current-source retry parent",
+                "Preserve the private stage and restore the exact provider identity before retrying.",
+            ));
+        }
+        let confirmation_sha256 =
+            retry_recapture_confirmation_sha256(parent_before_lineage, child_initial)?;
+        let durable_binding_matches = child_initial.revision == 1
+            && parent_before_lineage.local_job_id == self.parent_job_id
+            && parent_before_lineage.revision == self.parent_revision
+            && parent_before_lineage.request_sha256 == self.parent_request_sha256
+            && child_initial.provider_resume.is_none()
+            && child_initial.provider == self.parent_provider
+            && child_initial.created_at_ms == self.source_created_at_ms
+            && child_initial.request == self.request
+            && child_initial.operation_id == self.request.operation_id
+            && binding.child_job_id == child_initial.local_job_id
+            && binding.child_operation_id == child_initial.operation_id
+            && binding.parent_before_revision == parent_before_lineage.revision
+            && matches!(
+                &binding.options.source_policy,
+                RetrySourcePolicyV1::RecapturedGitSnapshot {
+                    confirmation_sha256: stored_confirmation,
+                    snapshot_consent_sha256,
+                    source_archive_sha256,
+                } if stored_confirmation == &confirmation_sha256
+                    && snapshot_consent_sha256 == &self.snapshot_consent_sha256
+                    && source_archive_sha256 == &self.source_archive_sha256
+            );
+        if !durable_binding_matches {
+            return Err(remote_error(
+                "retry_snapshot_lineage_mismatch",
+                "the durable retry lineage differs from the freshly consented private stage",
+                "Preserve the child and stage; reconcile their exact immutable binding before submission.",
+            ));
+        }
+        match self.authority {
+            CurrentSnapshotRetryStageAuthority::SameInvocation(staged) => {
+                let staged = *staged;
+                GithubGitSnapshotSubmissionV1::same_invocation(
+                    durable_identity,
+                    staged.request,
+                    self.snapshot_consent_sha256,
+                    staged.locator,
+                    staged.stage,
+                )
+            }
+            CurrentSnapshotRetryStageAuthority::FreshReconsent => {
+                GithubGitSnapshotSubmissionV1::after_fresh_reconsent(
+                    durable_identity,
+                    self.request,
+                    self.snapshot_consent_sha256,
+                )
+            }
+        }
+        .map_err(|error| {
+            provider_failure(
+                &error,
+                "snapshot_submission_invalid",
+                "the current-source retry stage could not form specialized snapshot submission authority",
+            )
+        })
+    }
+}
+
+fn validate_current_snapshot_operation_guard(
+    prepared: &PreparedCurrentSnapshotRetry,
+    parent_retry_lease: &JobOperationLease,
+    guard: CurrentSnapshotRetryOperationGuard<'_>,
+) -> Result<(), CliError> {
+    let parent_valid = parent_retry_lease.kind() == JobOperationKind::Retry
+        && parent_retry_lease.local_job_id() == &prepared.parent.local_job_id;
+    let operation_valid = match (prepared.durable_owner.as_ref(), guard) {
+        (None, CurrentSnapshotRetryOperationGuard::Vacant(vacancy)) => {
+            vacancy.operation_id() == prepared.preview.operation_id
+        }
+        (Some(owner), CurrentSnapshotRetryOperationGuard::ExistingChild(lease)) => {
+            lease.kind() == JobOperationKind::Build && lease.local_job_id() == owner
+        }
+        _ => false,
+    };
+    if parent_valid && operation_valid {
+        return Ok(());
+    }
+    Err(remote_error(
+        "snapshot_retry_operation_guard_mismatch",
+        "the current-source retry stage lacks its exact continuous JobStore operation authority",
+        "Hold the matching vacant operation reservation or existing child Build lease through staging and durable lineage.",
+    ))
+}
+
+fn current_snapshot_retry_request_template(
+    parent: &StoredJobV1,
+    operation_id: &str,
+    source_repository: &str,
+    source: SourceManifest,
+) -> Result<IosDeviceBuildRequest, CliError> {
+    let mut request = parent.request.clone();
+    operation_id.clone_into(&mut request.operation_id);
+    request.source_mode = SourceMode::GitSnapshot;
+    request.source_repository = Some(source_repository.to_owned());
+    request.source_revision = None;
+    request.source = source;
+    canonical_git_snapshot_request_template_sha256(&request).map_err(|error| {
+        provider_failure(
+            &error,
+            "retry_snapshot_request_invalid",
+            "the current-source retry request template is invalid",
+        )
+    })?;
+    Ok(request)
+}
+
+fn current_snapshot_manifest_diff(
+    previous: &SourceManifest,
+    current: &SourceManifest,
+) -> Result<CurrentSnapshotManifestDiffV1, CliError> {
+    let previous_entries = previous
+        .entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let current_entries = current
+        .entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect::<BTreeMap<_, _>>();
+    if previous_entries.len() != previous.entries.len()
+        || current_entries.len() != current.entries.len()
+    {
+        return Err(remote_error(
+            "snapshot_manifest_invalid",
+            "a retry source manifest contains duplicate paths",
+            "Preserve the durable parent and rebuild a canonical current-source preview.",
+        ));
+    }
+    let mut added = Vec::new();
+    let mut modified = Vec::new();
+    let mut removed = Vec::new();
+    let mut unchanged = 0_u64;
+    for (path, entry) in &current_entries {
+        match previous_entries.get(path) {
+            None => added.push((*path).to_owned()),
+            Some(previous_entry) if *previous_entry == *entry => {
+                unchanged = unchanged.checked_add(1).ok_or_else(|| {
+                    remote_error(
+                        "snapshot_plan_bound_exceeded",
+                        "the retry source diff exceeds its supported count",
+                        "Reduce the source set before retrying.",
+                    )
+                })?;
+            }
+            Some(_) => modified.push((*path).to_owned()),
+        }
+    }
+    for path in previous_entries.keys() {
+        if !current_entries.contains_key(path) {
+            removed.push((*path).to_owned());
+        }
+    }
+    let added_count = u64::try_from(added.len()).map_err(|_| snapshot_diff_bound_error())?;
+    let modified_count = u64::try_from(modified.len()).map_err(|_| snapshot_diff_bound_error())?;
+    let removed_count = u64::try_from(removed.len()).map_err(|_| snapshot_diff_bound_error())?;
+    let total_changed = added
+        .len()
+        .checked_add(modified.len())
+        .and_then(|count| count.checked_add(removed.len()))
+        .ok_or_else(snapshot_diff_bound_error)?;
+    let mut changed_paths = added
+        .into_iter()
+        .map(|path| (path, 0_u8))
+        .chain(modified.into_iter().map(|path| (path, 1_u8)))
+        .chain(removed.into_iter().map(|path| (path, 2_u8)))
+        .collect::<Vec<_>>();
+    changed_paths.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut retained_path_bytes = 0_usize;
+    let mut retained_count = 0_usize;
+    for (path, _) in &changed_paths {
+        let Some(next_bytes) = retained_path_bytes.checked_add(path.len()) else {
+            break;
+        };
+        if retained_count == MAX_CURRENT_SNAPSHOT_DIFF_PATHS
+            || next_bytes > MAX_CURRENT_SNAPSHOT_DIFF_PATH_BYTES
+        {
+            break;
+        }
+        retained_path_bytes = next_bytes;
+        retained_count += 1;
+    }
+    changed_paths.truncate(retained_count);
+    let mut added_paths = Vec::new();
+    let mut modified_paths = Vec::new();
+    let mut removed_paths = Vec::new();
+    for (path, kind) in changed_paths {
+        match kind {
+            0 => added_paths.push(path),
+            1 => modified_paths.push(path),
+            2 => removed_paths.push(path),
+            _ => unreachable!("bounded diff uses fixed internal categories"),
+        }
+    }
+    Ok(CurrentSnapshotManifestDiffV1 {
+        added_count,
+        modified_count,
+        removed_count,
+        added_paths,
+        modified_paths,
+        removed_paths,
+        unchanged,
+        project_path_changed: previous.project_path != current.project_path,
+        paths_truncated: retained_count < total_changed,
+    })
+}
+
+fn snapshot_diff_bound_error() -> CliError {
+    remote_error(
+        "snapshot_plan_bound_exceeded",
+        "the retry source diff exceeds its supported count",
+        "Reduce the source set before retrying.",
+    )
+}
+
+fn exact_current_snapshot_stage(
+    provider: &GithubProvider,
+    request_template: &IosDeviceBuildRequest,
+    preview: &super::github_snapshot::GithubSnapshotPreviewV1,
+    cancellation: &CancellationToken,
+) -> Result<Option<GithubGitSnapshotRecoveryCandidateV1>, CliError> {
+    check_snapshot_cancellation(cancellation)?;
+    let mut matching = None;
+    for candidate in provider
+        .discover_uncheckpointed_git_snapshot_stages()
+        .map_err(|error| {
+            provider_failure(
+                &error,
+                "snapshot_recovery_discovery_failed",
+                "private current-source retry stages could not be inspected safely",
+            )
+        })?
+    {
+        if candidate.final_request.operation_id != request_template.operation_id {
+            continue;
+        }
+        if matching.is_some() {
+            return Err(remote_error(
+                "snapshot_recovery_ambiguous",
+                "more than one complete private stage claims the current retry operation",
+                "Preserve the stages and inspect their exact operation identities before retrying.",
+            ));
+        }
+        let mut expected = request_template.clone();
+        expected.source_revision = Some(candidate.stage.graph.commit.as_str().to_owned());
+        if candidate.final_request != expected
+            || candidate.stage.final_request != expected
+            || candidate.stage.source_created_at_ms != preview.plan.source_created_at_ms
+            || candidate.stage.consent_sha256 != preview.consent_sha256
+            || candidate.stage.manifest_sha256 != preview.plan.source.sha256
+        {
+            return Err(remote_error(
+                "snapshot_recovery_plan_changed",
+                "the existing private retry stage differs from the freshly consented source plan",
+                "Preserve the stage and create a new operation-bound retry preview.",
+            ));
+        }
+        matching = Some(candidate);
+    }
+    check_snapshot_cancellation(cancellation)?;
+    Ok(matching)
+}
+
+fn current_snapshot_candidate_preview(
+    prepared: &PreparedCurrentSnapshotRetry,
+    candidate: &GithubGitSnapshotRecoveryCandidateV1,
+) -> Result<Option<super::github_snapshot::GithubSnapshotPreviewV1>, CliError> {
+    if candidate.final_request.operation_id == prepared.parent.operation_id {
+        return Ok(None);
+    }
+    let template = current_snapshot_retry_request_template(
+        &prepared.parent,
+        &candidate.final_request.operation_id,
+        &prepared.stored.source_repository,
+        prepared.approved_source.manifest().clone(),
+    )?;
+    let mut expected = template;
+    expected.source_revision = Some(candidate.stage.graph.commit.as_str().to_owned());
+    if expected != candidate.final_request || expected != candidate.stage.final_request {
+        return Ok(None);
+    }
+    let preview = super::github_snapshot::GithubSnapshotPreviewV1::new(
+        &candidate.final_request.operation_id,
+        candidate.stage.source_created_at_ms,
+        &prepared.stored.source_repository,
+        &prepared.approved_source,
+        &prepared.approved_path_dependencies,
+    )?;
+    if preview.consent_sha256 != candidate.stage.consent_sha256
+        || preview.plan.source.sha256 != candidate.stage.manifest_sha256
+    {
+        return Ok(None);
+    }
+    Ok(Some(preview))
+}
+
+fn validate_current_snapshot_retry_owner(
+    parent: &StoredJobV1,
+    owner: &StoredJobV1,
+    candidate: &GithubGitSnapshotRecoveryCandidateV1,
+) -> Result<(), CliError> {
+    let exact_child = owner.retry_lineage.parent_job_id.as_ref() == Some(&parent.local_job_id)
+        && parent
+            .retry_lineage
+            .child_job_ids
+            .contains(&owner.local_job_id)
+        && owner.operation_id == candidate.final_request.operation_id
+        && owner.request == candidate.final_request
+        && owner.project == parent.project
+        && owner.provider == parent.provider;
+    if !exact_child {
+        return Err(remote_error(
+            "snapshot_recovery_foreign_owner",
+            "a matching private retry stage belongs to a different durable operation",
+            "Preserve both the stage and JobStore owner; do not adopt or overwrite them.",
+        ));
+    }
+    if owner.provider_resume.is_some() {
+        return Err(remote_error(
+            "snapshot_retry_restore_required",
+            "the durable current-source retry child already has a provider checkpoint",
+            "Restore and reconcile the exact child; never adopt or resubmit its private stage.",
+        ));
+    }
+    if owner.terminal_outcome.is_some()
+        || owner.failure.is_some()
+        || !matches!(
+            owner.state,
+            StoredJobState::SourceReady | StoredJobState::Submitting
+        )
+    {
+        return Err(remote_error(
+            "snapshot_retry_child_settled",
+            "the private retry stage belongs to a durable child that cannot be newly submitted",
+            "Inspect the exact child and preserve its stage for reconciliation.",
+        ));
+    }
+    Ok(())
+}
+
+pub(in crate::commands) fn ide_snapshot_preview(
+    project_binding: &ProjectFilesystemBinding,
+    ferry_config: &rustferry_core::FerryConfig,
+    binary_name: &str,
+    profile: BuildProfile,
+) -> Result<super::github_snapshot::IdeSnapshotPreview, CliError> {
+    project_binding.verify()?;
+    let root = project_binding.root();
+    let config_path = root.join(CONFIG_RELATIVE_PATH);
+    let (config_identity, config_bytes) = read_private_config_snapshot(root, &config_path)?;
+    let stored = decode_stored_config(&config_bytes)?;
+    validate_stored_config(&stored)?;
+    let signing = select_signing_plan(&stored, ferry_config, binary_name, None, true)?;
+    if signing.mode != SigningMode::UnsignedCompileOnly {
+        return Err(remote_error(
+            "snapshot_unsigned_required",
+            "the IDE GitHub snapshot preview is not unsigned compile-only",
+            "Use the unsigned snapshot build mode and remove every signing option.",
+        ));
+    }
+    let reporter = Reporter::new(false, true, false);
+    let (_workspace, source, path_dependencies) =
+        snapshot_build_source_bundle_plan(root, &reporter)?;
+    let operation_id = operation_id();
+    let source_created_at_ms = unix_timestamp_ms()?;
+    let preview = super::github_snapshot::GithubSnapshotPreviewV1::new(
+        &operation_id,
+        source_created_at_ms,
+        &stored.source_repository,
+        &source,
+        &path_dependencies,
+    )?;
+    let request = snapshot_request_template(
+        ferry_config,
+        binary_name,
+        profile == BuildProfile::Release,
+        &operation_id,
+        &stored.source_repository,
+        source.manifest().clone(),
+        signing,
+        BTreeSet::from([IosArtifactType::Xcarchive]),
+    )?;
+    canonical_git_snapshot_request_template_sha256(&request).map_err(|error| {
+        remote_error_with_details(
+            "invalid_snapshot_build_request",
+            "the IDE snapshot preview could not form a valid unsigned iPhone build request",
+            "Correct the project configuration before requesting snapshot consent.",
+            vec![error.to_string()],
+        )
+    })?;
+    ensure_config_snapshot_unchanged(root, &config_path, &config_identity, &config_bytes)?;
+    project_binding.verify()?;
+    super::github_snapshot::ide_snapshot_preview(
+        root,
+        &project_binding.identity_string(),
+        profile,
+        &preview,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the typed IDE boundary binds the exact project, target, consent, and cancellation inputs"
+)]
+pub(in crate::commands) fn ide_snapshot_submit(
+    project_binding: &ProjectFilesystemBinding,
+    ferry_config: &rustferry_core::FerryConfig,
+    package_name: &str,
+    binary_name: &str,
+    consent_token: &str,
+    preview_sha256: &str,
+    approved: bool,
+    cancellation: &CancellationToken,
+) -> Result<(StoredJobV1, String), CliError> {
+    if !approved {
+        return Err(remote_error(
+            "snapshot_consent_required",
+            "the IDE snapshot submission was not explicitly approved",
+            "Approve the exact current preview and resubmit its unchanged token and SHA-256.",
+        ));
+    }
+    check_snapshot_cancellation(cancellation)?;
+    project_binding.verify()?;
+    let consent = super::github_snapshot::decode_ide_snapshot_consent(
+        project_binding.root(),
+        &project_binding.identity_string(),
+        consent_token,
+        preview_sha256,
+    )?;
+    let profile = consent.profile;
+    let completion = build_iphone_github_snapshot(
+        project_binding,
+        ferry_config,
+        package_name,
+        binary_name,
+        None,
+        profile == BuildProfile::Release,
+        true,
+        &SnapshotConsentAuthority::Ide(consent),
+        Some(BuildArtifactSelection::Archive),
+        false,
+        false,
+        cancellation,
+        &Reporter::new(false, true, false),
+    )?
+    .ok_or_else(|| {
+        remote_error(
+            "snapshot_submission_missing",
+            "the approved IDE snapshot submission returned no durable job receipt",
+            "Request a new preview only after inspecting the JobStore for the exact operation.",
+        )
+    })?;
+    Ok((completion.record, completion.preview_sha256))
+}
+
+#[allow(
+    clippy::fn_params_excessive_bools,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the snapshot route preserves the public build command's validated option boundary"
+)]
+fn build_iphone_github_snapshot(
+    project_binding: &ProjectFilesystemBinding,
+    ferry_config: &rustferry_core::FerryConfig,
+    package_name: &str,
+    binary_name: &str,
+    expected_team: Option<&str>,
+    release: bool,
+    unsigned: bool,
+    consent: &SnapshotConsentAuthority,
+    artifact: Option<BuildArtifactSelection>,
+    include_dsym: bool,
+    dry_run: bool,
+    cancellation: &CancellationToken,
+    reporter: &Reporter,
+) -> Result<Option<SnapshotBuildCompletion>, CliError> {
+    check_snapshot_cancellation(cancellation)?;
+    if !unsigned || expected_team.is_some() {
+        return Err(remote_error(
+            "snapshot_unsigned_required",
+            "GitHub snapshot builds are unsigned compile-only builds",
+            "Pass --unsigned and remove --team before approving a public source snapshot.",
+        ));
+    }
+    let root = project_binding.root();
+    let requested_artifacts =
+        select_requested_artifacts(SigningMode::UnsignedCompileOnly, artifact, include_dsym)?;
+    let config_path = root.join(CONFIG_RELATIVE_PATH);
+    let (approved_config_identity, approved_config_bytes) =
+        read_private_config_snapshot(root, &config_path)?;
+    let stored = decode_stored_config(&approved_config_bytes)?;
+    validate_stored_config(&stored)?;
+    let signing = select_signing_plan(&stored, ferry_config, binary_name, None, true)?;
+    if signing.mode != SigningMode::UnsignedCompileOnly {
+        return Err(remote_error(
+            "snapshot_unsigned_required",
+            "the GitHub snapshot signing plan is not unsigned compile-only",
+            "Pass --unsigned and remove every signing option.",
+        ));
+    }
+    let expected_downloads = expected_artifact_downloads(
+        root,
+        &ferry_config.app.name,
+        release,
+        signing.mode,
+        &requested_artifacts,
+    )?;
+    project_binding.verify()?;
+
+    let profile = if release {
+        BuildProfile::Release
+    } else {
+        BuildProfile::Debug
+    };
+    consent.validate_context(profile, &stored.source_repository)?;
+    let (operation_id, source_created_at_ms) = consent.operation_identity()?;
+    let (_workspace, approved_source, path_dependencies) =
+        snapshot_build_source_bundle_plan(root, reporter)?;
+    check_snapshot_cancellation(cancellation)?;
+    project_binding.verify()?;
+    let approved = super::github_snapshot::GithubSnapshotPreviewV1::new(
+        &operation_id,
+        source_created_at_ms,
+        &stored.source_repository,
+        &approved_source,
+        &path_dependencies,
+    )?;
+    if dry_run {
+        ensure_config_snapshot_unchanged(
+            root,
+            &config_path,
+            &approved_config_identity,
+            &approved_config_bytes,
+        )?;
+        project_binding.verify()?;
+        super::github_snapshot::report_snapshot_preview(&approved, reporter);
+        return Ok(None);
+    }
+
+    consent.approve(&approved, reporter, cancellation)?;
+    project_binding.verify()?;
+    let (_workspace, current_source, current_path_dependencies) =
+        snapshot_build_source_bundle_plan(root, reporter)?;
+    check_snapshot_cancellation(cancellation)?;
+    let revalidated = super::github_snapshot::GithubSnapshotPreviewV1::new(
+        &operation_id,
+        source_created_at_ms,
+        &stored.source_repository,
+        &current_source,
+        &current_path_dependencies,
+    )?;
+    super::github_snapshot::ensure_same_snapshot_plan(&approved, &revalidated)?;
+    ensure_config_snapshot_unchanged(
+        root,
+        &config_path,
+        &approved_config_identity,
+        &approved_config_bytes,
+    )?;
+    project_binding.verify()?;
+
+    let current_template = snapshot_request_template(
+        ferry_config,
+        binary_name,
+        release,
+        &operation_id,
+        &stored.source_repository,
+        current_source.manifest().clone(),
+        signing.clone(),
+        requested_artifacts.clone(),
+    )?;
+    let mut preacquired_snapshot_vacancy = None;
+    let preopened_job_store = if consent.is_ide() {
+        let store = JobStore::open_default()?;
+        match store.try_acquire_vacant_snapshot_operation_lease(&operation_id)? {
+            SnapshotOperationVacancyV1::Vacant(vacancy) => {
+                preacquired_snapshot_vacancy = Some(vacancy);
+            }
+            SnapshotOperationVacancyV1::Owned(owner) => {
+                validate_ide_snapshot_owner(&owner.record, project_binding, &current_template)?;
+                if snapshot_job_is_fully_settled(&owner.record) {
+                    if owner.record.state == StoredJobState::Succeeded
+                        && owner.record.terminal_outcome == Some(StoredBuildOutcome::Succeeded)
+                    {
+                        return Ok(Some(SnapshotBuildCompletion {
+                            record: owner.record,
+                            preview_sha256: revalidated.consent_sha256,
+                        }));
+                    }
+                    return Err(remote_error_with_details(
+                        "snapshot_operation_already_settled",
+                        "the approved IDE snapshot operation already has a terminal durable owner",
+                        "Inspect the exact existing job; request a new preview only for a new intentional build.",
+                        vec![format!("local_job_id={}", owner.local_job_id.as_str())],
+                    ));
+                }
+            }
+        }
+        Some(store)
+    } else {
+        None
+    };
+
+    let (locked_stored, config_lock) = load_config_for_build(root)?;
+    if locked_stored != stored {
+        return Err(provider_config_changed());
+    }
+    ensure_config_snapshot_unchanged(
+        root,
+        &config_path,
+        &approved_config_identity,
+        &approved_config_bytes,
+    )?;
+    let mut config_lock = Some(config_lock);
+    let artifact_path = expected_downloads[0].path.clone();
+    let provider = build_provider(root, root, &stored)?;
+    handshake_with_source_mode_cancellable(
+        &provider,
+        SourceMode::GitSnapshot,
+        signing.mode,
+        &requested_artifacts,
+        cancellation,
+    )?;
+    let readiness = provider_call(
+        provider.doctor(
+            ProviderDoctorRequest {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+                operation_id: format!("{operation_id}-doctor"),
+                require_signing: false,
+            },
+            cancellation.clone(),
+        ),
+        "provider_doctor_failed",
+        "the GitHub provider doctor could not complete",
+    )?;
+    ensure_doctor_ready(&readiness, false)?;
+    let durable_provider_identity = provider.durable_identity().map_err(|error| {
+        provider_failure(
+            &error,
+            "provider_identity_unavailable",
+            "the GitHub provider identity could not be bound durably",
+        )
+    })?;
+    project_binding.verify()?;
+
+    let job_store = preopened_job_store.map_or_else(JobStore::open_default, Ok)?;
+    let current_provider = StoredProviderIdentityV1::from(durable_provider_identity.clone());
+    let resumable = find_resumable_snapshot_job(
+        &job_store,
+        project_binding,
+        &current_provider,
+        &current_template,
+    )?;
+    let mut recovery = None;
+    if resumable.is_none() {
+        for candidate in provider
+            .discover_uncheckpointed_git_snapshot_stages()
+            .map_err(|error| {
+                provider_failure(
+                    &error,
+                    "snapshot_recovery_discovery_failed",
+                    "complete private Git snapshot stages could not be inspected safely",
+                )
+            })?
+        {
+            let expected = snapshot_request_for_candidate(&current_template, &candidate);
+            if expected != candidate.final_request {
+                continue;
+            }
+            let candidate_preview = super::github_snapshot::GithubSnapshotPreviewV1::new(
+                &candidate.final_request.operation_id,
+                candidate.stage.source_created_at_ms,
+                &stored.source_repository,
+                &current_source,
+                &current_path_dependencies,
+            )?;
+            if candidate_preview.consent_sha256 != candidate.stage.consent_sha256 {
+                continue;
+            }
+            consent.validate_existing_preview(&candidate_preview)?;
+            let owner =
+                job_store.snapshot_operation_owner(&candidate.final_request.operation_id)?;
+            if recovery
+                .replace((candidate, candidate_preview, owner))
+                .is_some()
+            {
+                return Err(remote_error(
+                    "snapshot_recovery_ambiguous",
+                    "more than one complete snapshot stage matches the current build",
+                    "Inspect the private snapshot stages and their durable JobStore ownership before retrying.",
+                ));
+            }
+        }
+    }
+
+    let execution_plan = if let Some(record) = resumable {
+        let operation_lease =
+            job_store.try_acquire_operation_lease(&record.local_job_id, JobOperationKind::Build)?;
+        let record = job_store.latest_under_operation_lease(
+            &record.local_job_id,
+            JobOperationKind::Build,
+            &operation_lease,
+        )?;
+        validate_resumable_snapshot_job(
+            &record,
+            project_binding,
+            &current_provider,
+            &current_template,
+        )?;
+        let snapshot = record
+            .provider_resume
+            .as_ref()
+            .and_then(|resume| resume.git_snapshot.as_ref())
+            .expect("validated resumable snapshot carries its exact snapshot checkpoint");
+        let resume_preview = super::github_snapshot::GithubSnapshotPreviewV1::new(
+            &record.operation_id,
+            snapshot.stage.source_created_at_ms,
+            &stored.source_repository,
+            &current_source,
+            &current_path_dependencies,
+        )?;
+        if resume_preview.consent_sha256 != snapshot.stage.consent_sha256 {
+            return Err(remote_error(
+                "snapshot_resume_consent_mismatch",
+                "the durable snapshot resume no longer matches the exact current consent plan",
+                "Preserve and inspect the durable job; do not create a replacement operation.",
+            ));
+        }
+        consent.validate_existing_preview(&resume_preview)?;
+        SnapshotExecutionPlan {
+            request: record.request.clone(),
+            consent_sha256: snapshot.stage.consent_sha256.clone(),
+            source_created_at_ms: snapshot.stage.source_created_at_ms,
+            submission: SnapshotSubmissionAuthority::RestoreExisting,
+            owner: SnapshotDurableOwner::Existing {
+                record: Box::new(record),
+                operation_lease,
+            },
+        }
+    } else if let Some((candidate, candidate_preview, owner)) = recovery {
+        if let Some(owner) = owner.as_ref() {
+            validate_existing_snapshot_owner(
+                owner,
+                project_binding,
+                &StoredProviderIdentityV1::from(durable_provider_identity.clone()),
+                &candidate,
+            )?;
+        }
+        let requires_reconsent = owner
+            .as_ref()
+            .is_none_or(|owner| owner.record.provider_resume.is_none());
+        let recovered_preview = if requires_reconsent {
+            consent.approve(&candidate_preview, reporter, cancellation)?;
+            let (_workspace, recovered_source, recovered_path_dependencies) =
+                snapshot_build_source_bundle_plan(root, reporter)?;
+            check_snapshot_cancellation(cancellation)?;
+            let recovered_preview = super::github_snapshot::GithubSnapshotPreviewV1::new(
+                &candidate.final_request.operation_id,
+                candidate.stage.source_created_at_ms,
+                &stored.source_repository,
+                &recovered_source,
+                &recovered_path_dependencies,
+            )?;
+            super::github_snapshot::ensure_same_snapshot_plan(
+                &candidate_preview,
+                &recovered_preview,
+            )?;
+            let recovered_template = snapshot_request_template(
+                ferry_config,
+                binary_name,
+                release,
+                &candidate.final_request.operation_id,
+                &stored.source_repository,
+                recovered_source.manifest().clone(),
+                signing.clone(),
+                requested_artifacts.clone(),
+            )?;
+            let recovered_request = snapshot_request_for_candidate(&recovered_template, &candidate);
+            if recovered_request != candidate.final_request {
+                return Err(remote_error(
+                    "snapshot_recovery_plan_changed",
+                    "the complete private snapshot stage no longer matches the accepted build plan",
+                    "Review a new zero-write plan; do not adopt or delete the preserved stage.",
+                ));
+            }
+            recovered_preview
+        } else {
+            candidate_preview
+        };
+        ensure_config_snapshot_unchanged(
+            root,
+            &config_path,
+            &approved_config_identity,
+            &approved_config_bytes,
+        )?;
+        project_binding.verify()?;
+        let (submission, durable_owner) = if let Some(owner) = owner {
+            let operation_lease = job_store
+                .try_acquire_operation_lease(&owner.local_job_id, JobOperationKind::Build)?;
+            let submission = existing_snapshot_submission_authority(&owner.record);
+            (
+                submission,
+                SnapshotDurableOwner::Existing {
+                    record: Box::new(owner.record),
+                    operation_lease,
+                },
+            )
+        } else {
+            let vacancy = snapshot_vacancy_for_operation(
+                &job_store,
+                &mut preacquired_snapshot_vacancy,
+                &candidate.final_request.operation_id,
+            )?;
+            (
+                SnapshotSubmissionAuthority::FreshReconsent,
+                SnapshotDurableOwner::Vacant(vacancy),
+            )
+        };
+        SnapshotExecutionPlan {
+            request: candidate.final_request.clone(),
+            consent_sha256: recovered_preview.consent_sha256,
+            source_created_at_ms: candidate.stage.source_created_at_ms,
+            submission,
+            owner: durable_owner,
+        }
+    } else {
+        check_snapshot_cancellation(cancellation)?;
+        let vacancy = snapshot_vacancy_for_operation(
+            &job_store,
+            &mut preacquired_snapshot_vacancy,
+            &operation_id,
+        )?;
+        let staged = super::github_snapshot::stage_same_invocation_snapshot(
+            &GithubPaths::new(root, root).git_isolation,
+            &current_source,
+            current_template,
+            source_created_at_ms,
+            &revalidated.consent_sha256,
+            |inputs, operation_id, created_at_ms| {
+                provider
+                    .precompute_git_snapshot_graph(
+                        inputs,
+                        operation_id,
+                        created_at_ms,
+                        cancellation,
+                    )
+                    .map_err(|error| {
+                        provider_failure(
+                            &error,
+                            "snapshot_graph_precompute_failed",
+                            "the staged snapshot object graph could not be verified without mutation",
+                        )
+                    })
+            },
+        )?;
+        SnapshotExecutionPlan {
+            request: staged.request.clone(),
+            consent_sha256: revalidated.consent_sha256.clone(),
+            source_created_at_ms,
+            submission: SnapshotSubmissionAuthority::SameInvocation(Box::new(staged)),
+            owner: SnapshotDurableOwner::Vacant(vacancy),
+        }
+    };
+
+    let SnapshotExecutionPlan {
+        request,
+        consent_sha256,
+        source_created_at_ms: source_stage_created_at_ms,
+        submission: authority,
+        owner,
+    } = execution_plan;
+    let (local_job_id, mut operation_lease, existing_record) = match owner {
+        SnapshotDurableOwner::Vacant(vacancy) => {
+            let local_job_id = LocalJobId::generate();
+            let initial_job = snapshot_initial_job(
+                project_binding,
+                StoredProviderIdentityV1::from(durable_provider_identity.clone()),
+                local_job_id.clone(),
+                request.clone(),
+                source_stage_created_at_ms,
+                unix_timestamp_ms()?,
+            )?;
+            let created = job_store.create_with_operation_lease(vacancy, &initial_job)?;
+            if created.revision.local_job_id != local_job_id || created.revision.revision != 1 {
+                return Err(remote_error(
+                    "snapshot_job_creation_uncertain",
+                    "the durable snapshot job creation receipt did not match its exact initial revision",
+                    "Preserve the JobStore and private stage for inspection before retrying.",
+                ));
+            }
+            (local_job_id, Some(created.operation_lease), None)
+        }
+        SnapshotDurableOwner::Existing {
+            record,
+            operation_lease,
+        } => {
+            let record = *record;
+            (
+                record.local_job_id.clone(),
+                Some(operation_lease),
+                Some(record),
+            )
+        }
+    };
+    let destinations_are_unbound = existing_record.as_ref().is_none_or(|record| {
+        record
+            .artifacts
+            .iter()
+            .all(|artifact| artifact.download_destination.is_none())
+    });
+    if !matches!(&authority, SnapshotSubmissionAuthority::RestoreExisting)
+        || destinations_are_unbound
+    {
+        for download in &expected_downloads {
+            ensure_config_snapshot_unchanged(
+                root,
+                &config_path,
+                &approved_config_identity,
+                &approved_config_bytes,
+            )?;
+            project_binding.verify()?;
+            prepare_artifact_destination(root, &download.path)?;
+        }
+    }
+    let submission = match authority {
+        SnapshotSubmissionAuthority::SameInvocation(staged) => {
+            let staged = *staged;
+            Some(GithubGitSnapshotSubmissionV1::same_invocation(
+                durable_provider_identity.clone(),
+                staged.request,
+                consent_sha256.clone(),
+                staged.locator,
+                staged.stage,
+            ))
+        }
+        SnapshotSubmissionAuthority::FreshReconsent => {
+            Some(GithubGitSnapshotSubmissionV1::after_fresh_reconsent(
+                durable_provider_identity.clone(),
+                request.clone(),
+                consent_sha256.clone(),
+            ))
+        }
+        SnapshotSubmissionAuthority::RestoreExisting => None,
+    }
+    .transpose()
+    .map_err(|error| {
+        provider_failure(
+            &error,
+            "snapshot_submission_invalid",
+            "the durable snapshot submission authority is invalid",
+        )
+    })?;
+    let provider = provider.with_checkpoint_sink(GithubJobStoreCheckpointSink::new(
+        job_store.clone(),
+        local_job_id.clone(),
+    ));
+    project_binding.verify()?;
+    reporter.progress(format!(
+        "Preparing GitHub snapshot build {} for {} at {}",
+        local_job_id.as_str(),
+        package_name,
+        request
+            .source_revision
+            .as_deref()
+            .unwrap_or("<unresolved-snapshot>")
+    ));
+    let build_deadline = Instant::now() + BUILD_TIMEOUT;
+    let job_id = if let Some(submission) = submission {
+        let (provider_job_hint, submit_error) =
+            match provider.submit_git_snapshot(submission, cancellation) {
+                Ok(handle) => (Some(handle.job_id), None),
+                Err(error) => (None, Some(error)),
+            };
+        reconcile_submit_attempt_with_cancellation(
+            &provider,
+            &job_store,
+            &local_job_id,
+            project_binding,
+            provider_job_hint.as_deref(),
+            submit_error.as_ref(),
+            cancellation,
+        )?
+    } else {
+        let resume = existing_record
+            .as_ref()
+            .and_then(|record| record.provider_resume.clone())
+            .ok_or_else(|| {
+                remote_error(
+                    "snapshot_resume_missing",
+                    "the existing snapshot job lost its durable provider checkpoint",
+                    "Preserve the JobStore and private stage for inspection; do not adopt or resubmit it.",
+                )
+            })?;
+        let job_id = resume.job_id.clone();
+        provider
+            .restore_job_resumes_offline(vec![resume], &durable_provider_identity)
+            .and_then(|()| provider.revalidate_restored_job_live(&job_id, cancellation))
+            .and_then(|()| {
+                provider
+                    .reconcile_restored_job(&job_id, cancellation)
+                    .map(drop)
+            })
+            .map_err(|error| {
+                provider_failure(
+                    &error,
+                    "snapshot_resume_failed",
+                    "the exact checkpointed snapshot job could not be restored and reconciled",
+                )
+            })?;
+        job_id
+    };
+    require_bound_provider_job(
+        &job_store,
+        &local_job_id,
+        &job_id,
+        provider.workflow_run_trigger(),
+    )?;
+    release_build_wait_guards(&mut config_lock, &mut operation_lease);
+    let terminal = poll_job(
+        &provider,
+        &job_store,
+        &local_job_id,
+        &job_id,
+        build_deadline,
+        cancellation,
+        reporter,
+    );
+    let reacquired_operation_lease =
+        acquire_build_mutation_lease(&job_store, &local_job_id, cancellation)?;
+    let post_wait_rebind = (|| {
+        let (current_stored, reacquired_config_lock) = load_config_for_build(root)?;
+        if current_stored != stored {
+            return Err(provider_config_changed());
+        }
+        ensure_config_snapshot_unchanged(
+            root,
+            &config_path,
+            &approved_config_identity,
+            &approved_config_bytes,
+        )?;
+        project_binding.verify()?;
+        Ok(reacquired_config_lock)
+    })();
+    let reacquired_config_lock = match post_wait_rebind {
+        Ok(config_lock) => config_lock,
+        Err(error) => {
+            return Err(reconcile_post_wait_rebind_failure(
+                &provider,
+                &job_store,
+                &local_job_id,
+                &job_id,
+                project_binding,
+                &terminal,
+                &error,
+            ));
+        }
+    };
+    let completed_downloads = complete_submitted_job(
+        &provider,
+        &job_store,
+        &local_job_id,
+        &job_id,
+        project_binding,
+        &request,
+        &expected_downloads,
+        &artifact_path,
+        build_deadline,
+        terminal,
+        reporter,
+    )?;
+    for guard in &completed_downloads.validation_guards {
+        guard.verify()?;
+    }
+    for binding in completed_downloads.destinations.values() {
+        binding.verify(project_binding)?;
+    }
+    project_binding.verify()?;
+    let record = job_store.latest_under_operation_lease(
+        &local_job_id,
+        JobOperationKind::Build,
+        &reacquired_operation_lease,
+    )?;
+    if record.state != StoredJobState::Succeeded
+        || record.terminal_outcome != Some(StoredBuildOutcome::Succeeded)
+        || record.cleanup_status != StoredCleanupStatus::Confirmed
+    {
+        return Err(remote_error(
+            "snapshot_completion_not_durable",
+            "the snapshot build completed without an exact durable success and cleanup receipt",
+            "Preserve the local job and resume its exact completion before reporting success.",
+        ));
+    }
+    let output = RemoteBuildOutput {
+        project: root.to_string(),
+        provider: "github",
+        profile: profile_name(release),
+        signing_mode: signing_mode_name(signing.mode),
+        source_revision: request
+            .source_revision
+            .clone()
+            .unwrap_or_else(|| "<missing>".to_owned()),
+        source_sha256: request.source.sha256.clone(),
+        source_files: request.source.entries.len(),
+        expected_artifact: artifact_path.to_string(),
+        artifact: Some(artifact_path.to_string()),
+        artifact_sha256: Some(completed_downloads.primary_sha256),
+        supporting_artifacts: Vec::new(),
+        local_job_id: Some(local_job_id.as_str().to_owned()),
+        job_id: Some(job_id),
+        validated: true,
+        cleanup_confirmed: true,
+        dry_run: false,
+    };
+    let mut warnings = unsigned_warning(signing.mode);
+    warnings.extend(super::github_snapshot::snapshot_warnings(&consent_sha256));
+    reporter.success(
+        "build",
+        &output,
+        || {
+            format!(
+                "Remote GitHub snapshot build completed and verified\n\nLocal job:\n  {}\n\nArtifact:\n  {}\n\nSHA-256:\n  {}",
+                output.local_job_id.as_deref().unwrap_or("<missing>"),
+                output.artifact.as_deref().unwrap_or("<missing>"),
+                output.artifact_sha256.as_deref().unwrap_or("<missing>")
+            )
+        },
+        &warnings,
+    );
+    drop(reacquired_config_lock);
+    drop(reacquired_operation_lease);
+    Ok(Some(SnapshotBuildCompletion {
+        record,
+        preview_sha256: consent_sha256,
+    }))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the request constructor keeps every consent-bound snapshot field explicit"
+)]
+fn snapshot_request_template(
+    ferry_config: &rustferry_core::FerryConfig,
+    binary_name: &str,
+    release: bool,
+    operation_id: &str,
+    source_repository: &str,
+    source: SourceManifest,
+    signing: SigningPlan,
+    requested_artifacts: BTreeSet<IosArtifactType>,
+) -> Result<IosDeviceBuildRequest, CliError> {
+    Ok(IosDeviceBuildRequest {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        operation_id: operation_id.to_owned(),
+        product_name: ferry_config.app.name.clone(),
+        bundle_identifier: ferry_config.app.identifier.clone(),
+        minimum_ios_version: ferry_config.ios.min_version.clone(),
+        product: rustferry_apple::derive_ios_device_product_expectation(ferry_config, binary_name)?,
+        profile: if release {
+            BuildProfile::Release
+        } else {
+            BuildProfile::Debug
+        },
+        source_mode: SourceMode::GitSnapshot,
+        source_repository: Some(source_repository.to_owned()),
+        source_revision: None,
+        source,
+        signing,
+        requested_artifacts,
+    })
+}
+
+fn snapshot_request_for_candidate(
+    template: &IosDeviceBuildRequest,
+    candidate: &GithubGitSnapshotRecoveryCandidateV1,
+) -> IosDeviceBuildRequest {
+    let mut request = template.clone();
+    candidate
+        .final_request
+        .operation_id
+        .clone_into(&mut request.operation_id);
+    request.source_revision = Some(candidate.stage.graph.commit.as_str().to_owned());
+    request
+}
+
+fn find_resumable_snapshot_job(
+    store: &JobStore,
+    project_binding: &ProjectFilesystemBinding,
+    provider: &StoredProviderIdentityV1,
+    current_template: &IosDeviceBuildRequest,
+) -> Result<Option<StoredJobV1>, CliError> {
+    let summaries = store.list_latest_for_project(
+        project_binding.root.as_str(),
+        project_binding.identity.as_ref(),
+        MAX_LISTED_JOBS,
+    )?;
+    if summaries.len() == MAX_LISTED_JOBS {
+        return Err(remote_error(
+            "snapshot_resume_scan_bound",
+            "the exact project has too many durable jobs to prove snapshot resume uniqueness",
+            "Prune completed lineages before starting another snapshot build; no new operation was created.",
+        ));
+    }
+    let mut matching = None;
+    for summary in summaries {
+        let record = store.latest_for_project(
+            &summary.local_job_id,
+            project_binding.root.as_str(),
+            project_binding.identity.as_ref(),
+        )?;
+        if !resumable_snapshot_job_matches(&record, provider, current_template) {
+            continue;
+        }
+        if matching.replace(record).is_some() {
+            return Err(remote_error(
+                "snapshot_resume_ambiguous",
+                "more than one unfinished durable snapshot job matches the current exact source plan",
+                "Inspect and complete the matching jobs before starting another snapshot operation.",
+            ));
+        }
+    }
+    Ok(matching)
+}
+
+fn validate_resumable_snapshot_job(
+    record: &StoredJobV1,
+    project_binding: &ProjectFilesystemBinding,
+    provider: &StoredProviderIdentityV1,
+    current_template: &IosDeviceBuildRequest,
+) -> Result<(), CliError> {
+    if record.project.canonical_root != project_binding.root.as_str()
+        || record.project.filesystem_identity != project_binding.identity.to_string()
+        || !resumable_snapshot_job_matches(record, provider, current_template)
+    {
+        return Err(remote_error(
+            "snapshot_resume_changed",
+            "the durable snapshot job changed before its exact Build lease was acquired",
+            "Inspect the job and rerun only after its project, provider, source, and cleanup state are stable.",
+        ));
+    }
+    Ok(())
+}
+
+fn resumable_snapshot_job_matches(
+    record: &StoredJobV1,
+    provider: &StoredProviderIdentityV1,
+    current_template: &IosDeviceBuildRequest,
+) -> bool {
+    if &record.provider != provider
+        || record.request.source_mode != SourceMode::GitSnapshot
+        || record.provider_resume.is_none()
+        || snapshot_job_is_fully_settled(record)
+    {
+        return false;
+    }
+    let mut expected = current_template.clone();
+    expected.operation_id.clone_from(&record.operation_id);
+    expected
+        .source_revision
+        .clone_from(&record.request.source_revision);
+    expected == record.request
+}
+
+fn snapshot_job_is_fully_settled(record: &StoredJobV1) -> bool {
+    record.cleanup_status == StoredCleanupStatus::Confirmed
+        && matches!(
+            record.state,
+            StoredJobState::Succeeded
+                | StoredJobState::Failed
+                | StoredJobState::Cancelled
+                | StoredJobState::Expired
+        )
+}
+
+enum SnapshotSubmissionAuthority {
+    SameInvocation(Box<super::github_snapshot::StagedGithubSnapshotV1>),
+    FreshReconsent,
+    RestoreExisting,
+}
+
+fn existing_snapshot_submission_authority(record: &StoredJobV1) -> SnapshotSubmissionAuthority {
+    if record.provider_resume.is_some() {
+        SnapshotSubmissionAuthority::RestoreExisting
+    } else {
+        SnapshotSubmissionAuthority::FreshReconsent
+    }
+}
+
+enum SnapshotDurableOwner {
+    Vacant(cargo_ferry::job_store::VacantSnapshotOperationLease),
+    Existing {
+        record: Box<StoredJobV1>,
+        operation_lease: JobOperationLease,
+    },
+}
+
+struct SnapshotExecutionPlan {
+    request: IosDeviceBuildRequest,
+    consent_sha256: String,
+    source_created_at_ms: u64,
+    submission: SnapshotSubmissionAuthority,
+    owner: SnapshotDurableOwner,
+}
+
+fn require_snapshot_vacancy(
+    outcome: SnapshotOperationVacancyV1,
+) -> Result<cargo_ferry::job_store::VacantSnapshotOperationLease, CliError> {
+    match outcome {
+        SnapshotOperationVacancyV1::Vacant(vacancy) => Ok(vacancy),
+        SnapshotOperationVacancyV1::Owned(owner) => Err(snapshot_stage_already_owned(&owner)),
+    }
+}
+
+fn snapshot_vacancy_for_operation(
+    store: &JobStore,
+    preacquired: &mut Option<cargo_ferry::job_store::VacantSnapshotOperationLease>,
+    operation_id: &str,
+) -> Result<cargo_ferry::job_store::VacantSnapshotOperationLease, CliError> {
+    if let Some(vacancy) = preacquired.take() {
+        if vacancy.operation_id() != operation_id {
+            return Err(remote_error(
+                "snapshot_operation_changed",
+                "the approved snapshot operation changed before durable ownership",
+                "Preserve private stages and request a new exact preview; do not reuse either operation identifier.",
+            ));
+        }
+        return Ok(vacancy);
+    }
+    require_snapshot_vacancy(store.try_acquire_vacant_snapshot_operation_lease(operation_id)?)
+}
+
+fn validate_ide_snapshot_owner(
+    record: &StoredJobV1,
+    project_binding: &ProjectFilesystemBinding,
+    current_template: &IosDeviceBuildRequest,
+) -> Result<(), CliError> {
+    let mut expected = current_template.clone();
+    expected
+        .source_revision
+        .clone_from(&record.request.source_revision);
+    if record.operation_id != current_template.operation_id
+        || record.project.canonical_root != project_binding.root.as_str()
+        || record.project.filesystem_identity != project_binding.identity.to_string()
+        || record.request.source_mode != SourceMode::GitSnapshot
+        || record.request != expected
+    {
+        return Err(remote_error_with_details(
+            "snapshot_operation_owned",
+            "the approved IDE snapshot operation belongs to a different durable build identity",
+            "Inspect the exact existing job; do not adopt, resubmit, or replace its snapshot stage.",
+            vec![format!("local_job_id={}", record.local_job_id.as_str())],
+        ));
+    }
+    Ok(())
+}
+
+fn snapshot_stage_already_owned(
+    owner: &cargo_ferry::job_store::SnapshotOperationOwnerV1,
+) -> CliError {
+    let provider_state = if owner.record.provider_resume.is_some() {
+        "checkpointed"
+    } else {
+        "pre_checkpoint"
+    };
+    remote_error_with_details(
+        "snapshot_operation_owned",
+        "the complete private snapshot stage already has a durable local job owner",
+        "Resume or inspect the exact existing job; never adopt its stage into a second job.",
+        vec![
+            format!("local_job_id={}", owner.local_job_id.as_str()),
+            format!("provider_state={provider_state}"),
+        ],
+    )
+}
+
+fn validate_existing_snapshot_owner(
+    owner: &cargo_ferry::job_store::SnapshotOperationOwnerV1,
+    project_binding: &ProjectFilesystemBinding,
+    provider: &StoredProviderIdentityV1,
+    candidate: &GithubGitSnapshotRecoveryCandidateV1,
+) -> Result<(), CliError> {
+    let record = &owner.record;
+    if record.local_job_id != owner.local_job_id
+        || record.operation_id != candidate.final_request.operation_id
+        || record.request != candidate.final_request
+        || &record.provider != provider
+        || record.project.canonical_root != project_binding.root.as_str()
+        || record.project.filesystem_identity != project_binding.identity.to_string()
+    {
+        return Err(snapshot_stage_already_owned(owner));
+    }
+    if let Some(resume) = &record.provider_resume {
+        let snapshot_matches = resume.git_snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.stage_locator == candidate.stage_locator && snapshot.stage == candidate.stage
+        });
+        if resume.request != candidate.final_request || !snapshot_matches {
+            return Err(snapshot_stage_already_owned(owner));
+        }
+    } else if record.revision != 1
+        || record.state != StoredJobState::SourceReady
+        || record.last_confirmed_state != Some(StoredJobState::SourceReady)
+        || record.provider_job_id.is_some()
+        || record.provider_run_id.is_some()
+        || record.terminal_outcome.is_some()
+        || record.cleanup_status != StoredCleanupStatus::NotStarted
+    {
+        return Err(snapshot_stage_already_owned(owner));
+    }
+    Ok(())
+}
+
+fn snapshot_initial_job(
+    project_binding: &ProjectFilesystemBinding,
+    provider: StoredProviderIdentityV1,
+    local_job_id: LocalJobId,
+    request: IosDeviceBuildRequest,
+    created_at_ms: u64,
+    updated_at_ms: u64,
+) -> Result<StoredJobV1, CliError> {
+    request.validate().map_err(|error| {
+        remote_error_with_details(
+            "invalid_snapshot_build_request",
+            "the consented GitHub snapshot request failed final validation",
+            "Preserve the private stage and inspect the exact request before retrying.",
+            vec![error.to_string()],
+        )
+    })?;
+    let request_sha256 = canonical_request_sha256(&request).map_err(|error| {
+        provider_failure(
+            &error,
+            "request_identity_unavailable",
+            "the validated snapshot request could not be hashed canonically",
+        )
+    })?;
+    let semantic_retry_sha256 = canonical_retry_template_sha256_v1(&request).map_err(|error| {
+        provider_failure(
+            &error,
+            "retry_identity_unavailable",
+            "the validated snapshot request could not be bound to a retry identity",
+        )
+    })?;
+    let application_identifier = request.bundle_identifier.clone();
+    let operation_id = request.operation_id.clone();
+    let source_revision = request.source_revision.clone();
+    let manifest_sha256 = request.source.sha256.clone();
+    let profile = request.profile;
+    let signing_mode = request.signing.mode;
+    Ok(StoredJobV1 {
+        schema_version: JOB_STORE_SCHEMA_VERSION,
+        local_job_id,
+        revision: 1,
+        project: StoredProjectIdentityV1 {
+            canonical_root: project_binding.root.to_string(),
+            filesystem_identity: project_binding.identity.to_string(),
+            application_identifier,
+        },
+        provider,
+        provider_job_id: None,
+        provider_run_id: None,
+        operation_id,
+        request,
+        request_sha256,
+        semantic_retry_sha256,
+        source: StoredSourceIdentityV1 {
+            revision: source_revision,
+            manifest_sha256,
+        },
+        target: "iphone".to_owned(),
+        profile,
+        signing_mode,
+        created_at_ms,
+        submitted_at_ms: None,
+        updated_at_ms: updated_at_ms.max(created_at_ms),
+        state: StoredJobState::SourceReady,
+        last_confirmed_state: Some(StoredJobState::SourceReady),
+        terminal_outcome: None,
+        compile_evidence: None,
+        signed_cleanup_evidence: None,
+        artifacts: Vec::new(),
+        log_location: None,
+        cleanup_status: StoredCleanupStatus::NotStarted,
+        retry_lineage: StoredRetryLineageV1 {
+            attempt: 0,
+            parent_job_id: None,
+            child_job_ids: Vec::new(),
+        },
+        cancellation_status: StoredCancellationStatus::NotRequested,
+        failure: None,
+        provider_resume: None,
+    })
+}
+
 #[allow(
     clippy::fn_params_excessive_bools,
     clippy::too_many_arguments,
     clippy::too_many_lines
 )]
-pub fn build_iphone(
-    root: &Utf8Path,
+pub(super) fn build_iphone(
+    project_binding: &ProjectFilesystemBinding,
     ferry_config: &rustferry_core::FerryConfig,
     package_name: &str,
     binary_name: &str,
@@ -2418,24 +5229,55 @@ pub fn build_iphone(
     expected_team: Option<&str>,
     release: bool,
     unsigned: bool,
+    snapshot: bool,
+    snapshot_yes: bool,
     artifact: Option<BuildArtifactSelection>,
     include_dsym: bool,
     dry_run: bool,
     reporter: &Reporter,
 ) -> Result<(), CliError> {
+    project_binding.verify()?;
+    let root = project_binding.root();
     let RemoteProviderChoice::Github = provider;
+    if snapshot {
+        return build_iphone_github_snapshot(
+            project_binding,
+            ferry_config,
+            package_name,
+            binary_name,
+            expected_team,
+            release,
+            unsigned,
+            &SnapshotConsentAuthority::Cli { yes: snapshot_yes },
+            artifact,
+            include_dsym,
+            dry_run,
+            &CancellationToken::new(),
+            reporter,
+        )
+        .map(drop);
+    }
     if unsigned {
         select_requested_artifacts(SigningMode::UnsignedCompileOnly, artifact, include_dsym)?;
     }
-    let (stored, _config_lock) = load_config_for_build(root)?;
+    let (stored, config_lock) = load_config_for_build(root)?;
+    let config_path = root.join(CONFIG_RELATIVE_PATH);
+    let (config_identity, config_bytes) = read_private_config_snapshot(root, &config_path)?;
+    if decode_stored_config(&config_bytes)? != stored {
+        return Err(provider_config_changed());
+    }
+    let mut config_lock = Some(config_lock);
+    project_binding.verify()?;
     let signing = select_signing_plan(&stored, ferry_config, binary_name, expected_team, unsigned)?;
-    let git = git_context(root, &stored.source_remote_name, reporter)?;
-    let execution = git_remote_context(&git.root, &stored.execution_remote_name, reporter)?;
+    project_binding.verify()?;
+    let (git, execution) = git_context_from_stored(root, &stored, reporter)?;
     ensure_configured_repositories(&stored, &git, &execution)?;
     ensure_clean(&git, reporter)?;
+    project_binding.verify()?;
     let mut source = source_manifest(root, &git, reporter)?;
     bind_manifest_to_revision(&git, &mut source, reporter)?;
     ensure_clean_revision(&git, reporter)?;
+    project_binding.verify()?;
     let product =
         rustferry_apple::derive_ios_device_product_expectation(ferry_config, binary_name)?;
     let signing_mode = signing.mode;
@@ -2479,6 +5321,7 @@ pub fn build_iphone(
             vec![error.to_string()],
         )
     })?;
+    project_binding.verify()?;
 
     let expected_downloads = expected_artifact_downloads(
         root,
@@ -2487,6 +5330,7 @@ pub fn build_iphone(
         signing_mode,
         &request.requested_artifacts,
     )?;
+    project_binding.verify()?;
     let artifact_path = expected_downloads[0].path.clone();
     let planned = RemoteBuildOutput {
         project: root.to_string(),
@@ -2504,12 +5348,14 @@ pub fn build_iphone(
             .skip(1)
             .map(|download| download.path.to_string())
             .collect(),
+        local_job_id: None,
         job_id: None,
         validated: false,
         cleanup_confirmed: false,
         dry_run: true,
     };
     if dry_run {
+        project_binding.verify()?;
         reporter.success(
             "build",
             &planned,
@@ -2525,10 +5371,14 @@ pub fn build_iphone(
     }
 
     for download in &expected_downloads {
+        project_binding.verify()?;
         prepare_artifact_destination(root, &download.path)?;
+        project_binding.verify()?;
     }
     let provider = build_provider(root, &git.root, &stored)?;
+    project_binding.verify()?;
     handshake(&provider, signing_mode, &request.requested_artifacts)?;
+    project_binding.verify()?;
     let readiness = provider_call(
         provider.doctor(
             ProviderDoctorRequest {
@@ -2542,31 +5392,298 @@ pub fn build_iphone(
         "the GitHub provider doctor could not complete",
     )?;
     ensure_doctor_ready(&readiness, signing_mode.is_signed())?;
+    project_binding.verify()?;
+
+    let canonical_root = project_binding.root.clone();
+    let project_filesystem_identity = project_binding.identity.clone();
+    let durable_provider_identity = provider.durable_identity().map_err(|error| {
+        provider_failure(
+            &error,
+            "provider_identity_unavailable",
+            "the GitHub provider identity could not be bound durably",
+        )
+    })?;
+    let request_sha256 = canonical_request_sha256(&request).map_err(|error| {
+        provider_failure(
+            &error,
+            "request_identity_unavailable",
+            "the validated remote build request could not be hashed canonically",
+        )
+    })?;
+    let semantic_retry_sha256 = canonical_retry_template_sha256_v1(&request).map_err(|error| {
+        provider_failure(
+            &error,
+            "retry_identity_unavailable",
+            "the validated remote build request could not be bound to a retry identity",
+        )
+    })?;
+    let created_at_ms = unix_timestamp_ms()?;
+    let local_job_id = LocalJobId::generate();
+    let job_store = JobStore::open_default()?;
+    project_binding.verify()?;
+    let initial_job = StoredJobV1 {
+        schema_version: JOB_STORE_SCHEMA_VERSION,
+        local_job_id: local_job_id.clone(),
+        revision: 1,
+        project: StoredProjectIdentityV1 {
+            canonical_root: canonical_root.to_string(),
+            filesystem_identity: project_filesystem_identity.to_string(),
+            application_identifier: request.bundle_identifier.clone(),
+        },
+        provider: StoredProviderIdentityV1::from(durable_provider_identity),
+        provider_job_id: None,
+        provider_run_id: None,
+        operation_id: operation_id.clone(),
+        request: request.clone(),
+        request_sha256,
+        semantic_retry_sha256,
+        source: StoredSourceIdentityV1 {
+            revision: request.source_revision.clone(),
+            manifest_sha256: request.source.sha256.clone(),
+        },
+        target: "iphone".to_owned(),
+        profile: request.profile,
+        signing_mode,
+        created_at_ms,
+        submitted_at_ms: None,
+        updated_at_ms: created_at_ms,
+        state: StoredJobState::SourceReady,
+        last_confirmed_state: Some(StoredJobState::SourceReady),
+        terminal_outcome: None,
+        compile_evidence: None,
+        signed_cleanup_evidence: None,
+        artifacts: Vec::new(),
+        log_location: None,
+        cleanup_status: StoredCleanupStatus::NotStarted,
+        retry_lineage: StoredRetryLineageV1 {
+            attempt: 0,
+            parent_job_id: None,
+            child_job_ids: Vec::new(),
+        },
+        cancellation_status: StoredCancellationStatus::NotRequested,
+        failure: None,
+        provider_resume: None,
+    };
+    project_binding.verify()?;
+    job_store.create(&initial_job)?;
+    let mut operation_lease =
+        Some(job_store.try_acquire_operation_lease(&local_job_id, JobOperationKind::Build)?);
+    let provider = provider.with_checkpoint_sink(GithubJobStoreCheckpointSink::new(
+        job_store.clone(),
+        local_job_id.clone(),
+    ));
+    if let Err(error) = project_binding.verify() {
+        persist_controller_failure(
+            &job_store,
+            &local_job_id,
+            "controller.project_identity_changed",
+            false,
+        )?;
+        return Err(error);
+    }
 
     reporter.progress(format!(
-        "Submitting GitHub iPhone build for {} at {}",
-        package_name, git.revision
+        "Submitting GitHub iPhone build {} for {} at {}",
+        local_job_id.as_str(),
+        package_name,
+        git.revision
     ));
     let build_deadline = Instant::now() + BUILD_TIMEOUT;
-    let handle = provider_call(
-        provider.submit(request.clone(), CancellationToken::new()),
-        "remote_submit_failed",
-        "the GitHub provider did not accept the iPhone build",
+    let (provider_job_hint, submit_error) =
+        match poll_provider_once(provider.submit(request.clone(), CancellationToken::new())) {
+            ImmediateProviderResult::Ready(Ok(handle)) => (Some(handle.job_id), None),
+            ImmediateProviderResult::Ready(Err(error)) => (None, Some(error)),
+            ImmediateProviderResult::Pending => {
+                persist_submit_uncertain(&job_store, &local_job_id)?;
+                return Err(provider_runtime_required());
+            }
+        };
+    let job_id = reconcile_submit_attempt(
+        &provider,
+        &job_store,
+        &local_job_id,
+        project_binding,
+        provider_job_hint.as_deref(),
+        submit_error.as_ref(),
     )?;
-    let job_id = handle.job_id;
-    let terminal = match poll_job(&provider, &job_id, build_deadline, reporter) {
+    if let Err(error) = project_binding.verify() {
+        persist_submit_uncertain(&job_store, &local_job_id)?;
+        return Err(error);
+    }
+    if let Err(error) = require_bound_provider_job(
+        &job_store,
+        &local_job_id,
+        &job_id,
+        provider.workflow_run_trigger(),
+    ) {
+        persist_submit_uncertain(&job_store, &local_job_id)?;
+        return Err(error);
+    }
+    release_build_wait_guards(&mut config_lock, &mut operation_lease);
+    let terminal = poll_job(
+        &provider,
+        &job_store,
+        &local_job_id,
+        &job_id,
+        build_deadline,
+        &CancellationToken::new(),
+        reporter,
+    );
+    let reacquire_cancellation = CancellationToken::new();
+    let reacquired_operation_lease =
+        acquire_build_mutation_lease(&job_store, &local_job_id, &reacquire_cancellation)?;
+    let post_wait_rebind = (|| {
+        let (current_stored, reacquired_config_lock) = load_config_for_build(root)?;
+        if current_stored != stored {
+            return Err(provider_config_changed());
+        }
+        ensure_config_snapshot_unchanged(root, &config_path, &config_identity, &config_bytes)?;
+        project_binding.verify()?;
+        git.caller_git.head_revision().map_err(|_| {
+            remote_error(
+                "caller_repository_identity_changed",
+                "the sealed caller Git repository changed identity while the remote build ran",
+                "Restore the exact caller repository before completing local artifact publication.",
+            )
+        })?;
+        Ok(reacquired_config_lock)
+    })();
+    let reacquired_config_lock = match post_wait_rebind {
+        Ok(config_lock) => config_lock,
+        Err(error) => {
+            return Err(reconcile_post_wait_rebind_failure(
+                &provider,
+                &job_store,
+                &local_job_id,
+                &job_id,
+                project_binding,
+                &terminal,
+                &error,
+            ));
+        }
+    };
+    let completed_downloads = complete_submitted_job(
+        &provider,
+        &job_store,
+        &local_job_id,
+        &job_id,
+        project_binding,
+        &request,
+        &expected_downloads,
+        &artifact_path,
+        build_deadline,
+        terminal,
+        reporter,
+    )?;
+    let artifact_sha256 = completed_downloads.primary_sha256.clone();
+    let output = RemoteBuildOutput {
+        project: root.to_string(),
+        provider: "github",
+        profile: profile_name(release),
+        signing_mode: signing_mode_name(signing_mode),
+        source_revision: git.revision,
+        source_sha256: request.source.sha256,
+        source_files: request.source.entries.len(),
+        expected_artifact: artifact_path.to_string(),
+        artifact: Some(artifact_path.to_string()),
+        artifact_sha256: Some(artifact_sha256),
+        supporting_artifacts: expected_downloads
+            .iter()
+            .skip(1)
+            .map(|download| download.path.to_string())
+            .collect(),
+        local_job_id: Some(local_job_id.as_str().to_owned()),
+        job_id: Some(job_id),
+        validated: true,
+        cleanup_confirmed: true,
+        dry_run: false,
+    };
+    for guard in &completed_downloads.validation_guards {
+        guard.verify()?;
+    }
+    for binding in completed_downloads.destinations.values() {
+        binding.verify(project_binding)?;
+    }
+    project_binding.verify()?;
+    drop(reacquired_config_lock);
+    drop(reacquired_operation_lease);
+    reporter.success(
+        "build",
+        &output,
+        || {
+            let supporting = if output.supporting_artifacts.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\n\nSupporting artifacts:\n{}",
+                    output
+                        .supporting_artifacts
+                        .iter()
+                        .map(|path| format!("  {path}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            };
+            format!(
+                "✓ Remote iPhone build completed and verified\n\nLocal job:\n  {}\n\nArtifact:\n  {}\n\nSHA-256:\n  {}{}",
+                output.local_job_id.as_deref().unwrap_or("<missing>"),
+                output.artifact.as_deref().unwrap_or("<missing>"),
+                output.artifact_sha256.as_deref().unwrap_or("<missing>"),
+                supporting
+            )
+        },
+        &unsigned_warning(signing_mode),
+    );
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "terminal tracking, artifact publication, local validation, and cleanup form one durable completion transaction"
+)]
+fn complete_submitted_job(
+    provider: &GithubProvider,
+    store: &JobStore,
+    local_job_id: &LocalJobId,
+    job_id: &str,
+    project_binding: &ProjectFilesystemBinding,
+    request: &IosDeviceBuildRequest,
+    expected_downloads: &[ExpectedDownload],
+    artifact_path: &Utf8Path,
+    deadline: Instant,
+    terminal: Result<JobTerminal, CliError>,
+    reporter: &Reporter,
+) -> Result<CompletedArtifactDownloads, CliError> {
+    let build_deadline = deadline;
+    let operation_id = request.operation_id.as_str();
+    let source_revision = request.source_revision.as_deref().ok_or_else(|| {
+        remote_error(
+            "source_revision_missing",
+            "the durable GitHub request has no exact source revision",
+            "Preserve the job and inspect its immutable request before completion.",
+        )
+    })?;
+    let terminal = match terminal {
         Ok(terminal) => terminal,
         Err(error) => {
-            let cleanup = cleanup_job(&provider, &job_id);
+            let cleanup =
+                cleanup_job_durably(provider, store, local_job_id, job_id, project_binding);
             if matches!(error, CliError::CommandInterrupted { .. }) {
-                reporter.progress(if cleanup.is_ok() {
-                    "Remote cancellation and cleanup confirmed"
-                } else {
-                    "Remote cancellation cleanup was not confirmed; inspect the exact job"
-                });
+                let latest = store.latest(local_job_id).ok();
+                reporter.progress(interrupted_cleanup_progress_for_job(
+                    latest.as_ref(),
+                    job_id,
+                ));
                 return Err(error);
             }
             if cleanup.is_ok() {
+                persist_controller_failure(
+                    store,
+                    local_job_id,
+                    "controller.tracking_failed",
+                    true,
+                )?;
                 return Err(error);
             }
             return Err(remote_error_with_details(
@@ -2585,7 +5702,7 @@ pub fn build_iphone(
         }
     };
     if terminal.state != JobState::Succeeded {
-        let cleanup = cleanup_job(&provider, &job_id);
+        let cleanup = cleanup_job_durably(provider, store, local_job_id, job_id, project_binding);
         let mut details = vec![
             format!("provider=github"),
             format!("job_id={job_id}"),
@@ -2609,176 +5726,313 @@ pub fn build_iphone(
         ));
     }
 
-    let manifests = list_artifacts_with_retry(&provider, &job_id, build_deadline, reporter);
-    let mut downloaded_files = ArtifactDownloadRollback::default();
-    let download = manifests.and_then(|manifests| {
+    let download: Result<CompletedArtifactDownloads, ArtifactProcessingFailure> = (|| {
+        let manifests =
+            list_artifacts_with_retry(provider, job_id, build_deadline, reporter, project_binding)?;
+        project_binding.verify()?;
         if manifests.len() != 1 {
             return Err(remote_error(
                 "artifact_manifest_ambiguous",
                 "the GitHub job did not produce exactly one verified artifact manifest",
                 "Retain the job and inspect its uploaded artifact set before retrying.",
-            ));
+            )
+            .into());
         }
         let manifest = &manifests[0];
         if manifest.operation_id != operation_id
             || manifest.job_id != job_id
-            || manifest.source_revision.as_deref() != Some(git.revision.as_str())
+            || manifest.source_revision.as_deref() != Some(source_revision)
         {
             return Err(remote_error(
                 "artifact_identity_mismatch",
                 "the verified artifact manifest does not match this exact build request",
                 "Do not use the artifact; retain the job metadata for investigation and retry with a new operation ID.",
-            ));
+            )
+            .into());
         }
         for artifact_type in &request.requested_artifacts {
             require_one_artifact(manifest, artifact_type.artifact_kind())?;
         }
-
-        let mut primary_sha256 = None;
-        for expected in &expected_downloads {
+        let mut destinations = BTreeMap::new();
+        for expected in expected_downloads {
             let artifact = require_one_artifact(manifest, expected.kind)?;
-            let destination = ProtocolPath::new(
-                ProtocolPathSemantics::ClientAbsolute,
-                expected.path.to_string(),
-            )
-            .map_err(|error| {
-                remote_error_with_details(
-                    "artifact_destination_invalid",
-                    "a local artifact destination is invalid",
-                    "Choose a project location with a canonical absolute target directory.",
-                    vec![error.to_string()],
-                )
-            })?;
-            let result = provider_call(
-                provider.download_artifact(
-                    ArtifactDownloadRequest {
-                        job_id: job_id.clone(),
-                        artifact_id: artifact.artifact_id.clone(),
-                        destination,
-                    },
-                    CancellationToken::new(),
-                ),
-                "artifact_download_failed",
-                "an independently verified iPhone build artifact could not be downloaded",
-            )?;
-            downloaded_files.record(&expected.path).map_err(|error| {
-                remote_error_with_details(
-                    "artifact_rollback_identity_unavailable",
-                    "the downloaded artifact could not be bound to its local file identity",
-                    "Preserve the local artifact for inspection; remove it manually only after confirming its contents, then retry.",
-                    vec![format!("artifact={}", expected.path), error.to_string()],
-                )
-            })?;
-            let expected_manifest = downloaded_manifest(manifest);
-            if result.local_path.value != expected.path.as_str()
-                || result.manifest != expected_manifest
+            let destination = DownloadDestinationBinding::capture(&expected.path, project_binding)?;
+            if destinations
+                .insert(artifact.artifact_id.clone(), destination)
+                .is_some()
             {
                 return Err(remote_error(
-                    "artifact_destination_mismatch",
-                    "the provider returned different artifact identity or local path metadata",
-                    "Do not use the downloaded artifacts; preserve the job ID for investigation.",
-                ));
+                    "artifact_identity_duplicated",
+                    "the verified artifact manifest reused an artifact identifier",
+                    "Preserve the exact job and inspect its verified artifact manifest before retrying.",
+                )
+                .into());
             }
+        }
+        persist_or_verify_download_destinations(store, local_job_id, &destinations)?;
+
+        let mut primary_sha256 = None;
+        for expected in expected_downloads {
+            let artifact = require_one_artifact(manifest, expected.kind)?;
+            let destination_binding = destinations
+                .get(&artifact.artifact_id)
+                .ok_or_else(|| {
+                    remote_error(
+                        "artifact_destination_intent_missing",
+                        "a verified artifact has no durable destination binding",
+                        "Preserve the local job and inspect its exact download intents before retrying.",
+                    )
+                })?;
+            download_or_resume_artifact(
+                provider,
+                store,
+                local_job_id,
+                job_id,
+                manifest,
+                artifact,
+                destination_binding,
+                project_binding,
+            )?;
             if expected.path == artifact_path {
                 primary_sha256 = Some(artifact.sha256.clone());
             }
         }
-        primary_sha256.ok_or_else(|| {
-            remote_error(
+        match store.latest(local_job_id).map_err(CliError::from)?.state {
+            StoredJobState::Downloading => persist_downloads_complete(store, local_job_id)?,
+            StoredJobState::Downloaded
+            | StoredJobState::Validating
+            | StoredJobState::CleanupPending
+            | StoredJobState::Succeeded => {}
+            _ => {
+                return Err(ArtifactProcessingFailure::from(remote_error(
+                    "artifact_download_phase_mismatch",
+                    "the durable job cannot resume artifact completion from its current state",
+                    "Preserve the job and reconcile its exact provider and artifact checkpoints.",
+                )));
+            }
+        }
+        let primary_sha256 = primary_sha256.ok_or_else(|| {
+            ArtifactProcessingFailure::from(remote_error(
                 "artifact_missing",
                 "the primary iPhone artifact was not downloaded",
                 "Inspect the verified manifest and retry after correcting the provider output.",
-            )
+            ))
+        })?;
+        Ok(CompletedArtifactDownloads {
+            primary_sha256,
+            destinations,
+            validation_guards: Vec::new(),
         })
-    });
+    })();
 
-    let cleanup = cleanup_job(&provider, &job_id);
-    let artifact_sha256 = match (download, cleanup) {
-        (Ok(sha256), Ok(_)) => sha256,
-        (Ok(_), Err(error)) => {
-            return Err(remote_error_with_details(
-                "remote_cleanup_failed",
-                "the artifact was verified, but exact temporary-ref cleanup failed",
-                "Preserve the job ID and retry only after inspecting the exact provider-created temporary ref.",
-                vec![
-                    format!("job_id={job_id}"),
-                    format!("artifact={artifact_path}"),
-                    error.to_string(),
-                ],
-            ));
+    let completed_downloads = match download {
+        Ok(mut downloads) => {
+            downloads.validation_guards = match finish_completed_downloads(
+                provider,
+                store,
+                local_job_id,
+                job_id,
+                project_binding,
+                &downloads.destinations,
+            ) {
+                Ok(guards) => guards,
+                Err(error) => {
+                    let latest = store.latest(local_job_id)?;
+                    if latest.cleanup_status == StoredCleanupStatus::Confirmed
+                        && latest.state != StoredJobState::Succeeded
+                    {
+                        persist_controller_failure(
+                            store,
+                            local_job_id,
+                            "controller.final_artifact_validation_failed",
+                            false,
+                        )?;
+                    }
+                    return Err(error);
+                }
+            };
+            downloads
         }
-        (Err(error), Ok(_)) => return Err(error),
-        (Err(error), Err(cleanup_error)) => {
-            return Err(remote_error_with_details(
-                "artifact_retrieval_and_cleanup_failed",
-                "artifact retrieval failed and remote cleanup was not confirmed",
-                "Preserve the exact job ID and inspect both the artifact set and temporary ref before retrying.",
-                vec![
-                    format!("job_id={job_id}"),
-                    error.to_string(),
-                    cleanup_error.to_string(),
-                ],
-            ));
-        }
-    };
-    downloaded_files.commit();
-
-    let output = RemoteBuildOutput {
-        project: root.to_string(),
-        provider: "github",
-        profile: profile_name(release),
-        signing_mode: signing_mode_name(signing_mode),
-        source_revision: git.revision,
-        source_sha256: request.source.sha256,
-        source_files: request.source.entries.len(),
-        expected_artifact: artifact_path.to_string(),
-        artifact: Some(artifact_path.to_string()),
-        artifact_sha256: Some(artifact_sha256),
-        supporting_artifacts: expected_downloads
-            .iter()
-            .skip(1)
-            .map(|download| download.path.to_string())
-            .collect(),
-        job_id: Some(job_id),
-        validated: true,
-        cleanup_confirmed: true,
-        dry_run: false,
-    };
-    reporter.success(
-        "build",
-        &output,
-        || {
-            let supporting = if output.supporting_artifacts.is_empty() {
-                String::new()
+        Err(download_failure) => {
+            let state_checkpoint = if download_failure.local_publication_uncertain {
+                persist_artifact_publication_uncertain(
+                    store,
+                    local_job_id,
+                    "controller.artifact_publication_uncertain",
+                )
             } else {
-                format!(
-                    "\n\nSupporting artifacts:\n{}",
-                    output
-                        .supporting_artifacts
-                        .iter()
-                        .map(|path| format!("  {path}"))
-                        .collect::<Vec<_>>()
-                        .join("\n")
+                persist_controller_failure(
+                    store,
+                    local_job_id,
+                    "controller.artifact_processing_failed",
+                    false,
                 )
             };
-            format!(
-                "✓ Remote iPhone build completed and verified\n\nArtifact:\n  {}\n\nSHA-256:\n  {}{}",
-                output.artifact.as_deref().unwrap_or("<missing>"),
-                output.artifact_sha256.as_deref().unwrap_or("<missing>"),
-                supporting
-            )
-        },
-        &unsigned_warning(signing_mode),
+            let cleanup =
+                cleanup_job_durably(provider, store, local_job_id, job_id, project_binding);
+            match (state_checkpoint, cleanup) {
+                (Ok(()), Ok(())) => return Err(*download_failure.error),
+                (Err(state_error), Ok(())) => {
+                    return Err(remote_error_with_details(
+                        "artifact_retrieval_checkpoint_failed",
+                        "artifact retrieval failed and its durable local reconciliation state could not be confirmed",
+                        "Preserve the exact local job ID and intended destinations before any retry.",
+                        vec![
+                            format!("local_job_id={}", local_job_id.as_str()),
+                            format!("job_id={job_id}"),
+                            download_failure.error.to_string(),
+                            state_error.to_string(),
+                        ],
+                    ));
+                }
+                (state_checkpoint, Err(cleanup_error)) => {
+                    let mut details = vec![
+                        format!("local_job_id={}", local_job_id.as_str()),
+                        format!("job_id={job_id}"),
+                        download_failure.error.to_string(),
+                        cleanup_error.to_string(),
+                    ];
+                    if let Err(state_error) = state_checkpoint {
+                        details.push(state_error.to_string());
+                    }
+                    return Err(remote_error_with_details(
+                        "artifact_retrieval_and_cleanup_failed",
+                        "artifact retrieval failed and remote cleanup was not confirmed",
+                        "Preserve the exact local and provider job IDs, then reconcile the intended artifact destinations and temporary ref before retrying.",
+                        details,
+                    ));
+                }
+            }
+        }
+    };
+    for guard in &completed_downloads.validation_guards {
+        guard.verify()?;
+    }
+    for binding in completed_downloads.destinations.values() {
+        binding.verify(project_binding)?;
+    }
+    project_binding.verify()?;
+
+    Ok(completed_downloads)
+}
+
+fn release_build_wait_guards(
+    config_lock: &mut Option<ProviderConfigLock>,
+    operation_lease: &mut Option<JobOperationLease>,
+) {
+    drop(config_lock.take());
+    drop(operation_lease.take());
+}
+
+fn acquire_build_mutation_lease(
+    store: &JobStore,
+    local_job_id: &LocalJobId,
+    cancellation: &CancellationToken,
+) -> Result<JobOperationLease, CliError> {
+    acquire_build_mutation_lease_until(
+        store,
+        local_job_id,
+        cancellation,
+        Instant::now() + BUILD_LEASE_REACQUIRE_TIMEOUT,
+    )
+}
+
+fn acquire_build_mutation_lease_until(
+    store: &JobStore,
+    local_job_id: &LocalJobId,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Result<JobOperationLease, CliError> {
+    loop {
+        if cancellation.is_cancelled() || rustferry_core::process_control::interrupt_requested() {
+            return Err(CliError::CommandInterrupted {
+                tool: "GitHub Actions job".to_owned(),
+                stage: "reacquire local artifact mutation lease",
+            });
+        }
+        match store.try_acquire_operation_lease(local_job_id, JobOperationKind::Build) {
+            Ok(lease) => return Ok(lease),
+            Err(JobStoreError::JobBusy { .. }) if Instant::now() < deadline => {
+                thread::sleep(BUILD_LEASE_REACQUIRE_POLL);
+            }
+            Err(JobStoreError::JobBusy { .. }) => {
+                return Err(remote_error_with_details(
+                    "job_build_reacquire_busy",
+                    "the durable job remained busy after its bounded remote wait",
+                    "Preserve the job and rerun completion after the active cancel, log, retry, or artifact operation finishes.",
+                    vec![format!("local_job_id={}", local_job_id.as_str())],
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn reconcile_post_wait_rebind_failure(
+    provider: &GithubProvider,
+    store: &JobStore,
+    local_job_id: &LocalJobId,
+    provider_job_id: &str,
+    project_binding: &ProjectFilesystemBinding,
+    observation: &Result<JobTerminal, CliError>,
+    rebind_error: &CliError,
+) -> CliError {
+    let cleanup = cleanup_job_durably(
+        provider,
+        store,
+        local_job_id,
+        provider_job_id,
+        project_binding,
     );
-    Ok(())
+    let checkpoint = persist_controller_failure(
+        store,
+        local_job_id,
+        "controller.post_wait_rebind_failed",
+        cleanup.is_ok(),
+    );
+    let observation = match observation {
+        Ok(terminal) => format!("observed_state={}", state_name(terminal.state)),
+        Err(error) => format!("observation_error_code={}", error.code()),
+    };
+    let mut details = vec![
+        format!("local_job_id={}", local_job_id.as_str()),
+        format!("provider_job_id={provider_job_id}"),
+        observation,
+        format!("rebind_error_code={}", rebind_error.code()),
+    ];
+    details.push(match cleanup {
+        Ok(()) => "cleanup=confirmed".to_owned(),
+        Err(error) => format!("cleanup_error_code={}", error.code()),
+    });
+    if let Err(error) = checkpoint {
+        details.push(format!("checkpoint_error_code={}", error.code()));
+    }
+    remote_error_with_details(
+        "post_wait_rebind_failed",
+        "the durable job could not rebind its exact local mutation boundary after remote observation",
+        "Preserve the job and reconcile its exact cleanup state before retrying local artifact completion.",
+        details,
+    )
 }
 
 #[allow(clippy::too_many_lines)]
 fn setup(arguments: RemoteSetupArgs, dry_run: bool, reporter: &Reporter) -> Result<(), CliError> {
     let RemoteProviderChoice::Github = arguments.provider;
+    require_secure_git_publication_platform()?;
     let root = find_project_root(arguments.project_dir.as_deref())?;
     let git = git_context(&root, &arguments.source_remote_name, reporter)?;
-    let execution = git_remote_context(&git.root, &arguments.execution_remote_name, reporter)?;
+    let execution = if arguments.source_remote_name == arguments.execution_remote_name {
+        GitRemoteContext {
+            repository: git.repository.clone(),
+            repository_slug: git.repository_slug.clone(),
+            source_repository: git.source_repository.clone(),
+            fetch_endpoint: git.fetch_endpoint.clone(),
+            push_endpoint: git.push_endpoint.clone(),
+        }
+    } else {
+        git_remote_context(&git.caller_git, &arguments.execution_remote_name, reporter)?
+    };
+    validate_execution_endpoint_transports(&execution.fetch_endpoint, &execution.push_endpoint)?;
     let repository = match arguments.execution_repository.as_deref() {
         Some(specification) => {
             let (_, slug, source) = parse_repository_spec(specification)?;
@@ -2833,8 +6087,10 @@ fn setup(arguments: RemoteSetupArgs, dry_run: bool, reporter: &Reporter) -> Resu
         schema_version: CONFIG_SCHEMA_VERSION,
         repository,
         source_repository: git.source_repository.clone(),
-        source_remote_name: arguments.source_remote_name,
-        execution_remote_name: arguments.execution_remote_name,
+        source_fetch_endpoint: git.fetch_endpoint.clone(),
+        source_push_endpoint: git.push_endpoint.clone(),
+        execution_fetch_endpoint: execution.fetch_endpoint.clone(),
+        execution_push_endpoint: execution.push_endpoint.clone(),
         trusted_source_ref,
         workflow_file: WORKFLOW_FILE.to_owned(),
         protected_environment: PROTECTED_ENVIRONMENT.to_owned(),
@@ -2842,6 +6098,7 @@ fn setup(arguments: RemoteSetupArgs, dry_run: bool, reporter: &Reporter) -> Resu
         worker_repository: worker_repository.clone(),
         worker_revision,
         worker_version: arguments.worker_version,
+        run_trigger: arguments.run_trigger.into(),
         signing_targets,
         signing: None,
     };
@@ -2988,8 +6245,7 @@ fn setup(arguments: RemoteSetupArgs, dry_run: bool, reporter: &Reporter) -> Resu
 fn doctor(arguments: &RemoteDoctorArgs, reporter: &Reporter) -> Result<(), CliError> {
     let root = find_project_root(arguments.project_dir.as_deref())?;
     let stored = load_config(&root)?;
-    let git = git_context(&root, &stored.source_remote_name, reporter)?;
-    let execution = git_remote_context(&git.root, &stored.execution_remote_name, reporter)?;
+    let (git, execution) = git_context_from_stored(&root, &stored, reporter)?;
     ensure_configured_repositories(&stored, &git, &execution)?;
     let provider = build_provider(&root, &git.root, &stored)?;
     let operation_id = format!("{}-doctor", operation_id());
@@ -3051,12 +6307,283 @@ fn doctor(arguments: &RemoteDoctorArgs, reporter: &Reporter) -> Result<(), CliEr
     Ok(())
 }
 
+pub(in crate::commands) fn ide_signing_readiness(
+    project_binding: &ProjectFilesystemBinding,
+) -> Result<IdeSigningReadiness, CliError> {
+    map_ide_signing_readiness(signing_readiness_inner(project_binding))
+}
+
+fn map_ide_signing_readiness(
+    readiness: Result<IdeSigningReadiness, CliError>,
+) -> Result<IdeSigningReadiness, CliError> {
+    readiness.map_err(|_| {
+        remote_error(
+            "ide_signing_readiness_unavailable",
+            "GitHub signing readiness could not be established safely",
+            "Run `cargo ferry remote doctor github` for operator diagnostics, then retry the IDE readiness check.",
+        )
+    })
+}
+
+pub(in crate::commands) fn github_signing_readiness(
+    project_binding: &ProjectFilesystemBinding,
+) -> Result<IdeSigningReadiness, CliError> {
+    signing_readiness_inner(project_binding).map_err(|error| {
+        remote_error(
+            error.code(),
+            "GitHub iPhone-signing readiness could not be established safely",
+            "Verify the exact project and GitHub remote configuration, then retry the signing doctor.",
+        )
+    })
+}
+
+fn signing_readiness_inner(
+    project_binding: &ProjectFilesystemBinding,
+) -> Result<IdeSigningReadiness, CliError> {
+    project_binding.verify()?;
+    let root = project_binding.root();
+    let stored = load_config(root)?;
+    let local_checks = local_signing_readiness_checks(root, &stored)?;
+    let reporter = Reporter::new(false, true, false);
+    let (git, execution) = git_context_from_stored(root, &stored, &reporter)?;
+    ensure_configured_repositories(&stored, &git, &execution)?;
+    let provider = build_provider(root, &git.root, &stored)?;
+    let report = provider_call(
+        provider.doctor(
+            ProviderDoctorRequest {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+                operation_id: format!("{}-ide-signing-doctor", operation_id()),
+                require_signing: true,
+            },
+            CancellationToken::new(),
+        ),
+        "provider_doctor_failed",
+        "the GitHub provider doctor could not complete",
+    )?;
+    project_binding.verify()?;
+    Ok(signing_readiness_from_report(local_checks, report))
+}
+
+fn signing_readiness_from_report(
+    local_checks: Vec<IdeSigningReadinessCheck>,
+    report: rustferry_remote::ProviderDoctorReport,
+) -> IdeSigningReadiness {
+    let reviewer_check_present = report
+        .checks
+        .iter()
+        .any(|check| check.code == "github.signing_environment.reviewers");
+    let mut checks = Vec::with_capacity(
+        report
+            .checks
+            .len()
+            .saturating_add(local_checks.len())
+            .saturating_add(1),
+    );
+    checks.extend(report.checks.into_iter().map(|check| {
+        let reviewer_gate = check.code == "github.signing_environment.reviewers";
+        let ready = check.status == rustferry_remote::ProviderCheckStatus::Ready;
+        IdeSigningReadinessCheck {
+            code: safe_ide_readiness_code(&check.code),
+            required: reviewer_gate
+                || check.status != rustferry_remote::ProviderCheckStatus::Warning,
+            ready,
+            reason_code: (!ready).then_some(if reviewer_gate {
+                "required_reviewer_gate_unproven"
+            } else if check.status == rustferry_remote::ProviderCheckStatus::Warning {
+                "optional_provider_check_degraded"
+            } else {
+                "required_provider_check_failed"
+            }),
+        }
+    }));
+    if !reviewer_check_present {
+        checks.push(readiness_check(
+            "github.signing_environment.reviewers",
+            false,
+            "required_reviewer_gate_unproven",
+        ));
+    }
+    checks.extend(local_checks);
+    let ready = checks.iter().all(|check| !check.required || check.ready);
+    IdeSigningReadiness { ready, checks }
+}
+
+fn local_signing_readiness_checks(
+    root: &Utf8Path,
+    stored: &StoredGithubConfig,
+) -> Result<Vec<IdeSigningReadinessCheck>, CliError> {
+    let signing_configured = stored.signing.is_some();
+    let ferry_config = rustferry_core::FerryConfig::load(&root.join("ferry.toml"))?;
+    let cargo_targets = super::platform_build::read_cargo_targets(root)?;
+    let current_targets = unsigned_signing_plan(&ferry_config, cargo_targets.binary())?.targets;
+    let target_graph_ready = current_targets == stored.signing_targets;
+    let secret_names =
+        SigningSecretNames::for_targets(&stored.signing_targets).map_err(|error| {
+            remote_error_with_details(
+                "invalid_signing_target_secret_map",
+                "the configured signing target graph cannot form its static secret-name map",
+                "Rerun GitHub remote setup from the unchanged project target graph.",
+                vec![error.to_string()],
+            )
+        })?;
+    let public_metadata_only = stored
+        .signing
+        .as_ref()
+        .is_none_or(signing_reference_kinds_are_github_actions);
+    let team_ready = stored
+        .signing
+        .as_ref()
+        .and_then(|plan| plan.team.as_ref())
+        .is_some();
+    let profile_map_ready = stored
+        .signing
+        .as_ref()
+        .is_some_and(|plan| signing_reference_names_match(plan, &secret_names));
+    let workflow = workflow_from_stored(stored)?;
+    let namespace_prefix = format!(
+        "refs/heads/{}/",
+        workflow.temporary_branch_namespace().as_str()
+    );
+    let namespace_ready = workflow.temporary_branch_namespace().as_str()
+        == stored.temporary_namespace
+        && !workflow
+            .trusted_source_ref()
+            .as_str()
+            .starts_with(&namespace_prefix);
+    let generated = generate_workflow(&workflow);
+    let (compile_secret_isolated, signing_source_absent) =
+        signing_workflow_phase_policy(generated.yaml());
+
+    Ok(vec![
+        readiness_check(
+            "github_actions_ios_signing.configured",
+            signing_configured,
+            "signing_not_configured",
+        ),
+        readiness_check(
+            "github.signing_config.public_metadata_only",
+            public_metadata_only,
+            "signing_config_contains_unsupported_reference",
+        ),
+        readiness_check(
+            "github.signing_team",
+            team_ready,
+            "signing_team_not_configured",
+        ),
+        readiness_check(
+            "github.signing_target_graph",
+            target_graph_ready,
+            "signing_target_graph_changed",
+        ),
+        readiness_check(
+            "github.signing_profile_map",
+            profile_map_ready,
+            "signing_profile_map_not_configured",
+        ),
+        readiness_check(
+            "github.temporary_ref_namespace",
+            namespace_ready,
+            "temporary_ref_namespace_invalid",
+        ),
+        readiness_check(
+            "github.workflow.phase_a_secret_isolation",
+            compile_secret_isolated,
+            "phase_a_secret_isolation_unproven",
+        ),
+        readiness_check(
+            "github.workflow.phase_b_no_source_execution",
+            signing_source_absent,
+            "phase_b_source_isolation_unproven",
+        ),
+    ])
+}
+
+fn readiness_check(
+    code: &'static str,
+    ready: bool,
+    failure_reason: &'static str,
+) -> IdeSigningReadinessCheck {
+    IdeSigningReadinessCheck {
+        code: code.to_owned(),
+        required: true,
+        ready,
+        reason_code: (!ready).then_some(failure_reason),
+    }
+}
+
+fn signing_reference_kinds_are_github_actions(plan: &SigningPlan) -> bool {
+    plan.signing.as_ref().is_some_and(|signing| {
+        signing.identity.private_key.reference.kind()
+            == rustferry_remote::SecretReferenceKind::GithubActions
+            && signing.password.as_ref().is_some_and(|reference| {
+                reference.kind() == rustferry_remote::SecretReferenceKind::GithubActions
+            })
+    }) && plan.provisioning.iter().all(|provisioning| {
+        provisioning.profile.kind() == rustferry_remote::SecretReferenceKind::GithubActions
+    })
+}
+
+fn signing_reference_names_match(plan: &SigningPlan, names: &SigningSecretNames) -> bool {
+    signing_reference_kinds_are_github_actions(plan)
+        && plan.signing.as_ref().is_some_and(|signing| {
+            signing.identity.private_key.reference.name() == names.certificate_p12().as_str()
+                && signing.password.as_ref().is_some_and(|reference| {
+                    reference.name() == names.certificate_password().as_str()
+                })
+        })
+        && plan.provisioning.iter().all(|provisioning| {
+            names
+                .profile_for_target(&provisioning.target)
+                .is_some_and(|name| provisioning.profile.name() == name.as_str())
+        })
+}
+
+fn signing_workflow_phase_policy(yaml: &str) -> (bool, bool) {
+    let Some((_, after_compile)) = yaml.split_once("  compile:\n") else {
+        return (false, false);
+    };
+    let Some((compile, sign)) = after_compile.split_once("\n  sign:\n") else {
+        return (false, false);
+    };
+    let compile_secret_isolated = !compile.contains("${{ secrets")
+        && !compile.contains("RUSTFERRY_GOAL3_IOS_")
+        && !compile
+            .lines()
+            .any(|line| line.starts_with("    environment:"));
+    let signing_source_absent = [
+        "actions/checkout@",
+        "cargo ",
+        "xcodebuild ",
+        "codesign ",
+        "security ",
+        "pull_request",
+    ]
+    .iter()
+    .all(|forbidden| !sign.contains(forbidden))
+        && sign.contains("Verify sealed handoff digest before signing")
+        && sign.contains("run-job \\\n")
+        && sign.contains("--phase sign");
+    (compile_secret_isolated, signing_source_absent)
+}
+
+fn safe_ide_readiness_code(code: &str) -> String {
+    if !code.is_empty()
+        && code.len() <= 128
+        && code.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
+    {
+        code.to_owned()
+    } else {
+        "github.readiness.unknown".to_owned()
+    }
+}
+
 fn status(arguments: &RemoteStatusArgs, reporter: &Reporter) -> Result<(), CliError> {
     let RemoteProviderChoice::Github = arguments.provider;
     let root = find_project_root(arguments.project_dir.as_deref())?;
     let stored = load_config(&root)?;
-    let git = git_context(&root, &stored.source_remote_name, reporter)?;
-    let execution = git_remote_context(&git.root, &stored.execution_remote_name, reporter)?;
+    let (git, execution) = git_context_from_stored(&root, &stored, reporter)?;
     ensure_configured_repositories(&stored, &git, &execution)?;
     let generated = generate_workflow(&workflow_from_stored(&stored)?);
     let paths = GithubPaths::new(&root, &git.root);
@@ -3228,27 +6755,14 @@ fn validate_github_signing_plan(plan: &SigningPlan) -> Result<(), CliError> {
             vec![error.to_string()],
         )
     })?;
-    let Some(signing) = &plan.signing else {
+    if plan.signing.is_none() {
         return Err(remote_error(
             "invalid_signing_plan",
             "the public signing plan has no certificate reference",
             "Regenerate the manual-development signing plan.",
         ));
-    };
-    let references_match = signing.identity.private_key.reference.kind()
-        == rustferry_remote::SecretReferenceKind::GithubActions
-        && signing.identity.private_key.reference.name() == names.certificate_p12().as_str()
-        && signing.password.as_ref().is_some_and(|reference| {
-            reference.kind() == rustferry_remote::SecretReferenceKind::GithubActions
-                && reference.name() == names.certificate_password().as_str()
-        })
-        && plan.provisioning.iter().all(|provisioning| {
-            provisioning.profile.kind() == rustferry_remote::SecretReferenceKind::GithubActions
-                && names
-                    .profile_for_target(&provisioning.target)
-                    .is_some_and(|name| provisioning.profile.name() == name.as_str())
-        });
-    if !references_match {
+    }
+    if !signing_reference_names_match(plan, &names) {
         return Err(remote_error(
             "signing_secret_reference_mismatch",
             "the signing plan does not use the configured protected GitHub secret names",
@@ -3341,49 +6855,31 @@ fn git_context(
     remote_name: &str,
     reporter: &Reporter,
 ) -> Result<GitContext, CliError> {
-    let git = executable("git")?;
-    let root_text = utf8_line(
-        &checked_git_output(
-            &git,
-            &[
-                OsString::from("rev-parse"),
-                OsString::from("--show-toplevel"),
-            ],
-            project_root,
-            "locate Git repository",
-            reporter,
-        )?,
-        "Git repository root",
-    )?;
-    let root = Utf8PathBuf::from(root_text.clone())
-        .canonicalize_utf8()
-        .map_err(|source| CliError::Io {
-            action: "resolve Git repository",
-            path: Utf8PathBuf::from(root_text),
-            source,
-        })?;
-    if !project_root.starts_with(&root) {
-        return Err(remote_error(
-            "project_outside_repository",
-            "the RustFerry project is outside the selected Git repository",
-            "Run the command from the repository containing the project.",
-        ));
-    }
-    let remote = git_remote_context(&root, remote_name, reporter)?;
-    let revision = utf8_line(
-        &checked_git_output(
-            &git,
-            &[
-                OsString::from("rev-parse"),
-                OsString::from("--verify"),
-                OsString::from("HEAD"),
-            ],
-            &root,
-            "resolve exact Git revision",
-            reporter,
-        )?,
-        "Git revision",
-    )?;
+    let caller_git = CallerGitRepository::open(project_root).map_err(caller_git_policy_error)?;
+    let (root, revision) = git_repository_state(&caller_git, reporter)?;
+    let remote = git_remote_context(&caller_git, remote_name, reporter)?;
+    Ok(GitContext {
+        caller_git,
+        root,
+        repository: remote.repository,
+        repository_slug: remote.repository_slug,
+        source_repository: remote.source_repository,
+        fetch_endpoint: remote.fetch_endpoint,
+        push_endpoint: remote.push_endpoint,
+        revision,
+    })
+}
+
+fn git_repository_state(
+    caller_git: &CallerGitRepository,
+    reporter: &Reporter,
+) -> Result<(Utf8PathBuf, String), CliError> {
+    reporter.verbose("git (sealed offline reader) rev-parse --verify HEAD");
+    let root =
+        Utf8PathBuf::from_path_buf(caller_git.root().to_owned()).map_err(CliError::NonUtf8Path)?;
+    let output =
+        checked_caller_git_output(caller_git.head_revision(), "resolve exact Git revision")?;
+    let revision = utf8_line(&output, "Git revision")?;
     if revision.len() != 40
         || !revision
             .bytes()
@@ -3395,65 +6891,117 @@ fn git_context(
             "Commit the project in a SHA-1 Git repository before using the GitHub provider.",
         ));
     }
-    Ok(GitContext {
-        root,
-        repository: remote.repository,
-        repository_slug: remote.repository_slug,
-        source_repository: remote.source_repository,
-        revision,
-    })
+    Ok((root, revision))
 }
 
 fn git_remote_context(
-    repository_root: &Utf8Path,
+    caller_git: &CallerGitRepository,
     remote_name: &str,
     reporter: &Reporter,
 ) -> Result<GitRemoteContext, CliError> {
     validate_git_remote_name(remote_name)?;
-    let git = executable("git")?;
-    let fetch_url = utf8_line(
-        &checked_git_output(
-            &git,
-            &[
-                OsString::from("remote"),
-                OsString::from("get-url"),
-                OsString::from(remote_name),
-            ],
-            repository_root,
-            "inspect Git fetch remote",
-            reporter,
-        )?,
-        "Git fetch remote URL",
-    )?;
-    let push_url = utf8_line(
-        &checked_git_output(
-            &git,
-            &[
-                OsString::from("remote"),
-                OsString::from("get-url"),
-                OsString::from("--push"),
-                OsString::from(remote_name),
-            ],
-            repository_root,
-            "inspect Git push remote",
-            reporter,
-        )?,
-        "Git push remote URL",
-    )?;
-    let (repository, repository_slug, source_repository) = parse_repository_spec(&fetch_url)?;
-    let (_, push_slug, push_repository) = parse_repository_spec(&push_url)?;
-    if push_slug != repository_slug || push_repository != source_repository {
-        return Err(remote_error(
-            "git_remote_identity_mismatch",
-            "the selected Git remote has different fetch and push repository identities",
-            "Configure both URLs of the selected remote for the same exact GitHub repository.",
-        ));
-    }
+    reporter.verbose(format!(
+        "git (sealed offline reader) config --local --no-includes remote.{remote_name}"
+    ));
+    let snapshot = caller_git.discover_remote(remote_name).map_err(|error| {
+        remote_error_with_details(
+            "git_remote_discovery_failed",
+            "the selected local Git remote could not be captured safely",
+            "Configure exactly one local URL and at most one push URL for the selected GitHub remote, without includes or rewrites.",
+            vec![error.to_string()],
+        )
+    })?;
+    let repository = snapshot.fetch().repository().clone();
+    let repository_slug = snapshot.fetch().repository_slug();
+    let source_repository = format!("https://github.com/{repository_slug}");
     Ok(GitRemoteContext {
         repository,
         repository_slug,
         source_repository,
+        fetch_endpoint: snapshot.fetch().clone(),
+        push_endpoint: snapshot.push().clone(),
     })
+}
+
+fn stored_remote_snapshot(
+    fetch: &GithubGitEndpoint,
+    push: &GithubGitEndpoint,
+) -> Result<GithubRemoteSnapshot, CliError> {
+    GithubRemoteSnapshot::new(fetch.clone(), push.clone()).map_err(|_| {
+        remote_error(
+            "invalid_provider_config",
+            "the stored Git fetch and push endpoints identify different repositories",
+            "Remove the generated provider config and rerun GitHub setup.",
+        )
+    })
+}
+
+fn validate_execution_endpoint_transports(
+    fetch: &GithubGitEndpoint,
+    push: &GithubGitEndpoint,
+) -> Result<(), CliError> {
+    if fetch.repository() != push.repository() {
+        return Err(remote_error(
+            "invalid_provider_config",
+            "the stored Git fetch and push endpoints identify different repositories",
+            "Remove the generated provider config and rerun GitHub setup.",
+        ));
+    }
+    #[cfg(unix)]
+    if fetch.transport() != GithubGitTransport::Ssh || push.transport() != GithubGitTransport::Ssh {
+        return Err(remote_error(
+            "secure_git_execution_transport_unsupported",
+            "secure GitHub execution fetch and push require SSH on this platform",
+            "Configure both execution remote fetch and push URLs as git@github.com:owner/repository, then rerun setup.",
+        ));
+    }
+    Ok(())
+}
+
+fn git_context_from_stored(
+    project_root: &Utf8Path,
+    stored: &StoredGithubConfig,
+    reporter: &Reporter,
+) -> Result<(GitContext, GitRemoteContext), CliError> {
+    let caller_git = CallerGitRepository::open(project_root).map_err(caller_git_policy_error)?;
+    let (root, revision) = git_repository_state(&caller_git, reporter)?;
+    let source =
+        stored_remote_snapshot(&stored.source_fetch_endpoint, &stored.source_push_endpoint)?;
+    let execution = stored_remote_snapshot(
+        &stored.execution_fetch_endpoint,
+        &stored.execution_push_endpoint,
+    )?;
+    let source_slug = source.fetch().repository_slug();
+    let execution_slug = execution.fetch().repository_slug();
+    let git = GitContext {
+        caller_git,
+        root,
+        repository: source.fetch().repository().clone(),
+        repository_slug: source_slug.clone(),
+        source_repository: format!("https://github.com/{source_slug}"),
+        fetch_endpoint: source.fetch().clone(),
+        push_endpoint: source.push().clone(),
+        revision,
+    };
+    let execution = GitRemoteContext {
+        repository: execution.fetch().repository().clone(),
+        repository_slug: execution_slug.clone(),
+        source_repository: format!("https://github.com/{execution_slug}"),
+        fetch_endpoint: execution.fetch().clone(),
+        push_endpoint: execution.push().clone(),
+    };
+    Ok((git, execution))
+}
+
+fn require_secure_git_publication_platform() -> Result<(), CliError> {
+    if !cfg!(any(unix, windows)) {
+        return Err(remote_error(
+            "secure_git_platform_unsupported",
+            "secure GitHub ref publication is unsupported on this platform",
+            "Run GitHub setup and publication on a supported Unix or Windows installation.",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_git_remote_name(value: &str) -> Result<(), CliError> {
@@ -3474,17 +7022,10 @@ fn validate_git_remote_name(value: &str) -> Result<(), CliError> {
 }
 
 fn ensure_clean(git: &GitContext, reporter: &Reporter) -> Result<(), CliError> {
-    let executable = executable("git")?;
-    let output = checked_git_output(
-        &executable,
-        &[
-            OsString::from("status"),
-            OsString::from("--porcelain=v1"),
-            OsString::from("--untracked-files=all"),
-        ],
-        &git.root,
+    reporter.verbose("git (sealed offline reader) status --porcelain=v1");
+    let output = checked_caller_git_output(
+        git.caller_git.working_tree_status(),
         "inspect Git working tree",
-        reporter,
     )?;
     if output.is_empty() {
         Ok(())
@@ -3499,21 +7040,10 @@ fn ensure_clean(git: &GitContext, reporter: &Reporter) -> Result<(), CliError> {
 
 fn ensure_clean_revision(git: &GitContext, reporter: &Reporter) -> Result<(), CliError> {
     ensure_clean(git, reporter)?;
-    let executable = executable("git")?;
-    let current = utf8_line(
-        &checked_git_output(
-            &executable,
-            &[
-                OsString::from("rev-parse"),
-                OsString::from("--verify"),
-                OsString::from("HEAD"),
-            ],
-            &git.root,
-            "recheck exact Git revision",
-            reporter,
-        )?,
-        "Git revision",
-    )?;
+    reporter.verbose("git (sealed offline reader) rev-parse --verify HEAD");
+    let output =
+        checked_caller_git_output(git.caller_git.head_revision(), "recheck exact Git revision")?;
+    let current = utf8_line(&output, "Git revision")?;
     if current == git.revision {
         Ok(())
     } else {
@@ -3537,8 +7067,7 @@ fn bind_manifest_to_revision(
     manifest: &mut SourceManifest,
     reporter: &Reporter,
 ) -> Result<(), CliError> {
-    let executable = executable("git")?;
-    let tree = git_tree_blobs(&executable, git, &manifest.entries, reporter)?;
+    let tree = git_tree_blobs(git, &manifest.entries, reporter)?;
     let limits = SourceLimits::default();
     let mut unique_blobs = BTreeMap::new();
     let mut exact_total_size = 0_u64;
@@ -3570,7 +7099,7 @@ fn bind_manifest_to_revision(
             .entry(blob.object_id.clone())
             .or_insert(blob.size);
     }
-    let digests = hash_git_blobs(&executable, git, &unique_blobs, reporter)?;
+    let digests = hash_git_blobs(git, &unique_blobs, reporter)?;
     for entry in &mut manifest.entries {
         let blob = &tree[&entry.path];
         entry.size = blob.size;
@@ -3594,7 +7123,6 @@ fn bind_manifest_to_revision(
 }
 
 fn git_tree_blobs(
-    executable: &Utf8Path,
     git: &GitContext,
     entries: &[SourceManifestEntry],
     reporter: &Reporter,
@@ -3615,25 +7143,14 @@ fn git_tree_blobs(
         if end == start {
             end += 1;
         }
-        let mut arguments = vec![
-            OsString::from("--literal-pathspecs"),
-            OsString::from("ls-tree"),
-            OsString::from("-l"),
-            OsString::from("-z"),
-            OsString::from(&git.revision),
-            OsString::from("--"),
-        ];
-        arguments.extend(
-            entries[start..end]
-                .iter()
-                .map(|entry| OsString::from(&entry.path)),
-        );
-        let output = checked_git_output(
-            executable,
-            &arguments,
-            &git.root,
+        let paths = entries[start..end]
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+        reporter.verbose("git (sealed offline reader) ls-tree");
+        let output = checked_caller_git_output(
+            git.caller_git.tree_entries(&git.revision, &paths),
             "read exact Git tree",
-            reporter,
         )?;
         parse_git_tree(&output, &mut tree)?;
         start = end;
@@ -3716,7 +7233,6 @@ fn parse_git_tree(output: &[u8], tree: &mut BTreeMap<String, GitTreeBlob>) -> Re
 }
 
 fn hash_git_blobs(
-    executable: &Utf8Path,
     git: &GitContext,
     blobs: &BTreeMap<String, u64>,
     reporter: &Reporter,
@@ -3752,23 +7268,19 @@ fn hash_git_blobs(
                     "Reduce the selected source tree and retry.",
                 )
             })?;
-        let output = git_output(
-            executable,
-            &[OsString::from("cat-file"), OsString::from("--batch")],
-            &git.root,
-            "hash exact Git blobs",
-            reporter,
-            output_limit,
-            Some(&input),
-        )?;
-        if !output.status.success() {
+        reporter.verbose("git (sealed offline reader) cat-file --batch");
+        let output = git
+            .caller_git
+            .blob_batch(&input, output_limit)
+            .map_err(|_| caller_git_command_error("hash exact Git blobs", None))?;
+        if !output.success() {
             return Err(remote_error(
                 "git_blob_read_failed",
                 "Git could not read the exact source blobs",
                 "Verify the repository object database and retry.",
             ));
         }
-        parse_git_blob_batch(&output.stdout, batch, &mut digests)?;
+        parse_git_blob_batch(output.stdout(), batch, &mut digests)?;
         start = end;
     }
     Ok(digests)
@@ -3863,22 +7375,12 @@ fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
 }
 
 fn current_branch(git: &GitContext, reporter: &Reporter) -> Result<String, CliError> {
-    let executable = executable("git")?;
-    utf8_line(
-        &checked_git_output(
-            &executable,
-            &[
-                OsString::from("symbolic-ref"),
-                OsString::from("--quiet"),
-                OsString::from("--short"),
-                OsString::from("HEAD"),
-            ],
-            &git.root,
-            "resolve trusted Git branch",
-            reporter,
-        )?,
-        "Git branch",
-    )
+    reporter.verbose("git (sealed offline reader) symbolic-ref --short HEAD");
+    let output = checked_caller_git_output(
+        git.caller_git.current_branch(),
+        "resolve trusted Git branch",
+    )?;
+    utf8_line(&output, "Git branch")
 }
 
 fn ensure_provider_metadata_ignored(
@@ -3893,22 +7395,14 @@ fn ensure_provider_metadata_ignored(
             "Keep the RustFerry project inside its selected Git repository.",
         )
     })?;
-    let executable = executable("git")?;
-    let output = git_output(
-        &executable,
-        &[
-            OsString::from("check-ignore"),
-            OsString::from("--quiet"),
-            OsString::from("--"),
-            OsString::from(relative.as_str()),
-        ],
-        &git.root,
-        "verify private provider metadata is ignored",
-        reporter,
-        1024,
-        None,
-    )?;
-    match output.status.code() {
+    reporter.verbose("git (sealed offline reader) check-ignore");
+    let output = git
+        .caller_git
+        .check_ignore(relative.as_str())
+        .map_err(|_| {
+            caller_git_command_error("verify private provider metadata is ignored", None)
+        })?;
+    match output.exit_code() {
         Some(0) => Ok(()),
         Some(1) => Err(remote_error_with_details(
             "provider_config_not_ignored",
@@ -3976,6 +7470,10 @@ fn parse_repository_spec(value: &str) -> Result<(Repository, String, String), Cl
     Ok((repository, slug, source))
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "provider restoration keeps every persisted identity and endpoint binding explicit"
+)]
 fn build_provider(
     project_root: &Utf8Path,
     repository_root: &Utf8Path,
@@ -4003,6 +7501,16 @@ fn build_provider(
             vec![error.to_string()],
         )
     })?;
+    let source_endpoints =
+        stored_remote_snapshot(&stored.source_fetch_endpoint, &stored.source_push_endpoint)?;
+    let execution_endpoints = stored_remote_snapshot(
+        &stored.execution_fetch_endpoint,
+        &stored.execution_push_endpoint,
+    )?;
+    validate_execution_endpoint_transports(
+        execution_endpoints.fetch(),
+        execution_endpoints.push(),
+    )?;
     let config = GithubProviderConfig::new(
         repository,
         stored.source_repository.clone(),
@@ -4013,10 +7521,16 @@ fn build_provider(
             publish_temporary_ref: true,
             cancel_run: true,
             delete_temporary_ref: true,
+            publish_git_snapshot_source: true,
+            delete_git_snapshot_source: true,
+            manage_git_snapshot_keepalive: true,
         },
         &worker_version,
         8,
     )
+    .and_then(|config| {
+        config.bind_git_endpoints(source_endpoints.clone(), execution_endpoints.clone())
+    })
     .map_err(|error| {
         remote_error_with_details(
             "invalid_provider_config",
@@ -4037,27 +7551,34 @@ fn build_provider(
                 vec![error.to_string()],
             )
         })?;
-    let git_runner =
-        GitProcessRunner::new(executable("git")?, repository_root).map_err(|error| {
+    let trusted_git = rustferry_github::git_process::trusted_git_executable().map_err(|error| {
+        remote_error_with_details(
+            "trusted_git_unavailable",
+            "the standard trusted Git toolchain is unavailable",
+            "Install the supported standard Git toolchain and retry.",
+            vec![error.to_string()],
+        )
+    })?;
+    let git_runner = GitProcessRunner::new(trusted_git, &paths.git_isolation).map_err(|error| {
             remote_error_with_details(
                 "git_publisher_invalid",
                 "the local Git publisher could not be configured",
-                "Use a canonical Git executable and repository checkout.",
+                "Use the standard Git-for-Windows installation and the private generated publisher directory.",
                 vec![error.to_string()],
             )
         })?;
-    let publisher = GitTemporaryRefPublisher::new(
+    let publisher = GitTemporaryRefPublisher::new_with_endpoints(
         git_runner,
         &paths.git_isolation,
-        stored.source_remote_name.clone(),
-        stored.execution_remote_name.clone(),
+        &source_endpoints,
+        &execution_endpoints,
         Duration::from_mins(2),
     )
     .map_err(|error| {
         remote_error_with_details(
             "git_publisher_invalid",
             "the temporary Git ref publisher could not be configured",
-            "Rerun GitHub setup with a safe remote name and private generated directory.",
+            "Rerun GitHub setup to capture canonical endpoints into a private generated directory.",
             vec![error.to_string()],
         )
     })?;
@@ -4075,7 +7596,33 @@ fn handshake(
     signing_mode: SigningMode,
     requested_artifacts: &BTreeSet<IosArtifactType>,
 ) -> Result<(), CliError> {
-    let required_features = required_build_features(signing_mode, requested_artifacts);
+    handshake_with_source_mode(provider, SourceMode::Git, signing_mode, requested_artifacts)
+}
+
+fn handshake_with_source_mode(
+    provider: &GithubProvider,
+    source_mode: SourceMode,
+    signing_mode: SigningMode,
+    requested_artifacts: &BTreeSet<IosArtifactType>,
+) -> Result<(), CliError> {
+    handshake_with_source_mode_cancellable(
+        provider,
+        source_mode,
+        signing_mode,
+        requested_artifacts,
+        &CancellationToken::new(),
+    )
+}
+
+fn handshake_with_source_mode_cancellable(
+    provider: &GithubProvider,
+    source_mode: SourceMode,
+    signing_mode: SigningMode,
+    requested_artifacts: &BTreeSet<IosArtifactType>,
+    cancellation: &CancellationToken,
+) -> Result<(), CliError> {
+    let required_features =
+        required_build_features_for_source(source_mode, signing_mode, requested_artifacts);
     provider_call(
         provider.handshake(
             HandshakeRequest {
@@ -4084,7 +7631,7 @@ fn handshake(
                     .expect("cargo package version is semantic version syntax"),
                 required_features,
             },
-            CancellationToken::new(),
+            cancellation.clone(),
         ),
         "provider_handshake_failed",
         "the GitHub worker/provider contract is incompatible with this client",
@@ -4092,12 +7639,13 @@ fn handshake(
     Ok(())
 }
 
-fn required_build_features(
+fn required_build_features_for_source(
+    source_mode: SourceMode,
     signing_mode: SigningMode,
     requested_artifacts: &BTreeSet<IosArtifactType>,
 ) -> Vec<ProviderFeature> {
     let mut required_features = vec![
-        ProviderFeature::SourceMode(SourceMode::Git),
+        ProviderFeature::SourceMode(source_mode),
         ProviderFeature::IosDeviceBuild,
         ProviderFeature::SigningMode(signing_mode),
         ProviderFeature::LiveEvents,
@@ -4121,26 +7669,1229 @@ struct JobTerminal {
     diagnostics: Vec<String>,
 }
 
+fn unix_timestamp_ms() -> Result<u64, CliError> {
+    let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| {
+        remote_error(
+            "system_clock_invalid",
+            "the system clock is earlier than the Unix epoch",
+            "Correct the system clock before creating a durable remote job.",
+        )
+    })?;
+    u64::try_from(elapsed.as_millis()).map_err(|_| {
+        remote_error(
+            "system_clock_invalid",
+            "the system clock cannot be represented by the durable job schema",
+            "Correct the system clock before creating a durable remote job.",
+        )
+    })
+}
+
+fn update_stored_job(
+    store: &JobStore,
+    local_job_id: &LocalJobId,
+    update: impl FnOnce(&StoredJobV1, &mut StoredJobV1) -> Result<(), JobStoreError>,
+) -> Result<(), CliError> {
+    let timestamp_ms = unix_timestamp_ms()?;
+    store.update(local_job_id, |previous| {
+        let mut next = previous.clone();
+        next.revision = previous
+            .revision
+            .checked_add(1)
+            .ok_or(JobStoreError::InvalidRecord {
+                reason: "job revision cannot advance beyond the supported range",
+            })?;
+        next.updated_at_ms = previous.updated_at_ms.max(timestamp_ms);
+        update(previous, &mut next)?;
+        Ok(next)
+    })?;
+    Ok(())
+}
+
+fn require_bound_provider_job(
+    store: &JobStore,
+    local_job_id: &LocalJobId,
+    provider_job_id: &str,
+    run_trigger: WorkflowRunTrigger,
+) -> Result<(), CliError> {
+    let latest = store.latest(local_job_id)?;
+    if latest.provider_job_id.as_deref() != Some(provider_job_id)
+        || latest.provider_resume.as_ref().is_none_or(|resume| {
+            !provider_resume_is_bound(resume, provider_job_id, run_trigger)
+        })
+    {
+        return Err(remote_error(
+            "provider_checkpoint_missing",
+            "the accepted GitHub job is missing its durable resume checkpoint",
+            "Preserve the local job ID and inspect its immutable revisions before retrying.",
+        ));
+    }
+    Ok(())
+}
+
+fn provider_resume_is_bound(
+    resume: &rustferry_github::provider::GithubJobResumeV1,
+    provider_job_id: &str,
+    run_trigger: WorkflowRunTrigger,
+) -> bool {
+    resume.job_id == provider_job_id
+        && resume.dispatch_commit.is_some()
+        && !resume.publication_uncertain
+        && !resume.publication_absent
+        && !resume.publication_not_attempted
+        && resume.validate_trigger_binding().is_ok()
+        && match run_trigger {
+            WorkflowRunTrigger::Push => resume.workflow_dispatch.is_none(),
+            WorkflowRunTrigger::WorkflowDispatch => resume
+                .workflow_dispatch
+                .as_ref()
+                .is_some_and(|dispatch| dispatch.receipt.is_some() && resume.run.is_some()),
+        }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SubmitPublicationEvidence {
+    Mapped,
+    Absent,
+    Conflict,
+    Pending,
+}
+
+fn submit_publication_evidence(
+    resume: &rustferry_github::provider::GithubJobResumeV1,
+    provider_job_id: &str,
+    run_trigger: WorkflowRunTrigger,
+) -> SubmitPublicationEvidence {
+    if resume.job_id != provider_job_id {
+        return SubmitPublicationEvidence::Pending;
+    }
+    if resume.dispatch_commit.is_some()
+        && !resume.publication_uncertain
+        && !resume.publication_absent
+        && !resume.publication_not_attempted
+        && resume.validate_trigger_binding().is_ok()
+        && match run_trigger {
+            WorkflowRunTrigger::Push => resume.workflow_dispatch.is_none(),
+            WorkflowRunTrigger::WorkflowDispatch => resume
+                .workflow_dispatch
+                .as_ref()
+                .is_some_and(|dispatch| dispatch.receipt.is_some())
+                && resume.run.is_some(),
+        }
+    {
+        return SubmitPublicationEvidence::Mapped;
+    }
+    if resume.publication_not_attempted
+        || resume.publication_absent
+            && resume.publication_absence_observations >= 2
+            && resume.publication_process_fenced
+            && resume.temporary_ref_deleted
+    {
+        return SubmitPublicationEvidence::Absent;
+    }
+    if resume.state == JobState::Failed
+        && resume.dispatch_commit.is_none()
+        && resume.publication_uncertain
+        && !resume.publication_absent
+        && !resume.publication_not_attempted
+        && resume.publication_process_fenced
+        && resume.publication_absence_first_observed_at_ms != 0
+        && resume.publication_absence_observations >= 2
+    {
+        return SubmitPublicationEvidence::Conflict;
+    }
+    SubmitPublicationEvidence::Pending
+}
+
+fn reconcile_submit_publication_with_cancellation(
+    provider: &GithubProvider,
+    store: &JobStore,
+    local_job_id: &LocalJobId,
+    project_binding: &ProjectFilesystemBinding,
+    provider_job_id: &str,
+    cancellation: &CancellationToken,
+) -> Result<SubmitPublicationEvidence, CliError> {
+    let run_trigger = provider.workflow_run_trigger();
+    let mut backoff = SUBMIT_RECONCILIATION_INITIAL_BACKOFF;
+    let mut post_deadline_attempts = 0_u8;
+    loop {
+        let latest = store.latest(local_job_id)?;
+        let resume = latest.provider_resume.as_ref().ok_or_else(|| {
+            remote_error(
+                "submit_reconciliation_checkpoint_missing",
+                "the GitHub submission lost its durable reconciliation checkpoint",
+                "Preserve the local job ID and reconcile its exact publication intent before retrying.",
+            )
+        })?;
+        let evidence = submit_publication_evidence(resume, provider_job_id, run_trigger);
+        if evidence != SubmitPublicationEvidence::Pending {
+            return Ok(evidence);
+        }
+        if cancellation.is_cancelled() || rustferry_core::process_control::interrupt_requested() {
+            return Err(CliError::CommandInterrupted {
+                tool: "GitHub publication reconciliation".to_owned(),
+                stage: "remote iPhone build",
+            });
+        }
+        project_binding.verify()?;
+        let reconciliation = provider.reconcile_restored_job(provider_job_id, cancellation);
+        project_binding.verify()?;
+        let reconciled = store.latest(local_job_id)?;
+        let resume = reconciled.provider_resume.as_ref().ok_or_else(|| {
+            remote_error(
+                "submit_reconciliation_checkpoint_missing",
+                "the GitHub submission lost its durable reconciliation checkpoint",
+                "Preserve the local job ID and reconcile its exact publication intent before retrying.",
+            )
+        })?;
+        let evidence = submit_publication_evidence(resume, provider_job_id, run_trigger);
+        if evidence != SubmitPublicationEvidence::Pending {
+            return Ok(evidence);
+        }
+        let retryable = match reconciliation {
+            Ok(GithubJobReconciliation::Missing | GithubJobReconciliation::Conflict) => true,
+            Ok(
+                GithubJobReconciliation::NotStarted
+                | GithubJobReconciliation::AlreadyMapped
+                | GithubJobReconciliation::Recovered
+                | GithubJobReconciliation::ConflictResolved,
+            ) => false,
+            Err(error) => error.retryable(),
+        };
+        if !retryable {
+            return Ok(SubmitPublicationEvidence::Pending);
+        }
+        let now_ms = unix_timestamp_ms()?;
+        if now_ms >= resume.publication_quiescence_deadline_ms {
+            post_deadline_attempts = post_deadline_attempts.saturating_add(1);
+            if post_deadline_attempts >= SUBMIT_RECONCILIATION_POST_DEADLINE_ATTEMPTS {
+                return Ok(SubmitPublicationEvidence::Pending);
+            }
+            sleep_interruptibly_with_cancellation(
+                SUBMIT_RECONCILIATION_INITIAL_BACKOFF,
+                cancellation,
+            );
+            continue;
+        }
+        post_deadline_attempts = 0;
+        let until_deadline = Duration::from_millis(
+            resume
+                .publication_quiescence_deadline_ms
+                .saturating_sub(now_ms),
+        );
+        sleep_interruptibly_with_cancellation(backoff.min(until_deadline), cancellation);
+        backoff = backoff
+            .saturating_mul(2)
+            .min(SUBMIT_RECONCILIATION_MAX_BACKOFF);
+    }
+}
+
+fn reconcile_submit_attempt(
+    provider: &GithubProvider,
+    store: &JobStore,
+    local_job_id: &LocalJobId,
+    project_binding: &ProjectFilesystemBinding,
+    provider_job_hint: Option<&str>,
+    submit_error: Option<&rustferry_remote::RemoteBuildError>,
+) -> Result<String, CliError> {
+    reconcile_submit_attempt_with_cancellation(
+        provider,
+        store,
+        local_job_id,
+        project_binding,
+        provider_job_hint,
+        submit_error,
+        &CancellationToken::new(),
+    )
+}
+
+fn reconcile_submit_attempt_with_cancellation(
+    provider: &GithubProvider,
+    store: &JobStore,
+    local_job_id: &LocalJobId,
+    project_binding: &ProjectFilesystemBinding,
+    provider_job_hint: Option<&str>,
+    submit_error: Option<&rustferry_remote::RemoteBuildError>,
+    cancellation: &CancellationToken,
+) -> Result<String, CliError> {
+    let latest = store.latest(local_job_id)?;
+    let Some(resume) = latest.provider_resume.as_ref() else {
+        if let Some(submit_error) = submit_error {
+            persist_controller_failure(
+                store,
+                local_job_id,
+                "controller.submit_failed_before_publication",
+                submit_error.retryable(),
+            )?;
+            return Err(provider_failure(
+                submit_error,
+                "remote_submit_failed",
+                "the GitHub provider did not accept the iPhone build",
+            ));
+        }
+        persist_submit_uncertain(store, local_job_id)?;
+        return Err(remote_error(
+            "provider_checkpoint_missing",
+            "the acknowledged GitHub job is missing its durable publication checkpoint",
+            "Preserve the local job ID and reconcile the exact submission before retrying.",
+        ));
+    };
+    let provider_job_id = resume.job_id.clone();
+    if provider_job_hint.is_some_and(|hint| hint != provider_job_id) {
+        persist_submit_uncertain(store, local_job_id)?;
+        return Err(remote_error(
+            "provider_job_identity_mismatch",
+            "the acknowledged GitHub job differs from its durable publication checkpoint",
+            "Preserve the local job ID and reconcile the exact provider job before retrying.",
+        ));
+    }
+    let evidence = match reconcile_submit_publication_with_cancellation(
+        provider,
+        store,
+        local_job_id,
+        project_binding,
+        &provider_job_id,
+        cancellation,
+    ) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            persist_submit_uncertain(store, local_job_id)?;
+            return Err(error);
+        }
+    };
+    if evidence == SubmitPublicationEvidence::Mapped {
+        return Ok(provider_job_id);
+    }
+    if evidence == SubmitPublicationEvidence::Absent {
+        persist_controller_failure(
+            store,
+            local_job_id,
+            "controller.submit_failed_without_publication",
+            submit_error.is_some_and(rustferry_remote::RemoteBuildError::retryable),
+        )?;
+        return Err(submit_error.map_or_else(
+            || {
+                remote_error(
+                    "remote_submit_not_published",
+                    "the GitHub provider acknowledged a build whose exact publication is proven absent",
+                    "Preserve the local job ID and retry with a new operation only after reviewing the durable absence proof.",
+                )
+            },
+            |error| {
+                provider_failure(
+                    error,
+                    "remote_submit_failed",
+                    "the GitHub provider did not accept the iPhone build",
+                )
+            },
+        ));
+    }
+    if evidence == SubmitPublicationEvidence::Conflict {
+        return Err(remote_error_with_details(
+            "remote_submit_conflict",
+            "the GitHub submission resolved to a conflicting temporary ref without an exact matching run",
+            "Preserve the local and provider job IDs; do not retry this operation or alter the conflicting ref automatically.",
+            vec![
+                format!("local_job_id={}", local_job_id.as_str()),
+                format!("job_id={provider_job_id}"),
+            ],
+        ));
+    }
+    persist_submit_uncertain(store, local_job_id)?;
+    Err(remote_error_with_details(
+        "remote_submit_uncertain",
+        "the GitHub submission outcome could not be reconciled to an exact publication or absence proof",
+        "Preserve the local and provider job IDs; reconcile this exact publication intent before retrying.",
+        vec![
+            format!("local_job_id={}", local_job_id.as_str()),
+            format!("job_id={provider_job_id}"),
+        ],
+    ))
+}
+
+fn persist_submit_uncertain(store: &JobStore, local_job_id: &LocalJobId) -> Result<(), CliError> {
+    let latest = store.latest(local_job_id)?;
+    if latest.cleanup_status == StoredCleanupStatus::Uncertain
+        && matches!(
+            latest.state,
+            StoredJobState::Unknown | StoredJobState::Failed
+        )
+    {
+        return Ok(());
+    }
+    update_stored_job(store, local_job_id, |previous, next| {
+        next.cleanup_status = StoredCleanupStatus::Uncertain;
+        if previous.failure.is_none()
+            && !matches!(
+                previous.state,
+                StoredJobState::Failed | StoredJobState::CleanupFailed
+            )
+        {
+            next.state = StoredJobState::Unknown;
+            next.last_confirmed_state = Some(effective_local_phase(previous));
+        }
+        Ok(())
+    })
+}
+
+fn persist_downloading(
+    store: &JobStore,
+    local_job_id: &LocalJobId,
+    destinations: &BTreeMap<String, DownloadDestinationBinding>,
+) -> Result<(), CliError> {
+    update_stored_job(store, local_job_id, |_previous, next| {
+        if next.artifacts.len() != destinations.len()
+            || destinations
+                .values()
+                .map(|destination| &destination.path)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != destinations.len()
+        {
+            return Err(JobStoreError::InvalidRecord {
+                reason: "download destinations do not exactly cover durable artifacts",
+            });
+        }
+        for artifact in &mut next.artifacts {
+            let destination = destinations.get(&artifact.record.artifact_id).ok_or(
+                JobStoreError::InvalidRecord {
+                    reason: "download destination is missing for a durable artifact",
+                },
+            )?;
+            if artifact.download_destination.is_some()
+                || artifact.download_parent_identity.is_some()
+                || artifact.local_path.is_some()
+                || artifact.local_file_identity.is_some()
+            {
+                return Err(JobStoreError::InvalidRecord {
+                    reason: "artifact download destination or result was already bound",
+                });
+            }
+            artifact.download_destination = Some(destination.path.clone());
+            artifact.download_parent_identity = Some(destination.parent_identity.to_string());
+        }
+        next.state = StoredJobState::Downloading;
+        Ok(())
+    })
+}
+
+fn persist_or_verify_download_destinations(
+    store: &JobStore,
+    local_job_id: &LocalJobId,
+    destinations: &BTreeMap<String, DownloadDestinationBinding>,
+) -> Result<(), CliError> {
+    let latest = store.latest(local_job_id)?;
+    let has_intent = latest
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.download_destination.is_some());
+    if !has_intent {
+        return persist_downloading(store, local_job_id, destinations);
+    }
+    let exact = latest.artifacts.len() == destinations.len()
+        && latest.artifacts.iter().all(|artifact| {
+            destinations
+                .get(&artifact.record.artifact_id)
+                .is_some_and(|binding| {
+                    artifact.download_destination.as_deref() == Some(binding.path.as_str())
+                        && artifact.download_parent_identity.as_deref()
+                            == Some(binding.parent_identity.as_str())
+                })
+        });
+    if !exact {
+        return Err(remote_error(
+            "artifact_destination_intent_mismatch",
+            "the durable artifact destinations differ from the exact reconstructed bindings",
+            "Preserve the job and intended paths; do not overwrite or redirect its artifacts.",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "one crash-recovery boundary validates existing publication or performs one create-only provider download"
+)]
+fn download_or_resume_artifact(
+    provider: &GithubProvider,
+    store: &JobStore,
+    local_job_id: &LocalJobId,
+    job_id: &str,
+    manifest: &rustferry_remote::ArtifactManifest,
+    artifact: &rustferry_remote::ArtifactRecord,
+    destination_binding: &DownloadDestinationBinding,
+    project_binding: &ProjectFilesystemBinding,
+) -> Result<ValidatedLocalArtifact, ArtifactProcessingFailure> {
+    project_binding
+        .verify()
+        .map_err(ArtifactProcessingFailure::from)?;
+    destination_binding
+        .verify(project_binding)
+        .map_err(ArtifactProcessingFailure::from)?;
+    let path = Utf8Path::new(&destination_binding.path);
+    let latest = store.latest(local_job_id).map_err(CliError::from)?;
+    let durable = latest
+        .artifacts
+        .iter()
+        .find(|stored| stored.record.artifact_id == artifact.artifact_id)
+        .ok_or_else(|| {
+            ArtifactProcessingFailure::from(remote_error(
+                "artifact_destination_intent_missing",
+                "a verified artifact has no durable destination intent",
+                "Preserve the local job and inspect its immutable artifact records.",
+            ))
+        })?;
+    if path.exists() {
+        let validated =
+            independently_validate_download(store, local_job_id, &artifact.artifact_id, path)
+                .map_err(|error| ArtifactProcessingFailure {
+                    error: Box::new(error),
+                    local_publication_uncertain: true,
+                })?;
+        if let Some(identity) = durable.local_file_identity.as_deref() {
+            let expected = identity
+                .parse::<RegularFileFilesystemIdentity>()
+                .map_err(|error| {
+                    ArtifactProcessingFailure::from(remote_error_with_details(
+                        "durable_artifact_identity_invalid",
+                        "the durable artifact identity is invalid",
+                        "Preserve the local job and inspect its immutable artifact record.",
+                        vec![error.to_string()],
+                    ))
+                })?;
+            if durable.local_path.as_deref() != Some(destination_binding.path.as_str())
+                || validated.file_identity != expected
+            {
+                return Err(ArtifactProcessingFailure::from(remote_error(
+                    "durable_artifact_identity_changed",
+                    "the existing artifact differs from its durable path or filesystem identity",
+                    "Do not use the artifact; preserve the local job for inspection.",
+                )));
+            }
+            return Ok(validated);
+        }
+        persist_downloaded_artifact(store, local_job_id, &artifact.artifact_id, &validated)
+            .map_err(|failure| ArtifactProcessingFailure {
+                error: Box::new(failure.error),
+                local_publication_uncertain: true,
+            })?;
+        return Ok(validated);
+    }
+    if durable.local_path.is_some() || durable.local_file_identity.is_some() {
+        return Err(ArtifactProcessingFailure::from(remote_error(
+            "durable_artifact_missing",
+            "a durable downloaded artifact is missing from its exact local path",
+            "Do not redownload over the durable record; preserve the job for inspection.",
+        )));
+    }
+    let destination = ProtocolPath::new(
+        ProtocolPathSemantics::ClientAbsolute,
+        destination_binding.path.clone(),
+    )
+    .map_err(|error| {
+        ArtifactProcessingFailure::from(remote_error_with_details(
+            "artifact_destination_invalid",
+            "a local artifact destination is invalid",
+            "Choose a project location with a canonical absolute target directory.",
+            vec![error.to_string()],
+        ))
+    })?;
+    let result = match poll_provider_once(provider.download_artifact(
+        ArtifactDownloadRequest {
+            job_id: job_id.to_owned(),
+            artifact_id: artifact.artifact_id.clone(),
+            destination,
+        },
+        CancellationToken::new(),
+    )) {
+        ImmediateProviderResult::Ready(Ok(result)) => result,
+        ImmediateProviderResult::Ready(Err(error)) => {
+            return Err(ArtifactProcessingFailure {
+                error: Box::new(provider_failure(
+                    &error,
+                    "artifact_download_failed",
+                    "an independently verified iPhone build artifact could not be downloaded",
+                )),
+                local_publication_uncertain: true,
+            });
+        }
+        ImmediateProviderResult::Pending => {
+            return Err(ArtifactProcessingFailure {
+                error: Box::new(provider_runtime_required()),
+                local_publication_uncertain: true,
+            });
+        }
+    };
+    project_binding
+        .verify()
+        .map_err(|error| ArtifactProcessingFailure {
+            error: Box::new(error),
+            local_publication_uncertain: true,
+        })?;
+    destination_binding
+        .verify(project_binding)
+        .map_err(|error| ArtifactProcessingFailure {
+            error: Box::new(error),
+            local_publication_uncertain: true,
+        })?;
+    if result.local_path.value != destination_binding.path.as_str()
+        || result.manifest != downloaded_manifest(manifest)
+    {
+        return Err(ArtifactProcessingFailure {
+            error: Box::new(remote_error(
+                "artifact_destination_mismatch",
+                "the provider returned different artifact identity or local path metadata",
+                "Do not use the downloaded artifacts; preserve the job ID for investigation.",
+            )),
+            local_publication_uncertain: true,
+        });
+    }
+    let provider_file_identity = result
+        .local_file_identity
+        .parse::<RegularFileFilesystemIdentity>()
+        .map_err(|error| ArtifactProcessingFailure {
+            error: Box::new(remote_error_with_details(
+                "artifact_publisher_identity_invalid",
+                "the provider returned an invalid publisher-captured artifact identity",
+                "Preserve the intended destination and reconcile the exact local job before retrying.",
+                vec![error.to_string()],
+            )),
+            local_publication_uncertain: true,
+        })?;
+    let validated =
+        independently_validate_download(store, local_job_id, &artifact.artifact_id, path).map_err(
+            |error| ArtifactProcessingFailure {
+                error: Box::new(error),
+                local_publication_uncertain: true,
+            },
+        )?;
+    if validated.file_identity != provider_file_identity {
+        return Err(ArtifactProcessingFailure {
+            error: Box::new(remote_error(
+                "artifact_publisher_identity_changed",
+                "the downloaded artifact path no longer names the provider-published file",
+                "Preserve the intended destination and reconcile the exact local job before retrying.",
+            )),
+            local_publication_uncertain: true,
+        });
+    }
+    persist_downloaded_artifact(store, local_job_id, &artifact.artifact_id, &validated).map_err(
+        |failure| ArtifactProcessingFailure {
+            error: Box::new(failure.error),
+            local_publication_uncertain: true,
+        },
+    )?;
+    Ok(validated)
+}
+
+fn independently_validate_download(
+    store: &JobStore,
+    local_job_id: &LocalJobId,
+    artifact_id: &str,
+    path: &Utf8Path,
+) -> Result<ValidatedLocalArtifact, CliError> {
+    let latest = store.latest(local_job_id)?;
+    let artifact = latest
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.record.artifact_id == artifact_id)
+        .ok_or_else(|| {
+            remote_error(
+                "artifact_binding_incomplete",
+                "a downloaded artifact has no exact durable manifest record",
+                "Preserve the destination intent and inspect the exact verified manifest before reconciliation.",
+            )
+        })?;
+    if artifact.download_destination.as_deref() != Some(path.as_str())
+        || artifact.download_parent_identity.is_none()
+        || artifact.local_path.is_some()
+        || artifact.local_file_identity.is_some()
+    {
+        return Err(remote_error(
+            "artifact_binding_incomplete",
+            "a downloaded artifact differs from its durable destination intent",
+            "Preserve the destination intent and inspect the exact verified manifest before reconciliation.",
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        remote_error(
+            "artifact_destination_invalid",
+            "a downloaded artifact has no destination parent",
+            "Preserve the local job and inspect its exact download intent before reconciliation.",
+        )
+    })?;
+    let parent_identity = artifact
+        .download_parent_identity
+        .as_deref()
+        .expect("download parent identity was checked above")
+        .parse::<DirectoryFilesystemIdentity>()
+        .map_err(|error| {
+            remote_error_with_details(
+                "artifact_parent_identity_invalid",
+                "a durable artifact destination parent has an invalid filesystem identity",
+                "Preserve the local job and inspect its immutable destination intent.",
+                vec![error.to_string()],
+            )
+        })?;
+    verify_directory_identity(parent.as_std_path(), &parent_identity).map_err(|error| {
+        remote_error_with_details(
+            "artifact_parent_identity_changed",
+            "a downloaded artifact destination parent changed filesystem identity",
+            "Preserve the local job and reconcile its exact intended destination before retrying.",
+            vec![error.to_string()],
+        )
+    })?;
+    let file_identity = independently_validate_artifact_file(artifact, path)?;
+    verify_directory_identity(parent.as_std_path(), &parent_identity).map_err(|error| {
+        remote_error_with_details(
+            "artifact_parent_identity_changed",
+            "a downloaded artifact destination parent changed during validation",
+            "Preserve the local job and reconcile its exact intended destination before retrying.",
+            vec![error.to_string()],
+        )
+    })?;
+    Ok(ValidatedLocalArtifact {
+        path: path.to_string(),
+        file_identity,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn independently_validate_artifact_file(
+    artifact: &StoredArtifactV1,
+    path: &Utf8Path,
+) -> Result<RegularFileFilesystemIdentity, CliError> {
+    let persistent_identity = RegularFileFilesystemIdentity::capture(path.as_std_path()).map_err(
+        |error| {
+            remote_error_with_details(
+                "artifact_validation_failed",
+                "a downloaded artifact is not a stable single-link regular file",
+                "Do not use the artifact; keep the rollback guard active and retry with a new local job.",
+                vec![
+                    format!("artifact_id={}", artifact.record.artifact_id),
+                    error.to_string(),
+                ],
+            )
+        },
+    )?;
+    let path_identity = ArtifactFileIdentity::capture(path).map_err(|error| {
+        remote_error_with_details(
+            "artifact_validation_failed",
+            "a downloaded artifact could not be bound to its final filesystem identity",
+            "Do not use the artifact; keep the rollback guard active and retry with a new local job.",
+            vec![
+                format!("artifact_id={}", artifact.record.artifact_id),
+                error.to_string(),
+            ],
+        )
+    })?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|source| CliError::Io {
+            action: "open downloaded artifact for independent validation",
+            path: path.to_owned(),
+            source,
+        })?;
+    let open_identity = ArtifactFileIdentity::from_file(&file).map_err(|error| {
+        remote_error_with_details(
+            "artifact_validation_failed",
+            "a downloaded artifact handle is not a stable regular file",
+            "Do not use the artifact; keep the rollback guard active and retry with a new local job.",
+            vec![
+                format!("artifact_id={}", artifact.record.artifact_id),
+                error.to_string(),
+            ],
+        )
+    })?;
+    let metadata = file.metadata().map_err(|source| CliError::Io {
+        action: "inspect downloaded artifact for independent validation",
+        path: path.to_owned(),
+        source,
+    })?;
+    if path_identity != open_identity || metadata.len() != artifact.record.size {
+        return Err(remote_error_with_details(
+            "artifact_validation_failed",
+            "a downloaded artifact changed identity or length before independent validation",
+            "Do not use the artifact; keep the rollback guard active and retry with a new local job.",
+            vec![format!("artifact_id={}", artifact.record.artifact_id)],
+        ));
+    }
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    let mut bytes_read = 0_u64;
+    loop {
+        let count = file.read(buffer.as_mut()).map_err(|source| CliError::Io {
+            action: "hash downloaded artifact independently",
+            path: path.to_owned(),
+            source,
+        })?;
+        if count == 0 {
+            break;
+        }
+        bytes_read = bytes_read.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+        if bytes_read > artifact.record.size {
+            return Err(remote_error(
+                "artifact_validation_failed",
+                "a downloaded artifact exceeded its verified byte length while hashing",
+                "Do not use the artifact; keep the rollback guard active and retry with a new local job.",
+            ));
+        }
+        digest.update(&buffer[..count]);
+    }
+    let final_identity = ArtifactFileIdentity::capture(path).map_err(|error| {
+        remote_error_with_details(
+            "artifact_validation_failed",
+            "a downloaded artifact changed while independent validation completed",
+            "Do not use the artifact; keep the rollback guard active and retry with a new local job.",
+            vec![
+                format!("artifact_id={}", artifact.record.artifact_id),
+                error.to_string(),
+            ],
+        )
+    })?;
+    if bytes_read != artifact.record.size
+        || sha256_hex(digest.finalize()) != artifact.record.sha256
+        || final_identity != open_identity
+    {
+        return Err(remote_error_with_details(
+            "artifact_validation_failed",
+            "a downloaded artifact failed independent size, SHA-256, or identity validation",
+            "Do not use the artifact; keep the rollback guard active and retry with a new local job.",
+            vec![format!("artifact_id={}", artifact.record.artifact_id)],
+        ));
+    }
+    verify_regular_file_identity(path.as_std_path(), &persistent_identity).map_err(|error| {
+        remote_error_with_details(
+            "artifact_validation_failed",
+            "a downloaded artifact changed persistent filesystem identity while it was validated",
+            "Do not use the artifact; keep the rollback guard active and retry with a new local job.",
+            vec![
+                format!("artifact_id={}", artifact.record.artifact_id),
+                error.to_string(),
+            ],
+        )
+    })?;
+    Ok(persistent_identity)
+}
+
+#[derive(Debug)]
+struct ArtifactPathPersistenceFailure {
+    error: CliError,
+}
+
+#[derive(Debug)]
+struct ArtifactProcessingFailure {
+    error: Box<CliError>,
+    local_publication_uncertain: bool,
+}
+
+impl From<CliError> for ArtifactProcessingFailure {
+    fn from(error: CliError) -> Self {
+        Self {
+            error: Box::new(error),
+            local_publication_uncertain: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArtifactPathReconciliation {
+    Persisted,
+    NotPersisted,
+    Uncertain,
+}
+
+fn reconcile_artifact_path_publication(
+    previous_revision: u64,
+    latest: Option<&StoredJobV1>,
+    artifact_id: &str,
+    validated: &ValidatedLocalArtifact,
+) -> ArtifactPathReconciliation {
+    let Some(latest) = latest else {
+        return ArtifactPathReconciliation::Uncertain;
+    };
+    let artifact = latest
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.record.artifact_id == artifact_id);
+    if artifact.is_some_and(|artifact| {
+        artifact.download_destination.as_ref() == Some(&validated.path)
+            && artifact.download_parent_identity.is_some()
+            && artifact.local_path.as_ref() == Some(&validated.path)
+            && artifact.local_file_identity.as_deref() == Some(validated.file_identity.as_str())
+    }) {
+        ArtifactPathReconciliation::Persisted
+    } else if latest.revision == previous_revision
+        && artifact.is_some_and(|artifact| {
+            artifact.local_path.is_none() && artifact.local_file_identity.is_none()
+        })
+    {
+        ArtifactPathReconciliation::NotPersisted
+    } else {
+        ArtifactPathReconciliation::Uncertain
+    }
+}
+
+fn persist_downloaded_artifact(
+    store: &JobStore,
+    local_job_id: &LocalJobId,
+    artifact_id: &str,
+    validated: &ValidatedLocalArtifact,
+) -> Result<(), ArtifactPathPersistenceFailure> {
+    let before = store
+        .latest(local_job_id)
+        .map_err(|error| ArtifactPathPersistenceFailure {
+            error: error.into(),
+        })?;
+    let update = update_stored_job(store, local_job_id, |_previous, next| {
+        if next.state != StoredJobState::Downloading {
+            return Err(JobStoreError::InvalidRecord {
+                reason: "artifact result can only bind while downloading",
+            });
+        }
+        let artifact = next
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.record.artifact_id == artifact_id)
+            .ok_or(JobStoreError::InvalidRecord {
+                reason: "local artifact result has no durable artifact record",
+            })?;
+        if artifact.download_destination.as_ref() != Some(&validated.path)
+            || artifact.local_path.is_some()
+            || artifact.local_file_identity.is_some()
+        {
+            return Err(JobStoreError::InvalidRecord {
+                reason: "local artifact result differs from its durable destination intent",
+            });
+        }
+        artifact.local_path = Some(validated.path.clone());
+        artifact.local_file_identity = Some(validated.file_identity.to_string());
+        artifact.locally_validated = false;
+        Ok(())
+    });
+    let Err(error) = update else {
+        return Ok(());
+    };
+    let latest = store.latest(local_job_id).ok();
+    match reconcile_artifact_path_publication(
+        before.revision,
+        latest.as_ref(),
+        artifact_id,
+        validated,
+    ) {
+        ArtifactPathReconciliation::Persisted => Ok(()),
+        ArtifactPathReconciliation::NotPersisted | ArtifactPathReconciliation::Uncertain => {
+            Err(ArtifactPathPersistenceFailure { error })
+        }
+    }
+}
+
+fn persist_downloads_complete(store: &JobStore, local_job_id: &LocalJobId) -> Result<(), CliError> {
+    update_stored_job(store, local_job_id, |_previous, next| {
+        if next.state != StoredJobState::Downloading
+            || next.artifacts.is_empty()
+            || next.artifacts.iter().any(|artifact| {
+                artifact.download_destination.is_none()
+                    || artifact.download_parent_identity.is_none()
+                    || artifact.local_path.as_deref() != artifact.download_destination.as_deref()
+                    || artifact.local_file_identity.is_none()
+            })
+        {
+            return Err(JobStoreError::InvalidRecord {
+                reason: "download completion lacks an exact path and identity for every artifact",
+            });
+        }
+        next.state = StoredJobState::Downloaded;
+        Ok(())
+    })
+}
+
+fn persist_validating(store: &JobStore, local_job_id: &LocalJobId) -> Result<(), CliError> {
+    update_stored_job(store, local_job_id, |_previous, next| {
+        next.state = StoredJobState::Validating;
+        Ok(())
+    })
+}
+
+fn persist_validation_ready_for_cleanup(
+    store: &JobStore,
+    local_job_id: &LocalJobId,
+) -> Result<(), CliError> {
+    update_stored_job(store, local_job_id, |previous, next| {
+        if previous.state != StoredJobState::Validating {
+            return Err(JobStoreError::InvalidRecord {
+                reason: "cleanup intent must preserve the exact validating phase",
+            });
+        }
+        next.state = StoredJobState::CleanupPending;
+        next.last_confirmed_state = Some(StoredJobState::Validating);
+        next.cleanup_status = StoredCleanupStatus::Pending;
+        Ok(())
+    })
+}
+
+fn persist_controller_failure(
+    store: &JobStore,
+    local_job_id: &LocalJobId,
+    code: &'static str,
+    retryable: bool,
+) -> Result<(), CliError> {
+    let latest = store.latest(local_job_id)?;
+    if latest.failure.is_some()
+        || matches!(
+            latest.state,
+            StoredJobState::Succeeded
+                | StoredJobState::CleanupFailed
+                | StoredJobState::Cancelled
+                | StoredJobState::Expired
+        )
+        || matches!(
+            latest.terminal_outcome,
+            Some(StoredBuildOutcome::Cancelled | StoredBuildOutcome::Expired)
+        )
+    {
+        return Ok(());
+    }
+    update_stored_job(store, local_job_id, |_previous, next| {
+        next.state = StoredJobState::Failed;
+        next.last_confirmed_state = Some(StoredJobState::Failed);
+        next.failure = Some(StoredFailureV1 {
+            code: code.to_owned(),
+            retryable,
+        });
+        Ok(())
+    })
+}
+
+fn persist_artifact_publication_uncertain(
+    store: &JobStore,
+    local_job_id: &LocalJobId,
+    code: &'static str,
+) -> Result<(), CliError> {
+    let latest = store.latest(local_job_id)?;
+    if latest
+        .failure
+        .as_ref()
+        .is_some_and(|failure| failure.code == code)
+        && latest.state == StoredJobState::Unknown
+    {
+        return Ok(());
+    }
+    if latest.failure.is_some() {
+        return Ok(());
+    }
+    update_stored_job(store, local_job_id, |previous, next| {
+        next.state = StoredJobState::Unknown;
+        next.last_confirmed_state = Some(effective_local_phase(previous));
+        next.failure = Some(StoredFailureV1 {
+            code: code.to_owned(),
+            retryable: false,
+        });
+        Ok(())
+    })
+}
+
+fn persist_cancellation_requested(
+    store: &JobStore,
+    local_job_id: &LocalJobId,
+) -> Result<bool, CliError> {
+    let latest = store.latest(local_job_id)?;
+    if latest.terminal_outcome.is_some()
+        || latest.failure.is_some()
+        || latest.cancellation_status == StoredCancellationStatus::Confirmed
+    {
+        return Ok(false);
+    }
+    if matches!(
+        latest.cancellation_status,
+        StoredCancellationStatus::Requested
+            | StoredCancellationStatus::Dispatched
+            | StoredCancellationStatus::Uncertain
+    ) {
+        return Ok(true);
+    }
+    update_stored_job(store, local_job_id, |_previous, next| {
+        next.state = StoredJobState::CancellationRequested;
+        next.cancellation_status = StoredCancellationStatus::Requested;
+        Ok(())
+    })?;
+    Ok(true)
+}
+
+fn persist_cancellation_uncertain(
+    store: &JobStore,
+    local_job_id: &LocalJobId,
+) -> Result<(), CliError> {
+    let latest = store.latest(local_job_id)?;
+    if latest.terminal_outcome.is_some()
+        || latest.failure.is_some()
+        || latest.cancellation_status == StoredCancellationStatus::Confirmed
+        || latest.state == StoredJobState::Unknown
+            && latest.cancellation_status == StoredCancellationStatus::Uncertain
+    {
+        return Ok(());
+    }
+    update_stored_job(store, local_job_id, |previous, next| {
+        next.state = StoredJobState::Unknown;
+        next.last_confirmed_state = Some(effective_local_phase(previous));
+        next.cancellation_status = StoredCancellationStatus::Uncertain;
+        Ok(())
+    })
+}
+
+fn persist_terminal_cancellation_result(
+    store: &JobStore,
+    local_job_id: &LocalJobId,
+    state: JobState,
+) -> Result<(), CliError> {
+    if state == JobState::Cancelled {
+        let latest = store.latest(local_job_id)?;
+        if latest.terminal_outcome == Some(StoredBuildOutcome::Cancelled)
+            && latest.cancellation_status == StoredCancellationStatus::Confirmed
+        {
+            return Ok(());
+        }
+        return Err(remote_error(
+            "cancellation_checkpoint_missing",
+            "the provider reported cancellation without an exact durable terminal checkpoint",
+            "Preserve the local job ID and inspect its latest immutable provider checkpoint.",
+        ));
+    }
+    let latest = store.latest(local_job_id)?;
+    let expected_outcome = match state {
+        JobState::Succeeded => StoredBuildOutcome::Succeeded,
+        JobState::Failed => StoredBuildOutcome::Failed,
+        _ => {
+            return Err(remote_error(
+                "cancellation_terminal_checkpoint_missing",
+                "the provider acknowledgement is not an exact supported terminal build outcome",
+                "Preserve the local job ID and inspect its immutable provider checkpoint.",
+            ));
+        }
+    };
+    if latest.terminal_outcome != Some(expected_outcome) {
+        return Err(remote_error(
+            "cancellation_terminal_checkpoint_missing",
+            "the provider acknowledgement lacks a matching durable terminal build outcome",
+            "Preserve the local job ID and inspect its immutable provider checkpoint.",
+        ));
+    }
+    if latest.cancellation_status == StoredCancellationStatus::Failed {
+        return Ok(());
+    }
+    update_stored_job(store, local_job_id, |_previous, next| {
+        next.cancellation_status = StoredCancellationStatus::Failed;
+        Ok(())
+    })
+}
+
+fn persist_non_cancel_terminal_race(
+    store: &JobStore,
+    local_job_id: &LocalJobId,
+) -> Result<(), CliError> {
+    let latest = store.latest(local_job_id)?;
+    if latest.cancellation_status == StoredCancellationStatus::Failed {
+        return Ok(());
+    }
+    if latest.terminal_outcome.is_none() && latest.failure.is_none() {
+        return Err(remote_error(
+            "cancellation_terminal_checkpoint_missing",
+            "a non-cancel terminal race lacks exact durable outcome evidence",
+            "Preserve the local job ID and inspect its immutable provider checkpoint.",
+        ));
+    }
+    update_stored_job(store, local_job_id, |_previous, next| {
+        next.cancellation_status = StoredCancellationStatus::Failed;
+        Ok(())
+    })
+}
+
+fn interrupted_cleanup_progress(
+    outcome: Option<StoredBuildOutcome>,
+    cancellation_confirmed: bool,
+    cleanup_confirmed: bool,
+) -> &'static str {
+    match (outcome, cancellation_confirmed, cleanup_confirmed) {
+        (Some(StoredBuildOutcome::Cancelled), true, true) => {
+            "Remote cancellation and cleanup confirmed"
+        }
+        (Some(StoredBuildOutcome::Cancelled), true, false) => {
+            "Remote cancellation was confirmed, but cleanup remains unconfirmed"
+        }
+        (Some(StoredBuildOutcome::Succeeded), _, true) => {
+            "Remote build succeeded before cancellation; cleanup confirmed"
+        }
+        (Some(StoredBuildOutcome::Succeeded), _, false) => {
+            "Remote build succeeded before cancellation; cleanup remains unconfirmed"
+        }
+        (Some(StoredBuildOutcome::Failed), _, true) => {
+            "Remote build failed before cancellation; cleanup confirmed"
+        }
+        (Some(StoredBuildOutcome::Failed), _, false) => {
+            "Remote build failed before cancellation; cleanup remains unconfirmed"
+        }
+        (Some(StoredBuildOutcome::Expired), _, true) => {
+            "Remote build expired before cancellation; cleanup confirmed"
+        }
+        (Some(StoredBuildOutcome::Expired), _, false) => {
+            "Remote build expired before cancellation; cleanup remains unconfirmed"
+        }
+        (Some(StoredBuildOutcome::Cancelled), false, true) => {
+            "Remote cleanup confirmed, but cancellation lacks durable confirmation"
+        }
+        (Some(StoredBuildOutcome::Cancelled), false, false) | (None, _, false) => {
+            "Remote cancellation and cleanup remain unconfirmed; inspect the exact job"
+        }
+        (None, _, true) => "Remote cleanup confirmed, but the terminal job outcome is uncertain",
+    }
+}
+
+fn interrupted_cleanup_progress_for_job(
+    job: Option<&StoredJobV1>,
+    provider_job_id: &str,
+) -> &'static str {
+    interrupted_cleanup_progress(
+        job.and_then(|job| job.terminal_outcome),
+        job.is_some_and(|job| job.cancellation_status == StoredCancellationStatus::Confirmed),
+        job.is_some_and(|job| durable_cleanup_is_confirmed(job, provider_job_id)),
+    )
+}
+
 fn poll_job(
     provider: &GithubProvider,
+    store: &JobStore,
+    local_job_id: &LocalJobId,
     job_id: &str,
     deadline: Instant,
+    cancellation: &CancellationToken,
     reporter: &Reporter,
 ) -> Result<JobTerminal, CliError> {
     let mut sequence = None;
     let mut diagnostics = Vec::new();
     loop {
-        if rustferry_core::process_control::interrupt_requested() {
+        if cancellation.is_cancelled() || rustferry_core::process_control::interrupt_requested() {
             reporter
                 .progress("Cancellation requested; waiting for exact-run termination and cleanup");
-            let _ = cancel_and_wait(
+            let cancellation = cancel_and_wait(CancellationWaitContext {
                 provider,
+                store,
+                local_job_id,
                 job_id,
-                "client_interrupted",
-                &mut sequence,
-                &mut diagnostics,
+                reason: "client_interrupted",
+                sequence: &mut sequence,
+                diagnostics: &mut diagnostics,
                 reporter,
-            );
+            });
+            reporter.progress(match cancellation.outcome {
+                CancellationWaitOutcome::Cancelled => "Exact remote cancellation confirmed",
+                CancellationWaitOutcome::OtherTerminal => {
+                    "Remote job reached another terminal outcome before cancellation"
+                }
+                CancellationWaitOutcome::Uncertain => {
+                    "Remote cancellation outcome remains uncertain"
+                }
+            });
             return Err(CliError::CommandInterrupted {
                 tool: "GitHub Actions job".to_owned(),
                 stage: "remote iPhone build",
@@ -4150,14 +8901,17 @@ fn poll_job(
             reporter
                 .progress("Build timeout reached; waiting for exact-run cancellation and cleanup");
             let mut details = vec![format!("job_id={job_id}")];
-            details.extend(cancel_and_wait(
+            let cancellation = cancel_and_wait(CancellationWaitContext {
                 provider,
+                store,
+                local_job_id,
                 job_id,
-                "client_timeout",
-                &mut sequence,
-                &mut diagnostics,
+                reason: "client_timeout",
+                sequence: &mut sequence,
+                diagnostics: &mut diagnostics,
                 reporter,
-            ));
+            });
+            details.extend(cancellation.details);
             details.extend(diagnostics);
             return Err(remote_error_with_details(
                 "remote_job_timed_out",
@@ -4173,7 +8927,7 @@ fn poll_job(
                     after_sequence: sequence,
                     limit: 128,
                 },
-                CancellationToken::new(),
+                cancellation.clone(),
             ),
             "remote_events_failed",
             "GitHub build events could not be retrieved",
@@ -4181,14 +8935,17 @@ fn poll_job(
             Ok(page) => page,
             Err(error) => {
                 let mut details = vec![format!("job_id={job_id}"), error.to_string()];
-                details.extend(cancel_and_wait(
+                let cancellation = cancel_and_wait(CancellationWaitContext {
                     provider,
+                    store,
+                    local_job_id,
                     job_id,
-                    "client_tracking_failed",
-                    &mut sequence,
-                    &mut diagnostics,
+                    reason: "client_tracking_failed",
+                    sequence: &mut sequence,
+                    diagnostics: &mut diagnostics,
                     reporter,
-                ));
+                });
+                details.extend(cancellation.details);
                 details.extend(diagnostics);
                 return Err(remote_error_with_details(
                     "remote_job_tracking_failed",
@@ -4208,7 +8965,61 @@ fn poll_job(
                 diagnostics,
             });
         }
-        sleep_interruptibly(POLL_INTERVAL);
+        sleep_interruptibly_with_cancellation(POLL_INTERVAL, cancellation);
+    }
+}
+
+fn observe_job_until_terminal(
+    provider: &GithubProvider,
+    local_job_id: &LocalJobId,
+    job_id: &str,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+    reporter: &Reporter,
+) -> Result<JobTerminal, CliError> {
+    let mut sequence = None;
+    let mut diagnostics = Vec::new();
+    loop {
+        if cancellation.is_cancelled() || rustferry_core::process_control::interrupt_requested() {
+            return Err(CliError::CommandInterrupted {
+                tool: "GitHub Actions retry job".to_owned(),
+                stage: "remote iPhone retry",
+            });
+        }
+        if Instant::now() >= deadline {
+            return Err(remote_error_with_details(
+                "remote_retry_observation_timed_out",
+                "the GitHub retry did not reach an exact terminal state within the bounded wait",
+                "The child remains durable; rerun jobs retry to continue observation or cancel it separately.",
+                vec![
+                    format!("local_job_id={}", local_job_id.as_str()),
+                    format!("job_id={job_id}"),
+                ],
+            ));
+        }
+        let page = provider_call(
+            provider.events(
+                EventRequest {
+                    job_id: job_id.to_owned(),
+                    after_sequence: sequence,
+                    limit: 128,
+                },
+                cancellation.clone(),
+            ),
+            "remote_retry_events_failed",
+            "GitHub retry events could not be retrieved",
+        )?;
+        record_events(&page.events, reporter, &mut diagnostics);
+        if page.next_sequence.is_some() {
+            sequence = page.next_sequence;
+        }
+        if page.state.is_build_terminal() {
+            return Ok(JobTerminal {
+                state: page.state,
+                diagnostics,
+            });
+        }
+        sleep_interruptibly_with_cancellation(POLL_INTERVAL, cancellation);
     }
 }
 
@@ -4222,8 +9033,10 @@ fn list_artifacts_with_retry(
     job_id: &str,
     deadline: Instant,
     reporter: &Reporter,
+    project_binding: &ProjectFilesystemBinding,
 ) -> Result<Vec<rustferry_remote::ArtifactManifest>, CliError> {
     retry_artifact_listing(
+        || project_binding.verify(),
         || {
             poll_provider_once(provider.list_artifacts(
                 ArtifactListRequest {
@@ -4239,7 +9052,8 @@ fn list_artifacts_with_retry(
     )
 }
 
-fn retry_artifact_listing<F>(
+fn retry_artifact_listing<B, F>(
+    mut before_list: B,
     mut list: F,
     deadline: Instant,
     reporter: &Reporter,
@@ -4247,11 +9061,13 @@ fn retry_artifact_listing<F>(
     backoff: Duration,
 ) -> Result<Vec<rustferry_remote::ArtifactManifest>, CliError>
 where
+    B: FnMut() -> Result<(), CliError>,
     F: FnMut() -> ImmediateProviderResult<Vec<rustferry_remote::ArtifactManifest>>,
 {
     let mut last_failure = "the verified artifact manifest is not indexed yet".to_owned();
     for attempt in 1..=attempts {
         check_artifact_listing_deadline(deadline)?;
+        before_list()?;
         match list() {
             ImmediateProviderResult::Ready(Ok(manifests)) if !manifests.is_empty() => {
                 check_artifact_listing_deadline(deadline)?;
@@ -4305,20 +9121,68 @@ fn check_artifact_listing_deadline(deadline: Instant) -> Result<(), CliError> {
     Ok(())
 }
 
-fn cancel_and_wait(
-    provider: &GithubProvider,
-    job_id: &str,
-    reason: &str,
-    sequence: &mut Option<u64>,
-    diagnostics: &mut Vec<String>,
-    reporter: &Reporter,
-) -> Vec<String> {
-    let mut details = Vec::new();
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CancellationWaitOutcome {
+    Cancelled,
+    OtherTerminal,
+    Uncertain,
+}
+
+#[derive(Debug)]
+struct CancellationWaitResult {
+    outcome: CancellationWaitOutcome,
+    details: Vec<String>,
+}
+
+struct CancellationWaitContext<'a> {
+    provider: &'a GithubProvider,
+    store: &'a JobStore,
+    local_job_id: &'a LocalJobId,
+    job_id: &'a str,
+    reason: &'a str,
+    sequence: &'a mut Option<u64>,
+    diagnostics: &'a mut Vec<String>,
+    reporter: &'a Reporter,
+}
+
+fn cancellation_outcome_from_job(job: &StoredJobV1) -> CancellationWaitOutcome {
+    if job.terminal_outcome == Some(StoredBuildOutcome::Cancelled)
+        && job.cancellation_status == StoredCancellationStatus::Confirmed
+    {
+        CancellationWaitOutcome::Cancelled
+    } else if job.terminal_outcome.is_some() || job.failure.is_some() {
+        CancellationWaitOutcome::OtherTerminal
+    } else {
+        CancellationWaitOutcome::Uncertain
+    }
+}
+
+fn begin_cancellation(
+    context: &CancellationWaitContext<'_>,
+    details: &mut Vec<String>,
+) -> Option<CancellationWaitOutcome> {
+    let should_cancel = match persist_cancellation_requested(context.store, context.local_job_id) {
+        Ok(should_cancel) => should_cancel,
+        Err(error) => {
+            details.push(format!("cancel_intent_persistence={error}"));
+            return Some(CancellationWaitOutcome::Uncertain);
+        }
+    };
+    if !should_cancel {
+        details.push("cancel_skipped_terminal=true".to_owned());
+        let outcome = context
+            .store
+            .latest(context.local_job_id)
+            .map_or(CancellationWaitOutcome::Uncertain, |latest| {
+                cancellation_outcome_from_job(&latest)
+            });
+        return Some(outcome);
+    }
     match provider_call(
-        provider.cancel(
+        context.provider.cancel(
             CancellationRequest {
-                job_id: job_id.to_owned(),
-                reason: reason.to_owned(),
+                job_id: context.job_id.to_owned(),
+                reason: context.reason.to_owned(),
             },
             CancellationToken::new(),
         ),
@@ -4332,12 +9196,44 @@ fn cancel_and_wait(
                 state_name(acknowledgement.state)
             ));
             if acknowledgement.state.is_build_terminal() {
+                let outcome = match persist_terminal_cancellation_result(
+                    context.store,
+                    context.local_job_id,
+                    acknowledgement.state,
+                ) {
+                    Ok(()) if acknowledgement.state == JobState::Cancelled => {
+                        CancellationWaitOutcome::Cancelled
+                    }
+                    Ok(()) => CancellationWaitOutcome::OtherTerminal,
+                    Err(error) => {
+                        details.push(format!("terminal_checkpoint={error}"));
+                        CancellationWaitOutcome::Uncertain
+                    }
+                };
                 details.push("terminal_after_cancel=true".to_owned());
-                return details;
+                return Some(outcome);
             }
         }
         Err(error) => details.push(format!("cancel_error={error}")),
     }
+    None
+}
+
+fn cancel_and_wait(context: CancellationWaitContext<'_>) -> CancellationWaitResult {
+    let mut details = Vec::new();
+    if let Some(outcome) = begin_cancellation(&context, &mut details) {
+        return CancellationWaitResult { outcome, details };
+    }
+    let CancellationWaitContext {
+        provider,
+        store,
+        local_job_id,
+        job_id,
+        reason: _,
+        sequence,
+        diagnostics,
+        reporter,
+    } = context;
     let deadline = Instant::now() + CANCELLATION_TIMEOUT;
     while Instant::now() < deadline {
         match provider_call(
@@ -4358,8 +9254,20 @@ fn cancel_and_wait(
                     *sequence = page.next_sequence;
                 }
                 if page.state.is_build_terminal() {
+                    let outcome =
+                        match persist_terminal_cancellation_result(store, local_job_id, page.state)
+                        {
+                            Ok(()) if page.state == JobState::Cancelled => {
+                                CancellationWaitOutcome::Cancelled
+                            }
+                            Ok(()) => CancellationWaitOutcome::OtherTerminal,
+                            Err(error) => {
+                                details.push(format!("terminal_checkpoint={error}"));
+                                CancellationWaitOutcome::Uncertain
+                            }
+                        };
                     details.push(format!("terminal_state={}", state_name(page.state)));
-                    return details;
+                    return CancellationWaitResult { outcome, details };
                 }
             }
             Err(error) => {
@@ -4373,8 +9281,25 @@ fn cancel_and_wait(
         }
         thread::sleep(POLL_INTERVAL);
     }
-    details.push("terminal_after_cancel=false".to_owned());
-    details
+    let outcome = store
+        .latest(local_job_id)
+        .map_or(CancellationWaitOutcome::Uncertain, |latest| {
+            cancellation_outcome_from_job(&latest)
+        });
+    if outcome == CancellationWaitOutcome::Uncertain {
+        if let Err(error) = persist_cancellation_uncertain(store, local_job_id) {
+            details.push(format!("cancel_uncertain_persistence={error}"));
+        }
+        details.push("terminal_after_cancel=false".to_owned());
+    } else {
+        if outcome == CancellationWaitOutcome::OtherTerminal
+            && let Err(error) = persist_non_cancel_terminal_race(store, local_job_id)
+        {
+            details.push(format!("terminal_race_persistence={error}"));
+        }
+        details.push("terminal_race_observed_durably=true".to_owned());
+    }
+    CancellationWaitResult { outcome, details }
 }
 
 fn record_events(events: &[RemoteBuildEvent], reporter: &Reporter, diagnostics: &mut Vec<String>) {
@@ -4416,6 +9341,16 @@ fn sleep_interruptibly(duration: Duration) {
     }
 }
 
+fn sleep_interruptibly_with_cancellation(duration: Duration, cancellation: &CancellationToken) {
+    let started = Instant::now();
+    while started.elapsed() < duration
+        && !cancellation.is_cancelled()
+        && !rustferry_core::process_control::interrupt_requested()
+    {
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn cleanup_job(provider: &GithubProvider, job_id: &str) -> Result<CleanupConfirmation, CliError> {
     let confirmation = provider_call(
         provider.cleanup(
@@ -4444,6 +9379,559 @@ fn cleanup_job(provider: &GithubProvider, job_id: &str) -> Result<CleanupConfirm
         ));
     }
     Ok(confirmation)
+}
+
+fn persist_cleanup_pending(store: &JobStore, local_job_id: &LocalJobId) -> Result<(), CliError> {
+    let latest = store.latest(local_job_id)?;
+    if latest.state == StoredJobState::CleanupPending
+        && latest.cleanup_status == StoredCleanupStatus::Pending
+    {
+        return Ok(());
+    }
+    update_stored_job(store, local_job_id, |previous, next| {
+        next.state = StoredJobState::CleanupPending;
+        next.last_confirmed_state = Some(effective_local_phase(previous));
+        next.cleanup_status = StoredCleanupStatus::Pending;
+        Ok(())
+    })
+}
+
+fn persist_cleanup_uncertain(store: &JobStore, local_job_id: &LocalJobId) -> Result<(), CliError> {
+    let latest = store.latest(local_job_id)?;
+    if latest.state == StoredJobState::CleanupFailed {
+        return Ok(());
+    }
+    update_stored_job(store, local_job_id, |previous, next| {
+        next.cleanup_status = StoredCleanupStatus::Uncertain;
+        match previous.terminal_outcome {
+            Some(StoredBuildOutcome::Succeeded) => {
+                next.state = StoredJobState::Failed;
+                if next.failure.is_none() {
+                    next.failure = Some(StoredFailureV1 {
+                        code: "controller.cleanup_unconfirmed".to_owned(),
+                        retryable: true,
+                    });
+                }
+            }
+            Some(StoredBuildOutcome::Failed) => {
+                next.state = StoredJobState::Failed;
+            }
+            Some(StoredBuildOutcome::Cancelled | StoredBuildOutcome::Expired) | None => {
+                next.state = StoredJobState::Unknown;
+                next.last_confirmed_state = Some(effective_local_phase(previous));
+            }
+        }
+        Ok(())
+    })
+}
+
+fn effective_local_phase(job: &StoredJobV1) -> StoredJobState {
+    let overlay = matches!(
+        job.state,
+        StoredJobState::Unknown | StoredJobState::CleanupPending | StoredJobState::CleanupFailed
+    ) || recoverable_cleanup_failure(job);
+    if overlay
+        && let Some(confirmed) = job.last_confirmed_state
+        && !matches!(
+            confirmed,
+            StoredJobState::Unknown
+                | StoredJobState::CleanupPending
+                | StoredJobState::CleanupFailed
+        )
+    {
+        return confirmed;
+    }
+    job.state
+}
+
+fn recoverable_cleanup_failure(job: &StoredJobV1) -> bool {
+    let Some(failure) = &job.failure else {
+        return false;
+    };
+    if failure.code == "github.cleanup_failed" {
+        return matches!(
+            job.cleanup_status,
+            StoredCleanupStatus::Failed
+                | StoredCleanupStatus::Pending
+                | StoredCleanupStatus::Uncertain
+        ) && matches!(
+            job.state,
+            StoredJobState::CleanupFailed
+                | StoredJobState::CleanupPending
+                | StoredJobState::Failed
+                | StoredJobState::Unknown
+        ) && matches!(
+            job.provider_resume.as_ref(),
+            Some(resume) if resume.state == JobState::CleanupFailed
+        );
+    }
+    failure.code == "controller.cleanup_unconfirmed"
+        && failure.retryable
+        && matches!(
+            job.cleanup_status,
+            StoredCleanupStatus::Pending | StoredCleanupStatus::Uncertain
+        )
+        && matches!(
+            job.state,
+            StoredJobState::Failed | StoredJobState::CleanupPending | StoredJobState::Unknown
+        )
+}
+
+fn cleanup_job_durably(
+    provider: &GithubProvider,
+    store: &JobStore,
+    local_job_id: &LocalJobId,
+    provider_job_id: &str,
+    project_binding: &ProjectFilesystemBinding,
+) -> Result<(), CliError> {
+    cleanup_job_durably_with(
+        store,
+        local_job_id,
+        provider_job_id,
+        project_binding,
+        || cleanup_job(provider, provider_job_id),
+    )
+}
+
+fn cleanup_job_durably_with(
+    store: &JobStore,
+    local_job_id: &LocalJobId,
+    provider_job_id: &str,
+    project_binding: &ProjectFilesystemBinding,
+    cleanup: impl FnOnce() -> Result<CleanupConfirmation, CliError>,
+) -> Result<(), CliError> {
+    let before = store.latest(local_job_id)?;
+    if durable_cleanup_is_confirmed(&before, provider_job_id) {
+        project_binding.verify()?;
+        return Ok(());
+    }
+    if let Err(error) = project_binding.verify() {
+        persist_cleanup_uncertain(store, local_job_id)?;
+        return Err(error);
+    }
+    persist_cleanup_pending(store, local_job_id)?;
+    if let Err(error) = project_binding.verify() {
+        persist_cleanup_uncertain(store, local_job_id)?;
+        return Err(error);
+    }
+    let cleanup = cleanup();
+    let latest = store.latest(local_job_id)?;
+    if durable_cleanup_is_confirmed(&latest, provider_job_id) {
+        if let Err(error) = project_binding.verify() {
+            persist_controller_failure(
+                store,
+                local_job_id,
+                "controller.project_identity_changed",
+                false,
+            )?;
+            return Err(error);
+        }
+        return Ok(());
+    }
+    persist_cleanup_uncertain(store, local_job_id)?;
+    match cleanup {
+        Err(error) => Err(error),
+        Ok(_confirmation) => Err(remote_error(
+            "cleanup_checkpoint_missing",
+            "the provider returned cleanup success without a durable exact-cleanup checkpoint",
+            "Preserve the local job ID and inspect its immutable provider checkpoint before retrying.",
+        )),
+    }
+}
+
+fn durable_cleanup_is_confirmed(job: &StoredJobV1, provider_job_id: &str) -> bool {
+    job.provider_job_id.as_deref() == Some(provider_job_id)
+        && job.cleanup_status == StoredCleanupStatus::Confirmed
+        && job.provider_resume.as_ref().is_some_and(|resume| {
+            resume.job_id == provider_job_id
+                && resume.state == JobState::Cleaned
+                && resume.cleanup_requested
+                && (resume.temporary_ref_deleted || resume.publication_not_attempted)
+        })
+}
+
+fn is_exact_success_promotion(before: &StoredJobV1, after: &StoredJobV1) -> bool {
+    let Some(expected_revision) = before.revision.checked_add(1) else {
+        return false;
+    };
+    if after.revision != expected_revision || after.updated_at_ms < before.updated_at_ms {
+        return false;
+    }
+    let mut expected = before.clone();
+    expected.revision = after.revision;
+    expected.updated_at_ms = after.updated_at_ms;
+    expected.state = StoredJobState::Succeeded;
+    expected.last_confirmed_state = Some(StoredJobState::Succeeded);
+    for artifact in &mut expected.artifacts {
+        artifact.locally_validated = true;
+    }
+    expected == *after
+}
+
+fn validate_durable_artifact_for_promotion(
+    artifact: &StoredArtifactV1,
+    binding: &DownloadDestinationBinding,
+    project_binding: &ProjectFilesystemBinding,
+) -> Result<RetainedArtifactValidation, CliError> {
+    binding.verify(project_binding)?;
+    let (Some(path), Some(identity)) = (
+        artifact.local_path.as_deref(),
+        artifact.local_file_identity.as_deref(),
+    ) else {
+        return Err(remote_error(
+            "durable_job_incomplete",
+            "a successful durable artifact lacks its local path or filesystem identity",
+            "Do not use the artifact; preserve the local job ID and inspect its immutable revision.",
+        ));
+    };
+    let path = Utf8Path::new(path);
+    if artifact.download_destination.as_deref() != Some(binding.path.as_str())
+        || path != Utf8Path::new(&binding.path)
+    {
+        return Err(remote_error(
+            "durable_artifact_destination_changed",
+            "a durable artifact no longer matches its retained destination binding",
+            "Do not use the artifact; preserve the local job ID and reconcile its immutable destination.",
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        remote_error(
+            "artifact_destination_invalid",
+            "a durable artifact path has no destination parent",
+            "Do not use the artifact; preserve the local job and inspect its immutable intent.",
+        )
+    })?;
+    let parent_identity = artifact
+        .download_parent_identity
+        .as_deref()
+        .ok_or_else(|| {
+            remote_error(
+                "durable_job_incomplete",
+                "a durable artifact lacks its destination parent identity",
+                "Do not use the artifact; preserve the local job and inspect its immutable revision.",
+            )
+        })?
+        .parse::<DirectoryFilesystemIdentity>()
+        .map_err(|error| {
+            remote_error_with_details(
+                "artifact_parent_identity_invalid",
+                "a durable artifact destination parent has an invalid filesystem identity",
+                "Do not use the artifact; preserve the local job and inspect its immutable revision.",
+                vec![error.to_string()],
+            )
+        })?;
+    if parent_identity != binding.parent_identity {
+        return Err(remote_error(
+            "artifact_parent_identity_changed",
+            "a durable artifact parent differs from its retained live filesystem binding",
+            "Do not use the artifact; preserve the local job and reconcile its exact intended destination.",
+        ));
+    }
+    verify_directory_identity(parent.as_std_path(), &parent_identity).map_err(|error| {
+        remote_error_with_details(
+            "artifact_parent_identity_changed",
+            "a durable artifact destination parent changed before final validation",
+            "Do not use the artifact; preserve the local job and reconcile its intended destination.",
+            vec![error.to_string()],
+        )
+    })?;
+    let identity = identity
+        .parse::<RegularFileFilesystemIdentity>()
+        .map_err(|error| {
+            remote_error_with_details(
+                "durable_artifact_identity_invalid",
+                "a durable artifact has an invalid persistent filesystem identity",
+                "Do not use the artifact; preserve the local job ID and inspect its immutable revision.",
+                vec![
+                    format!("artifact_id={}", artifact.record.artifact_id),
+                    error.to_string(),
+                ],
+            )
+        })?;
+    let current_identity = independently_validate_artifact_file(artifact, path)?;
+    if current_identity != identity {
+        return Err(remote_error_with_details(
+            "durable_artifact_identity_changed",
+            "a durable artifact path no longer names its validated filesystem object",
+            "Do not use the artifact; preserve the local job ID and inspect the path replacement.",
+            vec![format!("artifact_id={}", artifact.record.artifact_id)],
+        ));
+    }
+    let retained = RetainedArtifactValidation::capture(path, &identity, &artifact.record)?;
+    verify_directory_identity(parent.as_std_path(), &parent_identity).map_err(|error| {
+        remote_error_with_details(
+            "artifact_parent_identity_changed",
+            "a durable artifact destination parent changed during final validation",
+            "Do not use the artifact; preserve the local job and reconcile its intended destination.",
+            vec![error.to_string()],
+        )
+    })?;
+    binding.verify(project_binding)?;
+    retained.verify()?;
+    Ok(retained)
+}
+
+fn validate_and_promote_durable_success(
+    store: &JobStore,
+    local_job_id: &LocalJobId,
+    project_binding: &ProjectFilesystemBinding,
+    destinations: &BTreeMap<String, DownloadDestinationBinding>,
+) -> Result<Vec<RetainedArtifactValidation>, CliError> {
+    validate_and_promote_durable_success_with_hook(
+        store,
+        local_job_id,
+        project_binding,
+        destinations,
+        |_| {},
+    )
+}
+
+fn retain_exact_durable_success(
+    store: &JobStore,
+    local_job_id: &LocalJobId,
+    project_binding: &ProjectFilesystemBinding,
+    destinations: &BTreeMap<String, DownloadDestinationBinding>,
+) -> Result<Vec<RetainedArtifactValidation>, CliError> {
+    let latest = store.latest(local_job_id)?;
+    if latest.state != StoredJobState::Succeeded
+        || latest.terminal_outcome != Some(StoredBuildOutcome::Succeeded)
+        || latest.cleanup_status != StoredCleanupStatus::Confirmed
+        || latest.artifacts.is_empty()
+        || latest.artifacts.len() != destinations.len()
+        || latest.artifacts.iter().any(|artifact| {
+            !artifact.locally_validated
+                || artifact.local_path.is_none()
+                || artifact.local_file_identity.is_none()
+        })
+    {
+        return Err(remote_error(
+            "durable_job_incomplete",
+            "the retry child lacks complete durable success, artifact, or cleanup evidence",
+            "Preserve the child and reconcile its exact artifact lifecycle before reporting success.",
+        ));
+    }
+    let mut retained = Vec::with_capacity(latest.artifacts.len());
+    for artifact in &latest.artifacts {
+        let binding = destinations
+            .get(&artifact.record.artifact_id)
+            .ok_or_else(|| {
+                remote_error(
+                    "durable_artifact_binding_missing",
+                    "a durable artifact lacks its exact live destination binding",
+                    "Preserve the child and reconcile every intended artifact destination.",
+                )
+            })?;
+        retained.push(validate_durable_artifact_for_promotion(
+            artifact,
+            binding,
+            project_binding,
+        )?);
+    }
+    for guard in &retained {
+        guard.verify()?;
+    }
+    project_binding.verify()?;
+    Ok(retained)
+}
+
+fn retain_completed_artifact_downloads(
+    store: &JobStore,
+    local_job_id: &LocalJobId,
+    project_binding: &ProjectFilesystemBinding,
+    expected_downloads: &[ExpectedDownload],
+    artifact_path: &Utf8Path,
+) -> Result<CompletedArtifactDownloads, CliError> {
+    let latest = store.latest(local_job_id)?;
+    let provider_job_id = latest.provider_job_id.as_deref().ok_or_else(|| {
+        remote_error(
+            "provider_job_identity_missing",
+            "the completed retry child lacks its exact provider job identifier",
+            "Preserve the child and inspect its immutable success checkpoint.",
+        )
+    })?;
+    if !durable_cleanup_is_confirmed(&latest, provider_job_id) {
+        return Err(remote_error(
+            "durable_cleanup_evidence_missing",
+            "the completed retry child lacks exact provider cleanup evidence",
+            "Preserve the child and reconcile its immutable provider cleanup checkpoint.",
+        ));
+    }
+    let mut destinations = BTreeMap::new();
+    let mut primary_sha256 = None;
+    for expected in expected_downloads {
+        let mut matches = latest
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.record.kind == expected.kind);
+        let artifact = matches.next().ok_or_else(|| {
+            remote_error(
+                "durable_artifact_binding_missing",
+                "the completed retry child lacks an expected durable artifact",
+                "Preserve the child and inspect its exact artifact records.",
+            )
+        })?;
+        if matches.next().is_some()
+            || artifact.download_destination.as_deref() != Some(expected.path.as_str())
+        {
+            return Err(remote_error(
+                "durable_artifact_binding_mismatch",
+                "the completed retry child has ambiguous or redirected artifact evidence",
+                "Preserve the child and do not report or overwrite its local artifacts.",
+            ));
+        }
+        let binding = DownloadDestinationBinding::capture(&expected.path, project_binding)?;
+        if destinations
+            .insert(artifact.record.artifact_id.clone(), binding)
+            .is_some()
+        {
+            return Err(remote_error(
+                "durable_artifact_binding_mismatch",
+                "the completed retry child reused an artifact identifier",
+                "Preserve the child and inspect its immutable artifact records.",
+            ));
+        }
+        if expected.path == artifact_path {
+            primary_sha256 = Some(artifact.record.sha256.clone());
+        }
+    }
+    let validation_guards =
+        retain_exact_durable_success(store, local_job_id, project_binding, &destinations)?;
+    Ok(CompletedArtifactDownloads {
+        primary_sha256: primary_sha256.ok_or_else(|| {
+            remote_error(
+                "artifact_missing",
+                "the completed retry child lacks its primary local artifact",
+                "Preserve the child and inspect its immutable artifact records.",
+            )
+        })?,
+        destinations,
+        validation_guards,
+    })
+}
+
+fn finish_completed_downloads(
+    provider: &GithubProvider,
+    store: &JobStore,
+    local_job_id: &LocalJobId,
+    job_id: &str,
+    project_binding: &ProjectFilesystemBinding,
+    destinations: &BTreeMap<String, DownloadDestinationBinding>,
+) -> Result<Vec<RetainedArtifactValidation>, CliError> {
+    match store.latest(local_job_id)?.state {
+        StoredJobState::Downloaded => persist_validating(store, local_job_id)?,
+        StoredJobState::Validating
+        | StoredJobState::CleanupPending
+        | StoredJobState::CleanupFailed
+        | StoredJobState::Succeeded => {}
+        _ => {
+            return Err(remote_error(
+                "artifact_validation_phase_mismatch",
+                "the durable job cannot resume final artifact validation from its current state",
+                "Preserve the job and reconcile its exact download and cleanup checkpoints.",
+            ));
+        }
+    }
+    if store.latest(local_job_id)?.state == StoredJobState::Validating {
+        persist_validation_ready_for_cleanup(store, local_job_id)?;
+    }
+    let latest = store.latest(local_job_id)?;
+    if latest.state == StoredJobState::Succeeded {
+        return retain_exact_durable_success(store, local_job_id, project_binding, destinations);
+    }
+    cleanup_job_durably(provider, store, local_job_id, job_id, project_binding)?;
+    let latest = store.latest(local_job_id)?;
+    if latest.state == StoredJobState::Succeeded {
+        return retain_exact_durable_success(store, local_job_id, project_binding, destinations);
+    }
+    validate_and_promote_durable_success(store, local_job_id, project_binding, destinations)
+}
+
+fn validate_and_promote_durable_success_with_hook(
+    store: &JobStore,
+    local_job_id: &LocalJobId,
+    project_binding: &ProjectFilesystemBinding,
+    destinations: &BTreeMap<String, DownloadDestinationBinding>,
+    mut after_artifact_validation: impl FnMut(usize),
+) -> Result<Vec<RetainedArtifactValidation>, CliError> {
+    let latest = store.latest(local_job_id)?;
+    if latest.state != StoredJobState::CleanupPending
+        || latest.terminal_outcome != Some(StoredBuildOutcome::Succeeded)
+        || latest.cleanup_status != StoredCleanupStatus::Confirmed
+        || latest.artifacts.is_empty()
+        || latest.artifacts.len() != destinations.len()
+        || latest.artifacts.iter().any(|artifact| {
+            artifact.local_path.is_none()
+                || artifact.download_parent_identity.is_none()
+                || artifact.local_file_identity.is_none()
+                || artifact.locally_validated
+        })
+    {
+        return Err(remote_error(
+            "durable_job_incomplete",
+            "the remote build cleanup completed without an exact pending local-validation record",
+            "Preserve the local job ID and inspect its latest immutable revision before using the artifacts.",
+        ));
+    }
+    project_binding.verify()?;
+    let mut retained_artifacts = Vec::with_capacity(latest.artifacts.len());
+    for (index, artifact) in latest.artifacts.iter().enumerate() {
+        let binding = destinations
+            .get(&artifact.record.artifact_id)
+            .ok_or_else(|| {
+                remote_error(
+                    "durable_artifact_binding_missing",
+                    "a durable artifact lacks its retained live destination binding",
+                    "Do not use the artifacts; preserve the local job and reconcile every intended destination.",
+                )
+            })?;
+        retained_artifacts.push(validate_durable_artifact_for_promotion(
+            artifact,
+            binding,
+            project_binding,
+        )?);
+        after_artifact_validation(index);
+    }
+    for binding in destinations.values() {
+        binding.verify(project_binding)?;
+    }
+    for retained in &retained_artifacts {
+        retained.verify()?;
+    }
+    project_binding.verify()?;
+    let promoted = update_stored_job(store, local_job_id, |previous, next| {
+        if previous.revision != latest.revision
+            || previous.state != StoredJobState::CleanupPending
+            || previous.terminal_outcome != Some(StoredBuildOutcome::Succeeded)
+            || previous.cleanup_status != StoredCleanupStatus::Confirmed
+            || previous.artifacts != latest.artifacts
+        {
+            return Err(JobStoreError::InvalidRecord {
+                reason: "local success promotion raced a different durable revision",
+            });
+        }
+        for artifact in &mut next.artifacts {
+            artifact.locally_validated = true;
+        }
+        next.state = StoredJobState::Succeeded;
+        next.last_confirmed_state = Some(StoredJobState::Succeeded);
+        Ok(())
+    });
+    if let Err(error) = promoted {
+        let reconciled = store
+            .latest(local_job_id)
+            .is_ok_and(|job| is_exact_success_promotion(&latest, &job));
+        if !reconciled {
+            return Err(error);
+        }
+    }
+    for retained in &retained_artifacts {
+        retained.verify()?;
+    }
+    for binding in destinations.values() {
+        binding.verify(project_binding)?;
+    }
+    project_binding.verify()?;
+    Ok(retained_artifacts)
 }
 
 fn provider_call<T>(
@@ -4526,7 +10014,7 @@ fn workflow_from_stored(stored: &StoredGithubConfig) -> Result<WorkflowConfig, C
             )
         })?
     };
-    WorkflowConfig::new(
+    WorkflowConfig::new_with_run_trigger(
         filename,
         environment,
         secret_names,
@@ -4534,6 +10022,7 @@ fn workflow_from_stored(stored: &StoredGithubConfig) -> Result<WorkflowConfig, C
         public_source,
         trusted,
         namespace,
+        stored.run_trigger.into(),
     )
     .map_err(|error| {
         remote_error_with_details(
@@ -4546,10 +10035,11 @@ fn workflow_from_stored(stored: &StoredGithubConfig) -> Result<WorkflowConfig, C
 }
 
 fn validate_stored_config(stored: &StoredGithubConfig) -> Result<(), CliError> {
-    if !matches!(
-        stored.schema_version,
-        LEGACY_CONFIG_SCHEMA_VERSION | CONFIG_SCHEMA_VERSION
-    ) || stored.workflow_file != WORKFLOW_FILE
+    if (1..CONFIG_SCHEMA_VERSION).contains(&stored.schema_version) {
+        return Err(configuration_upgrade_required());
+    }
+    if stored.schema_version != CONFIG_SCHEMA_VERSION
+        || stored.workflow_file != WORKFLOW_FILE
         || stored.protected_environment != PROTECTED_ENVIRONMENT
         || stored.temporary_namespace != TEMPORARY_NAMESPACE
     {
@@ -4559,17 +10049,23 @@ fn validate_stored_config(stored: &StoredGithubConfig) -> Result<(), CliError> {
             "Remove the generated provider config and rerun GitHub setup.",
         ));
     }
-    if (stored.schema_version == LEGACY_CONFIG_SCHEMA_VERSION && !stored.signing_targets.is_empty())
-        || (stored.schema_version == CONFIG_SCHEMA_VERSION && stored.signing_targets.is_empty())
-    {
+    if stored.signing_targets.is_empty() {
         return Err(remote_error(
             "invalid_provider_config",
             "the stored GitHub provider target-map schema is inconsistent",
             "Rerun GitHub setup from the current validated target graph.",
         ));
     }
-    validate_git_remote_name(&stored.source_remote_name)?;
-    validate_git_remote_name(&stored.execution_remote_name)?;
+    let source_endpoints =
+        stored_remote_snapshot(&stored.source_fetch_endpoint, &stored.source_push_endpoint)?;
+    let execution_endpoints = stored_remote_snapshot(
+        &stored.execution_fetch_endpoint,
+        &stored.execution_push_endpoint,
+    )?;
+    validate_execution_endpoint_transports(
+        execution_endpoints.fetch(),
+        execution_endpoints.push(),
+    )?;
     let (_, execution_slug, execution_repository) = parse_repository_spec(&stored.repository)?;
     let (_, source_slug, source) = parse_repository_spec(&stored.source_repository)?;
     let (_, _, worker_repository) = parse_repository_spec(&stored.worker_repository)?;
@@ -4577,6 +10073,8 @@ fn validate_stored_config(stored: &StoredGithubConfig) -> Result<(), CliError> {
         || source != stored.source_repository
         || worker_repository != stored.worker_repository
         || (worker_repository == execution_repository && execution_slug != source_slug)
+        || source_endpoints.fetch().repository_slug() != source_slug
+        || execution_endpoints.fetch().repository_slug() != execution_slug
     {
         return Err(remote_error(
             "invalid_provider_config",
@@ -4624,6 +10122,66 @@ fn acquire_provider_config_lock(
     acquire_provider_config_lock_with_interlock(root, path, || {})
 }
 
+#[cfg(unix)]
+fn open_provider_config_lock_file(path: &Utf8Path) -> Result<File, CliError> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(path).map_err(|source| CliError::Io {
+        action: "open provider-config lock",
+        path: path.to_owned(),
+        source,
+    })?;
+    let metadata = file.metadata().map_err(|source| CliError::Io {
+        action: "inspect open provider-config lock",
+        path: path.to_owned(),
+        source,
+    })?;
+    require_single_link(&metadata, "provider-config lock")?;
+    require_private_mode(path, &metadata)?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_provider_config_lock_file(path: &Utf8Path) -> Result<File, CliError> {
+    use std::os::windows::io::AsHandle as _;
+
+    let file = match fs::symlink_metadata(path) {
+        Ok(_) => rustferry_core::windows_private_directory::open_private_file(path.as_std_path())
+            .map_err(|error| {
+            if error.os_code() == Some(32) {
+                remote_error(
+                    "provider_config_busy",
+                    "another RustFerry command is updating the GitHub provider config",
+                    "Wait for that command to finish, then rerun signing setup.",
+                )
+            } else {
+                map_windows_private_provider_error(&error)
+            }
+        })?,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            rustferry_core::windows_private_directory::create_private_file(path.as_std_path())
+                .map_err(|error| map_windows_private_provider_error(&error))?
+        }
+        Err(source) => {
+            return Err(CliError::Io {
+                action: "inspect provider-config lock",
+                path: path.to_owned(),
+                source,
+            });
+        }
+    };
+    rustferry_core::windows_private_directory::verify_private_file_handle(file.as_handle())
+        .map_err(|error| map_windows_private_provider_error(&error))?;
+    Ok(file)
+}
+
 fn acquire_provider_config_lock_with_interlock(
     root: &Utf8Path,
     path: &Utf8Path,
@@ -4657,7 +10215,7 @@ fn acquire_provider_config_lock_with_interlock(
                         "Wait for that command to finish, then rerun signing setup.",
                     )
                 } else {
-                    map_windows_private_provider_error(error)
+                    map_windows_private_provider_error(&error)
                 }
             })?;
     reject_config_recovery_entries(parent)?;
@@ -4672,61 +10230,7 @@ fn acquire_provider_config_lock_with_interlock(
         ));
     }
 
-    #[cfg(unix)]
-    let file = {
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true);
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        options.open(path).map_err(|source| CliError::Io {
-            action: "open provider-config lock",
-            path: path.to_owned(),
-            source,
-        })?
-    };
-    #[cfg(windows)]
-    let file = match fs::symlink_metadata(path) {
-        Ok(_) => rustferry_core::windows_private_directory::open_private_file(path.as_std_path())
-            .map_err(|error| {
-            if error.os_code() == Some(32) {
-                remote_error(
-                    "provider_config_busy",
-                    "another RustFerry command is updating the GitHub provider config",
-                    "Wait for that command to finish, then rerun signing setup.",
-                )
-            } else {
-                map_windows_private_provider_error(error)
-            }
-        })?,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            rustferry_core::windows_private_directory::create_private_file(path.as_std_path())
-                .map_err(map_windows_private_provider_error)?
-        }
-        Err(source) => {
-            return Err(CliError::Io {
-                action: "inspect provider-config lock",
-                path: path.to_owned(),
-                source,
-            });
-        }
-    };
-    #[cfg(unix)]
-    {
-        let metadata = file.metadata().map_err(|source| CliError::Io {
-            action: "inspect open provider-config lock",
-            path: path.to_owned(),
-            source,
-        })?;
-        require_single_link(&metadata, "provider-config lock")?;
-        require_private_mode(path, &metadata)?;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::io::AsHandle as _;
-
-        rustferry_core::windows_private_directory::verify_private_file_handle(file.as_handle())
-            .map_err(map_windows_private_provider_error)?;
-    }
+    let file = open_provider_config_lock_file(path)?;
     let opened = ArtifactFileIdentity::from_file(&file).map_err(|source| CliError::Io {
         action: "identify open provider-config lock",
         path: path.to_owned(),
@@ -4919,7 +10423,7 @@ fn read_private_config_file(path: &Utf8Path) -> Result<(ArtifactFileIdentity, Ve
     let file = rustferry_core::windows_private_directory::open_private_file_for_removal(
         path.as_std_path(),
     )
-    .map_err(map_windows_private_provider_error)?;
+    .map_err(|error| map_windows_private_provider_error(&error))?;
     let opened_metadata = file.metadata().map_err(|source| CliError::Io {
         action: "inspect open GitHub provider config",
         path: path.to_owned(),
@@ -4932,7 +10436,7 @@ fn read_private_config_file(path: &Utf8Path) -> Result<(ArtifactFileIdentity, Ve
         use std::os::windows::io::AsHandle as _;
 
         rustferry_core::windows_private_directory::verify_private_file_handle(file.as_handle())
-            .map_err(map_windows_private_provider_error)?;
+            .map_err(|error| map_windows_private_provider_error(&error))?;
     }
     let opened = ConfigFileState::capture(&opened_metadata)?;
     let opened_identity =
@@ -4992,15 +10496,38 @@ fn provider_config_changed() -> CliError {
 fn load_config(root: &Utf8Path) -> Result<StoredGithubConfig, CliError> {
     let path = root.join(CONFIG_RELATIVE_PATH);
     let (_, bytes) = read_private_config_snapshot(root, &path)?;
-    let stored = serde_json::from_slice::<StoredGithubConfig>(&bytes).map_err(|_| {
-        remote_error(
-            "invalid_provider_config",
-            "the GitHub provider config is malformed or contains unknown fields",
-            "Remove the generated config and rerun GitHub setup.",
-        )
-    })?;
+    let stored = decode_stored_config(&bytes)?;
     validate_stored_config(&stored)?;
     Ok(stored)
+}
+
+fn decode_stored_config(bytes: &[u8]) -> Result<StoredGithubConfig, CliError> {
+    #[derive(Deserialize)]
+    struct SchemaProbe {
+        schema_version: u32,
+    }
+
+    serde_json::from_slice::<StoredGithubConfig>(bytes).map_err(|_| {
+        if serde_json::from_slice::<SchemaProbe>(bytes)
+            .is_ok_and(|probe| (1..CONFIG_SCHEMA_VERSION).contains(&probe.schema_version))
+        {
+            configuration_upgrade_required()
+        } else {
+            remote_error(
+                "invalid_provider_config",
+                "the GitHub provider config is malformed or contains unknown fields",
+                "Remove the generated config and rerun GitHub setup.",
+            )
+        }
+    })
+}
+
+fn configuration_upgrade_required() -> CliError {
+    remote_error(
+        "configuration_upgrade_required",
+        "the GitHub provider config predates immutable Git endpoint binding",
+        "After reviewing and moving the generated provider config aside, rerun GitHub setup to capture canonical fetch and push endpoints; remote names are never reconstructed at runtime.",
+    )
 }
 
 fn load_config_for_build(
@@ -5198,7 +10725,7 @@ impl PrivateConfigStaging {
         let file = rustferry_core::windows_private_directory::create_private_staging_file(
             path.as_std_path(),
         )
-        .map_err(map_windows_private_provider_error)?;
+        .map_err(|error| map_windows_private_provider_error(&error))?;
         Ok(Self {
             file: Some(file),
             path,
@@ -5413,14 +10940,14 @@ impl ConfigQuarantine {
         let root = parent.join(format!("{CONFIG_BACKUP_PREFIX}{}", Uuid::new_v4().simple()));
         let directory =
             rustferry_core::windows_private_directory::create_private_directory(root.as_std_path())
-                .map_err(map_windows_private_provider_error)?;
+                .map_err(|error| map_windows_private_provider_error(&error))?;
         after_directory_create(&root);
         let file = match rustferry_core::windows_private_directory::open_private_file_for_removal(
             path.as_std_path(),
         ) {
             Ok(file) => file,
             Err(error) => {
-                let primary = map_windows_private_provider_error(error);
+                let primary = map_windows_private_provider_error(&error);
                 return match rustferry_core::windows_private_directory::remove_private_directory_handle(
                     directory,
                 ) {
@@ -5524,8 +11051,7 @@ impl ConfigQuarantine {
         let recovery_root = self
             .path
             .parent()
-            .map(Utf8Path::to_owned)
-            .unwrap_or_else(|| recovery.clone());
+            .map_or_else(|| recovery.clone(), Utf8Path::to_owned);
         let identity = match self.file.as_ref().map(ArtifactFileIdentity::from_file) {
             Some(Ok(identity)) => identity,
             Some(Err(source)) => {
@@ -5595,8 +11121,7 @@ impl ConfigQuarantine {
         let recovery_root = self
             .path
             .parent()
-            .map(Utf8Path::to_owned)
-            .unwrap_or_else(|| recovery.clone());
+            .map_or_else(|| recovery.clone(), Utf8Path::to_owned);
         let file = self.file.take().ok_or_else(|| {
             ConfigRecoveryFailure::new(
                 [recovery.clone(), recovery_root.clone()],
@@ -5959,64 +11484,47 @@ fn checked_output(
     Ok(output.stdout)
 }
 
-fn git_output(
-    program: &Utf8Path,
-    arguments: &[OsString],
-    directory: &Utf8Path,
+fn checked_caller_git_output(
+    output: Result<CallerGitOutput, GitExecutionError>,
     stage: &'static str,
-    reporter: &Reporter,
-    output_limit: usize,
-    input: Option<&[u8]>,
-) -> Result<std::process::Output, CliError> {
-    let mut fixed = vec![
-        OsString::from("-c"),
-        OsString::from("core.hooksPath=/dev/null"),
-        OsString::from("-c"),
-        OsString::from("core.fsmonitor=false"),
-        OsString::from("-c"),
-        OsString::from("credential.interactive=never"),
-        OsString::from("-c"),
-        OsString::from("protocol.file.allow=never"),
-    ];
-    fixed.extend_from_slice(arguments);
-    run_captured_bounded_isolated(
-        program,
-        &fixed,
-        directory,
-        stage,
-        reporter,
-        output_limit,
-        input,
-    )
+) -> Result<Vec<u8>, CliError> {
+    let output = output.map_err(|_| caller_git_command_error(stage, None))?;
+    if !output.success() {
+        return Err(caller_git_command_error(stage, output.exit_code()));
+    }
+    Ok(output.stdout().to_vec())
 }
 
-fn checked_git_output(
-    program: &Utf8Path,
-    arguments: &[OsString],
-    directory: &Utf8Path,
-    stage: &'static str,
-    reporter: &Reporter,
-) -> Result<Vec<u8>, CliError> {
-    let output = git_output(
-        program,
-        arguments,
-        directory,
+fn caller_git_command_error(stage: &'static str, status: Option<i32>) -> CliError {
+    CliError::CommandFailed {
+        tool: "git".to_owned(),
         stage,
-        reporter,
-        MAX_TOOL_OUTPUT_BYTES,
-        None,
-    )?;
-    if !output.status.success() {
-        return Err(CliError::CommandFailed {
-            tool: "git".to_owned(),
-            stage,
-            status: output.status.code(),
-            stderr: String::new(),
-            log: None,
-            help: "Correct the repository state, then rerun with --verbose.".to_owned(),
-        });
+        status,
+        stderr: String::new(),
+        log: None,
+        help: "Correct the repository state, then rerun with --verbose.".to_owned(),
     }
-    Ok(output.stdout)
+}
+
+fn caller_git_policy_error(error: GitPublisherConfigError) -> CliError {
+    let (code, message, help) = match error {
+        GitPublisherConfigError::UnsafeCallerRepositoryConfig => (
+            "unsafe_local_git_config",
+            "the caller repository has executable or redirecting local Git policy",
+            "Remove local include, worktree-redirection, filter, and external-diff commands before retrying.",
+        ),
+        GitPublisherConfigError::UnsupportedSecurePlatform => (
+            "secure_git_platform_unsupported",
+            "the platform has no sealed caller-repository Git reader",
+            "Run this operation on supported Windows or Unix with the standard trusted Git installation.",
+        ),
+        _ => (
+            "sealed_git_reader_unavailable",
+            "the caller repository could not be bound to the sealed Git reader",
+            "Install the standard trusted Git toolchain and restore a canonical local repository before retrying.",
+        ),
+    };
+    remote_error_with_details(code, message, help, vec![error.to_string()])
 }
 
 fn utf8_line(bytes: &[u8], label: &'static str) -> Result<String, CliError> {
@@ -6101,7 +11609,7 @@ fn preflight_file(
 #[cfg(windows)]
 fn read_bounded_private_file_windows(path: &Utf8Path, maximum: u64) -> Result<Vec<u8>, CliError> {
     let file = rustferry_core::windows_private_directory::open_private_file(path.as_std_path())
-        .map_err(map_windows_private_provider_error)?;
+        .map_err(|error| map_windows_private_provider_error(&error))?;
     let metadata = file.metadata().map_err(|source| CliError::Io {
         action: "inspect private Windows provider file",
         path: path.to_owned(),
@@ -6182,8 +11690,17 @@ fn write_create_only(path: &Utf8Path, bytes: &[u8], private: bool) -> Result<(),
 }
 
 #[cfg(windows)]
-fn write_private_create_only_windows(path: &Utf8Path, bytes: &[u8]) -> Result<(), CliError> {
-    use rustferry_core::windows_private_directory::PrivateFileLinkState;
+struct PreparedPrivateProviderStaging {
+    file: File,
+    path: Utf8PathBuf,
+    identity: ArtifactFileIdentity,
+}
+
+#[cfg(windows)]
+fn prepare_private_provider_staging(
+    path: &Utf8Path,
+    bytes: &[u8],
+) -> Result<PreparedPrivateProviderStaging, CliError> {
     use std::os::windows::io::AsHandle as _;
 
     let parent = path.parent().ok_or_else(|| {
@@ -6204,7 +11721,7 @@ fn write_private_create_only_windows(path: &Utf8Path, bytes: &[u8]) -> Result<()
     let mut staging = rustferry_core::windows_private_directory::create_private_staging_file(
         staging_path.as_std_path(),
     )
-    .map_err(map_windows_private_provider_error)?;
+    .map_err(|error| map_windows_private_provider_error(&error))?;
     if let Err(source) = staging.write_all(bytes).and_then(|()| staging.sync_all()) {
         let original = CliError::Io {
             action: "write private Windows provider staging file",
@@ -6217,7 +11734,7 @@ fn write_private_create_only_windows(path: &Utf8Path, bytes: &[u8]) -> Result<()
     }
     if let Err(error) =
         rustferry_core::windows_private_directory::verify_private_file_handle(staging.as_handle())
-            .map_err(map_windows_private_provider_error)
+            .map_err(|error| map_windows_private_provider_error(&error))
     {
         return Err(cleanup_failed_private_provider_staging(
             staging, path, error,
@@ -6236,6 +11753,23 @@ fn write_private_create_only_windows(path: &Utf8Path, bytes: &[u8]) -> Result<()
             ));
         }
     };
+    Ok(PreparedPrivateProviderStaging {
+        file: staging,
+        path: staging_path,
+        identity: staging_identity,
+    })
+}
+
+#[cfg(windows)]
+fn write_private_create_only_windows(path: &Utf8Path, bytes: &[u8]) -> Result<(), CliError> {
+    use rustferry_core::windows_private_directory::PrivateFileLinkState;
+    use std::os::windows::io::AsHandle as _;
+
+    let PreparedPrivateProviderStaging {
+        file: staging,
+        path: staging_path,
+        identity: staging_identity,
+    } = prepare_private_provider_staging(path, bytes)?;
     if let Err(source) = fs::hard_link(&staging_path, path) {
         let original = CliError::Io {
             action: "publish private Windows provider file without overwriting",
@@ -6251,7 +11785,7 @@ fn write_private_create_only_windows(path: &Utf8Path, bytes: &[u8]) -> Result<()
             staging.as_handle(),
             PrivateFileLinkState::PublicationPair,
         )
-        .map_err(map_windows_private_provider_error)?;
+        .map_err(|error| map_windows_private_provider_error(&error))?;
         let final_identity =
             ArtifactFileIdentity::capture(path).map_err(|source| CliError::Io {
                 action: "identify published private Windows provider file",
@@ -6291,7 +11825,7 @@ fn write_private_create_only_windows(path: &Utf8Path, bytes: &[u8]) -> Result<()
     })?;
     let final_file =
         rustferry_core::windows_private_directory::open_private_file(path.as_std_path())
-            .map_err(map_windows_private_provider_error)?;
+            .map_err(|error| map_windows_private_provider_error(&error))?;
     let final_metadata = final_file.metadata().map_err(|source| CliError::Io {
         action: "inspect published private Windows provider file",
         path: path.to_owned(),
@@ -6394,7 +11928,7 @@ pub(super) fn ensure_directory_chain(
                         current.as_std_path(),
                     )
                     .map(drop)
-                    .map_err(map_windows_private_provider_error)?;
+                    .map_err(|error| map_windows_private_provider_error(&error))?;
                 } else {
                     fs::create_dir(&current).map_err(|source| CliError::Io {
                         action: "create generated directory",
@@ -6503,11 +12037,11 @@ fn require_private_mode(path: &Utf8Path, metadata: &fs::Metadata) -> Result<(), 
     if metadata.is_dir() {
         rustferry_core::windows_private_directory::open_private_directory(path.as_std_path())
             .map(drop)
-            .map_err(map_windows_private_provider_error)?;
+            .map_err(|error| map_windows_private_provider_error(&error))?;
     } else if metadata.is_file() {
         rustferry_core::windows_private_directory::open_private_file(path.as_std_path())
             .map(drop)
-            .map_err(map_windows_private_provider_error)?;
+            .map_err(|error| map_windows_private_provider_error(&error))?;
     } else {
         return Err(remote_error_with_details(
             "private_permissions_required",
@@ -6521,7 +12055,7 @@ fn require_private_mode(path: &Utf8Path, metadata: &fs::Metadata) -> Result<(), 
 
 #[cfg(windows)]
 fn map_windows_private_provider_error(
-    error: rustferry_core::windows_private_directory::PrivateDirectoryError,
+    error: &rustferry_core::windows_private_directory::PrivateDirectoryError,
 ) -> CliError {
     use rustferry_core::windows_private_directory::PrivateDirectoryCleanupStatus;
 
@@ -6651,6 +12185,10 @@ fn expected_artifact_downloads(
             ExpectedDownload {
                 kind: ArtifactKind::Manifest,
                 path: directory.join("artifact-manifest.json"),
+            },
+            ExpectedDownload {
+                kind: ArtifactKind::SigningReport,
+                path: directory.join("signing-report.json"),
             },
             ExpectedDownload {
                 kind: ArtifactKind::ValidationReport,
@@ -6885,26 +12423,46 @@ fn safe_public_text(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use super::CONFIG_BACKUP_PREFIX;
     #[cfg(any(test, not(unix)))]
     use super::parse_git_index_executable_paths;
     use super::{
-        ArtifactDownloadRollback, CONFIG_BACKUP_PREFIX, CONFIG_SCHEMA_VERSION,
-        CanonicalBase64SigningBlob, ConfigCommitError, ExistingFile, GithubPaths,
-        ImmediateProviderResult, MAX_ENVIRONMENT_SECRET_BYTES, ManualGithubSecretValues,
-        ManualGithubSigningAssets, ManualGithubSigningSession, ManualSigningRemote,
-        PROTECTED_ENVIRONMENT, RawSigningPassword, SigningSecretUpload, StoredGithubConfig,
-        TEMPORARY_NAMESPACE, WORKFLOW_FILE, acquire_provider_config_lock, downloaded_manifest,
-        encode_stored_config, ensure_config_snapshot_unchanged, ensure_doctor_ready,
-        ensure_provider_directories, ensure_workflow_directory, expected_artifact_downloads,
-        generate_workflow, load_config, load_signing_project_state, parse_repository_spec,
-        preflight_file, prepare_artifact_destination, provider_config_lock_for_signing,
-        read_private_config_snapshot, remote_error, replace_private_config,
-        required_build_features, required_signing_secret_names, retry_artifact_listing,
-        select_requested_artifacts, signing_config_commit_uncertain, source_manifest_digest,
-        unsigned_signing_plan, validate_git_remote_name, validate_manual_assets_match_plan,
-        validate_stored_config, workflow_from_stored, write_create_only,
+        ArtifactDownloadRollback, ArtifactPathReconciliation, CONFIG_SCHEMA_VERSION,
+        CancellationWaitOutcome, CanonicalBase64SigningBlob, ConfigCommitError,
+        DownloadDestinationBinding, ExistingFile, GithubPaths, ImmediateProviderResult,
+        MAX_ENVIRONMENT_SECRET_BYTES, ManualGithubSecretValues, ManualGithubSigningAssets,
+        ManualGithubSigningSession, ManualSigningRemote, PROTECTED_ENVIRONMENT,
+        ProjectFilesystemBinding, RawSigningPassword, SigningSecretUpload,
+        SnapshotSubmissionAuthority, StoredGithubConfig, StoredGithubWorkflowTrigger,
+        SubmitPublicationEvidence, TEMPORARY_NAMESPACE, ValidatedLocalArtifact, WORKFLOW_FILE,
+        acquire_provider_config_lock, cancellation_outcome_from_job, cleanup_job_durably_with,
+        decode_stored_config, downloaded_manifest, encode_stored_config,
+        ensure_config_snapshot_unchanged, ensure_doctor_ready, ensure_provider_directories,
+        ensure_workflow_directory, existing_snapshot_submission_authority,
+        expected_artifact_downloads, find_resumable_snapshot_job, generate_workflow,
+        independently_validate_download, interrupted_cleanup_progress,
+        interrupted_cleanup_progress_for_job, is_exact_success_promotion, load_config,
+        load_signing_project_state, local_signing_readiness_checks, map_ide_signing_readiness,
+        parse_repository_spec, persist_artifact_publication_uncertain,
+        persist_cancellation_requested, persist_cancellation_uncertain, persist_cleanup_pending,
+        persist_cleanup_uncertain, persist_controller_failure, persist_downloaded_artifact,
+        persist_downloading, persist_downloads_complete, persist_validating,
+        persist_validation_ready_for_cleanup, preflight_file, prepare_artifact_destination,
+        provider_config_lock_for_signing, provider_resume_is_bound, read_private_config_snapshot,
+        reconcile_artifact_path_publication, remote_error, replace_private_config,
+        required_build_features_for_source, required_signing_secret_names, retry_artifact_listing,
+        safe_ide_readiness_code, select_requested_artifacts, signing_config_commit_uncertain,
+        signing_readiness_from_report, signing_workflow_phase_policy, snapshot_initial_job,
+        sha256_bytes, snapshot_request_template, source_manifest_digest,
+        submit_publication_evidence,
+        unsigned_signing_plan, update_stored_job, validate_and_promote_durable_success,
+        validate_and_promote_durable_success_with_hook, validate_existing_snapshot_owner,
+        validate_git_remote_name, validate_manual_assets_match_plan, validate_stored_config,
+        workflow_from_stored, write_create_only,
     };
-    use std::cell::RefCell;
+    use super::{current_snapshot_manifest_diff, current_snapshot_retry_request_template};
+    use std::cell::{Cell, RefCell};
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::rc::Rc;
     use std::time::{Duration, Instant};
@@ -6914,19 +12472,43 @@ mod tests {
     use crate::cli::BuildArtifactSelection;
     use crate::error::CliError;
     use crate::output::Reporter;
+    use cargo_ferry::job_store::{
+        JOB_STORE_SCHEMA_VERSION, JobOperationKind, JobStore, LocalJobId,
+        SnapshotOperationVacancyV1, StoredArtifactV1, StoredBuildOutcome, StoredCancellationStatus,
+        StoredCleanupStatus, StoredJobState, StoredJobV1, StoredProjectIdentityV1,
+        StoredProviderIdentityV1, StoredRetryLineageV1, StoredSourceIdentityV1,
+    };
+    use rustferry_github::git_endpoint::GithubGitEndpoint;
+    use rustferry_github::provider::{
+        GITHUB_PROVIDER_ID, GITHUB_PUBLICATION_QUIESCENCE_WINDOW_MS, GithubGitSnapshotPhaseV1,
+        GithubGitSnapshotRecoveryCandidateV1, GithubGitSnapshotResumeV1, GithubJobResumeV1,
+        GithubPrincipalIdentityV1, GithubRunConclusionV1, GithubRunEventV1, GithubRunIdentityV1,
+        GithubRunStatusV1, GithubWorkflowDispatchReceiptV1, GithubWorkflowDispatchResumeV1,
+    };
+    use rustferry_github::workflow::WorkflowRunTrigger;
+    use rustferry_github::snapshot::{
+        GIT_SNAPSHOT_GRAPH_SCHEMA_VERSION, GitSha1ObjectId, GitSnapshotObjectGraphV1,
+    };
     use rustferry_github::transport::{
         EnvironmentSecretWriteRequest, GhExecutionError, Repository, TransportError,
     };
     use rustferry_github::{ProtectedEnvironment, SigningSecretNames};
     use rustferry_remote::{
-        ArtifactKind, ArtifactManifest, BundleIdentifier, CURRENT_PROTOCOL_VERSION,
-        DevelopmentTeam, DevelopmentTeamPlan, DevicePlan, EntitlementPlan, EntitlementSet,
-        IosArtifactType, ProviderCapabilities, ProviderCheck, ProviderCheckStatus,
-        ProviderDoctorReport, ProviderFeature, ProvisioningPlan, ProvisioningPlatform,
-        ProvisioningProfile, ProvisioningProfileType, RemoteBuildError, SecretBytes,
-        SecretReference, SecretReferenceKind, SigningCertificate, SigningIdentity, SigningMode,
-        SigningPlan, SigningPrivateKeyReference, SigningReference, SigningTarget,
-        SigningTargetKind, SourceBundleRequest, plan_source_bundle,
+        ArtifactKind, ArtifactManifest, ArtifactRecord, BuildProfile, BundleIdentifier,
+        COMPILE_PHASE_EVIDENCE_SCHEMA_VERSION, CURRENT_PROTOCOL_VERSION, CancellationToken,
+        CleanupConfirmation, CompilePhaseEvidence, CompileToolchainEvidence, DevelopmentTeam,
+        DevelopmentTeamPlan, DevicePlan, EntitlementPlan, EntitlementSet, GitSnapshotDescriptor,
+        IOS_DEVICE_RUST_TARGET, IosArtifactType, IosDeviceBuildRequest, IosDeviceBuildResult,
+        IosDeviceProductExpectation, JobState, ProviderCapabilities, ProviderCheck,
+        ProviderCheckStatus, ProviderDoctorReport, ProviderFeature, ProvisioningPlan,
+        ProvisioningPlatform, ProvisioningProfile, ProvisioningProfileType, RemoteBuildError,
+        RemoteBuildEvent, RemoteBuildEventKind, SEALED_UNSIGNED_ARCHIVE_SCHEMA_VERSION,
+        SealedUnsignedArchive, SecretBytes, SecretReference, SecretReferenceKind,
+        SigningCertificate, SigningIdentity, SigningMode, SigningPlan, SigningPrivateKeyReference,
+        SigningReference, SigningTarget, SigningTargetKind, SourceArchive, SourceBundleDescriptor,
+        SourceBundleRequest, SourceManifest, SourceManifestEntry, SourceMode,
+        UnsignedAppInspection, UnsignedXcarchiveExpectation, UnsignedXcarchiveInspection,
+        canonical_request_sha256, canonical_retry_template_sha256_v1, plan_source_bundle,
     };
 
     fn unsigned_stored_config() -> StoredGithubConfig {
@@ -6934,8 +12516,20 @@ mod tests {
             schema_version: CONFIG_SCHEMA_VERSION,
             repository: "example/private-builds".to_owned(),
             source_repository: "https://github.com/example/public-app".to_owned(),
-            source_remote_name: "public".to_owned(),
-            execution_remote_name: "signing".to_owned(),
+            source_fetch_endpoint: GithubGitEndpoint::parse(
+                "https://github.com/example/public-app",
+            )
+            .expect("source fetch endpoint"),
+            source_push_endpoint: GithubGitEndpoint::parse("https://github.com/example/public-app")
+                .expect("source push endpoint"),
+            execution_fetch_endpoint: GithubGitEndpoint::parse(
+                "git@github.com:example/private-builds",
+            )
+            .expect("execution fetch endpoint"),
+            execution_push_endpoint: GithubGitEndpoint::parse(
+                "git@github.com:example/private-builds",
+            )
+            .expect("execution push endpoint"),
             trusted_source_ref: "refs/heads/main".to_owned(),
             workflow_file: WORKFLOW_FILE.to_owned(),
             protected_environment: PROTECTED_ENVIRONMENT.to_owned(),
@@ -6943,6 +12537,7 @@ mod tests {
             worker_repository: "https://github.com/example/rustferry".to_owned(),
             worker_revision: "a".repeat(40),
             worker_version: "0.1.0".to_owned(),
+            run_trigger: StoredGithubWorkflowTrigger::Push,
             signing_targets: vec![SigningTarget {
                 name: "App".to_owned(),
                 bundle_identifier: BundleIdentifier::new("com.example.app").expect("bundle ID"),
@@ -6952,7 +12547,270 @@ mod tests {
         }
     }
 
-    fn provider_config_fixture() -> (
+    #[test]
+    fn current_snapshot_retry_diff_is_deterministic_and_globally_bounded() {
+        let previous_entries = vec![
+            SourceManifestEntry {
+                path: "a.txt".to_owned(),
+                size: 1,
+                sha256: "1".repeat(64),
+                executable: false,
+            },
+            SourceManifestEntry {
+                path: "b.txt".to_owned(),
+                size: 1,
+                sha256: "2".repeat(64),
+                executable: false,
+            },
+            SourceManifestEntry {
+                path: "removed.txt".to_owned(),
+                size: 1,
+                sha256: "3".repeat(64),
+                executable: false,
+            },
+        ];
+        let mut current_entries = vec![
+            previous_entries[0].clone(),
+            SourceManifestEntry {
+                path: "b.txt".to_owned(),
+                size: 2,
+                sha256: "4".repeat(64),
+                executable: false,
+            },
+        ];
+        current_entries.extend((0..140).map(|index| SourceManifestEntry {
+            path: format!("added-{index:03}.txt"),
+            size: 1,
+            sha256: format!("{index:064x}"),
+            executable: false,
+        }));
+        current_entries.sort_by(|left, right| left.path.cmp(&right.path));
+        let previous = SourceManifest {
+            schema_version: 1,
+            project_path: ".".to_owned(),
+            total_size: previous_entries.iter().map(|entry| entry.size).sum(),
+            sha256: source_manifest_digest(".", &previous_entries, 3),
+            entries: previous_entries,
+        };
+        let total_size = current_entries.iter().map(|entry| entry.size).sum();
+        let current = SourceManifest {
+            schema_version: 1,
+            project_path: "member".to_owned(),
+            sha256: source_manifest_digest("member", &current_entries, total_size),
+            entries: current_entries,
+            total_size,
+        };
+
+        let diff = current_snapshot_manifest_diff(&previous, &current).expect("snapshot diff");
+
+        assert_eq!(diff.added_count, 140);
+        assert_eq!(diff.modified_count, 1);
+        assert_eq!(diff.removed_count, 1);
+        assert_eq!(diff.unchanged, 1);
+        assert!(diff.project_path_changed);
+        assert!(diff.paths_truncated);
+        assert_eq!(diff.added_paths.len(), 128);
+        assert!(diff.modified_paths.is_empty());
+        assert!(diff.removed_paths.is_empty());
+        let retained = diff
+            .added_paths
+            .iter()
+            .chain(&diff.modified_paths)
+            .chain(&diff.removed_paths)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(retained.len(), 128);
+    }
+
+    #[test]
+    fn current_snapshot_retry_template_changes_only_operation_and_source() {
+        let temporary = tempfile::tempdir().expect("controller fixture");
+        let parent = durable_controller_record(&temporary, None);
+        let mut current_source = parent.request.source.clone();
+        current_source.entries[0].sha256 = "f".repeat(64);
+        current_source.sha256 = source_manifest_digest(
+            &current_source.project_path,
+            &current_source.entries,
+            current_source.total_size,
+        );
+
+        let template = current_snapshot_retry_request_template(
+            &parent,
+            "retry-current-source-1",
+            "https://github.com/example/public-app",
+            current_source.clone(),
+        )
+        .expect("current-source request template");
+
+        let mut expected = parent.request;
+        expected.operation_id = "retry-current-source-1".to_owned();
+        expected.source_mode = SourceMode::GitSnapshot;
+        expected.source_repository = Some("https://github.com/example/public-app".to_owned());
+        expected.source_revision = None;
+        expected.source = current_source;
+        assert_eq!(template, expected);
+    }
+
+    fn current_snapshot_retry_parent() -> (
+        tempfile::TempDir,
+        camino::Utf8PathBuf,
+        GithubPaths,
+        StoredJobV1,
+    ) {
+        let (temporary, root, paths, config) = provider_config_fixture();
+        std::fs::create_dir_all(root.join("src")).expect("source directory");
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").expect("source file");
+        std::fs::write(
+            root.join("Cargo.lock"),
+            "# This file is automatically @generated by Cargo.\nversion = 4\n\n[[package]]\nname = \"App\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("Cargo lockfile");
+        let root = canonical_utf8(root.as_std_path());
+        let project = ProjectFilesystemBinding::capture(&root).expect("project binding");
+        let source = plan_source_bundle(&SourceBundleRequest::new(&root, &root))
+            .expect("parent source plan");
+        let ferry_config = rustferry_core::FerryConfig::starter("App", "com.example.app");
+        let mut request = snapshot_request_template(
+            &ferry_config,
+            "App",
+            false,
+            "current-source-parent",
+            &config.source_repository,
+            source.manifest().clone(),
+            unsigned_signing_plan(&ferry_config, "App").expect("unsigned signing plan"),
+            BTreeSet::from([IosArtifactType::Xcarchive]),
+        )
+        .expect("parent request template");
+        request.source_revision = Some("a".repeat(40));
+        request.validate().expect("parent request");
+        let provider = StoredProviderIdentityV1 {
+            provider: GITHUB_PROVIDER_ID.to_owned(),
+            provider_config_sha256: "b".repeat(64),
+            principal: GithubPrincipalIdentityV1::User {
+                id: 7,
+                login: "retry-user".to_owned(),
+            },
+            execution_repository: "https://github.com/example/private-builds".to_owned(),
+            execution_repository_id: 42,
+        };
+        let parent = snapshot_initial_job(
+            &project,
+            provider,
+            LocalJobId::new("current-source-parent-job").expect("parent job ID"),
+            request,
+            1_700_000_000_000,
+            1_700_000_000_001,
+        )
+        .expect("parent job");
+        (temporary, root, paths, parent)
+    }
+
+    fn test_filesystem_snapshot(root: &std::path::Path) -> Vec<(String, Option<Vec<u8>>)> {
+        fn visit(
+            root: &std::path::Path,
+            current: &std::path::Path,
+            output: &mut Vec<(String, Option<Vec<u8>>)>,
+        ) {
+            let mut entries = std::fs::read_dir(current)
+                .expect("read fixture directory")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("read fixture entries");
+            entries.sort_by_key(std::fs::DirEntry::file_name);
+            for entry in entries {
+                let path = entry.path();
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("fixture-relative path")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if entry.file_type().expect("fixture file type").is_dir() {
+                    output.push((format!("{relative}/"), None));
+                    visit(root, &path, output);
+                } else {
+                    output.push((
+                        relative,
+                        Some(std::fs::read(path).expect("fixture file bytes")),
+                    ));
+                }
+            }
+        }
+
+        let mut output = Vec::new();
+        visit(root, root, &mut output);
+        output
+    }
+
+    #[test]
+    fn current_snapshot_retry_preview_is_zero_write_and_archive_free() {
+        let (temporary, _root, _paths, parent) = current_snapshot_retry_parent();
+        let before = test_filesystem_snapshot(temporary.path());
+
+        let prepared = super::prepare_current_snapshot_retry(
+            &parent,
+            "current-source-child".to_owned(),
+            1_700_000_000_100,
+        )
+        .expect("zero-write current-source preview");
+
+        assert_eq!(test_filesystem_snapshot(temporary.path()), before);
+        assert_eq!(prepared.preview().archive_status, "computed_after_consent");
+        assert_eq!(prepared.preview().archive_size, None);
+        assert_eq!(prepared.preview().archive_sha256, None);
+        assert_eq!(prepared.preview().source_repository_visibility, "public");
+        assert!(!prepared.preview().ref_deletion_erases_objects);
+    }
+
+    #[test]
+    fn current_snapshot_retry_stale_consent_creates_no_stage_or_lineage() {
+        let (_temporary, root, paths, parent) = current_snapshot_retry_parent();
+        let store_directory = tempfile::tempdir().expect("job store directory");
+        let store = JobStore::open_at(store_directory.path().join("job-store")).expect("job store");
+        store.create(&parent).expect("durable parent");
+        let prepared = super::prepare_current_snapshot_retry(
+            &parent,
+            "current-source-child".to_owned(),
+            1_700_000_000_100,
+        )
+        .expect("current-source preview");
+        let confirmed = prepared
+            .confirm(true, &Reporter::new(false, true, false))
+            .expect("explicit current-source consent");
+        std::fs::write(
+            root.join("src/main.rs"),
+            "fn main() { println!(\"changed\"); }\n",
+        )
+        .expect("change source after consent");
+        let parent_lease = store
+            .try_acquire_operation_lease(&parent.local_job_id, JobOperationKind::Retry)
+            .expect("parent Retry lease");
+        let vacancy = match store
+            .try_acquire_vacant_snapshot_operation_lease("current-source-child")
+            .expect("child operation reservation")
+        {
+            SnapshotOperationVacancyV1::Vacant(vacancy) => vacancy,
+            SnapshotOperationVacancyV1::Owned(_) => panic!("unexpected child owner"),
+        };
+
+        let error = confirmed
+            .stage(
+                &parent_lease,
+                super::CurrentSnapshotRetryOperationGuard::Vacant(&vacancy),
+                &CancellationToken::new(),
+            )
+            .expect_err("stale consent must fail before staging");
+
+        assert_eq!(error.code(), "snapshot_plan_changed");
+        assert!(
+            !paths
+                .git_isolation
+                .join("snapshots/current-source-child")
+                .exists()
+        );
+        assert!(parent.retry_lineage.child_job_ids.is_empty());
+        assert_eq!(store.latest(&parent.local_job_id).unwrap(), parent);
+    }
+
+    pub(super) fn provider_config_fixture() -> (
         tempfile::TempDir,
         camino::Utf8PathBuf,
         GithubPaths,
@@ -6971,7 +12829,7 @@ mod tests {
         .expect("project config");
         std::fs::write(
             root.join("Cargo.toml"),
-            "[package]\nname = \"App\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            "[package]\nname = \"App\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
         )
         .expect("Cargo manifest");
         let paths = GithubPaths::new(&root, &root);
@@ -6980,6 +12838,1870 @@ mod tests {
         let bytes = encode_stored_config(&config).expect("config bytes");
         write_create_only(&paths.config, &bytes, true).expect("provider config");
         (temporary, root, paths, config)
+    }
+
+    struct SnapshotRecoveryFixture {
+        temporary: tempfile::TempDir,
+        stage_path: std::path::PathBuf,
+        project_binding: ProjectFilesystemBinding,
+        provider: StoredProviderIdentityV1,
+        candidate: GithubGitSnapshotRecoveryCandidateV1,
+        initial_job: StoredJobV1,
+    }
+
+    fn snapshot_test_object(character: char) -> GitSha1ObjectId {
+        GitSha1ObjectId::new(character.to_string().repeat(40)).expect("snapshot object")
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the crash fixture binds the complete stage, request, project, provider, and initial job"
+    )]
+    fn snapshot_recovery_fixture() -> SnapshotRecoveryFixture {
+        let temporary = tempfile::tempdir().expect("snapshot recovery fixture");
+        let project_path = temporary.path().join("project");
+        std::fs::create_dir_all(project_path.join("src")).expect("project source directory");
+        let root = canonical_utf8(&project_path);
+        let ferry_config = rustferry_core::FerryConfig::starter("App", "com.example.app");
+        std::fs::write(
+            root.join("ferry.toml"),
+            ferry_config.to_pretty_toml().expect("ferry config TOML"),
+        )
+        .expect("ferry config");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='app'\nversion='0.1.0'\nedition='2024'\n",
+        )
+        .expect("Cargo manifest");
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").expect("Rust source");
+        let source = plan_source_bundle(&SourceBundleRequest::new(&root, &root))
+            .expect("snapshot source plan");
+        let operation_id = "snapshot-crash-recovery-1";
+        let signing = unsigned_signing_plan(&ferry_config, "app").expect("unsigned signing plan");
+        let request_template = snapshot_request_template(
+            &ferry_config,
+            "app",
+            false,
+            operation_id,
+            "https://github.com/example/public-app",
+            source.manifest().clone(),
+            signing,
+            BTreeSet::from([IosArtifactType::Xcarchive]),
+        )
+        .expect("snapshot request template");
+        let isolation = camino::Utf8PathBuf::from_path_buf(temporary.path().join("isolation"))
+            .expect("UTF-8 isolation path");
+        #[cfg(windows)]
+        drop(
+            rustferry_core::windows_private_directory::create_private_directory(
+                isolation.as_std_path(),
+            )
+            .expect("private snapshot isolation root"),
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+
+            let mut builder = std::fs::DirBuilder::new();
+            builder
+                .mode(0o700)
+                .create(isolation.as_std_path())
+                .expect("private snapshot isolation root");
+        }
+        let staged = crate::commands::github_snapshot::stage_same_invocation_snapshot(
+            &isolation,
+            &source,
+            request_template.clone(),
+            1_700_000_000_000,
+            &"9".repeat(64),
+            |_inputs, _operation_id, _created_at_ms| {
+                Ok(GitSnapshotObjectGraphV1 {
+                    schema_version: GIT_SNAPSHOT_GRAPH_SCHEMA_VERSION,
+                    archive_blob: snapshot_test_object('1'),
+                    descriptor_blob: snapshot_test_object('2'),
+                    goal3_tree: snapshot_test_object('3'),
+                    rustferry_tree: snapshot_test_object('4'),
+                    root_tree: snapshot_test_object('5'),
+                    commit: snapshot_test_object('6'),
+                })
+            },
+        )
+        .expect("complete snapshot stage");
+        let descriptor = GitSnapshotDescriptor::from_request(
+            &request_template,
+            SourceBundleDescriptor::new(
+                staged.stage.archive.clone(),
+                request_template.source.clone(),
+            ),
+        )
+        .expect("snapshot descriptor");
+        let candidate = GithubGitSnapshotRecoveryCandidateV1 {
+            stage_locator: staged.locator,
+            stage: staged.stage,
+            descriptor,
+            final_request: staged.request,
+        };
+        let stage_path = isolation
+            .join("snapshots")
+            .join(operation_id)
+            .into_std_path_buf();
+        let project_binding = ProjectFilesystemBinding::capture(&root).expect("project binding");
+        let provider = StoredProviderIdentityV1 {
+            provider: GITHUB_PROVIDER_ID.to_owned(),
+            provider_config_sha256: "a".repeat(64),
+            principal: GithubPrincipalIdentityV1::User {
+                id: 7,
+                login: "snapshot-user".to_owned(),
+            },
+            execution_repository: "https://github.com/example/private-builds".to_owned(),
+            execution_repository_id: 42,
+        };
+        let initial_job = snapshot_initial_job(
+            &project_binding,
+            provider.clone(),
+            LocalJobId::new("snapshot-crash-job").expect("local job ID"),
+            candidate.final_request.clone(),
+            candidate.stage.source_created_at_ms,
+            candidate.stage.source_created_at_ms.saturating_add(1),
+        )
+        .expect("initial snapshot job");
+        SnapshotRecoveryFixture {
+            temporary,
+            stage_path,
+            project_binding,
+            provider,
+            candidate,
+            initial_job,
+        }
+    }
+
+    fn snapshot_resume_at_phase(
+        record: &StoredJobV1,
+        candidate: &GithubGitSnapshotRecoveryCandidateV1,
+        phase: GithubGitSnapshotPhaseV1,
+    ) -> GithubJobResumeV1 {
+        let source_exact = phase == GithubGitSnapshotPhaseV1::SourceExact;
+        let source_phase = source_exact;
+        let source_publication_started_at_ms = if source_exact {
+            record.created_at_ms
+        } else {
+            0
+        };
+        GithubJobResumeV1 {
+            schema_version: 1,
+            provider: GITHUB_PROVIDER_ID.to_owned(),
+            provider_config_sha256: record.provider.provider_config_sha256.clone(),
+            principal: record.provider.principal.clone(),
+            execution_repository: record.provider.execution_repository.clone(),
+            execution_repository_id: record.provider.execution_repository_id,
+            source_repository: record
+                .request
+                .source_repository
+                .clone()
+                .expect("snapshot source repository"),
+            trusted_source_ref: "refs/heads/main".to_owned(),
+            workflow_path: ".github/workflows/rustferry-goal3-iphone.yml".to_owned(),
+            workflow_sha256: "b".repeat(64),
+            temporary_ref: format!("refs/heads/rustferry/goal3/builds/{}", record.operation_id),
+            operation_id: record.operation_id.clone(),
+            job_id: record.operation_id.clone(),
+            request: record.request.clone(),
+            request_sha256: record.request_sha256.clone(),
+            source_revision: record.source.revision.clone().expect("snapshot revision"),
+            git_snapshot: Some(GithubGitSnapshotResumeV1 {
+                schema_version: 1,
+                stage_locator: candidate.stage_locator.clone(),
+                stage: candidate.stage.clone(),
+                phase,
+                source_publication_attempts: u8::from(source_phase),
+                source_publication_started_at_ms,
+                source_publication_quiescence_deadline_ms: if source_exact {
+                    source_publication_started_at_ms
+                        .saturating_add(GITHUB_PUBLICATION_QUIESCENCE_WINDOW_MS)
+                } else {
+                    0
+                },
+                source_publication_process_fenced: source_phase,
+                source_publication_lease_scope_sha256: source_phase.then(|| "c".repeat(64)),
+                source_publication_absence_observations: 0,
+                source_publication_absence_first_observed_at_ms: 0,
+                source_publication_absence_last_observed_at_ms: 0,
+                keepalive_release_authorization_sha256: None,
+            }),
+            prepared_dispatch_commit: None,
+            dispatch_commit: None,
+            workflow_dispatch: None,
+            run: None,
+            created_at_ms: record.created_at_ms,
+            publication_started_at_ms: 0,
+            publication_quiescence_deadline_ms: u64::MAX,
+            state: JobState::Created,
+            publication_intent: false,
+            publication_uncertain: false,
+            publication_absent: false,
+            publication_not_attempted: false,
+            publication_process_fenced: false,
+            publication_lease_scope_sha256: None,
+            publication_absence_observations: 0,
+            publication_absence_first_observed_at_ms: 0,
+            cancellation_requested: false,
+            cancellation_dispatched: false,
+            cleanup_requested: false,
+            remove_artifacts_requested: false,
+            artifacts_removed: false,
+            temporary_ref_deleted: false,
+            verification_pending_event: false,
+            run_discovery_attempts: 0,
+            run_discovery_deadline_ms: record.created_at_ms.saturating_add(60_000),
+            manifests: Vec::new(),
+            compile_evidence: None,
+            signed_cleanup_evidence: None,
+            events: Vec::new(),
+        }
+    }
+
+    fn current_snapshot_template(
+        candidate: &GithubGitSnapshotRecoveryCandidateV1,
+    ) -> IosDeviceBuildRequest {
+        let mut template = candidate.final_request.clone();
+        template.source_revision = None;
+        template
+    }
+
+    #[test]
+    fn snapshot_crash_after_initial_owner_reuses_exact_job_for_fresh_reconsent() {
+        let fixture = snapshot_recovery_fixture();
+        let store = JobStore::open_at(fixture.temporary.path().join("job-store"))
+            .expect("snapshot job store");
+        let vacancy = match store
+            .try_acquire_vacant_snapshot_operation_lease(&fixture.initial_job.operation_id)
+            .expect("operation vacancy")
+        {
+            SnapshotOperationVacancyV1::Vacant(vacancy) => vacancy,
+            SnapshotOperationVacancyV1::Owned(_) => panic!("fixture operation must be vacant"),
+        };
+        let created = store
+            .create_with_operation_lease(vacancy, &fixture.initial_job)
+            .expect("atomic snapshot owner creation");
+        drop(created.operation_lease);
+
+        let owner = store
+            .snapshot_operation_owner(&fixture.initial_job.operation_id)
+            .expect("snapshot owner scan")
+            .expect("durable snapshot owner");
+        assert_eq!(owner.local_job_id, fixture.initial_job.local_job_id);
+        assert_eq!(owner.record.revision, 1);
+        assert!(owner.record.provider_resume.is_none());
+        validate_existing_snapshot_owner(
+            &owner,
+            &fixture.project_binding,
+            &fixture.provider,
+            &fixture.candidate,
+        )
+        .expect("exact revision-one owner");
+        assert!(matches!(
+            existing_snapshot_submission_authority(&owner.record),
+            SnapshotSubmissionAuthority::FreshReconsent
+        ));
+        let occupied = store
+            .try_acquire_vacant_snapshot_operation_lease(&fixture.initial_job.operation_id)
+            .expect("owned operation result");
+        assert!(matches!(
+            occupied,
+            SnapshotOperationVacancyV1::Owned(ref existing)
+                if existing.local_job_id == fixture.initial_job.local_job_id
+                    && existing.record.revision == 1
+        ));
+
+        let mut mismatched = owner;
+        mismatched.record.request.source.sha256 = "f".repeat(64);
+        assert!(
+            validate_existing_snapshot_owner(
+                &mismatched,
+                &fixture.project_binding,
+                &fixture.provider,
+                &fixture.candidate,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn snapshot_crash_after_prepared_checkpoint_is_restore_only() {
+        let fixture = snapshot_recovery_fixture();
+        let store = JobStore::open_at(fixture.temporary.path().join("job-store"))
+            .expect("snapshot job store");
+        let vacancy = match store
+            .try_acquire_vacant_snapshot_operation_lease(&fixture.initial_job.operation_id)
+            .expect("operation vacancy")
+        {
+            SnapshotOperationVacancyV1::Vacant(vacancy) => vacancy,
+            SnapshotOperationVacancyV1::Owned(_) => panic!("fixture operation must be vacant"),
+        };
+        let created = store
+            .create_with_operation_lease(vacancy, &fixture.initial_job)
+            .expect("atomic snapshot owner creation");
+        let resume = snapshot_resume_at_phase(
+            &fixture.initial_job,
+            &fixture.candidate,
+            GithubGitSnapshotPhaseV1::Prepared,
+        );
+        store
+            .checkpoint_github_resume(&fixture.initial_job.local_job_id, &resume)
+            .expect("Prepared provider checkpoint");
+        drop(created.operation_lease);
+
+        let owner = store
+            .snapshot_operation_owner(&fixture.initial_job.operation_id)
+            .expect("snapshot owner scan")
+            .expect("checkpointed snapshot owner");
+        assert!(owner.record.revision > 1);
+        assert!(owner.record.provider_resume.is_some());
+        validate_existing_snapshot_owner(
+            &owner,
+            &fixture.project_binding,
+            &fixture.provider,
+            &fixture.candidate,
+        )
+        .expect("exact Prepared owner");
+        assert!(matches!(
+            existing_snapshot_submission_authority(&owner.record),
+            SnapshotSubmissionAuthority::RestoreExisting
+        ));
+        assert!(matches!(
+            store
+                .try_acquire_vacant_snapshot_operation_lease(&fixture.initial_job.operation_id)
+                .expect("owned operation result"),
+            SnapshotOperationVacancyV1::Owned(ref existing)
+                if existing.local_job_id == fixture.initial_job.local_job_id
+                    && existing.record.revision == owner.record.revision
+        ));
+    }
+
+    #[test]
+    fn snapshot_resume_scan_recovers_after_stage_deletion_and_exact_source_publication() {
+        for phase in [
+            GithubGitSnapshotPhaseV1::StageDeleted,
+            GithubGitSnapshotPhaseV1::SourceExact,
+        ] {
+            let fixture = snapshot_recovery_fixture();
+            let store = JobStore::open_at(fixture.temporary.path().join("job-store"))
+                .expect("snapshot job store");
+            let vacancy = match store
+                .try_acquire_vacant_snapshot_operation_lease(&fixture.initial_job.operation_id)
+                .expect("operation vacancy")
+            {
+                SnapshotOperationVacancyV1::Vacant(vacancy) => vacancy,
+                SnapshotOperationVacancyV1::Owned(_) => panic!("fixture operation must be vacant"),
+            };
+            let created = store
+                .create_with_operation_lease(vacancy, &fixture.initial_job)
+                .expect("atomic snapshot owner creation");
+            let resume = snapshot_resume_at_phase(&fixture.initial_job, &fixture.candidate, phase);
+            store
+                .checkpoint_github_resume(&fixture.initial_job.local_job_id, &resume)
+                .expect("advanced snapshot checkpoint");
+            drop(created.operation_lease);
+            std::fs::remove_dir_all(&fixture.stage_path).expect("simulate durable stage deletion");
+
+            let found = find_resumable_snapshot_job(
+                &store,
+                &fixture.project_binding,
+                &fixture.provider,
+                &current_snapshot_template(&fixture.candidate),
+            )
+            .expect("resumable snapshot scan")
+            .expect("exact unfinished snapshot job");
+            assert_eq!(found.local_job_id, fixture.initial_job.local_job_id);
+            assert_eq!(
+                found
+                    .provider_resume
+                    .as_ref()
+                    .and_then(|resume| resume.git_snapshot.as_ref())
+                    .map(|snapshot| snapshot.phase),
+                Some(phase)
+            );
+            assert!(matches!(
+                existing_snapshot_submission_authority(&found),
+                SnapshotSubmissionAuthority::RestoreExisting
+            ));
+            assert!(!fixture.stage_path.exists());
+        }
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the durable controller fixture keeps one complete cross-layer record auditable"
+    )]
+    pub(super) fn durable_controller_record(
+        temporary: &tempfile::TempDir,
+        artifact_bytes: Option<&[u8]>,
+    ) -> StoredJobV1 {
+        let entries = vec![
+            SourceManifestEntry {
+                path: "Cargo.lock".to_owned(),
+                size: 0,
+                sha256: "6".repeat(64),
+                executable: false,
+            },
+            SourceManifestEntry {
+                path: "ferry.toml".to_owned(),
+                size: 0,
+                sha256: "7".repeat(64),
+                executable: false,
+            },
+        ];
+        let source = SourceManifest {
+            schema_version: 1,
+            project_path: ".".to_owned(),
+            entries: entries.clone(),
+            total_size: 0,
+            sha256: source_manifest_digest(".", &entries, 0),
+        };
+        let signing = SigningPlan {
+            mode: SigningMode::UnsignedCompileOnly,
+            signing: None,
+            team: None,
+            device: None,
+            targets: vec![SigningTarget {
+                name: "App".to_owned(),
+                bundle_identifier: BundleIdentifier::new("com.example.app").expect("bundle ID"),
+                kind: SigningTargetKind::Application,
+            }],
+            provisioning: Vec::new(),
+            entitlements: Vec::new(),
+            allow_provisioning_updates: false,
+        };
+        let request = IosDeviceBuildRequest {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            operation_id: "operation-controller-test".to_owned(),
+            product_name: "App".to_owned(),
+            bundle_identifier: "com.example.app".to_owned(),
+            minimum_ios_version: "16.0".to_owned(),
+            product: IosDeviceProductExpectation {
+                app_directory_name: "App.app".to_owned(),
+                executable: "App".to_owned(),
+                app_version: "1.0.0".to_owned(),
+                build_number: "1".to_owned(),
+                nested_bundles: Vec::new(),
+            },
+            profile: BuildProfile::Debug,
+            source_mode: SourceMode::Git,
+            source_repository: Some("https://github.com/example/app".to_owned()),
+            source_revision: Some("a".repeat(40)),
+            source,
+            signing,
+            requested_artifacts: BTreeSet::from([IosArtifactType::Xcarchive]),
+        };
+        request.validate().expect("valid durable request");
+        let artifacts = artifact_bytes
+            .map(|bytes| {
+                vec![StoredArtifactV1 {
+                    record: ArtifactRecord {
+                        artifact_id: "artifact-1".to_owned(),
+                        kind: ArtifactKind::Xcarchive,
+                        file_name: "App-unsigned.xcarchive.zip".to_owned(),
+                        size: u64::try_from(bytes.len()).expect("artifact size"),
+                        sha256: super::sha256_bytes(bytes),
+                        media_type: Some("application/zip".to_owned()),
+                    },
+                    download_destination: None,
+                    download_parent_identity: None,
+                    local_path: None,
+                    local_file_identity: None,
+                    locally_validated: false,
+                }]
+            })
+            .unwrap_or_default();
+        let state = if artifacts.is_empty() {
+            StoredJobState::SourceReady
+        } else {
+            StoredJobState::ArtifactReady
+        };
+        let outcome = (!artifacts.is_empty()).then_some(StoredBuildOutcome::Succeeded);
+        let record = StoredJobV1 {
+            schema_version: JOB_STORE_SCHEMA_VERSION,
+            local_job_id: LocalJobId::new("job-controller-test").expect("local job ID"),
+            revision: 1,
+            project: StoredProjectIdentityV1 {
+                canonical_root: canonical_utf8(temporary.path()).to_string(),
+                filesystem_identity: rustferry_core::DirectoryFilesystemIdentity::capture(
+                    temporary.path(),
+                )
+                .expect("project identity")
+                .to_string(),
+                application_identifier: request.bundle_identifier.clone(),
+            },
+            provider: StoredProviderIdentityV1 {
+                provider: GITHUB_PROVIDER_ID.to_owned(),
+                provider_config_sha256: "b".repeat(64),
+                principal: GithubPrincipalIdentityV1::User {
+                    id: 7,
+                    login: "example-user".to_owned(),
+                },
+                execution_repository: "https://github.com/example/builds".to_owned(),
+                execution_repository_id: 42,
+            },
+            provider_job_id: None,
+            provider_run_id: None,
+            operation_id: request.operation_id.clone(),
+            request_sha256: canonical_request_sha256(&request).expect("request hash"),
+            semantic_retry_sha256: canonical_retry_template_sha256_v1(&request)
+                .expect("retry hash"),
+            source: StoredSourceIdentityV1 {
+                revision: request.source_revision.clone(),
+                manifest_sha256: request.source.sha256.clone(),
+            },
+            target: "iphone".to_owned(),
+            profile: request.profile,
+            signing_mode: request.signing.mode,
+            request,
+            created_at_ms: 1,
+            submitted_at_ms: outcome.map(|_| 1),
+            updated_at_ms: 1,
+            state,
+            last_confirmed_state: Some(state),
+            terminal_outcome: outcome,
+            compile_evidence: None,
+            signed_cleanup_evidence: None,
+            artifacts,
+            log_location: None,
+            cleanup_status: StoredCleanupStatus::NotStarted,
+            retry_lineage: StoredRetryLineageV1 {
+                attempt: 0,
+                parent_job_id: None,
+                child_job_ids: Vec::new(),
+            },
+            cancellation_status: StoredCancellationStatus::NotRequested,
+            failure: None,
+            provider_resume: None,
+        };
+        record.validate().expect("valid durable record");
+        record
+    }
+
+    fn canonical_utf8(path: &std::path::Path) -> camino::Utf8PathBuf {
+        camino::Utf8PathBuf::from_path_buf(path.canonicalize().expect("canonical test path"))
+            .expect("UTF-8 test path")
+    }
+
+    fn test_download_destination(path: &camino::Utf8Path) -> DownloadDestinationBinding {
+        let parent = path.parent().expect("artifact parent").to_owned();
+        let managed_root_retained =
+            rustferry_core::RetainedDirectoryIdentity::open(parent.as_std_path())
+                .expect("retained managed root identity");
+        let parent_retained = rustferry_core::RetainedDirectoryIdentity::open(parent.as_std_path())
+            .expect("retained parent identity");
+        DownloadDestinationBinding {
+            path: path.to_string(),
+            managed_root: parent.clone(),
+            managed_root_identity: managed_root_retained.identity().clone(),
+            managed_root_retained,
+            parent_identity: parent_retained.identity().clone(),
+            parent_retained,
+            parent,
+        }
+    }
+
+    fn push_durable_github_event(
+        resume: &mut GithubJobResumeV1,
+        timestamp_ms: u64,
+        phase: &str,
+        kind: RemoteBuildEventKind,
+    ) {
+        let sequence = u64::try_from(resume.events.len()).expect("event count") + 1;
+        let event = RemoteBuildEvent::new(
+            resume.operation_id.clone(),
+            resume.job_id.clone(),
+            timestamp_ms,
+            GITHUB_PROVIDER_ID,
+            phase,
+            sequence,
+            kind,
+        )
+        .expect("valid durable GitHub event");
+        resume.events.push(event);
+    }
+
+    fn github_compile_evidence(record: &StoredJobV1) -> CompilePhaseEvidence {
+        let product = &record.request.product;
+        CompilePhaseEvidence {
+            schema_version: COMPILE_PHASE_EVIDENCE_SCHEMA_VERSION,
+            job_id: record.operation_id.clone(),
+            provider: GITHUB_PROVIDER_ID.to_owned(),
+            request_sha256: record.request_sha256.clone(),
+            source_sha256: record.request.source.sha256.clone(),
+            cargo_lock_sha256: "6".repeat(64),
+            config_sha256: "7".repeat(64),
+            rustferry_version: "0.1.0".to_owned(),
+            worker_version: "0.1.0".to_owned(),
+            toolchain: CompileToolchainEvidence {
+                worker_os: "macOS 26.0".to_owned(),
+                worker_architecture: "arm64".to_owned(),
+                xcode_version: "26.0".to_owned(),
+                iphoneos_sdk_version: "26.0".to_owned(),
+                iphoneos_sdk_build_version: "23A".to_owned(),
+                developer_directory_sha256: "8".repeat(64),
+                rust_version: "rustc 1.92.0".to_owned(),
+                rust_target: IOS_DEVICE_RUST_TARGET.to_owned(),
+            },
+            sealed_archive: SealedUnsignedArchive {
+                schema_version: SEALED_UNSIGNED_ARCHIVE_SCHEMA_VERSION,
+                transport: SourceArchive {
+                    size: 1,
+                    sha256: "9".repeat(64),
+                },
+                contents: record.request.source.clone(),
+                expectation: UnsignedXcarchiveExpectation {
+                    app_directory_name: product.app_directory_name.clone(),
+                    bundle_identifier: record.request.bundle_identifier.clone(),
+                    executable: product.executable.clone(),
+                    app_version: product.app_version.clone(),
+                    build_number: product.build_number.clone(),
+                    minimum_os: record.request.minimum_ios_version.clone(),
+                    sdk_version: "26.0".to_owned(),
+                    sdk_build_version: "23A".to_owned(),
+                    nested_bundles: product.nested_bundles.clone(),
+                    required_resources: BTreeMap::new(),
+                },
+            },
+            archive_inspection: UnsignedXcarchiveInspection {
+                application_path: format!("Applications/{}", product.app_directory_name),
+                architectures: vec!["arm64".to_owned()],
+                app: UnsignedAppInspection {
+                    app_directory_name: product.app_directory_name.clone(),
+                    bundle_identifier: record.request.bundle_identifier.clone(),
+                    executable: product.executable.clone(),
+                    main_executable: Vec::new(),
+                    nested_executables: BTreeMap::new(),
+                    extensions: Vec::new(),
+                    resources: BTreeMap::new(),
+                    entries: Vec::new(),
+                },
+                entries: Vec::new(),
+            },
+            started_at_unix_seconds: 1_700_000_000,
+            finished_at_unix_seconds: 1_700_000_060,
+        }
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the cleanup fixture spells out the complete durable provider evidence boundary"
+    )]
+    fn successful_cleanup_resume(record: &StoredJobV1) -> GithubJobResumeV1 {
+        let mut manifest = ArtifactManifest::new(&record.operation_id, &record.operation_id);
+        manifest.provider = GITHUB_PROVIDER_ID.to_owned();
+        manifest.source_repository = record.request.source_repository.clone();
+        manifest.source_revision = record.source.revision.clone();
+        manifest.source_sha256 = record.source.manifest_sha256.clone();
+        manifest.artifacts = record
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.record.clone())
+            .collect();
+        let dispatch_commit = "e".repeat(40);
+        let workflow_path = ".github/workflows/rustferry-goal3-iphone.yml".to_owned();
+        let branch = format!("rustferry/builds/{}", record.operation_id);
+        let mut resume = GithubJobResumeV1 {
+            schema_version: 1,
+            provider: GITHUB_PROVIDER_ID.to_owned(),
+            provider_config_sha256: record.provider.provider_config_sha256.clone(),
+            principal: record.provider.principal.clone(),
+            execution_repository: record.provider.execution_repository.clone(),
+            execution_repository_id: record.provider.execution_repository_id,
+            source_repository: record
+                .request
+                .source_repository
+                .clone()
+                .expect("Git source repository"),
+            trusted_source_ref: "refs/heads/main".to_owned(),
+            workflow_path: workflow_path.clone(),
+            workflow_sha256: "d".repeat(64),
+            temporary_ref: format!("refs/heads/{branch}"),
+            operation_id: record.operation_id.clone(),
+            job_id: record.operation_id.clone(),
+            request: record.request.clone(),
+            request_sha256: record.request_sha256.clone(),
+            source_revision: record.source.revision.clone().expect("source revision"),
+            git_snapshot: None,
+            prepared_dispatch_commit: Some(dispatch_commit.clone()),
+            dispatch_commit: Some(dispatch_commit.clone()),
+            workflow_dispatch: None,
+            run: Some(GithubRunIdentityV1 {
+                run_id: 7,
+                workflow_id: 8,
+                workflow_path,
+                head_sha: dispatch_commit,
+                branch,
+                event: GithubRunEventV1::Push,
+                run_number: 9,
+                run_attempt: 1,
+                status: GithubRunStatusV1::Completed,
+                conclusion: Some(GithubRunConclusionV1::Success),
+            }),
+            created_at_ms: record.created_at_ms,
+            publication_started_at_ms: record.created_at_ms,
+            publication_quiescence_deadline_ms: record
+                .created_at_ms
+                .saturating_add(GITHUB_PUBLICATION_QUIESCENCE_WINDOW_MS),
+            publication_absence_first_observed_at_ms: 0,
+            state: JobState::Succeeded,
+            publication_intent: true,
+            publication_uncertain: false,
+            publication_absent: false,
+            publication_not_attempted: false,
+            publication_process_fenced: true,
+            publication_lease_scope_sha256: Some("a".repeat(64)),
+            publication_absence_observations: 0,
+            cancellation_requested: false,
+            cancellation_dispatched: false,
+            cleanup_requested: true,
+            remove_artifacts_requested: false,
+            artifacts_removed: false,
+            temporary_ref_deleted: false,
+            verification_pending_event: false,
+            run_discovery_attempts: 0,
+            run_discovery_deadline_ms: record.created_at_ms,
+            manifests: vec![manifest.clone()],
+            compile_evidence: Some(github_compile_evidence(record)),
+            signed_cleanup_evidence: None,
+            events: Vec::new(),
+        };
+        push_durable_github_event(
+            &mut resume,
+            record.created_at_ms.saturating_add(1),
+            "artifacts",
+            RemoteBuildEventKind::ArtifactValidated {
+                artifact: manifest.clone(),
+            },
+        );
+        let result = IosDeviceBuildResult {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            operation_id: record.operation_id.clone(),
+            job_id: record.operation_id.clone(),
+            state: JobState::Succeeded,
+            artifacts: vec![manifest],
+            cleanup: None,
+        };
+        push_durable_github_event(
+            &mut resume,
+            record.created_at_ms.saturating_add(2),
+            "finished",
+            RemoteBuildEventKind::OperationFinished {
+                success: true,
+                duration_ms: 2,
+                result: Some(result),
+                error: None,
+            },
+        );
+        resume
+    }
+
+    fn create_provider_artifact_ready_job(store: &JobStore, evidence: &StoredJobV1) -> StoredJobV1 {
+        let mut initial = evidence.clone();
+        initial.submitted_at_ms = None;
+        initial.state = StoredJobState::SourceReady;
+        initial.last_confirmed_state = Some(StoredJobState::SourceReady);
+        initial.terminal_outcome = None;
+        initial.compile_evidence = None;
+        initial.signed_cleanup_evidence = None;
+        initial.artifacts.clear();
+        initial.cleanup_status = StoredCleanupStatus::NotStarted;
+        initial.cancellation_status = StoredCancellationStatus::NotRequested;
+        initial.failure = None;
+        initial.provider_resume = None;
+        initial.validate().expect("source-ready initial revision");
+        store.create(&initial).expect("initial revision");
+        for state in [StoredJobState::Submitting, StoredJobState::Running] {
+            update_stored_job(store, &initial.local_job_id, |_previous, next| {
+                next.state = state;
+                next.last_confirmed_state = Some(state);
+                Ok(())
+            })
+            .expect("advance local phase");
+        }
+        let mut resume = successful_cleanup_resume(evidence);
+        resume.cleanup_requested = false;
+        store
+            .checkpoint_github_resume(&initial.local_job_id, &resume)
+            .expect("successful provider checkpoint");
+        let ready = store
+            .latest(&initial.local_job_id)
+            .expect("artifact-ready revision");
+        assert_eq!(ready.state, StoredJobState::ArtifactReady);
+        assert_eq!(ready.terminal_outcome, Some(StoredBuildOutcome::Succeeded));
+        ready
+    }
+
+    fn checkpoint_cleaned_job(store: &JobStore, record: &StoredJobV1, checkpoint_cleaning: bool) {
+        let mut resume = successful_cleanup_resume(record);
+        store
+            .checkpoint_github_resume(&record.local_job_id, &resume)
+            .expect("pre-cleaning provider checkpoint");
+        let started_at_ms = record.created_at_ms.saturating_add(3);
+        push_durable_github_event(
+            &mut resume,
+            started_at_ms,
+            "cleanup",
+            RemoteBuildEventKind::CleanupStarted,
+        );
+        if checkpoint_cleaning {
+            resume.state = JobState::Cleaning;
+            store
+                .checkpoint_github_resume(&record.local_job_id, &resume)
+                .expect("cleaning checkpoint");
+        }
+        resume.state = JobState::Cleaned;
+        resume.temporary_ref_deleted = true;
+        let job_id = resume.job_id.clone();
+        push_durable_github_event(
+            &mut resume,
+            started_at_ms.saturating_add(1),
+            "cleanup",
+            RemoteBuildEventKind::CleanupFinished {
+                confirmation: CleanupConfirmation {
+                    job_id,
+                    completed_at_ms: started_at_ms.saturating_add(1),
+                    workspace_removed: true,
+                    signing_material_removed: true,
+                    artifacts_retained: true,
+                },
+            },
+        );
+        store
+            .checkpoint_github_resume(&record.local_job_id, &resume)
+            .expect("cleaned checkpoint");
+    }
+
+    fn complete_cleanup_with_cadence(
+        temporary: &tempfile::TempDir,
+        checkpoint_cleaning: bool,
+    ) -> StoredJobV1 {
+        let store = JobStore::open_at(temporary.path().join("job-store")).expect("job store");
+        let bytes = b"verified artifact bytes";
+        let evidence = durable_controller_record(temporary, Some(bytes));
+        let record = create_provider_artifact_ready_job(&store, &evidence);
+        let artifact_parent = temporary.path().join("target").join("ferry");
+        std::fs::create_dir_all(&artifact_parent).expect("artifact parent");
+        let artifact_path = canonical_utf8(&artifact_parent).join("App-unsigned.xcarchive.zip");
+        let destinations = BTreeMap::from([(
+            "artifact-1".to_owned(),
+            test_download_destination(&artifact_path),
+        )]);
+        persist_downloading(&store, &record.local_job_id, &destinations)
+            .expect("downloading revision");
+        std::fs::write(&artifact_path, bytes).expect("artifact bytes");
+        let validated = independently_validate_download(
+            &store,
+            &record.local_job_id,
+            "artifact-1",
+            &artifact_path,
+        )
+        .expect("independent local validation");
+        persist_downloaded_artifact(&store, &record.local_job_id, "artifact-1", &validated)
+            .expect("artifact path checkpoint");
+        persist_downloads_complete(&store, &record.local_job_id).expect("download completion");
+        persist_validating(&store, &record.local_job_id).expect("validating revision");
+        persist_validation_ready_for_cleanup(&store, &record.local_job_id)
+            .expect("cleanup overlay");
+        let pending = store.latest(&record.local_job_id).expect("pending cleanup");
+        assert_eq!(pending.state, StoredJobState::CleanupPending);
+        assert_eq!(
+            pending.last_confirmed_state,
+            Some(StoredJobState::Validating)
+        );
+
+        checkpoint_cleaned_job(&store, &record, checkpoint_cleaning);
+        let cleaned = store
+            .latest(&record.local_job_id)
+            .expect("cleaned revision");
+        assert_eq!(cleaned.state, StoredJobState::CleanupPending);
+        assert_eq!(
+            cleaned.last_confirmed_state,
+            Some(StoredJobState::Validating)
+        );
+        assert_eq!(cleaned.cleanup_status, StoredCleanupStatus::Confirmed);
+
+        let root = canonical_utf8(temporary.path());
+        let project_binding = ProjectFilesystemBinding::capture(&root).expect("project binding");
+        validate_and_promote_durable_success(
+            &store,
+            &record.local_job_id,
+            &project_binding,
+            &destinations,
+        )
+        .expect("durable success promotion");
+        store.latest(&record.local_job_id).expect("promoted job")
+    }
+
+    #[test]
+    fn cancellation_timeout_is_persisted_as_uncertain_without_claiming_terminal() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let store = JobStore::open_at(temporary.path().join("job-store")).expect("job store");
+        let record = durable_controller_record(&temporary, None);
+        store.create(&record).expect("initial revision");
+
+        assert!(
+            persist_cancellation_requested(&store, &record.local_job_id)
+                .expect("persist cancellation intent")
+        );
+        persist_cancellation_uncertain(&store, &record.local_job_id)
+            .expect("persist uncertain cancellation");
+
+        let latest = store.latest(&record.local_job_id).expect("latest revision");
+        assert_eq!(latest.state, StoredJobState::Unknown);
+        assert_eq!(
+            latest.last_confirmed_state,
+            Some(StoredJobState::CancellationRequested)
+        );
+        assert_eq!(
+            latest.cancellation_status,
+            StoredCancellationStatus::Uncertain
+        );
+        assert!(latest.terminal_outcome.is_none());
+    }
+
+    #[test]
+    fn cancelled_cleanup_uncertainty_preserves_cancelled_underlying_phase() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let store = JobStore::open_at(temporary.path().join("job-store")).expect("job store");
+        let record = durable_controller_record(&temporary, None);
+        store.create(&record).expect("initial revision");
+        assert!(
+            persist_cancellation_requested(&store, &record.local_job_id)
+                .expect("durable cancellation intent")
+        );
+        let mut resume = successful_cleanup_resume(&record);
+        resume.state = JobState::Cancelled;
+        resume.run.as_mut().expect("run identity").conclusion =
+            Some(GithubRunConclusionV1::Cancelled);
+        resume.cancellation_requested = true;
+        resume.cancellation_dispatched = true;
+        resume.cleanup_requested = false;
+        resume.manifests.clear();
+        resume.compile_evidence = None;
+        resume.events.clear();
+        push_durable_github_event(
+            &mut resume,
+            record.created_at_ms.saturating_add(1),
+            "cancelled",
+            RemoteBuildEventKind::OperationCancelled {
+                reason: "test cancellation".to_owned(),
+                duration_ms: 1,
+            },
+        );
+        store
+            .checkpoint_github_resume(&record.local_job_id, &resume)
+            .expect("cancelled provider checkpoint");
+
+        persist_cleanup_pending(&store, &record.local_job_id).expect("cleanup intent");
+        persist_cleanup_uncertain(&store, &record.local_job_id).expect("cleanup uncertainty");
+
+        let latest = store.latest(&record.local_job_id).expect("latest revision");
+        assert_eq!(latest.state, StoredJobState::Unknown);
+        assert_eq!(latest.last_confirmed_state, Some(StoredJobState::Cancelled));
+        assert_eq!(latest.terminal_outcome, Some(StoredBuildOutcome::Cancelled));
+        assert_eq!(
+            latest.cancellation_status,
+            StoredCancellationStatus::Confirmed
+        );
+        assert_eq!(latest.cleanup_status, StoredCleanupStatus::Uncertain);
+    }
+
+    #[test]
+    fn expired_cleanup_uncertainty_preserves_expired_underlying_phase() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let store = JobStore::open_at(temporary.path().join("job-store")).expect("job store");
+        let record = durable_controller_record(&temporary, None);
+        store.create(&record).expect("initial revision");
+        for state in [StoredJobState::Submitting, StoredJobState::Running] {
+            update_stored_job(&store, &record.local_job_id, |_previous, next| {
+                next.state = state;
+                next.last_confirmed_state = Some(state);
+                Ok(())
+            })
+            .expect("advance local phase");
+        }
+        let artifact_record = durable_controller_record(&temporary, Some(b"artifact bytes"));
+        update_stored_job(&store, &record.local_job_id, |_previous, next| {
+            next.state = StoredJobState::ArtifactReady;
+            next.last_confirmed_state = Some(StoredJobState::ArtifactReady);
+            next.artifacts.clone_from(&artifact_record.artifacts);
+            Ok(())
+        })
+        .expect("artifact-ready revision");
+        update_stored_job(&store, &record.local_job_id, |_previous, next| {
+            next.state = StoredJobState::Expired;
+            next.last_confirmed_state = Some(StoredJobState::Expired);
+            next.terminal_outcome = Some(StoredBuildOutcome::Expired);
+            Ok(())
+        })
+        .expect("expired revision");
+
+        persist_cleanup_pending(&store, &record.local_job_id).expect("cleanup intent");
+        persist_cleanup_uncertain(&store, &record.local_job_id).expect("cleanup uncertainty");
+
+        let latest = store.latest(&record.local_job_id).expect("latest revision");
+        assert_eq!(latest.state, StoredJobState::Unknown);
+        assert_eq!(latest.last_confirmed_state, Some(StoredJobState::Expired));
+        assert_eq!(latest.terminal_outcome, Some(StoredBuildOutcome::Expired));
+        assert_eq!(latest.cleanup_status, StoredCleanupStatus::Uncertain);
+    }
+
+    #[test]
+    fn succeeded_cleanup_uncertainty_remains_recoverable_for_cleanup_retry() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let store = JobStore::open_at(temporary.path().join("job-store")).expect("job store");
+        let record = durable_controller_record(&temporary, None);
+        store.create(&record).expect("initial revision");
+        for state in [StoredJobState::Submitting, StoredJobState::Running] {
+            update_stored_job(&store, &record.local_job_id, |_previous, next| {
+                next.state = state;
+                next.last_confirmed_state = Some(state);
+                Ok(())
+            })
+            .expect("advance local phase");
+        }
+        let artifact_record = durable_controller_record(&temporary, Some(b"artifact bytes"));
+        let mut resume = successful_cleanup_resume(&artifact_record);
+        resume.cleanup_requested = false;
+        store
+            .checkpoint_github_resume(&record.local_job_id, &resume)
+            .expect("successful provider checkpoint");
+
+        persist_cleanup_pending(&store, &record.local_job_id).expect("cleanup intent");
+        persist_cleanup_uncertain(&store, &record.local_job_id).expect("cleanup uncertainty");
+
+        let uncertain = store
+            .latest(&record.local_job_id)
+            .expect("uncertain cleanup revision");
+        assert_eq!(uncertain.state, StoredJobState::Failed);
+        assert_eq!(
+            uncertain.last_confirmed_state,
+            Some(StoredJobState::ArtifactReady)
+        );
+        assert_eq!(
+            uncertain.terminal_outcome,
+            Some(StoredBuildOutcome::Succeeded)
+        );
+        assert_eq!(uncertain.cleanup_status, StoredCleanupStatus::Uncertain);
+        let failure = uncertain
+            .failure
+            .as_ref()
+            .expect("sanitized cleanup failure");
+        assert_eq!(failure.code, "controller.cleanup_unconfirmed");
+        assert!(failure.retryable);
+
+        persist_cleanup_pending(&store, &record.local_job_id).expect("cleanup retry intent");
+        let retry = store
+            .latest(&record.local_job_id)
+            .expect("cleanup retry revision");
+        assert_eq!(retry.state, StoredJobState::CleanupPending);
+        assert_eq!(
+            retry.last_confirmed_state,
+            Some(StoredJobState::ArtifactReady)
+        );
+        assert_eq!(retry.cleanup_status, StoredCleanupStatus::Pending);
+        assert_eq!(retry.failure, uncertain.failure);
+    }
+
+    #[test]
+    fn cancellation_outcome_distinguishes_cancelled_terminal_races_and_uncertainty() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let uncertain = durable_controller_record(&temporary, None);
+        assert_eq!(
+            cancellation_outcome_from_job(&uncertain),
+            CancellationWaitOutcome::Uncertain
+        );
+
+        let other_terminal = durable_controller_record(&temporary, Some(b"artifact"));
+        assert_eq!(
+            cancellation_outcome_from_job(&other_terminal),
+            CancellationWaitOutcome::OtherTerminal
+        );
+
+        let mut cancelled = uncertain;
+        cancelled.state = StoredJobState::Cancelled;
+        cancelled.terminal_outcome = Some(StoredBuildOutcome::Cancelled);
+        cancelled.cancellation_status = StoredCancellationStatus::Confirmed;
+        assert_eq!(
+            cancellation_outcome_from_job(&cancelled),
+            CancellationWaitOutcome::Cancelled
+        );
+    }
+
+    #[test]
+    fn interrupted_cleanup_output_names_success_and_failure_terminal_races() {
+        assert_eq!(
+            interrupted_cleanup_progress(Some(StoredBuildOutcome::Succeeded), false, true),
+            "Remote build succeeded before cancellation; cleanup confirmed"
+        );
+        assert_eq!(
+            interrupted_cleanup_progress(Some(StoredBuildOutcome::Failed), false, false),
+            "Remote build failed before cancellation; cleanup remains unconfirmed"
+        );
+        assert_eq!(
+            interrupted_cleanup_progress(Some(StoredBuildOutcome::Cancelled), true, true),
+            "Remote cancellation and cleanup confirmed"
+        );
+    }
+
+    #[test]
+    fn submit_publication_evidence_requires_exact_mapping_or_strong_absence() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let record = durable_controller_record(&temporary, None);
+        let mut resume = successful_cleanup_resume(&record);
+        let job_id = resume.job_id.clone();
+
+        resume.publication_uncertain = true;
+        assert_eq!(
+            submit_publication_evidence(&resume, &job_id, WorkflowRunTrigger::Push),
+            SubmitPublicationEvidence::Pending
+        );
+
+        resume.dispatch_commit = Some("a".repeat(40));
+        resume.publication_uncertain = false;
+        assert_eq!(
+            submit_publication_evidence(&resume, &job_id, WorkflowRunTrigger::Push),
+            SubmitPublicationEvidence::Mapped
+        );
+        let mut dispatch_pre_intent = resume.clone();
+        dispatch_pre_intent.run = None;
+        dispatch_pre_intent.workflow_dispatch = None;
+        assert_eq!(
+            submit_publication_evidence(
+                &dispatch_pre_intent,
+                &job_id,
+                WorkflowRunTrigger::WorkflowDispatch,
+            ),
+            SubmitPublicationEvidence::Pending
+        );
+        assert!(!provider_resume_is_bound(
+            &dispatch_pre_intent,
+            &job_id,
+            WorkflowRunTrigger::WorkflowDispatch,
+        ));
+
+        let mut dispatch_mapped = resume.clone();
+        let dispatch_revision = dispatch_mapped
+            .dispatch_commit
+            .clone()
+            .expect("dispatch commit");
+        let run = dispatch_mapped.run.as_mut().expect("mapped Push run");
+        run.event = GithubRunEventV1::WorkflowDispatch;
+        run.head_sha.clone_from(&dispatch_revision);
+        let branch = run.branch.clone();
+        let workflow_id = run.workflow_id;
+        let workflow_path = run.workflow_path.clone();
+        let run_name = format!(
+            "rustferry-v1|{}|{}|{}|{}",
+            dispatch_mapped.operation_id,
+            dispatch_mapped.request_sha256,
+            dispatch_mapped.source_revision,
+            dispatch_revision,
+        );
+        let body = format!(
+            "{{\"ref\":\"{branch}\",\"inputs\":{{\"operation_id\":\"{}\",\"request_sha256\":\"{}\",\"source_revision\":\"{}\",\"dispatch_revision\":\"{}\"}}}}",
+            dispatch_mapped.operation_id,
+            dispatch_mapped.request_sha256,
+            dispatch_mapped.source_revision,
+            dispatch_revision,
+        );
+        let receipt = GithubWorkflowDispatchReceiptV1 {
+            run_id: run.run_id,
+            workflow_id,
+            workflow_path: workflow_path.clone(),
+            branch: branch.clone(),
+            dispatch_revision: dispatch_revision.clone(),
+            run_name: run_name.clone(),
+        };
+        dispatch_mapped.workflow_dispatch = Some(Box::new(GithubWorkflowDispatchResumeV1 {
+            schema_version: 1,
+            workflow_id,
+            workflow_path,
+            branch,
+            operation_id: dispatch_mapped.operation_id.clone(),
+            request_sha256: dispatch_mapped.request_sha256.clone(),
+            source_revision: dispatch_mapped.source_revision.clone(),
+            dispatch_revision,
+            body_sha256: sha256_bytes(body.as_bytes()),
+            run_name,
+            uncertain: false,
+            receipt: Some(receipt),
+        }));
+        dispatch_mapped
+            .validate_trigger_binding()
+            .expect("complete dispatch binding");
+        assert_eq!(
+            submit_publication_evidence(
+                &dispatch_mapped,
+                &job_id,
+                WorkflowRunTrigger::WorkflowDispatch,
+            ),
+            SubmitPublicationEvidence::Mapped
+        );
+        assert!(provider_resume_is_bound(
+            &dispatch_mapped,
+            &job_id,
+            WorkflowRunTrigger::WorkflowDispatch,
+        ));
+
+        let mut dispatch_intent = dispatch_mapped.clone();
+        let intent = dispatch_intent
+            .workflow_dispatch
+            .as_mut()
+            .expect("dispatch intent");
+        intent.receipt = None;
+        intent.uncertain = true;
+        dispatch_intent.run = None;
+        assert_eq!(
+            submit_publication_evidence(
+                &dispatch_intent,
+                &job_id,
+                WorkflowRunTrigger::WorkflowDispatch,
+            ),
+            SubmitPublicationEvidence::Pending
+        );
+        assert!(!provider_resume_is_bound(
+            &dispatch_intent,
+            &job_id,
+            WorkflowRunTrigger::WorkflowDispatch,
+        ));
+
+        let mut dispatch_receipt_only = dispatch_mapped.clone();
+        dispatch_receipt_only.run = None;
+        assert_eq!(
+            submit_publication_evidence(
+                &dispatch_receipt_only,
+                &job_id,
+                WorkflowRunTrigger::WorkflowDispatch,
+            ),
+            SubmitPublicationEvidence::Pending
+        );
+        assert!(!provider_resume_is_bound(
+            &dispatch_receipt_only,
+            &job_id,
+            WorkflowRunTrigger::WorkflowDispatch,
+        ));
+
+        let mut dispatch_as_push = dispatch_mapped.clone();
+        dispatch_as_push.run.as_mut().expect("dispatch run").event = GithubRunEventV1::Push;
+        assert!(!provider_resume_is_bound(
+            &dispatch_as_push,
+            &job_id,
+            WorkflowRunTrigger::WorkflowDispatch,
+        ));
+        assert!(!provider_resume_is_bound(
+            &dispatch_mapped,
+            &job_id,
+            WorkflowRunTrigger::Push,
+        ));
+        assert_eq!(
+            submit_publication_evidence(
+                &dispatch_mapped,
+                &job_id,
+                WorkflowRunTrigger::Push,
+            ),
+            SubmitPublicationEvidence::Pending
+        );
+
+        resume.dispatch_commit = None;
+        resume.publication_absent = true;
+        resume.publication_absence_observations = 1;
+        resume.temporary_ref_deleted = true;
+        assert_eq!(
+            submit_publication_evidence(&resume, &job_id, WorkflowRunTrigger::Push),
+            SubmitPublicationEvidence::Pending
+        );
+        resume.publication_absence_observations = 2;
+        assert_eq!(
+            submit_publication_evidence(&resume, &job_id, WorkflowRunTrigger::Push),
+            SubmitPublicationEvidence::Absent
+        );
+
+        resume.publication_absent = false;
+        resume.publication_uncertain = true;
+        resume.state = JobState::Failed;
+        resume.publication_absence_first_observed_at_ms = 1;
+        assert_eq!(
+            submit_publication_evidence(&resume, &job_id, WorkflowRunTrigger::Push),
+            SubmitPublicationEvidence::Conflict
+        );
+
+        assert_eq!(
+            submit_publication_evidence(
+                &resume,
+                "different-job",
+                WorkflowRunTrigger::Push,
+            ),
+            SubmitPublicationEvidence::Pending
+        );
+    }
+
+    #[test]
+    fn project_binding_rejects_or_blocks_a_replaced_directory_before_later_writes() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let project = temporary.path().join("project");
+        let original = temporary.path().join("original-project");
+        std::fs::create_dir(&project).expect("project directory");
+        let root = canonical_utf8(&project);
+        let binding = ProjectFilesystemBinding::capture(&root).expect("project binding");
+        binding.verify().expect("original binding");
+
+        if std::fs::rename(&project, &original).is_err() {
+            binding
+                .verify()
+                .expect("retained project path remains bound");
+            return;
+        }
+        std::fs::create_dir(&project).expect("replacement project");
+        assert!(binding.verify().is_err());
+    }
+
+    #[test]
+    fn project_binding_rejects_or_blocks_a_whole_root_alias_handoff() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let project = temporary.path().join("project");
+        let moved = temporary.path().join("moved-project");
+        std::fs::create_dir(&project).expect("project directory");
+        let root = canonical_utf8(&project);
+        let binding = ProjectFilesystemBinding::capture(&root).expect("project binding");
+
+        if std::fs::rename(&project, &moved).is_err() {
+            binding
+                .verify()
+                .expect("retained project path remains bound");
+            return;
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&moved, &project).expect("project alias");
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_dir(&moved, &project).is_err() {
+            return;
+        }
+
+        assert!(binding.verify().is_err());
+    }
+
+    #[test]
+    fn download_destination_rejects_a_linked_parent_below_target_ferry() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let project = temporary.path().join("project");
+        let managed = project.join("target").join("ferry");
+        let outside = temporary.path().join("outside");
+        std::fs::create_dir_all(&managed).expect("managed root");
+        std::fs::create_dir(&outside).expect("outside directory");
+        let linked = managed.join("linked");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &linked).expect("linked destination parent");
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_dir(&outside, &linked).is_err() {
+            return;
+        }
+
+        let root = canonical_utf8(&project);
+        let binding = ProjectFilesystemBinding::capture(&root).expect("project binding");
+        let destination = camino::Utf8PathBuf::from_path_buf(linked.join("artifact.zip"))
+            .expect("UTF-8 destination");
+        assert!(DownloadDestinationBinding::capture(&destination, &binding).is_err());
+    }
+
+    #[test]
+    fn download_destination_rejects_or_blocks_a_managed_root_alias_handoff() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let project = temporary.path().join("project");
+        let managed = project.join("target").join("ferry");
+        let parent = managed.join("ios").join("device").join("debug");
+        let moved = project.join("target").join("moved-ferry");
+        std::fs::create_dir_all(&parent).expect("artifact parent");
+        let root = canonical_utf8(&project);
+        let project_binding = ProjectFilesystemBinding::capture(&root).expect("project binding");
+        let destination = canonical_utf8(&parent).join("artifact.zip");
+        let binding = DownloadDestinationBinding::capture(&destination, &project_binding)
+            .expect("destination binding");
+
+        if std::fs::rename(&managed, &moved).is_err() {
+            binding
+                .verify(&project_binding)
+                .expect("retained managed root remains bound");
+            return;
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&moved, &managed).expect("managed root alias");
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_dir(&moved, &managed).is_err() {
+            return;
+        }
+
+        assert!(binding.verify(&project_binding).is_err());
+    }
+
+    #[test]
+    fn success_promotion_reconciliation_allows_only_validation_false_to_true() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let mut before = durable_controller_record(&temporary, Some(b"artifact"));
+        before.state = StoredJobState::CleanupPending;
+        before.cleanup_status = StoredCleanupStatus::Confirmed;
+        before.artifacts[0].download_destination = Some(
+            temporary
+                .path()
+                .join("target")
+                .join("ferry")
+                .join("artifact.zip")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        before.artifacts[0].download_parent_identity = Some("unix:1:2".to_owned());
+        before.artifacts[0].local_path = before.artifacts[0].download_destination.clone();
+        before.artifacts[0].local_file_identity = Some("unix:1:3".to_owned());
+
+        let mut promoted = before.clone();
+        promoted.revision += 1;
+        promoted.updated_at_ms += 1;
+        promoted.state = StoredJobState::Succeeded;
+        promoted.last_confirmed_state = Some(StoredJobState::Succeeded);
+        promoted.artifacts[0].locally_validated = true;
+        assert!(is_exact_success_promotion(&before, &promoted));
+
+        promoted.artifacts[0].local_file_identity = Some("unix:1:4".to_owned());
+        assert!(!is_exact_success_promotion(&before, &promoted));
+    }
+
+    #[test]
+    fn rejected_download_checkpoint_preserves_the_intended_file_for_reconciliation() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let store = JobStore::open_at(temporary.path().join("job-store")).expect("job store");
+        let bytes = b"verified artifact bytes";
+        let evidence = durable_controller_record(&temporary, Some(bytes));
+        let record = create_provider_artifact_ready_job(&store, &evidence);
+        let artifact_parent = temporary.path().join("target").join("ferry");
+        std::fs::create_dir_all(&artifact_parent).expect("artifact parent");
+        let artifact_path = canonical_utf8(&artifact_parent).join("App-unsigned.xcarchive.zip");
+        let destinations = BTreeMap::from([(
+            "artifact-1".to_owned(),
+            test_download_destination(&artifact_path),
+        )]);
+        persist_downloading(&store, &record.local_job_id, &destinations)
+            .expect("downloading revision");
+        std::fs::write(&artifact_path, bytes).expect("artifact bytes");
+        let validated = independently_validate_download(
+            &store,
+            &record.local_job_id,
+            "artifact-1",
+            &artifact_path,
+        )
+        .expect("independent validation");
+        persist_downloaded_artifact(&store, &record.local_job_id, "missing-artifact", &validated)
+            .expect_err("unknown artifact must not publish");
+
+        let latest = store.latest(&record.local_job_id).expect("latest revision");
+        assert_eq!(latest.state, StoredJobState::Downloading);
+        assert_eq!(
+            latest.artifacts[0].download_destination.as_deref(),
+            Some(artifact_path.as_str())
+        );
+        assert!(latest.artifacts[0].local_path.is_none());
+        assert_eq!(
+            std::fs::read(&artifact_path).expect("preserved artifact"),
+            bytes
+        );
+    }
+
+    #[test]
+    fn artifact_publication_uncertainty_preserves_downloading_and_downloaded_phases() {
+        for downloaded in [false, true] {
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let store = JobStore::open_at(temporary.path().join("job-store")).expect("job store");
+            let bytes = b"verified artifact bytes";
+            let evidence = durable_controller_record(&temporary, Some(bytes));
+            let record = create_provider_artifact_ready_job(&store, &evidence);
+            let artifact_parent = temporary.path().join("target").join("ferry");
+            std::fs::create_dir_all(&artifact_parent).expect("artifact parent");
+            let artifact_path = canonical_utf8(&artifact_parent).join("artifact.zip");
+            let destinations = BTreeMap::from([(
+                "artifact-1".to_owned(),
+                test_download_destination(&artifact_path),
+            )]);
+            persist_downloading(&store, &record.local_job_id, &destinations)
+                .expect("downloading revision");
+            if downloaded {
+                std::fs::write(&artifact_path, bytes).expect("artifact bytes");
+                let validated = independently_validate_download(
+                    &store,
+                    &record.local_job_id,
+                    "artifact-1",
+                    &artifact_path,
+                )
+                .expect("independent validation");
+                persist_downloaded_artifact(&store, &record.local_job_id, "artifact-1", &validated)
+                    .expect("artifact checkpoint");
+                persist_downloads_complete(&store, &record.local_job_id)
+                    .expect("downloaded revision");
+            }
+            let expected = if downloaded {
+                StoredJobState::Downloaded
+            } else {
+                StoredJobState::Downloading
+            };
+            let before = store.latest(&record.local_job_id).expect("download phase");
+            assert_eq!(before.state, expected);
+            assert_eq!(
+                before.last_confirmed_state,
+                Some(StoredJobState::ArtifactReady)
+            );
+
+            persist_artifact_publication_uncertain(
+                &store,
+                &record.local_job_id,
+                "controller.artifact_publication_uncertain",
+            )
+            .expect("durable publication uncertainty");
+
+            let uncertain = store
+                .latest(&record.local_job_id)
+                .expect("uncertain publication revision");
+            assert_eq!(uncertain.state, StoredJobState::Unknown);
+            assert_eq!(uncertain.last_confirmed_state, Some(expected));
+            let failure = uncertain.failure.as_ref().expect("sanitized failure");
+            assert_eq!(failure.code, "controller.artifact_publication_uncertain");
+            assert!(!failure.retryable);
+
+            persist_cleanup_pending(&store, &record.local_job_id)
+                .expect("cleanup intent after publication uncertainty");
+            let pending = store
+                .latest(&record.local_job_id)
+                .expect("cleanup-pending revision");
+            assert_eq!(pending.state, StoredJobState::CleanupPending);
+            assert_eq!(pending.last_confirmed_state, Some(expected));
+            assert_eq!(pending.cleanup_status, StoredCleanupStatus::Pending);
+        }
+    }
+
+    #[test]
+    fn artifact_failure_cleanup_uses_failed_phase_and_reaches_exact_confirmation() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let store = JobStore::open_at(temporary.path().join("job-store")).expect("job store");
+        let evidence = durable_controller_record(&temporary, Some(b"artifact bytes"));
+        let record = create_provider_artifact_ready_job(&store, &evidence);
+        let artifact_parent = temporary.path().join("target").join("ferry");
+        std::fs::create_dir_all(&artifact_parent).expect("artifact parent");
+        let artifact_path = canonical_utf8(&artifact_parent).join("artifact.zip");
+        let destinations = BTreeMap::from([(
+            "artifact-1".to_owned(),
+            test_download_destination(&artifact_path),
+        )]);
+        persist_downloading(&store, &record.local_job_id, &destinations)
+            .expect("downloading revision");
+        persist_controller_failure(
+            &store,
+            &record.local_job_id,
+            "controller.artifact_processing_failed",
+            false,
+        )
+        .expect("durable artifact failure");
+        let failed = store.latest(&record.local_job_id).expect("failed revision");
+        assert_eq!(failed.state, StoredJobState::Failed);
+        assert_eq!(failed.last_confirmed_state, Some(StoredJobState::Failed));
+
+        let root = canonical_utf8(temporary.path());
+        let project_binding = ProjectFilesystemBinding::capture(&root).expect("project binding");
+        let provider_job_id = record.provider_job_id.clone().expect("provider job ID");
+        let cleanup_called = Cell::new(false);
+        cleanup_job_durably_with(
+            &store,
+            &record.local_job_id,
+            &provider_job_id,
+            &project_binding,
+            || {
+                cleanup_called.set(true);
+                let pending = store
+                    .latest(&record.local_job_id)
+                    .expect("cleanup-pending revision");
+                assert_eq!(pending.state, StoredJobState::CleanupPending);
+                assert_eq!(pending.last_confirmed_state, Some(StoredJobState::Failed));
+                assert_eq!(pending.cleanup_status, StoredCleanupStatus::Pending);
+                checkpoint_cleaned_job(&store, &record, false);
+                Ok(CleanupConfirmation {
+                    job_id: provider_job_id.clone(),
+                    completed_at_ms: record.created_at_ms.saturating_add(4),
+                    workspace_removed: true,
+                    signing_material_removed: true,
+                    artifacts_retained: true,
+                })
+            },
+        )
+        .expect("exact durable cleanup");
+
+        assert!(cleanup_called.get());
+        let cleaned = store
+            .latest(&record.local_job_id)
+            .expect("cleaned revision");
+        assert_eq!(cleaned.state, StoredJobState::Failed);
+        assert_eq!(cleaned.cleanup_status, StoredCleanupStatus::Confirmed);
+        assert_eq!(
+            cleaned
+                .failure
+                .as_ref()
+                .map(|failure| failure.code.as_str()),
+            Some("controller.artifact_processing_failed")
+        );
+        let resume = cleaned
+            .provider_resume
+            .as_ref()
+            .expect("provider checkpoint");
+        assert_eq!(resume.state, JobState::Cleaned);
+        assert!(resume.temporary_ref_deleted);
+    }
+
+    #[test]
+    fn unreadable_path_checkpoint_remains_reconciliation_uncertain() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let record = durable_controller_record(&temporary, Some(b"artifact"));
+        let artifact_path = camino::Utf8PathBuf::from_path_buf(temporary.path().join("artifact"))
+            .expect("UTF-8 artifact path");
+        std::fs::write(&artifact_path, b"artifact").expect("artifact bytes");
+        let validated = ValidatedLocalArtifact {
+            path: artifact_path.to_string(),
+            file_identity: rustferry_core::RegularFileFilesystemIdentity::capture(
+                artifact_path.as_std_path(),
+            )
+            .expect("artifact identity"),
+        };
+
+        assert_eq!(
+            reconcile_artifact_path_publication(record.revision, None, "artifact-1", &validated,),
+            ArtifactPathReconciliation::Uncertain
+        );
+    }
+
+    #[test]
+    fn exact_downloads_are_rehashed_before_paths_and_validation_are_persisted() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let store = JobStore::open_at(temporary.path().join("job-store")).expect("job store");
+        let bytes = b"verified artifact bytes";
+        let evidence = durable_controller_record(&temporary, Some(bytes));
+        let record = create_provider_artifact_ready_job(&store, &evidence);
+        let artifact_parent = temporary.path().join("target").join("ferry");
+        std::fs::create_dir_all(&artifact_parent).expect("artifact parent");
+        let artifact_path = canonical_utf8(&artifact_parent).join("App-unsigned.xcarchive.zip");
+        let destinations = BTreeMap::from([(
+            "artifact-1".to_owned(),
+            test_download_destination(&artifact_path),
+        )]);
+        persist_downloading(&store, &record.local_job_id, &destinations)
+            .expect("downloading revision");
+        std::fs::write(&artifact_path, bytes).expect("artifact bytes");
+        let validated = independently_validate_download(
+            &store,
+            &record.local_job_id,
+            "artifact-1",
+            &artifact_path,
+        )
+        .expect("independent local validation");
+        persist_downloaded_artifact(&store, &record.local_job_id, "artifact-1", &validated)
+            .expect("path checkpoint");
+        persist_downloads_complete(&store, &record.local_job_id).expect("download completion");
+        persist_validating(&store, &record.local_job_id).expect("validating revision");
+        persist_validation_ready_for_cleanup(&store, &record.local_job_id)
+            .expect("validated cleanup intent");
+
+        let latest = store.latest(&record.local_job_id).expect("latest revision");
+        assert_eq!(latest.state, StoredJobState::CleanupPending);
+        assert_eq!(latest.cleanup_status, StoredCleanupStatus::Pending);
+        assert_eq!(
+            latest.artifacts[0].local_path.as_deref(),
+            Some(artifact_path.as_str())
+        );
+        assert!(latest.artifacts[0].download_parent_identity.is_some());
+        assert!(latest.artifacts[0].local_file_identity.is_some());
+        assert!(!latest.artifacts[0].locally_validated);
+        assert_eq!(std::fs::read(&artifact_path).expect("artifact"), bytes);
+    }
+
+    #[test]
+    fn cleanup_checkpoint_cadence_preserves_validation_and_promotes_exact_success() {
+        let direct_temporary = tempfile::tempdir().expect("direct cleanup directory");
+        let direct = complete_cleanup_with_cadence(&direct_temporary, false);
+        let cleaning_temporary = tempfile::tempdir().expect("cleaning checkpoint directory");
+        let with_cleaning = complete_cleanup_with_cadence(&cleaning_temporary, true);
+
+        for completed in [&direct, &with_cleaning] {
+            assert_eq!(completed.state, StoredJobState::Succeeded);
+            assert_eq!(
+                completed.last_confirmed_state,
+                Some(StoredJobState::Succeeded)
+            );
+            assert_eq!(
+                completed.terminal_outcome,
+                Some(StoredBuildOutcome::Succeeded)
+            );
+            assert_eq!(completed.cleanup_status, StoredCleanupStatus::Confirmed);
+            assert!(
+                completed
+                    .artifacts
+                    .iter()
+                    .all(|artifact| artifact.locally_validated)
+            );
+        }
+    }
+
+    #[test]
+    fn final_promotion_rejects_or_blocks_replacing_an_earlier_validated_artifact() {
+        let temporary = tempfile::tempdir().expect("promotion guard directory");
+        let store = JobStore::open_at(temporary.path().join("job-store")).expect("job store");
+        let first_bytes = b"first verified artifact";
+        let second_bytes = b"second verified artifact";
+        let mut evidence = durable_controller_record(&temporary, Some(first_bytes));
+        evidence.artifacts.push(StoredArtifactV1 {
+            record: ArtifactRecord {
+                artifact_id: "artifact-2".to_owned(),
+                kind: ArtifactKind::SanitizedLog,
+                file_name: "sanitized-build-log.txt".to_owned(),
+                size: u64::try_from(second_bytes.len()).expect("artifact size"),
+                sha256: super::sha256_bytes(second_bytes),
+                media_type: Some("text/plain".to_owned()),
+            },
+            download_destination: None,
+            download_parent_identity: None,
+            local_path: None,
+            local_file_identity: None,
+            locally_validated: false,
+        });
+        evidence.validate().expect("two-artifact durable record");
+        let record = create_provider_artifact_ready_job(&store, &evidence);
+        let parent = temporary.path().join("target").join("ferry");
+        std::fs::create_dir_all(&parent).expect("artifact parent");
+        let canonical_parent = canonical_utf8(&parent);
+        let first = canonical_parent.join("first.zip");
+        let second = canonical_parent.join("second.txt");
+        let destinations = BTreeMap::from([
+            ("artifact-1".to_owned(), test_download_destination(&first)),
+            ("artifact-2".to_owned(), test_download_destination(&second)),
+        ]);
+        persist_downloading(&store, &record.local_job_id, &destinations).expect("download intents");
+        for (artifact_id, path, bytes) in [
+            ("artifact-1", first.as_path(), first_bytes.as_slice()),
+            ("artifact-2", second.as_path(), second_bytes.as_slice()),
+        ] {
+            std::fs::write(path, bytes).expect("artifact bytes");
+            let validated =
+                independently_validate_download(&store, &record.local_job_id, artifact_id, path)
+                    .expect("validated artifact");
+            persist_downloaded_artifact(&store, &record.local_job_id, artifact_id, &validated)
+                .expect("artifact checkpoint");
+        }
+        persist_downloads_complete(&store, &record.local_job_id).expect("download completion");
+        persist_validating(&store, &record.local_job_id).expect("validating revision");
+        persist_validation_ready_for_cleanup(&store, &record.local_job_id)
+            .expect("cleanup overlay");
+        checkpoint_cleaned_job(&store, &record, false);
+        let root = canonical_utf8(temporary.path());
+        let project_binding = ProjectFilesystemBinding::capture(&root).expect("project binding");
+        let displaced = first.with_file_name("displaced-first.zip");
+        let mutation_succeeded = Cell::new(false);
+
+        let promotion = validate_and_promote_durable_success_with_hook(
+            &store,
+            &record.local_job_id,
+            &project_binding,
+            &destinations,
+            |index| {
+                if index == 0 {
+                    let renamed = std::fs::rename(&first, &displaced).is_ok();
+                    let overwritten = !renamed && std::fs::write(&first, b"replacement").is_ok();
+                    mutation_succeeded.set(renamed || overwritten);
+                    if renamed {
+                        std::fs::write(&first, b"replacement").expect("replacement artifact");
+                    }
+                }
+            },
+        );
+        let latest = store.latest(&record.local_job_id).expect("latest job");
+        if mutation_succeeded.get() {
+            assert!(promotion.is_err());
+            assert_eq!(latest.state, StoredJobState::CleanupPending);
+            assert!(
+                latest
+                    .artifacts
+                    .iter()
+                    .all(|artifact| !artifact.locally_validated)
+            );
+        } else {
+            promotion.expect("replacement was blocked by retained artifact guard");
+            assert_eq!(latest.state, StoredJobState::Succeeded);
+        }
+    }
+
+    #[test]
+    fn confirmed_cleanup_reentry_skips_provider_mutation_and_revision() {
+        let temporary = tempfile::tempdir().expect("cleanup reentry directory");
+        let completed = complete_cleanup_with_cadence(&temporary, false);
+        let store = JobStore::open_at(temporary.path().join("job-store")).expect("job store");
+        let root = canonical_utf8(temporary.path());
+        let project_binding = ProjectFilesystemBinding::capture(&root).expect("project binding");
+        let provider_job_id = completed
+            .provider_job_id
+            .as_deref()
+            .expect("provider job ID");
+
+        cleanup_job_durably_with(
+            &store,
+            &completed.local_job_id,
+            provider_job_id,
+            &project_binding,
+            || panic!("provider cleanup must not run after exact durable confirmation"),
+        )
+        .expect("idempotent cleanup reentry");
+
+        let unchanged = store
+            .latest(&completed.local_job_id)
+            .expect("unchanged latest job");
+        assert_eq!(unchanged.revision, completed.revision);
+        assert_eq!(unchanged, completed);
+    }
+
+    #[test]
+    fn confirmed_cleanup_reentry_keeps_confirmation_when_project_binding_changed() {
+        let temporary = tempfile::tempdir().expect("cleanup reentry directory");
+        let completed = complete_cleanup_with_cadence(&temporary, false);
+        let store = JobStore::open_at(temporary.path().join("job-store")).expect("job store");
+        let original = temporary.path().join("bound-project");
+        let replacement = temporary.path().join("replacement-project");
+        std::fs::create_dir(&original).expect("bound project");
+        std::fs::create_dir(&replacement).expect("replacement project");
+        let retained = rustferry_core::RetainedDirectoryIdentity::open(&original)
+            .expect("retained original project");
+        let project_binding = ProjectFilesystemBinding {
+            root: camino::Utf8PathBuf::from_path_buf(
+                replacement.canonicalize().expect("canonical replacement"),
+            )
+            .expect("UTF-8 replacement"),
+            identity: retained.identity().clone(),
+            retained,
+        };
+        let provider_job_id = completed
+            .provider_job_id
+            .as_deref()
+            .expect("provider job ID");
+
+        assert!(
+            cleanup_job_durably_with(
+                &store,
+                &completed.local_job_id,
+                provider_job_id,
+                &project_binding,
+                || panic!("provider cleanup must not run after exact durable confirmation"),
+            )
+            .is_err()
+        );
+
+        let latest = store.latest(&completed.local_job_id).expect("latest job");
+        assert_eq!(latest, completed);
+        assert_eq!(
+            interrupted_cleanup_progress_for_job(Some(&latest), provider_job_id),
+            "Remote build succeeded before cancellation; cleanup confirmed"
+        );
     }
 
     #[derive(Debug, Eq, PartialEq)]
@@ -7433,8 +15155,35 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
-    fn stored_target_map_renders_static_secrets_and_schema_two_remains_legacy_readable() {
+    fn unix_stored_config_rejects_any_https_execution_endpoint_before_use() {
+        let temporary = tempfile::tempdir().expect("fixture");
+        let root =
+            camino::Utf8PathBuf::from_path_buf(temporary.path().to_owned()).expect("UTF-8 root");
+        let paths = GithubPaths::new(&root, &root);
+        for endpoint in ["fetch", "push"] {
+            let mut config = unsigned_stored_config();
+            let https = GithubGitEndpoint::parse("https://github.com/example/private-builds")
+                .expect("HTTPS execution endpoint fixture");
+            match endpoint {
+                "fetch" => config.execution_fetch_endpoint = https,
+                "push" => config.execution_push_endpoint = https,
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                validate_stored_config(&config)
+                    .expect_err("Unix HTTPS execution endpoint must fail closed")
+                    .code(),
+                "secure_git_execution_transport_unsupported"
+            );
+            assert!(!paths.workflow.exists());
+            assert!(!paths.config.exists());
+        }
+    }
+
+    #[test]
+    fn stored_target_map_renders_static_secrets_and_legacy_schema_fails_closed() {
         let mut stored = unsigned_stored_config();
         stored.signing_targets.push(SigningTarget {
             name: "Widget".to_owned(),
@@ -7442,7 +15191,7 @@ mod tests {
                 .expect("widget bundle ID"),
             kind: SigningTargetKind::Extension,
         });
-        validate_stored_config(&stored).expect("schema three target map");
+        validate_stored_config(&stored).expect("current target map");
         let names = SigningSecretNames::for_targets(&stored.signing_targets).expect("secret map");
         let generated = generate_workflow(&workflow_from_stored(&stored).expect("workflow"));
         for name in names.all_names() {
@@ -7455,28 +15204,91 @@ mod tests {
             );
         }
 
-        let mut legacy = unsigned_stored_config();
-        legacy.schema_version = super::LEGACY_CONFIG_SCHEMA_VERSION;
-        legacy.signing_targets.clear();
-        let encoded = serde_json::to_vec(&legacy).expect("legacy config JSON");
-        let decoded = serde_json::from_slice::<StoredGithubConfig>(&encoded)
-            .expect("new client reads schema two config");
-        validate_stored_config(&decoded).expect("legacy single-profile config remains valid");
-        let legacy_workflow = generate_workflow(&workflow_from_stored(&decoded).expect("legacy"));
-        assert!(
-            legacy_workflow
-                .yaml()
-                .contains("secrets.RUSTFERRY_GOAL3_IOS_PROVISIONING_PROFILE")
+        for schema_version in 1..CONFIG_SCHEMA_VERSION {
+            let mut legacy = unsigned_stored_config();
+            legacy.schema_version = schema_version;
+            legacy.signing_targets.clear();
+            let encoded = serde_json::to_vec(&legacy).expect("legacy config JSON");
+            let decoded = serde_json::from_slice::<StoredGithubConfig>(&encoded)
+                .expect("bounded legacy fixture");
+            assert_eq!(
+                validate_stored_config(&decoded)
+                    .expect_err("legacy schema must require setup")
+                    .code(),
+                "configuration_upgrade_required"
+            );
+        }
+
+        let mut name_only = serde_json::to_value(unsigned_stored_config()).expect("config value");
+        let object = name_only.as_object_mut().expect("config object");
+        for field in [
+            "source_fetch_endpoint",
+            "source_push_endpoint",
+            "execution_fetch_endpoint",
+            "execution_push_endpoint",
+        ] {
+            object.remove(field);
+        }
+        object.insert(
+            "source_remote_name".to_owned(),
+            serde_json::Value::String("public".to_owned()),
         );
-        assert!(!legacy_workflow.yaml().contains("RFSIGNV2"));
+        object.insert(
+            "execution_remote_name".to_owned(),
+            serde_json::Value::String("signing".to_owned()),
+        );
+        object.insert(
+            "schema_version".to_owned(),
+            serde_json::Value::from(CONFIG_SCHEMA_VERSION - 1),
+        );
+        let name_only = serde_json::to_vec(&name_only).expect("legacy name-only JSON");
+        assert_eq!(
+            decode_stored_config(&name_only)
+                .expect_err("legacy name-only config must require setup")
+                .code(),
+            "configuration_upgrade_required"
+        );
 
         let mut malformed = unsigned_stored_config();
         malformed.signing_targets.clear();
         assert_eq!(
             validate_stored_config(&malformed)
-                .expect_err("schema three requires exact targets")
+                .expect_err("current schema requires exact targets")
                 .code(),
             "invalid_provider_config"
+        );
+    }
+
+    #[test]
+    fn stored_config_round_trip_preserves_distinct_canonical_fetch_and_push_endpoints() {
+        let mut stored = unsigned_stored_config();
+        stored.source_push_endpoint = GithubGitEndpoint::parse("git@github.com:example/public-app")
+            .expect("source SSH endpoint");
+        stored.execution_push_endpoint =
+            GithubGitEndpoint::parse("git@github.com:example/private-builds")
+                .expect("execution SSH endpoint");
+        stored.execution_fetch_endpoint =
+            GithubGitEndpoint::parse("git@github.com:example/private-builds")
+                .expect("execution SSH fetch endpoint");
+        let encoded = encode_stored_config(&stored).expect("stored config JSON");
+        let decoded = decode_stored_config(&encoded).expect("typed stored config");
+        validate_stored_config(&decoded).expect("mixed transport config");
+        assert_eq!(decoded, stored);
+        assert_eq!(
+            decoded.source_fetch_endpoint.canonical_url(),
+            "https://github.com/example/public-app"
+        );
+        assert_eq!(
+            decoded.source_push_endpoint.canonical_url(),
+            "git@github.com:example/public-app"
+        );
+        assert_eq!(
+            decoded.execution_fetch_endpoint.canonical_url(),
+            "git@github.com:example/private-builds"
+        );
+        assert_eq!(
+            decoded.execution_push_endpoint.canonical_url(),
+            "git@github.com:example/private-builds"
         );
     }
 
@@ -7643,7 +15455,10 @@ mod tests {
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .filter(|name| {
                 name.starts_with(CONFIG_BACKUP_PREFIX)
-                    || (name.starts_with(".provider.json.") && name.ends_with(".tmp"))
+                    || (name.starts_with(".provider.json.")
+                        && std::path::Path::new(name)
+                            .extension()
+                            .is_some_and(|extension| extension.eq_ignore_ascii_case("tmp")))
             })
             .collect::<Vec<_>>();
         assert!(
@@ -7851,7 +15666,6 @@ mod tests {
                 "provider_config_changed"
             );
             drop(identity);
-            return;
         }
         #[cfg(not(windows))]
         {
@@ -8598,6 +16412,201 @@ mod tests {
     }
 
     #[test]
+    fn ide_signing_readiness_retains_provider_evidence_when_assets_are_missing() {
+        let readiness = map_ide_signing_readiness(Ok(signing_readiness_from_report(
+            missing_asset_local_checks(),
+            signing_readiness_report(),
+        )))
+        .expect("sanitized IDE readiness result");
+        assert!(!readiness.ready);
+        assert!(readiness.checks.iter().any(|check| {
+            check.code == "github_actions_ios_signing.configured"
+                && check.required
+                && !check.ready
+                && check.reason_code == Some("signing_not_configured")
+        }));
+        assert!(readiness.checks.iter().any(|check| {
+            check.code == "github.authentication" && check.ready && check.reason_code.is_none()
+        }));
+    }
+
+    #[test]
+    fn signing_doctor_keeps_provider_evidence_when_assets_are_unconfigured() {
+        let readiness =
+            signing_readiness_from_report(missing_asset_local_checks(), signing_readiness_report());
+
+        assert!(!readiness.ready);
+        assert!(readiness.checks.iter().any(|check| {
+            check.code == "github_actions_ios_signing.configured"
+                && !check.ready
+                && check.reason_code == Some("signing_not_configured")
+        }));
+        assert!(readiness.checks.iter().any(|check| {
+            check.code == "github.authentication" && check.ready && check.reason_code.is_none()
+        }));
+        assert!(
+            readiness
+                .checks
+                .iter()
+                .any(|check| { check.code == "github.signing_repository_distinct" && check.ready })
+        );
+    }
+
+    #[test]
+    fn missing_asset_readiness_derives_static_target_namespace_and_phase_checks() {
+        let checks = missing_asset_local_checks();
+        for code in [
+            "github.signing_config.public_metadata_only",
+            "github.signing_target_graph",
+            "github.temporary_ref_namespace",
+            "github.workflow.phase_a_secret_isolation",
+            "github.workflow.phase_b_no_source_execution",
+        ] {
+            assert!(
+                checks
+                    .iter()
+                    .any(|check| check.code == code && check.required && check.ready),
+                "missing derived ready check {code}"
+            );
+        }
+        for code in [
+            "github_actions_ios_signing.configured",
+            "github.signing_team",
+            "github.signing_profile_map",
+        ] {
+            assert!(
+                checks
+                    .iter()
+                    .any(|check| check.code == code && check.required && !check.ready),
+                "missing derived absent-assets check {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn signing_readiness_requires_every_required_local_or_provider_check() {
+        let mut local_checks = missing_asset_local_checks();
+        for check in &mut local_checks {
+            check.ready = true;
+            check.reason_code = None;
+        }
+        let ready = signing_readiness_from_report(local_checks.clone(), signing_readiness_report());
+        assert!(ready.ready);
+
+        local_checks
+            .iter_mut()
+            .find(|check| check.code == "github.signing_team")
+            .expect("required Team check")
+            .ready = false;
+        let not_ready = signing_readiness_from_report(local_checks, signing_readiness_report());
+        assert!(!not_ready.ready);
+    }
+
+    #[test]
+    fn workflow_phase_checks_reject_compile_secrets_and_signing_source_execution() {
+        let config = unsigned_stored_config();
+        let workflow = generate_workflow(&workflow_from_stored(&config).expect("workflow config"));
+        assert_eq!(signing_workflow_phase_policy(workflow.yaml()), (true, true));
+
+        let compile_secret = workflow.yaml().replacen(
+            "  compile:\n",
+            "  compile:\n    env:\n      LEAK: '${{ secrets.BAD }}'\n",
+            1,
+        );
+        assert_eq!(
+            signing_workflow_phase_policy(&compile_secret),
+            (false, true)
+        );
+        let compile_bracket_secret = workflow.yaml().replacen(
+            "  compile:\n",
+            "  compile:\n    env:\n      LEAK: '${{ secrets[\"BAD\"] }}'\n",
+            1,
+        );
+        assert_eq!(
+            signing_workflow_phase_policy(&compile_bracket_secret),
+            (false, true)
+        );
+        let compile_signing_name = workflow.yaml().replacen(
+            "  compile:\n",
+            "  compile:\n    env:\n      RUSTFERRY_GOAL3_IOS_CERTIFICATE_P12: forbidden\n",
+            1,
+        );
+        assert_eq!(
+            signing_workflow_phase_policy(&compile_signing_name),
+            (false, true)
+        );
+        let signing_checkout = workflow.yaml().replacen(
+            "\n  sign:\n",
+            "\n  sign:\n    steps:\n      - uses: actions/checkout@forbidden\n",
+            1,
+        );
+        assert_eq!(
+            signing_workflow_phase_policy(&signing_checkout),
+            (true, false)
+        );
+    }
+
+    fn missing_asset_local_checks() -> Vec<super::IdeSigningReadinessCheck> {
+        let (_temporary, root, _paths, mut config) = provider_config_fixture();
+        let ferry_config = rustferry_core::FerryConfig::load(&root.join("ferry.toml"))
+            .expect("fixture Ferry config");
+        let cargo_targets =
+            super::super::platform_build::read_cargo_targets(&root).expect("fixture Cargo target");
+        config.signing_targets = unsigned_signing_plan(&ferry_config, cargo_targets.binary())
+            .expect("fixture target graph")
+            .targets;
+        local_signing_readiness_checks(&root, &config).expect("local readiness checks")
+    }
+
+    fn signing_readiness_report() -> ProviderDoctorReport {
+        ProviderDoctorReport {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            provider: "github".to_owned(),
+            ready: true,
+            checks: vec![
+                ProviderCheck {
+                    code: "github.authentication".to_owned(),
+                    status: ProviderCheckStatus::Ready,
+                    message: "safe".to_owned(),
+                    help: None,
+                },
+                ProviderCheck {
+                    code: "github.signing_repository_distinct".to_owned(),
+                    status: ProviderCheckStatus::Ready,
+                    message: "safe".to_owned(),
+                    help: None,
+                },
+                ProviderCheck {
+                    code: "github.signing_environment.reviewers".to_owned(),
+                    status: ProviderCheckStatus::Ready,
+                    message: "safe".to_owned(),
+                    help: None,
+                },
+            ],
+            capabilities: ProviderCapabilities::default(),
+        }
+    }
+
+    #[test]
+    fn ide_readiness_check_code_rejects_endpoint_or_freeform_text() {
+        assert_eq!(
+            safe_ide_readiness_code("github.signing_environment.reviewers"),
+            "github.signing_environment.reviewers"
+        );
+        for unsafe_code in [
+            "https://github.com/example/private",
+            "github check with spaces",
+            "GITHUB.SECRET",
+            "",
+        ] {
+            assert_eq!(
+                safe_ide_readiness_code(unsafe_code),
+                "github.readiness.unknown"
+            );
+        }
+    }
+
+    #[test]
     fn signed_default_downloads_are_exact_and_product_named() {
         let root = camino::Utf8Path::new("/project");
         let requested = select_requested_artifacts(SigningMode::ManualDevelopment, None, false)
@@ -8618,6 +16627,7 @@ mod tests {
             [
                 ArtifactKind::Ipa,
                 ArtifactKind::Manifest,
+                ArtifactKind::SigningReport,
                 ArtifactKind::ValidationReport,
                 ArtifactKind::SanitizedLog,
             ]
@@ -8730,6 +16740,22 @@ mod tests {
                 (ArtifactKind::Dsym, "Weather.dSYM.zip"),
             ]
         );
+        assert_eq!(
+            downloads
+                .iter()
+                .map(|download| download.kind)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                ArtifactKind::Ipa,
+                ArtifactKind::App,
+                ArtifactKind::Xcarchive,
+                ArtifactKind::Dsym,
+                ArtifactKind::Manifest,
+                ArtifactKind::SigningReport,
+                ArtifactKind::ValidationReport,
+                ArtifactKind::SanitizedLog,
+            ])
+        );
     }
 
     #[test]
@@ -8740,7 +16766,11 @@ mod tests {
             true,
         )
         .expect("all signed artifacts");
-        let features = required_build_features(SigningMode::ManualDevelopment, &requested);
+        let features = required_build_features_for_source(
+            SourceMode::Git,
+            SigningMode::ManualDevelopment,
+            &requested,
+        );
         let manifest_kinds = requested
             .iter()
             .copied()
@@ -8792,6 +16822,7 @@ mod tests {
         let expected = ArtifactManifest::new("operation", "job");
         let mut calls = 0;
         let listed = retry_artifact_listing(
+            || Ok(()),
             || {
                 calls += 1;
                 ImmediateProviderResult::Ready(match calls {
@@ -8870,6 +16901,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn hard_link_rollback_binds_the_open_source_file_before_publication_cleanup() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let root = camino::Utf8Path::from_path(temporary.path()).expect("UTF-8 temp path");
@@ -8892,6 +16924,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn partial_download_rollback_preserves_a_replaced_file() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let root = camino::Utf8Path::from_path(temporary.path()).expect("UTF-8 temp path");
@@ -8920,6 +16953,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn partial_download_rollback_never_unlinks_a_new_path_occupant() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let root = camino::Utf8Path::from_path(temporary.path()).expect("UTF-8 temp path");
@@ -8941,6 +16975,22 @@ mod tests {
             std::fs::read(&primary).expect("preserved concurrent replacement"),
             b"concurrent replacement"
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn partial_download_rollback_removes_only_the_retained_windows_file() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let root = camino::Utf8Path::from_path(temporary.path()).expect("UTF-8 temp path");
+        let primary = root.join("new.ipa");
+        std::fs::write(&primary, b"downloaded primary").expect("primary download");
+        let mut rollback = ArtifactDownloadRollback::default();
+        rollback.record(&primary).expect("retained removal handle");
+
+        assert!(std::fs::write(&primary, b"replacement").is_err());
+        assert!(std::fs::remove_file(&primary).is_err());
+        rollback.abort().expect("exact retained-handle rollback");
+        assert!(!primary.exists());
     }
 
     #[test]

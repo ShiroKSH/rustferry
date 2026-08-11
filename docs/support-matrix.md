@@ -1,16 +1,19 @@
 # Support matrix
 
-This matrix deliberately separates validation levels. “Model tested” means host-side API/model behavior passed deterministic tests; it is not mobile runtime evidence. [STATUS](STATUS.md) is the dated evidence log and overrides stale prose.
+This matrix deliberately separates validation levels. “Model tested” means host-side API/model behavior passed deterministic tests; it is not mobile runtime evidence. [STATUS](STATUS.md) records general platform evidence; [Goal 3 status](GOAL3_STATUS.md) is the dated authority for the remote-iPhone continuation and overrides stale Goal 3 prose.
 
 ## Validation vocabulary
 
 | Level | Required evidence |
 | --- | --- |
 | Implemented | Concrete code path exists; unsupported defaults do not count |
-| Compile validated | Relevant Rust/generated host compiled for that target |
-| Artifact validated | Final APK, `.app`, `.appex`, `.xcarchive`, or IPA passed independent structural/tool inspection |
-| Simulator/emulator validated | Behavior was observed in a simulator/emulator |
-| Device validated | Behavior was observed on physical hardware |
+| Locally tested | Focused deterministic tests passed on a development host |
+| Windows-native tested | Exact behavior passed on a real Windows host |
+| GitHub live validated | Real GitHub mutation/run completed with retained exact identifiers |
+| Apple signed validated | Real Apple credentials produced independently verified signed output |
+| Physical-device validated | The exact signed artifact was installed, launched, and observed on registered hardware |
+
+Build-path tables additionally use compile, artifact, and simulator/emulator evidence. Those narrower results never imply a higher Goal 3 level.
 
 ## Goal 3 physical-iPhone scenarios
 
@@ -26,7 +29,7 @@ physical-device validation.
 | --- | --- | --- |
 | iOS Simulator local macOS | ✅ artifact validated | arm64 `.app` and `.appex` bundles built and independently inspected; no Simulator runtime observation |
 | Physical iPhone local macOS | 🧪 implemented, hardware/signing validation pending | Official local Xcode development-signing/install/launch path exists; no real Team, profile, signed device artifact, or attached iPhone |
-| Physical iPhone from Windows via GitHub | 🟡 partial | Cross-platform client and Windows CI coverage exist; no live Windows-to-GitHub physical-iPhone build/download run |
+| Physical iPhone from Windows via GitHub | 🟡 partial | Durable control plane, GitSnapshot, artifacts, and native Windows suites pass; no live Windows-to-GitHub physical-iPhone build/download run |
 | Physical iPhone from Linux via GitHub | ✅ artifact validated | Linux acceptance `31261962599` triggered macOS worker `31262066567`, downloaded, hashed, and inspected an unsigned physical-device XCArchive |
 | Physical iPhone via SSH Mac | 🧪 implemented, hardware/signing validation pending | Named endpoint and unsigned snapshot session are locally tested; no live SSH Mac compile, SSH artifact, or signing support |
 | Unsigned device compile | ✅ artifact validated | Real `aarch64-apple-ios`/`iphoneos` XCArchive built by the GitHub macOS worker and independently revalidated on Linux |
@@ -35,9 +38,9 @@ physical-device validation.
 | Personal Team | 🚫 unsupported | GitHub, SSH, and worker capability reports disable Personal Team; no headless Personal Team flow exists |
 | Widget device signing | 🧪 implemented, hardware/signing validation pending | Remote manual setup accepts an exact Widget profile and static protected secret; no real development-signed Widget artifact or device run exists |
 | Live Activity device signing | 🧪 implemented, hardware/signing validation pending | Remote manual setup accepts an exact Live Activity profile and static protected secret; no real development-signed Activity artifact or device run exists |
-| GitHub Actions provider | ✅ artifact validated | Exact-revision unsigned build, download, digest check, archive inspection, and cleanup accepted; signed phase remains unvalidated |
+| GitHub Actions provider | ✅ artifact validated | Historical Linux Push exact-Git unsigned build/download accepted; GitSnapshot, Windows, cancellation/retry, and WorkflowDispatch paths have no live result |
 | SSH provider | 🧪 implemented, hardware/signing validation pending | Handshake, doctor, source upload, events, cancel, XCArchive receipt, and cleanup pass deterministic tests; v1 is unsigned-only |
-| Windows client artifact download | 🧪 implemented, hardware/signing validation pending | Download/verification/publication code is cross-platform; no live Windows client acceptance run |
+| Windows client artifact download | 🧪 implemented, live validation pending | Download/verification/publication and managed artifact commands pass native suites; no live Windows client acceptance run |
 | Linux client artifact download | ✅ artifact validated | Acceptance `31261962599` automatically downloaded and independently verified artifact `9023136948` |
 | Physical install | 🧪 implemented, hardware/signing validation pending | Typed devicectl install service exists; no signed downloaded IPA or attached-device install was exercised |
 | Physical launch | 🧪 implemented, hardware/signing validation pending | Typed devicectl launch service exists; no physical launch was exercised |
@@ -51,9 +54,20 @@ physical-device validation.
 | Android direct APK | Build plus typed devices/install/run/logs implemented | arm64 generated Rust app plus Java/DEX bridge | Public-CLI starter and Kitchen Sink APKs independently inspected | Deployment runtime not validated | Deployment runtime not validated |
 | iOS Simulator `.app` | Build plus typed devices/install/run/logs implemented | arm64 Slint executables | Public-CLI starter and Kitchen Sink `.app`/`.appex` bundles independently inspected | Deployment runtime not validated | N/A |
 | iOS physical-device app, local Mac | Official development-signing build/install/run implemented; explicit Team and provisioning controls | Deterministic arm64/Xcode plan tested; no local signing identity available | Signed app not validated | N/A | Not validated |
-| iOS physical-device archive, GitHub remote macOS | Exact-revision GitHub submission, trusted macOS compile, automatic download, and independent client validation implemented | Real `aarch64-apple-ios` archive compiled from a Linux client request | Unsigned `.xcarchive` validated; development-signed IPA pending real credentials/private execution setup | N/A | Not validated |
-| Deterministic snapshot transport | Inspect/create/verify CLI implemented with bounded source selection, no-clobber publication, and strict extraction | Host tests only | Source ZIP and descriptor round-trip validated in tests | N/A | N/A |
+| iOS physical-device archive, GitHub remote macOS | Exact-Git and explicit public GitSnapshot submission, trusted macOS compile, automatic download, independent client validation, and durable jobs implemented | Real `aarch64-apple-ios` archive compiled only from a historical Linux exact-Git request | Unsigned `.xcarchive` validated for historical exact-Git; GitSnapshot and development signing not live-validated | N/A | Not validated |
+| Deterministic snapshot transport | Inspect/create/verify plus explicit GitHub GitSnapshot consent/staging/recovery implemented | Host and Windows-native tests only | Source ZIP/descriptor round-trip validated in tests; no GitSnapshot-built GitHub artifact | N/A | N/A |
 | SSH Mac provider | Pinned endpoint, handshake/doctor, snapshot-v1 unsigned build, and private Unix/Windows config/operation staging implemented; deterministic local tests only | No live SSH Mac compile | No SSH-produced artifact; protocol returns unsigned XCArchive only | N/A | Not validated |
+
+## Goal 3 Windows control plane
+
+| Area | Implemented | Locally tested | Windows-native tested | GitHub live validated | Apple signed validated | Physical-device validated |
+| --- | --- | --- | --- | --- | --- | --- |
+| Durable jobs and sanitized logs | Yes | Yes | Yes | No Windows result | N/A | N/A |
+| Fresh-process cancel/retry/prune | Yes | Yes | Yes | No | No | No |
+| Managed local artifacts | Yes | Yes | Yes | No Windows management result; historical Linux download only | No | No |
+| Explicit GitHub GitSnapshot | Yes | Yes | Yes | No | No | No |
+| VS Code Remote Jobs | Yes | Yes | Yes | No | No | No |
+| Signing readiness | Yes | Yes | CLI path tested; no configured ready result | No signed run | No | No |
 
 ## Capability evidence
 
@@ -70,7 +84,7 @@ physical-device validation.
 | Widget | Snapshot model/tests + standalone example | Provider/backend enabled and artifact-inspected | Publisher, timeline renderer, and WidgetKit `.appex` artifact-inspected | None |
 | Live Activity | State model/tests + standalone example | Ongoing-notification fallback enabled in an inspected Kitchen Sink APK | ActivityKit lifecycle bridge and `.appex` artifact-inspected | None |
 
-Remote push is unavailable; schema version 1 rejects `push = true`. Device discovery and deployment use exact stable IDs, validated artifacts, bounded application-filtered logs, and official ADB/simctl/devicectl commands. No device behavior is inferred from those implemented paths.
+Application notification remote push is unavailable; schema version 1 rejects `push = true`. This is unrelated to the GitHub provider's Push workflow trigger. Device discovery and deployment use exact stable IDs, validated artifacts, bounded application-filtered logs, and official ADB/simctl/devicectl commands. No device behavior is inferred from those implemented paths.
 
 ## CI interpretation
 

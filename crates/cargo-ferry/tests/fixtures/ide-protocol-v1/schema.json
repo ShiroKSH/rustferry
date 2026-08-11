@@ -49,6 +49,838 @@
       ],
       "type": "object"
     },
+    "ArtifactActionEligibility": {
+      "allOf": [
+        {
+          "else": {
+            "required": [
+              "verify_reason_code"
+            ]
+          },
+          "if": {
+            "properties": {
+              "can_verify": {
+                "const": true
+              }
+            },
+            "required": [
+              "can_verify"
+            ]
+          },
+          "then": {
+            "not": {
+              "required": [
+                "verify_reason_code"
+              ]
+            }
+          }
+        },
+        {
+          "else": {
+            "required": [
+              "reveal_reason_code"
+            ]
+          },
+          "if": {
+            "properties": {
+              "can_reveal": {
+                "const": true
+              }
+            },
+            "required": [
+              "can_reveal"
+            ]
+          },
+          "then": {
+            "not": {
+              "required": [
+                "reveal_reason_code"
+              ]
+            }
+          }
+        },
+        {
+          "else": {
+            "required": [
+              "remove_reason_code"
+            ]
+          },
+          "if": {
+            "properties": {
+              "can_remove": {
+                "const": true
+              }
+            },
+            "required": [
+              "can_remove"
+            ]
+          },
+          "then": {
+            "not": {
+              "required": [
+                "remove_reason_code"
+              ]
+            }
+          }
+        }
+      ],
+      "properties": {
+        "can_remove": {
+          "type": "boolean"
+        },
+        "can_reveal": {
+          "type": "boolean"
+        },
+        "can_verify": {
+          "type": "boolean"
+        },
+        "remove_reason_code": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "reveal_reason_code": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "verify_reason_code": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "can_verify",
+        "can_reveal",
+        "can_remove"
+      ],
+      "type": "object"
+    },
+    "ArtifactContainerEvidence": {
+      "description": "Container integrity evidence.",
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "const": "opaque",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "entry_count": {
+              "maxLength": 20,
+              "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]{1}|1844674407370955161[0-4]|18446744073709551615)$",
+              "type": "string"
+            },
+            "expanded_size": {
+              "maxLength": 20,
+              "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]{1}|1844674407370955161[0-4]|18446744073709551615)$",
+              "type": "string"
+            },
+            "kind": {
+              "const": "zip",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "entry_count",
+            "expanded_size"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ArtifactIntegrityEvidence": {
+      "description": "Exact local-byte integrity evidence.",
+      "properties": {
+        "container": {
+          "$ref": "#/$defs/ArtifactContainerEvidence"
+        },
+        "filesystem_identity": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "size": {
+          "maxLength": 20,
+          "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]{1}|1844674407370955161[0-4]|18446744073709551615)$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "size",
+        "sha256",
+        "filesystem_identity",
+        "container"
+      ],
+      "type": "object"
+    },
+    "ArtifactProductEvidence": {
+      "description": "Independent product-level evidence.",
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "unsigned_xcarchive",
+                "ipa",
+                "signed_artifact_set"
+              ],
+              "type": "string"
+            },
+            "status": {
+              "const": "verified",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "kind"
+                ]
+              },
+              {
+                "required": [
+                  "reason_code"
+                ]
+              }
+            ]
+          },
+          "properties": {
+            "status": {
+              "const": "not_applicable",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "reason_code": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
+              "type": "string"
+            },
+            "status": {
+              "const": "evidence_unavailable",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason_code"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ArtifactRemoveReceipt": {
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "properties": {
+                "already_complete": {
+                  "const": false
+                },
+                "executed": {
+                  "const": true
+                },
+                "replacement_preserved": {
+                  "const": false
+                },
+                "result_state": {
+                  "const": "removed"
+                }
+              },
+              "required": [
+                "result_state",
+                "executed",
+                "already_complete",
+                "replacement_preserved"
+              ]
+            },
+            {
+              "properties": {
+                "already_complete": {
+                  "const": true
+                },
+                "executed": {
+                  "const": false
+                },
+                "replacement_preserved": {
+                  "const": false
+                },
+                "result_state": {
+                  "const": "already_removed"
+                }
+              },
+              "required": [
+                "result_state",
+                "executed",
+                "already_complete",
+                "replacement_preserved"
+              ]
+            },
+            {
+              "properties": {
+                "already_complete": {
+                  "const": false
+                },
+                "executed": {
+                  "const": false
+                },
+                "replacement_preserved": {
+                  "const": true
+                },
+                "result_state": {
+                  "const": "replacement_preserved"
+                }
+              },
+              "required": [
+                "result_state",
+                "executed",
+                "already_complete",
+                "replacement_preserved"
+              ]
+            }
+          ]
+        }
+      ],
+      "description": "Exact retained-artifact removal receipt.",
+      "properties": {
+        "already_complete": {
+          "type": "boolean"
+        },
+        "confirmation_provided": {
+          "const": true,
+          "type": "boolean"
+        },
+        "executed": {
+          "type": "boolean"
+        },
+        "replacement_preserved": {
+          "type": "boolean"
+        },
+        "result_state": {
+          "enum": [
+            "removed",
+            "already_removed",
+            "replacement_preserved"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "confirmation_provided",
+        "executed",
+        "result_state",
+        "already_complete",
+        "replacement_preserved"
+      ],
+      "type": "object"
+    },
+    "ArtifactRemoveResponse": {
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "properties": {
+                "receipt": {
+                  "properties": {
+                    "result_state": {
+                      "const": "removed"
+                    }
+                  },
+                  "required": [
+                    "result_state"
+                  ]
+                },
+                "replacement_preserved": {
+                  "const": false
+                },
+                "status": {
+                  "const": "removed"
+                }
+              },
+              "required": [
+                "status",
+                "replacement_preserved",
+                "receipt"
+              ]
+            },
+            {
+              "properties": {
+                "receipt": {
+                  "properties": {
+                    "result_state": {
+                      "const": "already_removed"
+                    }
+                  },
+                  "required": [
+                    "result_state"
+                  ]
+                },
+                "replacement_preserved": {
+                  "const": false
+                },
+                "status": {
+                  "const": "already_removed"
+                }
+              },
+              "required": [
+                "status",
+                "replacement_preserved",
+                "receipt"
+              ]
+            },
+            {
+              "properties": {
+                "receipt": {
+                  "properties": {
+                    "result_state": {
+                      "const": "replacement_preserved"
+                    }
+                  },
+                  "required": [
+                    "result_state"
+                  ]
+                },
+                "replacement_preserved": {
+                  "const": true
+                },
+                "status": {
+                  "const": "replacement_preserved"
+                }
+              },
+              "required": [
+                "status",
+                "replacement_preserved",
+                "receipt"
+              ]
+            }
+          ]
+        }
+      ],
+      "description": "Exact retained-artifact removal response.",
+      "properties": {
+        "artifact_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:-]+$",
+          "type": "string"
+        },
+        "local_job_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              "con",
+              "prn",
+              "aux",
+              "nul",
+              "com1",
+              "com2",
+              "com3",
+              "com4",
+              "com5",
+              "com6",
+              "com7",
+              "com8",
+              "com9",
+              "lpt1",
+              "lpt2",
+              "lpt3",
+              "lpt4",
+              "lpt5",
+              "lpt6",
+              "lpt7",
+              "lpt8",
+              "lpt9"
+            ]
+          },
+          "pattern": "^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$",
+          "type": "string"
+        },
+        "protocol_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "receipt": {
+          "$ref": "#/$defs/ArtifactRemoveReceipt"
+        },
+        "replacement_preserved": {
+          "type": "boolean"
+        },
+        "revision": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "status": {
+          "enum": [
+            "removed",
+            "already_removed",
+            "replacement_preserved"
+          ],
+          "type": "string"
+        },
+        "workspace": {
+          "maxLength": 32768,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "workspace",
+        "local_job_id",
+        "artifact_id",
+        "revision",
+        "receipt",
+        "status",
+        "replacement_preserved"
+      ],
+      "type": "object"
+    },
+    "ArtifactRevealReceipt": {
+      "description": "Path-free platform reveal receipt.",
+      "not": {
+        "anyOf": [
+          {
+            "required": [
+              "path"
+            ]
+          },
+          {
+            "required": [
+              "local_path"
+            ]
+          }
+        ]
+      },
+      "properties": {
+        "environment_policy": {
+          "const": "fixed_no_inheritance",
+          "type": "string"
+        },
+        "exact_path_bound_during_launch": {
+          "type": "boolean"
+        },
+        "launch_requested": {
+          "const": true,
+          "type": "boolean"
+        },
+        "launcher": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "post_launch_revalidation": {
+          "const": "passed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "launcher",
+        "environment_policy",
+        "launch_requested",
+        "exact_path_bound_during_launch",
+        "post_launch_revalidation"
+      ],
+      "type": "object"
+    },
+    "ArtifactRevealResponse": {
+      "description": "Exact retained-artifact reveal response.",
+      "not": {
+        "anyOf": [
+          {
+            "required": [
+              "path"
+            ]
+          },
+          {
+            "required": [
+              "local_path"
+            ]
+          }
+        ]
+      },
+      "properties": {
+        "artifact_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:-]+$",
+          "type": "string"
+        },
+        "local_job_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              "con",
+              "prn",
+              "aux",
+              "nul",
+              "com1",
+              "com2",
+              "com3",
+              "com4",
+              "com5",
+              "com6",
+              "com7",
+              "com8",
+              "com9",
+              "lpt1",
+              "lpt2",
+              "lpt3",
+              "lpt4",
+              "lpt5",
+              "lpt6",
+              "lpt7",
+              "lpt8",
+              "lpt9"
+            ]
+          },
+          "pattern": "^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$",
+          "type": "string"
+        },
+        "protocol_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "receipt": {
+          "$ref": "#/$defs/ArtifactRevealReceipt"
+        },
+        "revision": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "status": {
+          "const": "revealed",
+          "type": "string"
+        },
+        "workspace": {
+          "maxLength": 32768,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "workspace",
+        "local_job_id",
+        "artifact_id",
+        "revision",
+        "receipt",
+        "status"
+      ],
+      "type": "object"
+    },
+    "ArtifactVerifyResponse": {
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "properties": {
+                "outcome": {
+                  "const": "verified"
+                },
+                "product": {
+                  "not": {
+                    "properties": {
+                      "status": {
+                        "const": "evidence_unavailable"
+                      }
+                    },
+                    "required": [
+                      "status"
+                    ]
+                  }
+                },
+                "status": {
+                  "const": "verified"
+                }
+              },
+              "required": [
+                "outcome",
+                "status",
+                "product"
+              ]
+            },
+            {
+              "properties": {
+                "outcome": {
+                  "const": "evidence_unavailable"
+                },
+                "product": {
+                  "properties": {
+                    "status": {
+                      "const": "evidence_unavailable"
+                    }
+                  },
+                  "required": [
+                    "status"
+                  ]
+                },
+                "status": {
+                  "const": "evidence_unavailable"
+                }
+              },
+              "required": [
+                "outcome",
+                "status",
+                "product"
+              ]
+            }
+          ]
+        }
+      ],
+      "description": "Exact retained-artifact verification response.",
+      "properties": {
+        "artifact_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:-]+$",
+          "type": "string"
+        },
+        "evidence_level": {
+          "enum": [
+            "integrity",
+            "archive_safety",
+            "product",
+            "cross_validated"
+          ],
+          "type": "string"
+        },
+        "integrity": {
+          "$ref": "#/$defs/ArtifactIntegrityEvidence"
+        },
+        "local_job_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              "con",
+              "prn",
+              "aux",
+              "nul",
+              "com1",
+              "com2",
+              "com3",
+              "com4",
+              "com5",
+              "com6",
+              "com7",
+              "com8",
+              "com9",
+              "lpt1",
+              "lpt2",
+              "lpt3",
+              "lpt4",
+              "lpt5",
+              "lpt6",
+              "lpt7",
+              "lpt8",
+              "lpt9"
+            ]
+          },
+          "pattern": "^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$",
+          "type": "string"
+        },
+        "outcome": {
+          "enum": [
+            "verified",
+            "evidence_unavailable"
+          ],
+          "type": "string"
+        },
+        "product": {
+          "$ref": "#/$defs/ArtifactProductEvidence"
+        },
+        "protocol_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "revision": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "signed_cleanup_evidence_bound": {
+          "type": "boolean"
+        },
+        "status": {
+          "enum": [
+            "verified",
+            "evidence_unavailable"
+          ],
+          "type": "string"
+        },
+        "validation_levels": {
+          "items": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "workspace": {
+          "maxLength": 32768,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "workspace",
+        "local_job_id",
+        "artifact_id",
+        "revision",
+        "outcome",
+        "evidence_level",
+        "integrity",
+        "product",
+        "validation_levels",
+        "signed_cleanup_evidence_bound",
+        "status"
+      ],
+      "type": "object"
+    },
     "BuildMetadata": {
       "description": "Static information about this executable build.",
       "properties": {
@@ -259,9 +1091,7 @@
           "type": "array"
         },
         "protocol_version": {
-          "description": "Protocol version.",
-          "format": "uint32",
-          "minimum": 0,
+          "const": 1,
           "type": "integer"
         },
         "warnings": {
@@ -441,9 +1271,7 @@
       "description": "Host toolchain report returned by the shared doctor service.",
       "properties": {
         "protocol_version": {
-          "description": "Protocol version.",
-          "format": "uint32",
-          "minimum": 0,
+          "const": 1,
           "type": "integer"
         },
         "report": {
@@ -540,9 +1368,7 @@
           "description": "Extension-host environment."
         },
         "protocol_version": {
-          "description": "Negotiated protocol version.",
-          "format": "uint32",
-          "minimum": 0,
+          "const": 1,
           "type": "integer"
         },
         "runtime_dependency": {
@@ -621,6 +1447,1783 @@
       "required": [
         "os",
         "arch"
+      ],
+      "type": "object"
+    },
+    "JobActionEligibility": {
+      "allOf": [
+        {
+          "else": {
+            "required": [
+              "cancel_reason_code"
+            ]
+          },
+          "if": {
+            "properties": {
+              "can_cancel": {
+                "const": true
+              }
+            },
+            "required": [
+              "can_cancel"
+            ]
+          },
+          "then": {
+            "not": {
+              "required": [
+                "cancel_reason_code"
+              ]
+            }
+          }
+        },
+        {
+          "else": {
+            "required": [
+              "retry_reason_code"
+            ]
+          },
+          "if": {
+            "properties": {
+              "can_retry": {
+                "const": true
+              }
+            },
+            "required": [
+              "can_retry"
+            ]
+          },
+          "then": {
+            "not": {
+              "required": [
+                "retry_reason_code"
+              ]
+            }
+          }
+        }
+      ],
+      "properties": {
+        "can_cancel": {
+          "type": "boolean"
+        },
+        "can_retry": {
+          "type": "boolean"
+        },
+        "cancel_reason_code": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "retry_reason_code": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "can_cancel",
+        "can_retry"
+      ],
+      "type": "object"
+    },
+    "JobArtifact": {
+      "allOf": [
+        {
+          "else": {
+            "required": [
+              "verify_reason_code"
+            ]
+          },
+          "if": {
+            "properties": {
+              "can_verify": {
+                "const": true
+              }
+            },
+            "required": [
+              "can_verify"
+            ]
+          },
+          "then": {
+            "not": {
+              "required": [
+                "verify_reason_code"
+              ]
+            }
+          }
+        },
+        {
+          "else": {
+            "required": [
+              "reveal_reason_code"
+            ]
+          },
+          "if": {
+            "properties": {
+              "can_reveal": {
+                "const": true
+              }
+            },
+            "required": [
+              "can_reveal"
+            ]
+          },
+          "then": {
+            "not": {
+              "required": [
+                "reveal_reason_code"
+              ]
+            }
+          }
+        },
+        {
+          "else": {
+            "required": [
+              "remove_reason_code"
+            ]
+          },
+          "if": {
+            "properties": {
+              "can_remove": {
+                "const": true
+              }
+            },
+            "required": [
+              "can_remove"
+            ]
+          },
+          "then": {
+            "not": {
+              "required": [
+                "remove_reason_code"
+              ]
+            }
+          }
+        }
+      ],
+      "description": "One retained artifact without credentials or provider URLs.",
+      "properties": {
+        "artifact_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:-]+$",
+          "type": "string"
+        },
+        "can_remove": {
+          "type": "boolean"
+        },
+        "can_reveal": {
+          "type": "boolean"
+        },
+        "can_verify": {
+          "type": "boolean"
+        },
+        "current_status": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "download_destination": {
+          "maxLength": 32768,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "download_parent_identity": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "file_name": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "kind": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "local_file_identity": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "local_path": {
+          "maxLength": 32768,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "locally_validated": {
+          "type": "boolean"
+        },
+        "media_type": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "remove_reason_code": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "reveal_reason_code": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "size": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "verify_reason_code": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "kind",
+        "file_name",
+        "size",
+        "sha256",
+        "locally_validated",
+        "current_status",
+        "can_verify",
+        "can_reveal",
+        "can_remove"
+      ],
+      "type": "object"
+    },
+    "JobArtifactsResponse": {
+      "description": "Workspace-owned durable job artifacts.",
+      "properties": {
+        "artifacts": {
+          "description": "Exact retained artifacts.",
+          "items": {
+            "$ref": "#/$defs/JobArtifact"
+          },
+          "type": "array"
+        },
+        "local_job_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              "con",
+              "prn",
+              "aux",
+              "nul",
+              "com1",
+              "com2",
+              "com3",
+              "com4",
+              "com5",
+              "com6",
+              "com7",
+              "com8",
+              "com9",
+              "lpt1",
+              "lpt2",
+              "lpt3",
+              "lpt4",
+              "lpt5",
+              "lpt6",
+              "lpt7",
+              "lpt8",
+              "lpt9"
+            ]
+          },
+          "pattern": "^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$",
+          "type": "string"
+        },
+        "protocol_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "revision": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "workspace": {
+          "maxLength": 32768,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "workspace",
+        "local_job_id",
+        "revision",
+        "artifacts"
+      ],
+      "type": "object"
+    },
+    "JobCancelResponse": {
+      "description": "Workspace-bound cancellation result.",
+      "properties": {
+        "parent": {
+          "$ref": "#/$defs/JobDetails"
+        },
+        "protocol_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "receipt": {
+          "$ref": "#/$defs/JobCancellationReceipt"
+        },
+        "workspace": {
+          "maxLength": 32768,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "workspace",
+        "parent",
+        "receipt"
+      ],
+      "type": "object"
+    },
+    "JobCancellationReceipt": {
+      "description": "Durable cancellation receipt.",
+      "properties": {
+        "durable": {
+          "const": true,
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "cancellation_requested",
+          "type": "string"
+        },
+        "parent_local_job_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              "con",
+              "prn",
+              "aux",
+              "nul",
+              "com1",
+              "com2",
+              "com3",
+              "com4",
+              "com5",
+              "com6",
+              "com7",
+              "com8",
+              "com9",
+              "lpt1",
+              "lpt2",
+              "lpt3",
+              "lpt4",
+              "lpt5",
+              "lpt6",
+              "lpt7",
+              "lpt8",
+              "lpt9"
+            ]
+          },
+          "pattern": "^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$",
+          "type": "string"
+        },
+        "revision": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind",
+        "parent_local_job_id",
+        "durable",
+        "revision"
+      ],
+      "type": "object"
+    },
+    "JobDetails": {
+      "allOf": [
+        {
+          "else": {
+            "required": [
+              "cancel_reason_code"
+            ]
+          },
+          "if": {
+            "properties": {
+              "can_cancel": {
+                "const": true
+              }
+            },
+            "required": [
+              "can_cancel"
+            ]
+          },
+          "then": {
+            "not": {
+              "required": [
+                "cancel_reason_code"
+              ]
+            }
+          }
+        },
+        {
+          "else": {
+            "required": [
+              "retry_reason_code"
+            ]
+          },
+          "if": {
+            "properties": {
+              "can_retry": {
+                "const": true
+              }
+            },
+            "required": [
+              "can_retry"
+            ]
+          },
+          "then": {
+            "not": {
+              "required": [
+                "retry_reason_code"
+              ]
+            }
+          }
+        }
+      ],
+      "description": "Secret-free exact job details.",
+      "properties": {
+        "application_identifier": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "artifact_count": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "can_cancel": {
+          "description": "Whether cancellation is currently accepted.",
+          "type": "boolean"
+        },
+        "can_retry": {
+          "description": "Whether an exact retry is currently accepted.",
+          "type": "boolean"
+        },
+        "cancel_reason_code": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "cancellation_status": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "cleanup_status": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "created_at_ms": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "event_journal_bound": {
+          "type": "boolean"
+        },
+        "failure": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JobFailure"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "last_confirmed_state": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "local_job_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              "con",
+              "prn",
+              "aux",
+              "nul",
+              "com1",
+              "com2",
+              "com3",
+              "com4",
+              "com5",
+              "com6",
+              "com7",
+              "com8",
+              "com9",
+              "lpt1",
+              "lpt2",
+              "lpt3",
+              "lpt4",
+              "lpt5",
+              "lpt6",
+              "lpt7",
+              "lpt8",
+              "lpt9"
+            ]
+          },
+          "pattern": "^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$",
+          "type": "string"
+        },
+        "operation_id": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "profile": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "provider": {
+          "$ref": "#/$defs/JobProviderIdentity"
+        },
+        "provider_job_id": {
+          "maxLength": 20,
+          "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]{1}|1844674407370955161[0-4]|18446744073709551615)$",
+          "type": "string"
+        },
+        "provider_resume_available": {
+          "type": "boolean"
+        },
+        "provider_run_id": {
+          "maxLength": 20,
+          "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]{1}|1844674407370955161[0-4]|18446744073709551615)$",
+          "type": "string"
+        },
+        "request_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "retry": {
+          "$ref": "#/$defs/JobRetryLineage"
+        },
+        "retry_reason_code": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "revision": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "semantic_retry_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "signing_mode": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "source_manifest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "source_revision": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "state": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "submitted_at_ms": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "target": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "terminal_outcome": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "updated_at_ms": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "local_job_id",
+        "revision",
+        "provider",
+        "operation_id",
+        "request_sha256",
+        "semantic_retry_sha256",
+        "application_identifier",
+        "source_manifest_sha256",
+        "target",
+        "profile",
+        "signing_mode",
+        "created_at_ms",
+        "updated_at_ms",
+        "state",
+        "cleanup_status",
+        "cancellation_status",
+        "retry",
+        "artifact_count",
+        "event_journal_bound",
+        "provider_resume_available",
+        "can_cancel",
+        "can_retry"
+      ],
+      "type": "object"
+    },
+    "JobFailure": {
+      "description": "Sanitized terminal failure metadata.",
+      "properties": {
+        "code": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "code",
+        "retryable"
+      ],
+      "type": "object"
+    },
+    "JobListItem": {
+      "allOf": [
+        {
+          "else": {
+            "required": [
+              "cancel_reason_code"
+            ]
+          },
+          "if": {
+            "properties": {
+              "can_cancel": {
+                "const": true
+              }
+            },
+            "required": [
+              "can_cancel"
+            ]
+          },
+          "then": {
+            "not": {
+              "required": [
+                "cancel_reason_code"
+              ]
+            }
+          }
+        },
+        {
+          "else": {
+            "required": [
+              "retry_reason_code"
+            ]
+          },
+          "if": {
+            "properties": {
+              "can_retry": {
+                "const": true
+              }
+            },
+            "required": [
+              "can_retry"
+            ]
+          },
+          "then": {
+            "not": {
+              "required": [
+                "retry_reason_code"
+              ]
+            }
+          }
+        }
+      ],
+      "description": "Secret-free newest-job item.",
+      "properties": {
+        "app_label": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "application_identifier": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "can_cancel": {
+          "description": "Whether cancellation is currently accepted.",
+          "type": "boolean"
+        },
+        "can_retry": {
+          "description": "Whether an exact retry is currently accepted.",
+          "type": "boolean"
+        },
+        "cancel_reason_code": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "cancellation_status": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "cleanup_status": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "created_at_ms": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "last_confirmed_state": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "local_job_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              "con",
+              "prn",
+              "aux",
+              "nul",
+              "com1",
+              "com2",
+              "com3",
+              "com4",
+              "com5",
+              "com6",
+              "com7",
+              "com8",
+              "com9",
+              "lpt1",
+              "lpt2",
+              "lpt3",
+              "lpt4",
+              "lpt5",
+              "lpt6",
+              "lpt7",
+              "lpt8",
+              "lpt9"
+            ]
+          },
+          "pattern": "^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$",
+          "type": "string"
+        },
+        "operation_id": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "profile": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "provider": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "provider_job_id": {
+          "maxLength": 20,
+          "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]{1}|1844674407370955161[0-4]|18446744073709551615)$",
+          "type": "string"
+        },
+        "provider_run_id": {
+          "maxLength": 20,
+          "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]{1}|1844674407370955161[0-4]|18446744073709551615)$",
+          "type": "string"
+        },
+        "retry_reason_code": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "revision": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "signing_mode": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "state": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "submitted_at_ms": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "target": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "terminal_outcome": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "updated_at_ms": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "local_job_id",
+        "revision",
+        "provider",
+        "operation_id",
+        "app_label",
+        "application_identifier",
+        "target",
+        "profile",
+        "signing_mode",
+        "created_at_ms",
+        "updated_at_ms",
+        "state",
+        "cleanup_status",
+        "cancellation_status",
+        "can_cancel",
+        "can_retry"
+      ],
+      "type": "object"
+    },
+    "JobLogEvent": {
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "source": {
+                "const": "worker"
+              }
+            },
+            "required": [
+              "source"
+            ]
+          },
+          "then": {
+            "required": [
+              "source_sequence",
+              "source_event_sha256"
+            ]
+          }
+        }
+      ],
+      "dependentRequired": {
+        "source_event_sha256": [
+          "source_sequence"
+        ],
+        "source_sequence": [
+          "source_event_sha256"
+        ]
+      },
+      "description": "One decimal-string sanitized lifecycle event.",
+      "properties": {
+        "code": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "level": {
+          "enum": [
+            "info",
+            "warning",
+            "error"
+          ],
+          "type": "string"
+        },
+        "message": {
+          "maxLength": 16384,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "occurred_at_ms": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "phase": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "record_kind": {
+          "const": "sanitized_lifecycle_event",
+          "type": "string"
+        },
+        "sequence": {
+          "maxLength": 20,
+          "pattern": "^(?:[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]{1}|1844674407370955161[0-4]|18446744073709551615)$",
+          "type": "string"
+        },
+        "source": {
+          "enum": [
+            "controller",
+            "provider",
+            "worker"
+          ],
+          "type": "string"
+        },
+        "source_event_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "source_sequence": {
+          "maxLength": 20,
+          "pattern": "^(?:[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]{1}|1844674407370955161[0-4]|18446744073709551615)$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "record_kind",
+        "sequence",
+        "occurred_at_ms",
+        "source",
+        "level",
+        "code"
+      ],
+      "type": "object"
+    },
+    "JobLogsPageResponse": {
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "log_scope": {
+                "const": "durable_sanitized_lifecycle_events"
+              }
+            },
+            "required": [
+              "log_scope"
+            ]
+          },
+          "then": {
+            "properties": {
+              "provider_full_logs": {
+                "const": false
+              }
+            },
+            "required": [
+              "provider_full_logs"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "has_more": {
+                "const": true
+              }
+            },
+            "required": [
+              "has_more"
+            ]
+          },
+          "then": {
+            "properties": {
+              "events": {
+                "minItems": 1
+              },
+              "returned": {
+                "minimum": 1
+              }
+            },
+            "required": [
+              "events",
+              "returned"
+            ]
+          }
+        }
+      ],
+      "description": "One bounded cursor page of sanitized lifecycle events.",
+      "properties": {
+        "after_sequence": {
+          "maxLength": 20,
+          "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]{1}|1844674407370955161[0-4]|18446744073709551615)$",
+          "type": "string"
+        },
+        "events": {
+          "items": {
+            "$ref": "#/$defs/JobLogEvent"
+          },
+          "maxItems": 1000,
+          "type": "array"
+        },
+        "has_more": {
+          "type": "boolean"
+        },
+        "limit": {
+          "maximum": 1000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "local_job_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              "con",
+              "prn",
+              "aux",
+              "nul",
+              "com1",
+              "com2",
+              "com3",
+              "com4",
+              "com5",
+              "com6",
+              "com7",
+              "com8",
+              "com9",
+              "lpt1",
+              "lpt2",
+              "lpt3",
+              "lpt4",
+              "lpt5",
+              "lpt6",
+              "lpt7",
+              "lpt8",
+              "lpt9"
+            ]
+          },
+          "pattern": "^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$",
+          "type": "string"
+        },
+        "log_scope": {
+          "enum": [
+            "durable_sanitized_lifecycle_events",
+            "durable_sanitized_job_events"
+          ],
+          "type": "string"
+        },
+        "next_after_sequence": {
+          "maxLength": 20,
+          "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]{1}|1844674407370955161[0-4]|18446744073709551615)$",
+          "type": "string"
+        },
+        "phase": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "protocol_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "provider_full_logs": {
+          "type": "boolean"
+        },
+        "returned": {
+          "maximum": 1000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "terminal": {
+          "type": "boolean"
+        },
+        "workspace": {
+          "maxLength": 32768,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "workspace",
+        "local_job_id",
+        "log_scope",
+        "provider_full_logs",
+        "after_sequence",
+        "limit",
+        "returned",
+        "next_after_sequence",
+        "has_more",
+        "terminal",
+        "events"
+      ],
+      "type": "object"
+    },
+    "JobLogsResponse": {
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "log_scope": {
+                "const": "durable_sanitized_lifecycle_events"
+              }
+            },
+            "required": [
+              "log_scope"
+            ]
+          },
+          "then": {
+            "properties": {
+              "provider_full_logs": {
+                "const": false
+              }
+            },
+            "required": [
+              "provider_full_logs"
+            ]
+          }
+        }
+      ],
+      "description": "Workspace-owned sanitized durable lifecycle events.",
+      "properties": {
+        "events": {
+          "items": {
+            "$ref": "#/$defs/LegacyJobLogEvent"
+          },
+          "maxItems": 65536,
+          "type": "array"
+        },
+        "local_job_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              "con",
+              "prn",
+              "aux",
+              "nul",
+              "com1",
+              "com2",
+              "com3",
+              "com4",
+              "com5",
+              "com6",
+              "com7",
+              "com8",
+              "com9",
+              "lpt1",
+              "lpt2",
+              "lpt3",
+              "lpt4",
+              "lpt5",
+              "lpt6",
+              "lpt7",
+              "lpt8",
+              "lpt9"
+            ]
+          },
+          "pattern": "^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$",
+          "type": "string"
+        },
+        "log_scope": {
+          "enum": [
+            "durable_sanitized_lifecycle_events",
+            "durable_sanitized_job_events"
+          ],
+          "type": "string"
+        },
+        "next_sequence": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "phase": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "protocol_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "provider_full_logs": {
+          "description": "Always false for sanitized lifecycle events.",
+          "type": "boolean"
+        },
+        "returned": {
+          "maximum": 65536,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "since_ms": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "terminal": {
+          "description": "Whether the durable lifecycle is settled.",
+          "type": "boolean"
+        },
+        "workspace": {
+          "maxLength": 32768,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "workspace",
+        "local_job_id",
+        "log_scope",
+        "provider_full_logs",
+        "since_ms",
+        "returned",
+        "next_sequence",
+        "terminal",
+        "events"
+      ],
+      "type": "object"
+    },
+    "JobPrincipal": {
+      "description": "Public provider principal without credentials.",
+      "oneOf": [
+        {
+          "description": "Authenticated GitHub user identity.",
+          "properties": {
+            "id": {
+              "maxLength": 20,
+              "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]{1}|1844674407370955161[0-4]|18446744073709551615)$",
+              "type": "string"
+            },
+            "kind": {
+              "const": "user",
+              "type": "string"
+            },
+            "login": {
+              "maxLength": 4096,
+              "minLength": 1,
+              "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "id",
+            "login"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Same-repository built-in workflow credential.",
+          "properties": {
+            "kind": {
+              "const": "repository_credential",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "JobProviderIdentity": {
+      "description": "Exact provider identity bound to a durable job.",
+      "properties": {
+        "config_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "execution_repository_id": {
+          "maxLength": 20,
+          "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]{1}|1844674407370955161[0-4]|18446744073709551615)$",
+          "type": "string"
+        },
+        "name": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "principal": {
+          "$ref": "#/$defs/JobPrincipal"
+        }
+      },
+      "required": [
+        "name",
+        "config_sha256",
+        "principal",
+        "execution_repository_id"
+      ],
+      "type": "object"
+    },
+    "JobRetryBinding": {
+      "description": "Exact retry parent/child binding.",
+      "properties": {
+        "attempt": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "child_local_job_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              "con",
+              "prn",
+              "aux",
+              "nul",
+              "com1",
+              "com2",
+              "com3",
+              "com4",
+              "com5",
+              "com6",
+              "com7",
+              "com8",
+              "com9",
+              "lpt1",
+              "lpt2",
+              "lpt3",
+              "lpt4",
+              "lpt5",
+              "lpt6",
+              "lpt7",
+              "lpt8",
+              "lpt9"
+            ]
+          },
+          "pattern": "^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$",
+          "type": "string"
+        },
+        "parent_local_job_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              "con",
+              "prn",
+              "aux",
+              "nul",
+              "com1",
+              "com2",
+              "com3",
+              "com4",
+              "com5",
+              "com6",
+              "com7",
+              "com8",
+              "com9",
+              "lpt1",
+              "lpt2",
+              "lpt3",
+              "lpt4",
+              "lpt5",
+              "lpt6",
+              "lpt7",
+              "lpt8",
+              "lpt9"
+            ]
+          },
+          "pattern": "^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "parent_local_job_id",
+        "child_local_job_id",
+        "attempt"
+      ],
+      "type": "object"
+    },
+    "JobRetryLineage": {
+      "description": "Durable retry lineage.",
+      "properties": {
+        "attempt": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "child_job_ids": {
+          "items": {
+            "maxLength": 160,
+            "minLength": 1,
+            "not": {
+              "enum": [
+                "con",
+                "prn",
+                "aux",
+                "nul",
+                "com1",
+                "com2",
+                "com3",
+                "com4",
+                "com5",
+                "com6",
+                "com7",
+                "com8",
+                "com9",
+                "lpt1",
+                "lpt2",
+                "lpt3",
+                "lpt4",
+                "lpt5",
+                "lpt6",
+                "lpt7",
+                "lpt8",
+                "lpt9"
+              ]
+            },
+            "pattern": "^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "parent_job_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              "con",
+              "prn",
+              "aux",
+              "nul",
+              "com1",
+              "com2",
+              "com3",
+              "com4",
+              "com5",
+              "com6",
+              "com7",
+              "com8",
+              "com9",
+              "lpt1",
+              "lpt2",
+              "lpt3",
+              "lpt4",
+              "lpt5",
+              "lpt6",
+              "lpt7",
+              "lpt8",
+              "lpt9"
+            ]
+          },
+          "pattern": "^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "attempt",
+        "child_job_ids"
+      ],
+      "type": "object"
+    },
+    "JobRetryReceipt": {
+      "description": "Durable retry publication receipt.",
+      "properties": {
+        "disposition": {
+          "enum": [
+            "created",
+            "resumed_existing"
+          ],
+          "type": "string"
+        },
+        "durable": {
+          "const": true,
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "retry_created",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "durable",
+        "disposition"
+      ],
+      "type": "object"
+    },
+    "JobRetryResponse": {
+      "description": "Workspace-bound exact retry result.",
+      "properties": {
+        "child": {
+          "$ref": "#/$defs/JobDetails"
+        },
+        "lineage": {
+          "$ref": "#/$defs/JobRetryBinding"
+        },
+        "parent": {
+          "$ref": "#/$defs/JobDetails"
+        },
+        "protocol_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "receipt": {
+          "$ref": "#/$defs/JobRetryReceipt"
+        },
+        "workspace": {
+          "maxLength": 32768,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "workspace",
+        "parent",
+        "child",
+        "lineage",
+        "receipt"
+      ],
+      "type": "object"
+    },
+    "JobShowResponse": {
+      "description": "One workspace-owned durable job.",
+      "properties": {
+        "job": {
+          "$ref": "#/$defs/JobDetails",
+          "description": "Secret-free durable job details."
+        },
+        "protocol_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "workspace": {
+          "maxLength": 32768,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "workspace",
+        "job"
+      ],
+      "type": "object"
+    },
+    "JobsListResponse": {
+      "description": "Workspace-owned durable job listing.",
+      "properties": {
+        "jobs": {
+          "items": {
+            "$ref": "#/$defs/JobListItem"
+          },
+          "maxItems": 1000,
+          "type": "array"
+        },
+        "limit": {
+          "maximum": 1000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "protocol_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "returned": {
+          "maximum": 1000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "workspace": {
+          "maxLength": 32768,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "workspace",
+        "limit",
+        "returned",
+        "jobs"
+      ],
+      "type": "object"
+    },
+    "LegacyJobLogEvent": {
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "source": {
+                "const": "worker"
+              }
+            },
+            "required": [
+              "source"
+            ]
+          },
+          "then": {
+            "required": [
+              "source_sequence",
+              "source_event_sha256"
+            ]
+          }
+        }
+      ],
+      "dependentRequired": {
+        "source_event_sha256": [
+          "source_sequence"
+        ],
+        "source_sequence": [
+          "source_event_sha256"
+        ]
+      },
+      "description": "One legacy safe-number sanitized lifecycle event.",
+      "properties": {
+        "code": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "level": {
+          "enum": [
+            "info",
+            "warning",
+            "error"
+          ],
+          "type": "string"
+        },
+        "message": {
+          "maxLength": 16384,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "occurred_at_ms": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "phase": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "record_kind": {
+          "const": "sanitized_lifecycle_event",
+          "type": "string"
+        },
+        "sequence": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "source": {
+          "enum": [
+            "controller",
+            "provider",
+            "worker"
+          ],
+          "type": "string"
+        },
+        "source_event_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "source_sequence": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "record_kind",
+        "sequence",
+        "occurred_at_ms",
+        "source",
+        "level",
+        "code"
       ],
       "type": "object"
     },
@@ -726,9 +3329,7 @@
           "description": "Resolved project metadata."
         },
         "protocol_version": {
-          "description": "Protocol version.",
-          "format": "uint32",
-          "minimum": 0,
+          "const": 1,
           "type": "integer"
         },
         "templates": {
@@ -786,15 +3387,201 @@
           "description": "Typed failure."
         },
         "protocol_version": {
-          "description": "Protocol version.",
-          "format": "uint32",
-          "minimum": 0,
+          "const": 1,
           "type": "integer"
         }
       },
       "required": [
         "protocol_version",
         "error"
+      ],
+      "type": "object"
+    },
+    "RemoteBuildConsent": {
+      "additionalProperties": false,
+      "description": "Only accepted standard-input consent object.",
+      "properties": {
+        "approved": {
+          "const": true,
+          "type": "boolean"
+        },
+        "consent_token": {
+          "maxLength": 512,
+          "minLength": 32,
+          "pattern": "^[A-Za-z0-9_-]+$",
+          "type": "string"
+        },
+        "preview_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "consent_token",
+        "preview_sha256",
+        "approved"
+      ],
+      "type": "object"
+    },
+    "RemoteBuildPreviewResponse": {
+      "description": "Zero-write public GitHub snapshot preview.",
+      "properties": {
+        "consent_required": {
+          "const": true,
+          "type": "boolean"
+        },
+        "consent_token": {
+          "maxLength": 512,
+          "minLength": 32,
+          "pattern": "^[A-Za-z0-9_-]+$",
+          "type": "string"
+        },
+        "effects": {
+          "items": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]+$",
+            "type": "string"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "type": "array"
+        },
+        "preview_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "profile": {
+          "enum": [
+            "debug",
+            "release"
+          ],
+          "type": "string"
+        },
+        "protocol_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "provider": {
+          "const": "github",
+          "type": "string"
+        },
+        "signing_mode": {
+          "const": "unsigned",
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/$defs/RemoteBuildPreviewSource"
+        },
+        "source_mode": {
+          "const": "snapshot",
+          "type": "string"
+        },
+        "target": {
+          "const": "ios-device",
+          "type": "string"
+        },
+        "workspace": {
+          "maxLength": 32768,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "workspace",
+        "provider",
+        "target",
+        "profile",
+        "signing_mode",
+        "source_mode",
+        "preview_sha256",
+        "consent_token",
+        "source",
+        "effects",
+        "consent_required"
+      ],
+      "type": "object"
+    },
+    "RemoteBuildPreviewSource": {
+      "description": "Exact snapshot source identity shown before consent.",
+      "properties": {
+        "file_count": {
+          "maxLength": 20,
+          "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]{1}|1844674407370955161[0-4]|18446744073709551615)$",
+          "type": "string"
+        },
+        "manifest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "total_bytes": {
+          "maxLength": 20,
+          "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]{1}|1844674407370955161[0-4]|18446744073709551615)$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "manifest_sha256",
+        "file_count",
+        "total_bytes"
+      ],
+      "type": "object"
+    },
+    "RemoteBuildSubmissionReceipt": {
+      "description": "Durable snapshot submission receipt.",
+      "properties": {
+        "durable": {
+          "const": true,
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "remote_build_submitted",
+          "type": "string"
+        },
+        "preview_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "source_mode": {
+          "const": "snapshot",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "durable",
+        "source_mode",
+        "preview_sha256"
+      ],
+      "type": "object"
+    },
+    "RemoteBuildSubmissionResponse": {
+      "description": "Workspace-bound snapshot submission result.",
+      "properties": {
+        "job": {
+          "$ref": "#/$defs/JobDetails"
+        },
+        "protocol_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "receipt": {
+          "$ref": "#/$defs/RemoteBuildSubmissionReceipt"
+        },
+        "workspace": {
+          "maxLength": 32768,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "workspace",
+        "job",
+        "receipt"
       ],
       "type": "object"
     },
@@ -813,6 +3600,172 @@
       "required": [
         "usable",
         "source"
+      ],
+      "type": "object"
+    },
+    "SigningReadinessCheck": {
+      "allOf": [
+        {
+          "else": {
+            "required": [
+              "reason_code"
+            ]
+          },
+          "if": {
+            "properties": {
+              "ready": {
+                "const": true
+              }
+            },
+            "required": [
+              "ready"
+            ]
+          },
+          "then": {
+            "not": {
+              "required": [
+                "reason_code"
+              ]
+            }
+          }
+        }
+      ],
+      "description": "One sanitized signing-readiness check.",
+      "properties": {
+        "code": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "ready": {
+          "type": "boolean"
+        },
+        "reason_code": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "required": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "code",
+        "required",
+        "ready"
+      ],
+      "type": "object"
+    },
+    "SigningReadinessResponse": {
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "properties": {
+                "checks": {
+                  "not": {
+                    "contains": {
+                      "properties": {
+                        "ready": {
+                          "const": false
+                        },
+                        "required": {
+                          "const": true
+                        }
+                      },
+                      "required": [
+                        "required",
+                        "ready"
+                      ]
+                    }
+                  }
+                },
+                "ready": {
+                  "const": true
+                }
+              },
+              "required": [
+                "ready",
+                "checks"
+              ]
+            },
+            {
+              "properties": {
+                "checks": {
+                  "contains": {
+                    "properties": {
+                      "ready": {
+                        "const": false
+                      },
+                      "required": {
+                        "const": true
+                      }
+                    },
+                    "required": [
+                      "required",
+                      "ready"
+                    ]
+                  },
+                  "minContains": 1
+                },
+                "ready": {
+                  "const": false
+                }
+              },
+              "required": [
+                "ready",
+                "checks"
+              ]
+            }
+          ]
+        }
+      ],
+      "description": "Sanitized GitHub physical-iPhone signing readiness.",
+      "properties": {
+        "checks": {
+          "items": {
+            "$ref": "#/$defs/SigningReadinessCheck"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "type": "array"
+        },
+        "mode": {
+          "const": "github_actions_ios_signing",
+          "type": "string"
+        },
+        "protocol_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "provider": {
+          "const": "github",
+          "type": "string"
+        },
+        "ready": {
+          "type": "boolean"
+        },
+        "target": {
+          "const": "ios-device",
+          "type": "string"
+        },
+        "workspace": {
+          "maxLength": 32768,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "workspace",
+        "provider",
+        "target",
+        "mode",
+        "ready",
+        "checks"
       ],
       "type": "object"
     },
@@ -843,9 +3796,7 @@
       "description": "Apple Development identities available to editor signing UI.",
       "properties": {
         "protocol_version": {
-          "description": "Protocol version.",
-          "format": "uint32",
-          "minimum": 0,
+          "const": 1,
           "type": "integer"
         },
         "teams": {
@@ -1297,9 +4248,7 @@
           ]
         },
         "protocol_version": {
-          "description": "Protocol version.",
-          "format": "uint32",
-          "minimum": 0,
+          "const": 1,
           "type": "integer"
         },
         "timestamp_ms": {
@@ -1422,9 +4371,7 @@
           "type": "array"
         },
         "protocol_version": {
-          "description": "Protocol version.",
-          "format": "uint32",
-          "minimum": 0,
+          "const": 1,
           "type": "integer"
         },
         "valid": {
@@ -1470,6 +4417,58 @@
     {
       "$ref": "#/$defs/SigningTeamsResponse",
       "description": "Usable Apple Development teams."
+    },
+    {
+      "$ref": "#/$defs/JobsListResponse",
+      "description": "Workspace-owned durable job summaries."
+    },
+    {
+      "$ref": "#/$defs/JobShowResponse",
+      "description": "One workspace-owned durable job."
+    },
+    {
+      "$ref": "#/$defs/JobArtifactsResponse",
+      "description": "Workspace-owned durable job artifacts."
+    },
+    {
+      "$ref": "#/$defs/JobLogsResponse",
+      "description": "Workspace-owned sanitized durable job events."
+    },
+    {
+      "$ref": "#/$defs/JobLogsPageResponse",
+      "description": "One bounded cursor page of workspace-owned sanitized durable job events."
+    },
+    {
+      "$ref": "#/$defs/JobCancelResponse",
+      "description": "Durable job-cancellation receipt."
+    },
+    {
+      "$ref": "#/$defs/JobRetryResponse",
+      "description": "Durable exact-retry parent/child receipt."
+    },
+    {
+      "$ref": "#/$defs/ArtifactVerifyResponse",
+      "description": "Independent retained-artifact verification evidence."
+    },
+    {
+      "$ref": "#/$defs/ArtifactRevealResponse",
+      "description": "Path-free platform reveal receipt."
+    },
+    {
+      "$ref": "#/$defs/ArtifactRemoveResponse",
+      "description": "Exact retained-artifact removal receipt."
+    },
+    {
+      "$ref": "#/$defs/RemoteBuildPreviewResponse",
+      "description": "Zero-write GitHub snapshot preview."
+    },
+    {
+      "$ref": "#/$defs/RemoteBuildSubmissionResponse",
+      "description": "Durable GitHub snapshot submission receipt."
+    },
+    {
+      "$ref": "#/$defs/SigningReadinessResponse",
+      "description": "Sanitized physical-iPhone signing readiness."
     },
     {
       "$ref": "#/$defs/ProtocolErrorResponse",

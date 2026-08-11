@@ -1655,7 +1655,10 @@ fn build_artifact_manifest(
     manifest
         .source_revision
         .clone_from(&phase.request.source_revision);
-    manifest.source_snapshot = phase.request.source_mode == rustferry_remote::SourceMode::Snapshot;
+    manifest.source_snapshot = matches!(
+        phase.request.source_mode,
+        rustferry_remote::SourceMode::Snapshot | rustferry_remote::SourceMode::GitSnapshot
+    );
     manifest
         .source_sha256
         .clone_from(&phase.request.source.sha256);

@@ -27,13 +27,6 @@ const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(1);
 ///
 /// Returns a typed identity error when the path is not an absolute plain directory or the
 /// filesystem cannot provide the required persistent identity.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "durable jobs controller integration owns call sites"
-    )
-)]
 pub fn capture_project_directory_identity(
     project_root: &Utf8Path,
 ) -> Result<DirectoryFilesystemIdentity, DirectoryIdentityError> {
@@ -46,13 +39,6 @@ pub fn capture_project_directory_identity(
 ///
 /// Returns a typed identity error when the path cannot be reopened safely or identifies a
 /// different filesystem object.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "durable jobs controller integration owns call sites"
-    )
-)]
 pub fn verify_project_directory_identity(
     project_root: &Utf8Path,
     expected: &DirectoryFilesystemIdentity,
@@ -131,7 +117,40 @@ pub fn run_captured_bounded(
     )
 }
 
+/// Run a bounded external command with only the supplied environment entries.
+///
+/// The child environment is cleared before the exact entries are installed. Argument boundaries,
+/// output limits, timeout, and process-tree containment are identical to [`run_captured_bounded`].
+///
+/// # Errors
+///
+/// Returns a typed process, timeout, output-limit, interruption, or local I/O error.
+pub fn run_captured_bounded_with_exact_environment(
+    program: &Utf8Path,
+    arguments: &[OsString],
+    current_directory: &Utf8Path,
+    stage: &'static str,
+    reporter: &Reporter,
+    output_limit: usize,
+    environment: &[(OsString, OsString)],
+) -> Result<Output, CliError> {
+    run_captured_with_limits(
+        program,
+        arguments,
+        current_directory,
+        stage,
+        reporter,
+        COMMAND_TIMEOUT,
+        output_limit,
+        None,
+        false,
+        Some(environment),
+        true,
+    )
+}
+
 /// Run a bounded command with a minimal environment and optional fixed stdin bytes.
+#[cfg(all(test, unix))]
 pub fn run_captured_bounded_isolated(
     program: &Utf8Path,
     arguments: &[OsString],
@@ -176,6 +195,8 @@ fn run_captured_with_timeout(
         output_limit.unwrap_or(DEFAULT_PROCESS_OUTPUT_LIMIT),
         input,
         isolated_environment,
+        None,
+        false,
     )
 }
 
@@ -190,11 +211,17 @@ fn run_captured_with_limits(
     output_limit: usize,
     input: Option<&[u8]>,
     isolated_environment: bool,
+    exact_environment: Option<&[(OsString, OsString)]>,
+    atomically_contained: bool,
 ) -> Result<Output, CliError> {
     reporter.verbose(format_command(program, arguments));
     let mut command = Command::new(program);
     command.args(arguments).current_dir(current_directory);
-    if isolated_environment {
+    if let Some(environment) = exact_environment {
+        command
+            .env_clear()
+            .envs(environment.iter().map(|(name, value)| (name, value)));
+    } else if isolated_environment {
         apply_minimal_environment(&mut command);
     }
     command
@@ -207,24 +234,31 @@ fn run_captured_with_limits(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_process_group(&mut command);
-    let mut child = command.spawn().map_err(|source| CliError::Io {
-        action: "start external command",
-        path: program.to_owned(),
-        source,
-    })?;
+    let (mut child, process_group_guard) =
+        spawn_project_child(&mut command, program, atomically_contained)?;
+    let mut process_group_guard = Some(process_group_guard);
     let process_group = child.id();
-    let _process_group_guard = track_child(&mut child, program)?;
     let started = Instant::now();
     let mut capture = match capture_output(&mut child, program, output_limit) {
         Ok(capture) => capture,
         Err(error) => {
-            terminate_process_tree(&mut child, process_group);
+            terminate_supervised_process_tree(
+                &mut child,
+                process_group,
+                &mut process_group_guard,
+                atomically_contained,
+            );
             return Err(error);
         }
     };
     let stdin_writer = if let Some(input) = input {
         let Some(stdin) = child.stdin.take() else {
-            terminate_process_tree(&mut child, process_group);
+            terminate_supervised_process_tree(
+                &mut child,
+                process_group,
+                &mut process_group_guard,
+                atomically_contained,
+            );
             drain_after_termination(&mut capture);
             return Err(CliError::Io {
                 action: "open external command stdin",
@@ -235,7 +269,12 @@ fn run_captured_with_limits(
         match spawn_stdin_writer(stdin, input.to_vec()) {
             Ok(writer) => Some(writer),
             Err(source) => {
-                terminate_process_tree(&mut child, process_group);
+                terminate_supervised_process_tree(
+                    &mut child,
+                    process_group,
+                    &mut process_group_guard,
+                    atomically_contained,
+                );
                 drain_after_termination(&mut capture);
                 return Err(CliError::Io {
                     action: "start external command stdin writer",
@@ -251,7 +290,12 @@ fn run_captured_with_limits(
     let mut status = None;
     loop {
         if rustferry_core::process_control::interrupt_requested() {
-            terminate_process_tree(&mut child, process_group);
+            terminate_supervised_process_tree(
+                &mut child,
+                process_group,
+                &mut process_group_guard,
+                atomically_contained,
+            );
             drain_after_termination(&mut capture);
             return Err(CliError::CommandInterrupted {
                 tool: program.to_string(),
@@ -266,7 +310,12 @@ fn run_captured_with_limits(
                 Ok(true) => stdin_complete = true,
                 Ok(false) => {}
                 Err(source) => {
-                    terminate_process_tree(&mut child, process_group);
+                    terminate_supervised_process_tree(
+                        &mut child,
+                        process_group,
+                        &mut process_group_guard,
+                        atomically_contained,
+                    );
                     drain_after_termination(&mut capture);
                     return Err(CliError::Io {
                         action: "write external command stdin",
@@ -279,12 +328,22 @@ fn run_captured_with_limits(
         let capture_status = match capture.poll() {
             Ok(capture_status) => capture_status,
             Err(source) => {
-                terminate_process_tree(&mut child, process_group);
+                terminate_supervised_process_tree(
+                    &mut child,
+                    process_group,
+                    &mut process_group_guard,
+                    atomically_contained,
+                );
                 return Err(output_read_error(program, source));
             }
         };
         if let OutputCaptureStatus::LimitExceeded(stream) = capture_status {
-            terminate_process_tree(&mut child, process_group);
+            terminate_supervised_process_tree(
+                &mut child,
+                process_group,
+                &mut process_group_guard,
+                atomically_contained,
+            );
             drain_after_termination(&mut capture);
             return Err(CliError::ProcessOutputTooLarge {
                 tool: program.to_string(),
@@ -298,7 +357,12 @@ fn run_captured_with_limits(
                 Ok(Some(exit_status)) => status = Some(exit_status),
                 Ok(None) => {}
                 Err(source) => {
-                    terminate_process_tree(&mut child, process_group);
+                    terminate_supervised_process_tree(
+                        &mut child,
+                        process_group,
+                        &mut process_group_guard,
+                        atomically_contained,
+                    );
                     return Err(CliError::Io {
                         action: "wait for external command",
                         path: program.to_owned(),
@@ -312,7 +376,12 @@ fn run_captured_with_limits(
         }
         let remaining = timeout.saturating_sub(started.elapsed());
         if remaining.is_zero() {
-            terminate_process_tree(&mut child, process_group);
+            terminate_supervised_process_tree(
+                &mut child,
+                process_group,
+                &mut process_group_guard,
+                atomically_contained,
+            );
             drain_after_termination(&mut capture);
             return Err(CliError::CommandTimedOut {
                 tool: program.to_string(),
@@ -323,7 +392,12 @@ fn run_captured_with_limits(
         if capture.is_complete() {
             thread::sleep(remaining.min(OUTPUT_POLL_INTERVAL));
         } else if let Err(source) = capture.wait_timeout(remaining.min(OUTPUT_POLL_INTERVAL)) {
-            terminate_process_tree(&mut child, process_group);
+            terminate_supervised_process_tree(
+                &mut child,
+                process_group,
+                &mut process_group_guard,
+                atomically_contained,
+            );
             return Err(output_read_error(program, source));
         }
     }
@@ -333,6 +407,29 @@ fn run_captured_with_limits(
         stdout: captured.stdout,
         stderr: captured.stderr,
     })
+}
+
+fn spawn_project_child(
+    command: &mut Command,
+    program: &Utf8Path,
+    atomically_contained: bool,
+) -> Result<(Child, rustferry_core::process_control::ProcessGroupGuard), CliError> {
+    if atomically_contained {
+        return rustferry_core::process_control::spawn_tracked_child(command).map_err(|source| {
+            CliError::Io {
+                action: "start contained external command",
+                path: program.to_owned(),
+                source,
+            }
+        });
+    }
+    let mut child = command.spawn().map_err(|source| CliError::Io {
+        action: "start external command",
+        path: program.to_owned(),
+        source,
+    })?;
+    let guard = track_child(&mut child, program)?;
+    Ok((child, guard))
 }
 
 fn output_read_error(program: &Utf8Path, source: std::io::Error) -> CliError {
@@ -445,6 +542,26 @@ fn configure_process_group(command: &mut Command) {
 
 #[cfg(not(unix))]
 fn configure_process_group(_command: &mut Command) {}
+
+fn terminate_supervised_process_tree(
+    child: &mut Child,
+    process_group: u32,
+    process_group_guard: &mut Option<rustferry_core::process_control::ProcessGroupGuard>,
+    atomically_contained: bool,
+) {
+    #[cfg(windows)]
+    if atomically_contained {
+        // Closing the dedicated kill-on-close Job Object is the exact contained runner's
+        // termination authority. It avoids resolving any cleanup helper through ambient PATH.
+        drop(process_group_guard.take());
+        let _ = child.kill();
+        let _ = child.wait();
+        return;
+    }
+    let _ = process_group_guard;
+    let _ = atomically_contained;
+    terminate_process_tree(child, process_group);
+}
 
 fn terminate_process_tree(child: &mut Child, process_group: u32) {
     #[cfg(unix)]
@@ -613,6 +730,79 @@ mod filesystem_identity_tests {
     }
 }
 
+#[cfg(all(test, windows))]
+mod exact_environment_tests {
+    use super::*;
+
+    #[test]
+    fn exact_environment_capture_does_not_inherit_windows_entries() {
+        let system_root = Utf8PathBuf::from_path_buf(
+            rustferry_core::windows_system_root().expect("authoritative Windows root"),
+        )
+        .expect("UTF-8 Windows root");
+        let system32 = system_root.join("System32");
+        let program = system32.join("cmd.exe");
+        let fixed_path = format!("{system32};{system_root}");
+        let assertion = concat!(
+            "echo [%RUSTFERRY_SAFE%]",
+            "[%BROWSER%]",
+            "[%HOME%]",
+            "[%HTTP_PROXY%]",
+            "[%HTTPS_PROXY%]",
+            "[%GH_TOKEN%]",
+            "[%GITHUB_TOKEN%]",
+            "[%USERPROFILE%]"
+        );
+        let reporter = Reporter::new(false, true, false);
+        let output = run_captured_bounded_with_exact_environment(
+            &program,
+            &[
+                OsString::from("/d"),
+                OsString::from("/c"),
+                OsString::from(assertion),
+            ],
+            &system_root,
+            "exact environment",
+            &reporter,
+            4_096,
+            &[
+                (OsString::from("RUSTFERRY_SAFE"), OsString::from("fixed")),
+                (
+                    OsString::from("SystemRoot"),
+                    OsString::from(system_root.as_str()),
+                ),
+                (
+                    OsString::from("WINDIR"),
+                    OsString::from(system_root.as_str()),
+                ),
+                (OsString::from("COMSPEC"), OsString::from(program.as_str())),
+                (OsString::from("PATH"), OsString::from(&fixed_path)),
+            ],
+        )
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            concat!(
+                "[fixed]",
+                "[%BROWSER%]",
+                "[%HOME%]",
+                "[%HTTP_PROXY%]",
+                "[%HTTPS_PROXY%]",
+                "[%GH_TOKEN%]",
+                "[%GITHUB_TOKEN%]",
+                "[%USERPROFILE%]"
+            )
+        );
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -688,6 +878,8 @@ mod tests {
             TEST_OUTPUT_LIMIT,
             None,
             false,
+            None,
+            false,
         )
         .unwrap_err();
         assert!(matches!(
@@ -736,5 +928,28 @@ mod tests {
         .unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, b"fixed-input");
+    }
+
+    #[test]
+    fn exact_environment_capture_does_not_inherit_ambient_entries() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temporary.path().to_owned()).unwrap();
+        let reporter = Reporter::new(false, true, false);
+        let output = run_captured_bounded_with_exact_environment(
+            Utf8Path::new("/usr/bin/env"),
+            &[],
+            &root,
+            "exact environment",
+            &reporter,
+            4_096,
+            &[(OsString::from("RUSTFERRY_SAFE"), OsString::from("fixed"))],
+        )
+        .unwrap();
+        assert!(output.status.success());
+        let environment = String::from_utf8(output.stdout).unwrap();
+        assert!(environment.contains("RUSTFERRY_SAFE=fixed\n"));
+        assert!(!environment.contains("PATH="));
+        assert!(!environment.contains("HOME="));
+        assert!(!environment.contains("BROWSER="));
     }
 }

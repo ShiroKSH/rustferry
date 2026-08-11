@@ -1,9 +1,9 @@
 # Goal 3 Completion Audit
 
-Audit date: 2026-08-09
-Audited code revision: local `master` includes `2e0773a68d381ccf97aaa2fd7c099b3a3a2008bc`
+Audit date: 2026-08-09; Windows continuation update: 2026-08-10
+Audited code revision: frozen pre-docs Windows source revision recorded in `docs/GOAL3_STATUS.md`
 
-This ledger evaluates the full Goal 3 specification against the local `e850deb` integration base plus bounded multi-profile signing at `a339fff`, protected signed-log transport at `43b4476`, and selectable signed products at `2e0773a`. The requested local SSH-snapshot merge is present at `e850deb`. Local `master` is ahead of `origin/master` (`607fe78`) and has not been pushed. The affected-package tests pass locally; current-revision CI and live signed acceptance remain pending.
+This ledger preserves the original Goal 3 audit against `e850deb`, bounded multi-profile signing at `a339fff`, protected signed-log transport at `43b4476`, and selectable signed products at `2e0773a`, then updates the Windows durable-control-plane rows. The continuation remains on the dedicated Goal 3 branch. Local/native gates pass; Windows GitHub-live, signed, and device acceptance remain pending.
 
 Status meanings:
 
@@ -14,7 +14,18 @@ Status meanings:
 
 Unit, integration, synthetic signing, and mocked-provider tests prove deterministic code behavior only. They are not counted as live GitHub, Apple, SSH-host, signing, or physical-device proof. The app/Widget/Live Activity profile continuation is therefore recorded only as implemented-unproven until its live signing gates pass.
 
-## Local verification at `2e0773a`
+## Windows continuation verification
+
+| Gate | Result |
+|---|---|
+| cargo-ferry | 139 library, 235 binary, 11 jobs CLI; all passed |
+| Managed artifacts | 12 module and 9 CLI; all passed |
+| GitHub provider | 316 passed, 1 explicit live test ignored; strict Clippy passed |
+| IDE/VS Code | Rust black-box 4 passed; live TypeScript 74 passed/8 skipped; identical schema SHA-256 `DAC218CBCE888ACF6079E4DF304452D22990CE0DB81EDB5382549198255DB270` |
+| Strict gates | all-target check, Clippy with `-D warnings`, formatting, diff hygiene, and independent P0–P2 reviews passed |
+| Live evidence | No Windows-originated GitHub run, GitSnapshot, cancellation, retry, signed artifact, or device result |
+
+## Historical local verification at `2e0773a`
 
 | Check | Result |
 |---|---|
@@ -40,7 +51,7 @@ historical full-workspace and cross-platform CI results below remain separate ev
 | 6 | Compile Rust for `aarch64-apple-ios` | Proven | Live unsigned worker run `31262066567`; toolchain and target checks in `crates/rustferry-worker-macos/src/host.rs`; build pipeline in `crates/rustferry-worker-macos/src/pipeline.rs`. |
 | 7 | Build a real `iphoneos` application bundle | Proven | Live unsigned `.xcarchive` path from runs `31261962599` / `31262066567`; validation recorded in `docs/GOAL3_STATUS.md`; pipeline in `crates/rustferry-worker-macos/src/pipeline.rs`. |
 | 8 | Produce a correctly signed `.app` | Implemented-unproven | Signing/keychain/provisioning pipeline exists in `crates/rustferry-worker-macos/src/keychain.rs`, `provisioning.rs`, and `pipeline.rs`; only synthetic evidence is recorded in `docs/GOAL3_STATUS.md`. |
-| 9 | Produce a correctly signed `.xcarchive` | Implemented-unproven | The worker reconstructs the archive from the exact independently validated signed IPA app tree, requires a fresh deep strict signature check, and transports it for `--artifact archive|all`; no real signed archive or Organizer/export proof exists. |
+| 9 | Produce a correctly signed `.xcarchive` | Implemented-unproven | The worker reconstructs the archive from the exact independently validated signed IPA app tree, requires a fresh deep strict signature check, and transports it for `--artifact archive\|all`; no real signed archive or Organizer/export proof exists. |
 | 10 | Export a signed `.ipa` | Implemented-unproven | Export implementation in `crates/rustferry-worker-macos/src/export.rs`; `docs/GOAL3_STATUS.md` states real IPA export remains unvalidated. |
 | 11 | Validate certificate identity and requested Apple Team ID | Implemented-unproven | Typed plans in `crates/rustferry-remote/src/signing.rs`; validation in worker signing/provisioning modules; no real certificate/account run. |
 | 12 | Validate provisioning profile against bundle, team, certificate, and device | Implemented-unproven | `crates/rustferry-worker-macos/src/provisioning.rs`; synthetic fixtures only. |
@@ -48,9 +59,9 @@ historical full-workspace and cross-platform CI results below remain separate ev
 | 14 | Sign frameworks, extensions, and app inside-out | Implemented-unproven | Multi-target plan and ordering exist in `crates/rustferry-remote/src/signing.rs`; bounded per-target CLI/provider/worker transport passes local integration tests, with real signing pending. |
 | 15 | Support distinct profiles for the app and every extension | Implemented-unproven | Repeatable exact `TARGET=PATH`, at most three profiles, common-device validation, static per-target secrets, and `RFSIGNV2` input pass local cargo-ferry, rustferry-github, and worker tests; no live signed proof yet. |
 | 16 | Submit an exact clean Git revision without copying secrets | Proven | Clean-revision source flow in `crates/cargo-ferry/src/commands/remote.rs`; GitHub provider in `crates/rustferry-github/src/provider.rs`; live unsigned run `31261962599`. |
-| 17 | Submit an explicit deterministic source snapshot | Missing | SSH bundle machinery exists, but GitHub snapshot selection fails explicitly in `crates/cargo-ferry/src/commands/remote.rs`; no build `--snapshot` flag in `crates/cargo-ferry/src/cli.rs`. |
-| 18 | Emit structured job IDs, phases, progress, warnings, and terminal events | Implemented-unproven | Event model in `crates/rustferry-remote/src/protocol.rs`; GitHub polling implemented; required persistent `jobs` CLI is absent. |
-| 19 | Cancel and retry remote work safely | Implemented-unproven | Provider contracts include cancellation in `crates/rustferry-remote/src/provider.rs`; no required `jobs cancel/retry` commands and no live cancellation proof. |
+| 17 | Submit an explicit deterministic source snapshot | Implemented-unproven | `build iphone --remote github --snapshot --unsigned` provides zero-write preview, explicit consent, deterministic staging, durable ownership, recovery, exact worker binding, retry retention, and cleanup. Local/Windows suites pass; no GitHub-live snapshot. |
+| 18 | Emit structured job IDs, phases, progress, warnings, and terminal events | Implemented-unproven | Private immutable jobs plus list/show/logs/artifacts/prune persist sanitized lifecycle and bounded worker events across processes. Local/Windows suites pass; no Windows live job. |
+| 19 | Cancel and retry remote work safely | Implemented-unproven | Fresh-process cancellation, exact Git/retained GitSnapshot retry, current-source recapture, atomic lineage, and crash recovery are implemented and Windows-native tested; no live cancel/retry result. |
 | 20 | List and download all declared artifacts | Implemented-unproven | GitHub artifact flow in `crates/cargo-ferry/src/commands/remote.rs` and `crates/rustferry-github/src/provider.rs`; run `31261962599` proves unsigned archive download, while selected signed app/archive/dSYM sets have deterministic local coverage only. |
 | 21 | Verify downloaded SHA-256 values before success | Proven | Strict artifact verification in `crates/rustferry-remote/src/artifact.rs`; live acceptance hash checks in `.github/workflows/rustferry-goal3-linux-client-acceptance.yml`. |
 | 22 | Reject unsafe artifact paths and archive contents | Proven | Path/archive validation and limits in `crates/rustferry-remote/src/artifact.rs` and remote security tests. |
@@ -71,14 +82,14 @@ historical full-workspace and cross-platform CI results below remain separate ev
 | 5 | Setup completes an unsigned smoke build, download, and inspection | Missing | Setup stops after installation/instructions in `crates/cargo-ferry/src/commands/remote.rs`; acceptance workflow is separate. |
 | 6 | Doctor checks authentication, repository, workflow, permissions, environment, and secrets | Implemented-unproven | Doctor implementation in `crates/cargo-ferry/src/commands/remote.rs`; no private signed-environment run. |
 | 7 | Exact Git revision mode works without Apple credentials | Proven | Live runs `31261962599` / `31262066567`; `.github/workflows/rustferry-goal3-linux-client-acceptance.yml`. |
-| 8 | Explicit GitHub source-snapshot mode works | Missing | Explicit unsupported error in `crates/cargo-ferry/src/commands/remote.rs`. |
+| 8 | Explicit GitHub source-snapshot mode works | Implemented-unproven | Explicit public unsigned GitSnapshot route, consent, recovery, retry retention, and cleanup ownership pass local/Windows tests; no live GitHub build. |
 | 9 | Submission uses isolated, collision-resistant temporary refs/jobs | Proven | GitHub provider implementation and workflow concurrency in `crates/rustferry-github/src/provider.rs` and `.github/workflows/rustferry-goal3-iphone.yml`. |
 | 10 | Workflow/action/toolchain inputs are pinned | Proven | `.github/workflows/rustferry-goal3-iphone.yml`; `.github/workflows/rustferry-goal3-linux-client-acceptance.yml`. |
 | 11 | Compile phase has no signing-secret access | Proven | Workflow permissions/job separation in `.github/workflows/rustferry-goal3-iphone.yml`; compile job precedes protected sign job. |
 | 12 | Signed phase is isolated behind a protected environment | Implemented-unproven | Sign job environment and secret bindings in `.github/workflows/rustferry-goal3-iphone.yml`; private environment protection not live-proven. |
 | 13 | Secret set is explicit, exact, and passed through stdin | Implemented-unproven | `crates/rustferry-github/src/workflow.rs` derives a static application/extension profile set; the worker accepts bounded `RFSIGNV2` for multiple profiles and the legacy frame only for one application. Local integration tests pass; live protected-Environment proof remains pending. |
-| 14 | Provider reports queue/job/phase progress and terminal errors | Implemented-unproven | GitHub provider event polling in `crates/rustferry-github/src/provider.rs`; no persistent jobs UX and no malformed/provider-failure live run. |
-| 15 | Provider supports cancellation and cleanup | Implemented-unproven | Provider methods exist in `crates/rustferry-github/src/provider.rs`; no live cancellation/cleanup-failure evidence. |
+| 14 | Provider reports queue/job/phase progress and terminal errors | Implemented-unproven | Durable sanitized job events include bounded provider refresh and exact completion proof. Persistent CLI/IDE UX passes local/Windows suites; no malformed/provider-failure live run. |
+| 15 | Provider supports cancellation and cleanup | Implemented-unproven | Durable intent, exact owned-run cancellation, GET-only restart reconciliation, and cleanup are implemented/tested; no live cancellation/cleanup-failure evidence. |
 | 16 | Provider downloads declared artifacts and verifies integrity | Proven | Live unsigned artifact path in run `31261962599`; verification in `crates/rustferry-remote/src/artifact.rs` and acceptance workflow lines `141-158`. |
 | 17 | Protected manual signed workflow produces a real IPA | Missing | Current workflow is temporary-ref push-triggered, not the requested manual signed acceptance; no successful signed run or IPA artifact ID. |
 
@@ -133,14 +144,14 @@ historical full-workspace and cross-platform CI results below remain separate ev
 | Goal 3 uses separate target, cache, config, artifact, and temp roots | Proven | `scripts/goal3-run:51-59`. |
 | Commands are recorded with operation IDs | Proven | `scripts/goal3-run:61-95`; `docs/GOAL3_COMMAND_AUDIT.jsonl`. |
 | Every continuation shell command passed through the wrapper | Contradicted | One intermediate package test followed a wrapped command through an outer `&&` and therefore escaped wrapper recording. It stayed in the mutable checkout, touched no source checkout, and all authoritative final tests/checks were rerun through `goal3-run`. |
-| Work remains on a dedicated Goal 3 branch and never lands on `main`/`master` during development | Contradicted | Current branch is local `master`; Goal 3 was locally merged through `e850deb`. |
+| Work remains on a dedicated Goal 3 branch and never lands on `main`/`master` during Windows development | Proven | Windows continuation uses `goal3/windows-live-acceptance`; no automatic `master` merge. Historical pre-handoff local merges remain recorded separately. |
 | Goal 3 commits consistently use the mandated `goal3:` prefix | Contradicted | Integrated commit sequence includes `b32be13`, `36ea042`, and `e850deb` with conventional non-`goal3:` subjects. |
-| Reproducible integration package exists | Proven | `dist/goal3-integration/` contains patch series, bundle, checksums, apply/verify material. |
-| SSH continuation integration package exists | Proven | `dist/goal3-ssh-snapshot-v1/`; local integration commits `b32be13`, `36ea042`, `e850deb`. |
-| Multi-target signing integration package exists | Proven | `dist/goal3-multi-target-signing-v1/`; checksums pass and both mail-patch and aggregate-patch replays produce tree `37658727e2433b3b074fba1e811c58b36e409ae7`. |
-| Requested local merge is complete | Proven | Local `master` contains the SSH integration through `e850deb`, multi-target signing at `a339fff`, and selectable signed products at `2e0773a`. |
-| Integrated revision is pushed to origin | Missing | `origin/master` remains `607fe78`; local `master` is ahead. No push was requested or performed. |
-| Current integrated revision has CI/live acceptance | Missing | Last cited final CI run is `31261962607` at `607fe78`; no run at or after `2e0773a`. |
+| Generated integration packages are absent from landing | Proven | `dist/goal3-integration/`, `dist/goal3-ssh-snapshot-v1/`, and `dist/goal3-multi-target-signing-v1/` were removed; `/dist/goal3-*/` is ignored. Generated handoff artifacts are not product source. |
+| SSH continuation history is retained | Proven | Git history retains integration commits `b32be13`, `36ea042`, and `e850deb`; no removed `dist/` path is cited as current evidence. |
+| Multi-target signing history is retained | Proven | Git history retains bounded multi-target signing at `a339fff` and selectable signed products at `2e0773a`; generated replay packages are intentionally not committed. |
+| Historical requested local merge is recorded | Proven | The handoff ancestry contains the SSH integration through `e850deb`, multi-target signing at `a339fff`, and selectable signed products at `2e0773a`; Windows work continues on a dedicated branch. |
+| Windows continuation branch is pushed to origin | Missing | The frozen source/workflow commits and named branch have not yet been published. `master` is not the development target. |
+| Current Windows revision has CI/live acceptance | Missing | Frozen local/native gates pass; no Windows-originated GitHub/macOS run or current remote CI result is recorded. |
 
 ## External and live blockers
 
@@ -165,14 +176,14 @@ These are validation blockers, not substitutes for missing implementation.
 
 | Requirement | Status | Evidence |
 |---|---|---|
-| Full CLI families: `jobs`, `apple`, `device`, `artifact` | Missing | Top-level command enum in `crates/cargo-ferry/src/cli.rs`; dispatch in `crates/cargo-ferry/src/commands/mod.rs`. |
+| Full CLI families: `jobs`, `apple`, `device`, `artifact` | Missing | `jobs` and `artifact` are now implemented; the specifically requested top-level `apple` and `device` families remain absent, with current Apple/device behavior exposed through signing/devices/install/run/logs commands. |
 | Apple resource `plan/apply`, bundle-ID registration, and device registration | Missing | No corresponding command/client implementation; current signing models only consume existing metadata. |
 | Reusable deterministic fake provider covering all required failures | Missing | Only protocol unsupported doubles and transport-specific fakes exist; see `crates/rustferry-remote/tests/protocol.rs`. |
-| Required documentation package | Missing | Only `docs/remote/protocol.md`, `ssh-mac.md`, and `source-bundles.md` match the specified remote paths; required `docs/iphone/*`, `docs/security/*`, most remote docs, and the requested Goal 3 ADR topic set are absent. Existing ADR-004 covers VS Code debugging; ADR-005 through ADR-007 are absent. |
+| Required documentation package | Missing | GitHub provider/source/security, CLI, support, status, completion audit, and the complete `docs/goal3-windows/` package now exist. The broader original `docs/iphone/*`, `docs/security/*`, and requested Goal 3 ADR path inventory remains incomplete. |
 | Required README headline and complete from-any-computer quickstart | Missing | `README.md` retains the existing RustFerry headline and an unsigned/source-install path. |
 | Phase-by-phase cold/warm/cache performance ledger | Missing | No source-manifest, bundle, upload, queue, build, sign, export, download, or client-verification measurements; `docs/GOAL3_STATUS.md` records the gap. |
 | Honest support/status reporting | Proven | `docs/GOAL3_STATUS.md` says DoD incomplete; `docs/support-matrix.md` distinguishes live, synthetic, partial, and unsupported paths. |
 
 ## Completion conclusion
 
-Goal 3 is **not complete**. The Linux-to-GitHub-to-macOS unsigned archive path is live-proven and the protocol, worker, artifact verification, redaction, deterministic SSH snapshot, bounded multi-profile foundations, exact default signed-result transport, and selectable signed app/archive/main-app-dSYM path are substantial. The affected-package integration suite passes locally at `2e0773a`. Completion still requires code for the missing CLI/Apple/snapshot/provider/logging surfaces and live evidence for signed artifacts and physical-device use. The local merge is present by user request; it is neither pushed nor validated by current-revision CI or signed live acceptance.
+Goal 3 is **not complete**. The historical Linux-to-GitHub-to-macOS unsigned archive path is live-proven. The Windows continuation completes durable jobs/history/sanitized logs/cancel/retry/prune, managed artifacts, explicit public GitSnapshot, metadata-only signing readiness, and VS Code control-plane integration with local and Windows-native evidence. It does not have a Windows-originated GitHub run, live GitSnapshot/cancel/retry result, real Apple Development signing, or physical-device evidence. Remaining product gaps include the Apple registration/resource CLI surfaces, physical-device logs, broader documentation/ADR inventory, live performance ledger, private protected signing setup, real signed artifacts, and install/launch/runtime validation. The branch must be pushed and opened as a Draft PR; no automatic `master` merge closes these blockers.

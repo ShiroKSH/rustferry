@@ -8,16 +8,44 @@ use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
     error::Error,
     fmt,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
 };
+
+#[cfg(not(windows))]
+use std::fs::OpenOptions;
+#[cfg(windows)]
+use std::io::{Seek as _, SeekFrom};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
+#[cfg(windows)]
+use std::os::windows::io::AsHandle as _;
 
 use camino::{Utf8Path, Utf8PathBuf};
+#[cfg(windows)]
+use rustferry_core::windows_private_directory::{
+    PrivateDirectoryCleanupStatus, PrivateDirectoryError, PrivateDirectoryErrorKind,
+    PrivateFileLinkState, create_private_directory as create_windows_private_directory,
+    create_private_file as create_windows_private_file,
+    create_private_staging_file as create_windows_private_staging_file,
+    open_private_directory as open_windows_private_directory,
+    open_private_file as open_windows_private_file,
+    open_private_file_for_removal as open_windows_private_file_for_removal,
+    open_private_file_for_removal_in_state as open_windows_private_file_for_removal_in_state,
+    remove_private_directory_handle as remove_windows_private_directory_handle,
+    remove_private_directory_tree_handle as remove_windows_private_directory_tree_handle,
+    remove_private_file_handle as remove_windows_private_file_handle,
+    remove_private_file_handle_in_state as remove_windows_private_file_handle_in_state,
+    seal_private_staging_file as seal_windows_private_staging_file,
+    verify_private_file_handle as verify_windows_private_file_handle,
+    verify_private_file_handle_in_state as verify_windows_private_file_handle_in_state,
+};
+use rustferry_core::{
+    DirectoryIdentityError, RegularFileFilesystemIdentity, regular_file_identity_from_file,
+};
 use rustferry_remote::{
     ARTIFACT_MANIFEST_SCHEMA_VERSION, AppleToolchainEvidence, ArtifactDownloadRequest,
     ArtifactDownloadResult, ArtifactKind, ArtifactManifest, ArtifactRecord,
@@ -41,7 +69,10 @@ use crate::{
         SANITIZED_BUILD_LOG_NAME, SIGNED_XCARCHIVE_NAME, SIGNING_REPORT_NAME,
         VALIDATION_REPORT_NAME, ingest_github_actions_artifact,
     },
-    provider::{GITHUB_PROVIDER_ID, GithubArtifactContext, VerifiedArtifactStore},
+    provider::{
+        GITHUB_PROVIDER_ID, GithubArtifactContext, GithubSignedCleanupEvidenceV1,
+        GithubVerifiedRunEvidence, VerifiedArtifactStore,
+    },
     strict_json,
     transport::{
         ArtifactDownloadTarget, ArtifactInfo, ArtifactName, GhRunner, GithubTransport,
@@ -72,6 +103,11 @@ const MAX_UNSIGNED_OUTER_EXPANDED_BYTES: u64 =
 const MAX_COMPRESSION_RATIO: u64 = 200;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const TEMPORARY_NAME_ATTEMPTS: u64 = 128;
+#[cfg(windows)]
+const WINDOWS_RUN_CACHE_CLEANUP_ATTEMPTS: usize = 200;
+#[cfg(windows)]
+const WINDOWS_RUN_CACHE_CLEANUP_RETRY_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(5);
 
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -104,6 +140,8 @@ pub enum GithubArtifactStoreError {
     InvalidDestination,
     /// Cache or atomic client publication failed.
     Io(io::ErrorKind),
+    /// Exact Windows cleanup could not be confirmed and requires inspection.
+    CleanupUncertain,
 }
 
 impl fmt::Display for GithubArtifactStoreError {
@@ -132,6 +170,9 @@ impl fmt::Display for GithubArtifactStoreError {
                 formatter.write_str("client artifact destination is invalid")
             }
             Self::Io(kind) => write!(formatter, "GitHub artifact storage failed with {kind:?}"),
+            Self::CleanupUncertain => {
+                formatter.write_str("GitHub artifact storage cleanup could not be confirmed")
+            }
         }
     }
 }
@@ -146,7 +187,11 @@ impl From<TransportError> for GithubArtifactStoreError {
 
 impl From<GithubArtifactError> for GithubArtifactStoreError {
     fn from(value: GithubArtifactError) -> Self {
-        Self::FinalArtifact(value)
+        if value == GithubArtifactError::CleanupFailed {
+            Self::CleanupUncertain
+        } else {
+            Self::FinalArtifact(value)
+        }
     }
 }
 
@@ -168,6 +213,8 @@ struct CachedArtifact {
 struct VerifiedRun {
     manifest: ArtifactManifest,
     artifacts: BTreeMap<String, CachedArtifact>,
+    evidence: GithubVerifiedRunEvidence,
+    _verified_directory_guard: PrivateDirectoryGuard,
     _cache_directory: RunCacheDirectory,
 }
 
@@ -175,12 +222,14 @@ struct VerifiedRun {
 struct VerifiedRunContents {
     manifest: ArtifactManifest,
     artifacts: BTreeMap<String, CachedArtifact>,
+    evidence: GithubVerifiedRunEvidence,
 }
 
 #[derive(Debug)]
 struct RunCacheDirectory {
     cache_root: Utf8PathBuf,
     path: Utf8PathBuf,
+    guard: Option<PrivateDirectoryGuard>,
     owned: bool,
 }
 
@@ -190,20 +239,38 @@ impl RunCacheDirectory {
     }
 
     fn cleanup(mut self) -> Result<(), GithubArtifactStoreError> {
-        let result = remove_exact_run_directory(&self.cache_root, &self.path);
-        if result.is_ok() {
-            self.owned = false;
-        }
-        result
+        let guard = self
+            .guard
+            .take()
+            .ok_or(GithubArtifactStoreError::CleanupUncertain)?;
+        self.owned = false;
+        remove_exact_run_directory(&self.cache_root, &self.path, guard)
     }
 }
 
 impl Drop for RunCacheDirectory {
     fn drop(&mut self) {
         if self.owned {
-            let _ = remove_exact_run_directory(&self.cache_root, &self.path);
+            self.owned = false;
+            if let Some(guard) = self.guard.take() {
+                let _ = remove_exact_run_directory(&self.cache_root, &self.path, guard);
+            }
         }
     }
+}
+
+#[derive(Debug)]
+#[cfg_attr(not(windows), derive(Clone, Copy))]
+struct PrivateDirectoryGuard {
+    #[cfg(windows)]
+    handle: File,
+}
+
+fn release_private_directory_guard(guard: PrivateDirectoryGuard) {
+    #[cfg(windows)]
+    drop(guard);
+    #[cfg(not(windows))]
+    let PrivateDirectoryGuard {} = guard;
 }
 
 /// Concrete independent GitHub artifact verifier and private local cache.
@@ -211,6 +278,7 @@ pub struct GithubVerifiedArtifactStore<R> {
     transport: GithubTransport<R>,
     cache_root: Utf8PathBuf,
     verified: BTreeMap<RunCacheKey, VerifiedRun>,
+    _cache_root_guard: PrivateDirectoryGuard,
 }
 
 impl<R> GithubVerifiedArtifactStore<R> {
@@ -224,11 +292,12 @@ impl<R> GithubVerifiedArtifactStore<R> {
         transport: GithubTransport<R>,
         cache_root: impl AsRef<Path>,
     ) -> Result<Self, GithubArtifactStoreError> {
-        let cache_root = bind_private_cache_root(cache_root.as_ref())?;
+        let (cache_root, cache_root_guard) = bind_private_cache_root(cache_root.as_ref())?;
         Ok(Self {
             transport,
             cache_root,
             verified: BTreeMap::new(),
+            _cache_root_guard: cache_root_guard,
         })
     }
 
@@ -276,9 +345,9 @@ impl<R: GhRunner + Send> GithubVerifiedArtifactStore<R> {
             let transport_directory = run_directory.path().join("transport");
             let verified_directory = run_directory.path().join("verified");
             let final_staging = run_directory.path().join("final-staging");
-            create_private_directory(&transport_directory)?;
-            create_private_directory(&verified_directory)?;
-            create_private_directory(&final_staging)?;
+            let _transport_guard = create_private_directory(&transport_directory)?;
+            let verified_guard = create_private_directory(&verified_directory)?;
+            let final_staging_guard = create_private_directory(&final_staging)?;
 
             let unsigned_outer = self.download_outer(
                 context,
@@ -294,7 +363,10 @@ impl<R: GhRunner + Send> GithubVerifiedArtifactStore<R> {
             )?;
 
             if context.request.signing.mode == SigningMode::UnsignedCompileOnly {
-                return Ok(unsigned_verified_run(context, verified_unsigned));
+                return Ok((
+                    unsigned_verified_run(context, verified_unsigned),
+                    verified_guard,
+                ));
             }
             let final_info = final_info.ok_or(GithubArtifactStoreError::InvalidContext)?;
             let final_outer = self.download_outer(
@@ -313,6 +385,8 @@ impl<R: GhRunner + Send> GithubVerifiedArtifactStore<R> {
                 .request
                 .ipa_expectation()
                 .map_err(|_| GithubArtifactStoreError::InvalidContext)?;
+            release_private_directory_guard(final_staging_guard);
+            release_private_directory_guard(verified_guard);
             let published = ingest_github_actions_artifact(GithubArtifactIngestion {
                 archive_path: &final_outer,
                 temporary_directory: &final_staging,
@@ -320,14 +394,33 @@ impl<R: GhRunner + Send> GithubVerifiedArtifactStore<R> {
                 expected: &expected,
                 ipa_expectation: &ipa_expectation,
             })?;
-            signed_verified_run(published)
+            let api_sha256 = final_info
+                .digest()
+                .and_then(|digest| digest.strip_prefix("sha256:"))
+                .ok_or(GithubArtifactStoreError::MissingApiDigest)?;
+            let cleanup_evidence = GithubSignedCleanupEvidenceV1::from_verified_artifact(
+                context,
+                &verified_unsigned.compile,
+                &published.manifest,
+                &published.manifest_sha256,
+                final_info.id().get(),
+                api_sha256,
+            )
+            .map_err(|_| GithubArtifactStoreError::InvalidContext)?;
+            let verified_guard = open_private_directory(&verified_directory)?;
+            Ok((
+                signed_verified_run(published, verified_unsigned.compile, cleanup_evidence)?,
+                verified_guard,
+            ))
         })();
         match verification {
-            Ok(verified) => {
+            Ok((verified, verified_directory_guard)) => {
                 prune_verified_run_cache(run_directory.path(), &verified)?;
                 Ok(VerifiedRun {
                     manifest: verified.manifest,
                     artifacts: verified.artifacts,
+                    evidence: verified.evidence,
+                    _verified_directory_guard: verified_directory_guard,
                     _cache_directory: run_directory,
                 })
             }
@@ -389,6 +482,10 @@ impl<R: GhRunner + Send> VerifiedArtifactStore for GithubVerifiedArtifactStore<R
         false
     }
 
+    fn supports_signed_cleanup_evidence(&self) -> bool {
+        true
+    }
+
     fn list_verified(
         &mut self,
         context: &GithubArtifactContext,
@@ -398,6 +495,17 @@ impl<R: GhRunner + Send> VerifiedArtifactStore for GithubVerifiedArtifactStore<R
             Err(GithubArtifactStoreError::Transport(TransportError::ArtifactNotFound)) => {
                 Ok(Vec::new())
             }
+            Err(error) => Err(remote_store_error(error)),
+        }
+    }
+
+    fn verified_run_evidence(
+        &mut self,
+        context: &GithubArtifactContext,
+    ) -> RemoteBuildResult<Option<GithubVerifiedRunEvidence>> {
+        match self.ensure_verified(context) {
+            Ok(verified) => Ok(Some(verified.evidence.clone())),
+            Err(GithubArtifactStoreError::Transport(TransportError::ArtifactNotFound)) => Ok(None),
             Err(error) => Err(remote_store_error(error)),
         }
     }
@@ -419,8 +527,9 @@ impl<R: GhRunner + Send> VerifiedArtifactStore for GithubVerifiedArtifactStore<R
                 job_id: request.job_id.clone(),
                 artifact_id: request.artifact_id.clone(),
             })?;
-        atomic_verified_copy(&artifact.path, &artifact.record, &request.destination)
-            .map_err(remote_store_error)?;
+        let local_file_identity =
+            atomic_verified_copy(&artifact.path, &artifact.record, &request.destination)
+                .map_err(remote_store_error)?;
         let mut manifest = verified.manifest.clone();
         manifest
             .validation_levels
@@ -428,6 +537,7 @@ impl<R: GhRunner + Send> VerifiedArtifactStore for GithubVerifiedArtifactStore<R
         Ok(ArtifactDownloadResult {
             manifest,
             local_path: request.destination.clone(),
+            local_file_identity: local_file_identity.to_string(),
         })
     }
 
@@ -784,23 +894,24 @@ fn extract_unsigned_entry(
         .by_index(metadata.index)
         .map_err(|_| GithubArtifactStoreError::InvalidUnsignedEnvelope)?;
     let mut output = create_private_file(destination)?;
-    let copied = io::copy(
+    let copied = match io::copy(
         &mut entry.by_ref().take(metadata.size.saturating_add(1)),
         &mut output,
-    )
-    .map_err(|error| io_store_error(error.kind()))?;
+    ) {
+        Ok(copied) => copied,
+        Err(error) => {
+            remove_failed_private_file(destination, output)?;
+            return Err(io_store_error(error.kind()));
+        }
+    };
     if copied != metadata.size || metadata.size > file.maximum_size() {
-        drop(output);
-        remove_new_file(destination)?;
+        remove_failed_private_file(destination, output)?;
         return Err(GithubArtifactStoreError::InvalidUnsignedEnvelope);
     }
-    output
-        .flush()
-        .and_then(|()| output.sync_all())
-        .map_err(|error| {
-            let _ = fs::remove_file(destination);
-            io_store_error(error.kind())
-        })?;
+    if let Err(error) = output.flush().and_then(|()| output.sync_all()) {
+        remove_failed_private_file(destination, output)?;
+        return Err(io_store_error(error.kind()));
+    }
     Ok(())
 }
 
@@ -984,6 +1095,7 @@ fn unsigned_verified_run(
                 verified.sanitized_log,
             ),
         ]),
+        evidence: GithubVerifiedRunEvidence::new(verified.compile, None),
     }
 }
 
@@ -1074,6 +1186,8 @@ fn unsigned_manifest(
 
 fn signed_verified_run(
     published: crate::artifact::PublishedGithubArtifact,
+    compile_evidence: CompilePhaseEvidence,
+    cleanup_evidence: GithubSignedCleanupEvidenceV1,
 ) -> Result<VerifiedRunContents, GithubArtifactStoreError> {
     let crate::artifact::PublishedGithubArtifact {
         ipa_path,
@@ -1142,6 +1256,7 @@ fn signed_verified_run(
     Ok(VerifiedRunContents {
         manifest,
         artifacts,
+        evidence: GithubVerifiedRunEvidence::new(compile_evidence, Some(cleanup_evidence)),
     })
 }
 
@@ -1180,7 +1295,9 @@ fn insert_catalog_artifact(
     Ok(())
 }
 
-fn bind_private_cache_root(path: &Path) -> Result<Utf8PathBuf, GithubArtifactStoreError> {
+fn bind_private_cache_root(
+    path: &Path,
+) -> Result<(Utf8PathBuf, PrivateDirectoryGuard), GithubArtifactStoreError> {
     if !path.is_absolute() || !is_normal_path(path) {
         return Err(GithubArtifactStoreError::InvalidCacheRoot);
     }
@@ -1198,7 +1315,79 @@ fn bind_private_cache_root(path: &Path) -> Result<Utf8PathBuf, GithubArtifactSto
     if canonical != path {
         return Err(GithubArtifactStoreError::InvalidCacheRoot);
     }
-    Utf8PathBuf::from_path_buf(canonical).map_err(|_| GithubArtifactStoreError::InvalidCacheRoot)
+    let canonical = Utf8PathBuf::from_path_buf(canonical)
+        .map_err(|_| GithubArtifactStoreError::InvalidCacheRoot)?;
+    let guard = open_private_directory(&canonical)?;
+    Ok((canonical, guard))
+}
+
+#[cfg(windows)]
+fn open_private_directory(
+    path: &Utf8Path,
+) -> Result<PrivateDirectoryGuard, GithubArtifactStoreError> {
+    open_windows_private_directory(path.as_std_path())
+        .map(|handle| PrivateDirectoryGuard { handle })
+        .map_err(map_private_cache_error)
+}
+
+#[cfg(not(windows))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "keeps the retained-directory guard contract platform-neutral"
+)]
+fn open_private_directory(
+    _path: &Utf8Path,
+) -> Result<PrivateDirectoryGuard, GithubArtifactStoreError> {
+    Ok(PrivateDirectoryGuard {})
+}
+
+#[cfg(windows)]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "used directly as a path-free Result::map_err adapter"
+)]
+fn map_private_cache_error(error: PrivateDirectoryError) -> GithubArtifactStoreError {
+    if error.cleanup_status() == PrivateDirectoryCleanupStatus::Uncertain {
+        return GithubArtifactStoreError::CleanupUncertain;
+    }
+    if error.kind() == PrivateDirectoryErrorKind::AlreadyExists {
+        return GithubArtifactStoreError::Io(io::ErrorKind::AlreadyExists);
+    }
+    if matches!(error.os_code(), Some(2 | 3)) {
+        return GithubArtifactStoreError::Io(io::ErrorKind::NotFound);
+    }
+    GithubArtifactStoreError::InvalidCacheRoot
+}
+
+#[cfg(windows)]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "used directly as a path-free Result::map_err adapter"
+)]
+fn map_private_cleanup_error(error: PrivateDirectoryError) -> GithubArtifactStoreError {
+    if error.cleanup_status() == PrivateDirectoryCleanupStatus::Uncertain {
+        GithubArtifactStoreError::CleanupUncertain
+    } else {
+        GithubArtifactStoreError::InvalidCacheRoot
+    }
+}
+
+#[cfg(windows)]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "used directly as a path-free Result::map_err adapter"
+)]
+fn map_private_destination_error(error: PrivateDirectoryError) -> GithubArtifactStoreError {
+    if error.cleanup_status() == PrivateDirectoryCleanupStatus::Uncertain {
+        GithubArtifactStoreError::CleanupUncertain
+    } else {
+        GithubArtifactStoreError::InvalidDestination
+    }
+}
+
+#[cfg(windows)]
+fn windows_private_not_found(error: &PrivateDirectoryError) -> bool {
+    matches!(error.os_code(), Some(2 | 3))
 }
 
 fn create_run_directory(
@@ -1223,10 +1412,11 @@ fn create_run_directory(
     for sequence in 1..=TEMPORARY_NAME_ATTEMPTS {
         let candidate = cache_root.join(format!("{prefix}-{sequence}"));
         match create_private_directory(&candidate) {
-            Ok(()) => {
+            Ok(guard) => {
                 return Ok(RunCacheDirectory {
                     cache_root: cache_root.to_owned(),
                     path: candidate,
+                    guard: Some(guard),
                     owned: true,
                 });
             }
@@ -1240,6 +1430,7 @@ fn create_run_directory(
 fn remove_exact_run_directory(
     cache_root: &Utf8Path,
     run_directory: &Utf8Path,
+    guard: PrivateDirectoryGuard,
 ) -> Result<(), GithubArtifactStoreError> {
     if !cache_root.is_absolute()
         || run_directory.parent() != Some(cache_root)
@@ -1249,7 +1440,43 @@ fn remove_exact_run_directory(
     {
         return Err(GithubArtifactStoreError::InvalidCacheRoot);
     }
-    remove_exact_cache_entry(cache_root, run_directory)
+    #[cfg(windows)]
+    {
+        remove_exact_windows_run_directory(guard)
+    }
+    #[cfg(not(windows))]
+    {
+        release_private_directory_guard(guard);
+        remove_exact_cache_entry(cache_root, run_directory)
+    }
+}
+
+#[cfg(windows)]
+fn remove_exact_windows_run_directory(
+    guard: PrivateDirectoryGuard,
+) -> Result<(), GithubArtifactStoreError> {
+    for attempt in 1..=WINDOWS_RUN_CACHE_CLEANUP_ATTEMPTS {
+        // A failed recursive attempt consumes its handle and may remove part of the tree. Keep the
+        // original identity handle retained so every retry still targets the exact same root.
+        let cleanup_handle = guard
+            .handle
+            .try_clone()
+            .map_err(|error| io_store_error(error.kind()))?;
+        match remove_windows_private_directory_tree_handle(cleanup_handle) {
+            Ok(()) => {
+                release_private_directory_guard(guard);
+                return Ok(());
+            }
+            Err(error)
+                if attempt < WINDOWS_RUN_CACHE_CLEANUP_ATTEMPTS
+                    && matches!(error.kind(), PrivateDirectoryErrorKind::WindowsApi(_)) =>
+            {
+                std::thread::sleep(WINDOWS_RUN_CACHE_CLEANUP_RETRY_DELAY);
+            }
+            Err(error) => return Err(map_private_cleanup_error(error)),
+        }
+    }
+    Err(GithubArtifactStoreError::CleanupUncertain)
 }
 
 fn prune_verified_run_cache(
@@ -1283,6 +1510,7 @@ fn prune_verified_run_cache(
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn remove_exact_cache_entry(
     parent: &Utf8Path,
     path: &Utf8Path,
@@ -1307,7 +1535,44 @@ fn remove_exact_cache_entry(
     }
 }
 
-fn create_private_directory(path: &Utf8Path) -> Result<(), GithubArtifactStoreError> {
+#[cfg(windows)]
+fn remove_exact_cache_entry(
+    parent: &Utf8Path,
+    path: &Utf8Path,
+) -> Result<(), GithubArtifactStoreError> {
+    if !parent.is_absolute() || path.parent() != Some(parent) {
+        return Err(GithubArtifactStoreError::InvalidCacheRoot);
+    }
+    match open_windows_private_directory(path.as_std_path()) {
+        Ok(directory) => {
+            return remove_windows_private_directory_tree_handle(directory)
+                .map_err(map_private_cleanup_error);
+        }
+        Err(error) if windows_private_not_found(&error) => return Ok(()),
+        Err(error) if error.kind() == PrivateDirectoryErrorKind::NotDirectory => {}
+        Err(error) => return Err(map_private_cache_error(error)),
+    }
+    let file = match open_windows_private_file_for_removal(path.as_std_path()) {
+        Ok(file) => file,
+        Err(error) if windows_private_not_found(&error) => return Ok(()),
+        Err(error) => return Err(map_private_cache_error(error)),
+    };
+    remove_windows_private_file_handle(file).map_err(map_private_cleanup_error)
+}
+
+#[cfg(windows)]
+fn create_private_directory(
+    path: &Utf8Path,
+) -> Result<PrivateDirectoryGuard, GithubArtifactStoreError> {
+    create_windows_private_directory(path.as_std_path())
+        .map(|handle| PrivateDirectoryGuard { handle })
+        .map_err(map_private_cache_error)
+}
+
+#[cfg(not(windows))]
+fn create_private_directory(
+    path: &Utf8Path,
+) -> Result<PrivateDirectoryGuard, GithubArtifactStoreError> {
     #[cfg(unix)]
     let builder = {
         let mut builder = fs::DirBuilder::new();
@@ -1327,9 +1592,15 @@ fn create_private_directory(path: &Utf8Path) -> Result<(), GithubArtifactStoreEr
     if metadata.permissions().mode() & 0o077 != 0 {
         return Err(GithubArtifactStoreError::InvalidCacheRoot);
     }
-    Ok(())
+    Ok(PrivateDirectoryGuard {})
 }
 
+#[cfg(windows)]
+fn create_private_file(path: &Utf8Path) -> Result<File, GithubArtifactStoreError> {
+    create_windows_private_file(path.as_std_path()).map_err(map_private_cache_error)
+}
+
+#[cfg(not(windows))]
 fn create_private_file(path: &Utf8Path) -> Result<File, GithubArtifactStoreError> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -1343,13 +1614,35 @@ fn create_private_file(path: &Utf8Path) -> Result<File, GithubArtifactStoreError
 fn write_private_file(path: &Utf8Path, bytes: &[u8]) -> Result<(), GithubArtifactStoreError> {
     let mut file = create_private_file(path)?;
     if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
-        drop(file);
-        let _ = fs::remove_file(path);
+        remove_failed_private_file(path, file)?;
         return Err(io_store_error(error.kind()));
     }
     Ok(())
 }
 
+#[cfg(windows)]
+fn remove_failed_private_file(
+    _path: &Utf8Path,
+    file: File,
+) -> Result<(), GithubArtifactStoreError> {
+    remove_windows_private_file_handle(file).map_err(map_private_cleanup_error)
+}
+
+#[cfg(not(windows))]
+fn remove_failed_private_file(path: &Utf8Path, file: File) -> Result<(), GithubArtifactStoreError> {
+    drop(file);
+    remove_new_file(path)
+}
+
+#[cfg(windows)]
+fn open_regular_file(path: &Utf8Path) -> Result<File, GithubArtifactStoreError> {
+    if !path.is_absolute() {
+        return Err(GithubArtifactStoreError::InvalidCacheRoot);
+    }
+    open_windows_private_file(path.as_std_path()).map_err(map_private_cache_error)
+}
+
+#[cfg(not(windows))]
 fn open_regular_file(path: &Utf8Path) -> Result<File, GithubArtifactStoreError> {
     if !path.is_absolute() {
         return Err(GithubArtifactStoreError::InvalidCacheRoot);
@@ -1414,20 +1707,31 @@ fn verify_regular_file(
     Ok(())
 }
 
+#[cfg(windows)]
 fn atomic_verified_copy(
     source: &Utf8Path,
     record: &ArtifactRecord,
     destination: &ProtocolPath,
-) -> Result<(), GithubArtifactStoreError> {
+) -> Result<RegularFileFilesystemIdentity, GithubArtifactStoreError> {
+    atomic_verified_copy_windows(source, record, destination, |_| Ok(()))
+}
+
+#[cfg(not(windows))]
+fn atomic_verified_copy(
+    source: &Utf8Path,
+    record: &ArtifactRecord,
+    destination: &ProtocolPath,
+) -> Result<RegularFileFilesystemIdentity, GithubArtifactStoreError> {
     atomic_verified_copy_with_unlink(source, record, destination, remove_new_file)
 }
 
+#[cfg(not(windows))]
 fn atomic_verified_copy_with_unlink(
     source: &Utf8Path,
     record: &ArtifactRecord,
     destination: &ProtocolPath,
     unlink_temporary: impl FnOnce(&Utf8Path) -> Result<(), GithubArtifactStoreError>,
-) -> Result<(), GithubArtifactStoreError> {
+) -> Result<RegularFileFilesystemIdentity, GithubArtifactStoreError> {
     let destination = validated_destination(destination)?;
     let destination = Utf8PathBuf::from_path_buf(destination)
         .map_err(|_| GithubArtifactStoreError::InvalidDestination)?;
@@ -1500,8 +1804,15 @@ fn atomic_verified_copy_with_unlink(
             publication.rollback()?;
             return Err(unlink_error);
         }
+        let local_file_identity = match publication.identity() {
+            Ok(identity) => identity,
+            Err(error) => {
+                publication.rollback()?;
+                return Err(error);
+            }
+        };
         publication.commit();
-        Ok(())
+        Ok(local_file_identity)
     })();
     if copy_result.is_err() {
         let _ = fs::remove_file(&temporary_path);
@@ -1509,12 +1820,369 @@ fn atomic_verified_copy_with_unlink(
     copy_result
 }
 
+#[cfg(all(windows, test))]
+fn atomic_verified_copy_with_unlink(
+    source: &Utf8Path,
+    record: &ArtifactRecord,
+    destination: &ProtocolPath,
+    before_unlink: impl FnOnce(&Utf8Path) -> Result<(), GithubArtifactStoreError>,
+) -> Result<RegularFileFilesystemIdentity, GithubArtifactStoreError> {
+    atomic_verified_copy_windows(source, record, destination, before_unlink)
+}
+
+#[cfg(windows)]
+fn atomic_verified_copy_windows(
+    source: &Utf8Path,
+    record: &ArtifactRecord,
+    destination: &ProtocolPath,
+    before_commit: impl FnOnce(&Utf8Path) -> Result<(), GithubArtifactStoreError>,
+) -> Result<RegularFileFilesystemIdentity, GithubArtifactStoreError> {
+    let destination = validated_destination(destination)?;
+    let destination = Utf8PathBuf::from_path_buf(destination)
+        .map_err(|_| GithubArtifactStoreError::InvalidDestination)?;
+    if fs::symlink_metadata(&destination).is_ok() {
+        return Err(GithubArtifactStoreError::InvalidDestination);
+    }
+    let parent = destination
+        .parent()
+        .ok_or(GithubArtifactStoreError::InvalidDestination)?;
+    let (staging_directory, staging_path, mut staging_file) =
+        create_windows_client_staging(parent)?;
+
+    let copy_result = copy_verified_bytes(source, record, &mut staging_file);
+    if let Err(error) = copy_result {
+        cleanup_windows_client_staging(staging_directory, staging_file)?;
+        return Err(error);
+    }
+    if let Err(error) = verify_windows_private_file_handle(staging_file.as_handle()) {
+        cleanup_windows_client_staging(staging_directory, staging_file)?;
+        return Err(map_private_destination_error(error));
+    }
+    let (staging_directory, mut staging_file) =
+        seal_windows_client_staging(staging_directory, staging_file)?;
+    if let Err(error) = verify_sealed_staging_bytes(&mut staging_file, record) {
+        cleanup_windows_client_staging(staging_directory, staging_file)?;
+        return Err(error);
+    }
+    publish_windows_client_staging(
+        staging_directory,
+        &staging_path,
+        staging_file,
+        &destination,
+        before_commit,
+    )
+}
+
+#[cfg(windows)]
+fn create_windows_client_staging(
+    parent: &Utf8Path,
+) -> Result<(File, Utf8PathBuf, File), GithubArtifactStoreError> {
+    for _ in 0..TEMPORARY_NAME_ATTEMPTS {
+        let sequence = TEMPORARY_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let directory_path = parent.join(format!(
+            ".rustferry-client-{}-{sequence}.tmp",
+            std::process::id()
+        ));
+        let directory = match create_windows_private_directory(directory_path.as_std_path()) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == PrivateDirectoryErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(map_private_destination_error(error)),
+        };
+        let file_path = directory_path.join("artifact.tmp");
+        let file = match create_windows_private_staging_file(file_path.as_std_path()) {
+            Ok(file) => file,
+            Err(error) => {
+                remove_windows_private_directory_handle(directory)
+                    .map_err(map_private_cleanup_error)?;
+                return Err(map_private_destination_error(error));
+            }
+        };
+        return Ok((directory, file_path, file));
+    }
+    Err(GithubArtifactStoreError::InvalidDestination)
+}
+
+#[cfg(windows)]
+fn seal_windows_client_staging(
+    directory: File,
+    file: File,
+) -> Result<(File, File), GithubArtifactStoreError> {
+    match seal_windows_private_staging_file(file) {
+        Ok(file) => Ok((directory, file)),
+        Err(error) => {
+            let directory_cleanup = remove_windows_private_directory_handle(directory);
+            if error.cleanup_status() != PrivateDirectoryCleanupStatus::Confirmed
+                || directory_cleanup.is_err()
+            {
+                return Err(GithubArtifactStoreError::CleanupUncertain);
+            }
+            Err(map_private_destination_error(error))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn publish_windows_client_staging(
+    staging_directory: File,
+    staging_path: &Utf8Path,
+    staging_file: File,
+    destination: &Utf8Path,
+    before_commit: impl FnOnce(&Utf8Path) -> Result<(), GithubArtifactStoreError>,
+) -> Result<RegularFileFilesystemIdentity, GithubArtifactStoreError> {
+    if let Err(error) = fs::hard_link(staging_path, destination) {
+        cleanup_windows_client_staging(staging_directory, staging_file)?;
+        return Err(if error.kind() == io::ErrorKind::AlreadyExists {
+            GithubArtifactStoreError::InvalidDestination
+        } else {
+            io_store_error(error.kind())
+        });
+    }
+    if verify_windows_private_file_handle_in_state(
+        staging_file.as_handle(),
+        PrivateFileLinkState::PublicationPair,
+    )
+    .is_err()
+    {
+        cleanup_windows_client_staging_in_state(
+            staging_directory,
+            staging_file,
+            PrivateFileLinkState::PublicationPair,
+        )?;
+        return Err(GithubArtifactStoreError::CleanupUncertain);
+    }
+    let Ok(published) = open_windows_private_file_for_removal_in_state(
+        destination.as_std_path(),
+        PrivateFileLinkState::PublicationPair,
+    ) else {
+        cleanup_windows_client_staging_in_state(
+            staging_directory,
+            staging_file,
+            PrivateFileLinkState::PublicationPair,
+        )?;
+        return Err(GithubArtifactStoreError::CleanupUncertain);
+    };
+    if open_files_match(&staging_file, &published) != Ok(true) {
+        drop(published);
+        cleanup_windows_client_staging_in_state(
+            staging_directory,
+            staging_file,
+            PrivateFileLinkState::PublicationPair,
+        )?;
+        return Err(GithubArtifactStoreError::CleanupUncertain);
+    }
+    if path_matches_open_file(destination, &published) != Ok(true) {
+        rollback_windows_client_publication(staging_directory, staging_file, published)?;
+        return Err(GithubArtifactStoreError::InvalidDestination);
+    }
+    if let Err(error) = before_commit(destination) {
+        rollback_windows_client_publication(staging_directory, staging_file, published)?;
+        return Err(error);
+    }
+    let staging_unlink = staging_file
+        .try_clone()
+        .map_err(|error| io_store_error(error.kind()))
+        .and_then(|file| {
+            remove_windows_private_file_handle_in_state(file, PrivateFileLinkState::PublicationPair)
+                .map_err(map_private_cleanup_error)
+        });
+    if staging_unlink.is_err() {
+        rollback_windows_client_publication(staging_directory, staging_file, published)?;
+        return Err(GithubArtifactStoreError::CleanupUncertain);
+    }
+    drop(staging_file);
+    if remove_windows_private_directory_handle(staging_directory).is_err() {
+        let _ = remove_windows_private_file_handle(published);
+        return Err(GithubArtifactStoreError::CleanupUncertain);
+    }
+    if let Err(error) = verify_windows_private_file_handle(published.as_handle()) {
+        remove_windows_private_file_handle(published).map_err(map_private_cleanup_error)?;
+        return Err(map_private_destination_error(error));
+    }
+    if path_matches_open_file(destination, &published) != Ok(true) {
+        remove_windows_private_file_handle(published).map_err(map_private_cleanup_error)?;
+        return Err(GithubArtifactStoreError::InvalidDestination);
+    }
+    let local_file_identity = match regular_file_identity_from_file(&published) {
+        Ok(identity) => identity,
+        Err(error) => {
+            remove_windows_private_file_handle(published).map_err(map_private_cleanup_error)?;
+            return Err(map_local_identity_error(error));
+        }
+    };
+    drop(published);
+    Ok(local_file_identity)
+}
+
+#[cfg(windows)]
+fn cleanup_windows_client_staging(
+    directory: File,
+    file: File,
+) -> Result<(), GithubArtifactStoreError> {
+    cleanup_windows_client_staging_in_state(directory, file, PrivateFileLinkState::Single)
+}
+
+#[cfg(windows)]
+fn cleanup_windows_client_staging_in_state(
+    directory: File,
+    file: File,
+    state: PrivateFileLinkState,
+) -> Result<(), GithubArtifactStoreError> {
+    let file_cleanup = remove_windows_private_file_handle_in_state(file, state);
+    let directory_cleanup = remove_windows_private_directory_handle(directory);
+    if file_cleanup.is_err() || directory_cleanup.is_err() {
+        Err(GithubArtifactStoreError::CleanupUncertain)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn rollback_windows_client_publication(
+    directory: File,
+    staging_file: File,
+    published: File,
+) -> Result<(), GithubArtifactStoreError> {
+    let published_cleanup = remove_windows_private_file_handle_in_state(
+        published,
+        PrivateFileLinkState::PublicationPair,
+    );
+    let staging_state = if published_cleanup.is_ok() {
+        PrivateFileLinkState::Single
+    } else {
+        PrivateFileLinkState::PublicationPair
+    };
+    let staging_cleanup = remove_windows_private_file_handle_in_state(staging_file, staging_state);
+    let directory_cleanup = remove_windows_private_directory_handle(directory);
+    if published_cleanup.is_err() || staging_cleanup.is_err() || directory_cleanup.is_err() {
+        Err(GithubArtifactStoreError::CleanupUncertain)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn open_files_match(left: &File, right: &File) -> Result<bool, GithubArtifactStoreError> {
+    let left = FileIdentityHandle::from_file(
+        left.try_clone()
+            .map_err(|error| io_store_error(error.kind()))?,
+    )
+    .map_err(|error| io_store_error(error.kind()))?;
+    let right = FileIdentityHandle::from_file(
+        right
+            .try_clone()
+            .map_err(|error| io_store_error(error.kind()))?,
+    )
+    .map_err(|error| io_store_error(error.kind()))?;
+    Ok(left == right)
+}
+
+#[cfg(windows)]
+fn verify_sealed_staging_bytes(
+    file: &mut File,
+    record: &ArtifactRecord,
+) -> Result<(), GithubArtifactStoreError> {
+    if !is_lower_sha256(&record.sha256) {
+        return Err(GithubArtifactStoreError::InvalidSealedArchive);
+    }
+    verify_windows_private_file_handle(file.as_handle()).map_err(map_private_destination_error)?;
+    let initial = file
+        .metadata()
+        .map_err(|error| io_store_error(error.kind()))?;
+    if initial.len() != record.size {
+        return Err(GithubArtifactStoreError::InvalidSealedArchive);
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| io_store_error(error.kind()))?;
+    let mut hasher = Sha256::new();
+    let mut copied = 0_u64;
+    let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| io_store_error(error.kind()))?;
+        if read == 0 {
+            break;
+        }
+        copied = copied
+            .checked_add(u64::try_from(read).unwrap_or(u64::MAX))
+            .ok_or(GithubArtifactStoreError::InvalidSealedArchive)?;
+        if copied > record.size {
+            return Err(GithubArtifactStoreError::InvalidSealedArchive);
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let final_metadata = file
+        .metadata()
+        .map_err(|error| io_store_error(error.kind()))?;
+    verify_windows_private_file_handle(file.as_handle()).map_err(map_private_destination_error)?;
+    if copied != record.size
+        || final_metadata.len() != record.size
+        || hex::encode(hasher.finalize()) != record.sha256
+    {
+        return Err(GithubArtifactStoreError::InvalidSealedArchive);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn copy_verified_bytes(
+    source: &Utf8Path,
+    record: &ArtifactRecord,
+    output: &mut File,
+) -> Result<(), GithubArtifactStoreError> {
+    let mut input = open_regular_file(source)?;
+    let source_metadata = input
+        .metadata()
+        .map_err(|error| io_store_error(error.kind()))?;
+    if source_metadata.len() != record.size || !is_lower_sha256(&record.sha256) {
+        return Err(GithubArtifactStoreError::InvalidSealedArchive);
+    }
+    let mut hasher = Sha256::new();
+    let mut copied = 0_u64;
+    let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
+    loop {
+        let read = input
+            .read(&mut buffer)
+            .map_err(|error| io_store_error(error.kind()))?;
+        if read == 0 {
+            break;
+        }
+        copied = copied
+            .checked_add(u64::try_from(read).unwrap_or(u64::MAX))
+            .ok_or(GithubArtifactStoreError::InvalidSealedArchive)?;
+        if copied > record.size {
+            return Err(GithubArtifactStoreError::InvalidSealedArchive);
+        }
+        output
+            .write_all(&buffer[..read])
+            .map_err(|error| io_store_error(error.kind()))?;
+        hasher.update(&buffer[..read]);
+    }
+    output
+        .flush()
+        .and_then(|()| output.sync_all())
+        .map_err(|error| io_store_error(error.kind()))?;
+    verify_windows_private_file_handle(input.as_handle()).map_err(map_private_cache_error)?;
+    let final_metadata = input
+        .metadata()
+        .map_err(|error| io_store_error(error.kind()))?;
+    if copied != record.size
+        || final_metadata.len() != record.size
+        || hex::encode(hasher.finalize()) != record.sha256
+    {
+        return Err(GithubArtifactStoreError::InvalidSealedArchive);
+    }
+    Ok(())
+}
+
+#[cfg(any(not(windows), test))]
 struct ExactPublicationGuard {
     destination: Utf8PathBuf,
     linked_file: File,
     armed: bool,
 }
 
+#[cfg(any(not(windows), test))]
 impl ExactPublicationGuard {
     fn link(
         temporary: &Utf8Path,
@@ -1549,17 +2217,23 @@ impl ExactPublicationGuard {
         Ok(())
     }
 
+    fn identity(&self) -> Result<RegularFileFilesystemIdentity, GithubArtifactStoreError> {
+        regular_file_identity_from_file(&self.linked_file).map_err(map_local_identity_error)
+    }
+
     fn rollback(mut self) -> Result<(), GithubArtifactStoreError> {
         remove_exact_published_file(&self.destination, &self.linked_file)?;
         self.armed = false;
         Ok(())
     }
 
+    #[cfg(not(windows))]
     fn commit(mut self) {
         self.armed = false;
     }
 }
 
+#[cfg(any(not(windows), test))]
 impl Drop for ExactPublicationGuard {
     fn drop(&mut self) {
         if self.armed {
@@ -1568,6 +2242,7 @@ impl Drop for ExactPublicationGuard {
     }
 }
 
+#[cfg(any(not(windows), test))]
 fn remove_exact_published_file(
     destination: &Utf8Path,
     linked_file: &File,
@@ -1605,6 +2280,14 @@ fn path_matches_open_file(path: &Utf8Path, file: &File) -> Result<bool, GithubAr
     Ok(open_identity == path_identity)
 }
 
+fn map_local_identity_error(error: DirectoryIdentityError) -> GithubArtifactStoreError {
+    error
+        .os_code()
+        .map_or(GithubArtifactStoreError::InvalidDestination, |code| {
+            io_store_error(io::Error::from_raw_os_error(code).kind())
+        })
+}
+
 fn validated_destination(destination: &ProtocolPath) -> Result<PathBuf, GithubArtifactStoreError> {
     destination
         .validate()
@@ -1639,6 +2322,7 @@ fn validated_destination(destination: &ProtocolPath) -> Result<PathBuf, GithubAr
     Ok(canonical_parent.join(file_name))
 }
 
+#[cfg(not(windows))]
 fn remove_new_file(path: &Utf8Path) -> Result<(), GithubArtifactStoreError> {
     fs::remove_file(path).map_err(|error| io_store_error(error.kind()))
 }
@@ -1722,6 +2406,7 @@ fn remote_store_error(error: GithubArtifactStoreError) -> RemoteBuildError {
         GithubArtifactStoreError::ArtifactNotFound => "verified_artifact_not_found",
         GithubArtifactStoreError::InvalidDestination => "artifact_destination_invalid",
         GithubArtifactStoreError::Io(_) => "artifact_cache_io_failed",
+        GithubArtifactStoreError::CleanupUncertain => "artifact_cleanup_uncertain",
     };
     RemoteBuildError::ProviderFailure {
         provider: GITHUB_PROVIDER_ID.to_owned(),
@@ -1971,6 +2656,8 @@ mod tests {
             let mut store = GithubVerifiedArtifactStore::new(transport, &cache_root).unwrap();
             let directory = create_run_directory(store.cache_root(), &context).unwrap();
             let path = directory.path().to_owned();
+            let verified_directory_guard =
+                create_private_directory(&directory.path().join("verified")).unwrap();
             names.insert(path.file_name().unwrap().to_owned());
             let manifest = ArtifactManifest::new(OPERATION_ID, OPERATION_ID);
             store.verified.insert(
@@ -1978,6 +2665,8 @@ mod tests {
                 VerifiedRun {
                     manifest: manifest.clone(),
                     artifacts: BTreeMap::new(),
+                    evidence: GithubVerifiedRunEvidence::new(test_compile(&context.request), None),
+                    _verified_directory_guard: verified_directory_guard,
                     _cache_directory: directory,
                 },
             );
@@ -1986,7 +2675,7 @@ mod tests {
             assert!(path.is_dir());
             assert_eq!(fs::read_dir(&cache_root).unwrap().count(), 1);
             drop(store);
-            assert_eq!(fs::read_dir(&cache_root).unwrap().count(), 0);
+            assert_cache_root_eventually_empty(&cache_root);
         }
 
         assert_eq!(names.len(), 1);
@@ -2038,6 +2727,7 @@ mod tests {
                     path: retained_path.clone(),
                 },
             )]),
+            evidence: GithubVerifiedRunEvidence::new(test_compile(&context.request), None),
         };
 
         prune_verified_run_cache(directory.path(), &verified).unwrap();
@@ -2048,7 +2738,93 @@ mod tests {
         assert!(!directory.path().join("unsigned-xcarchive").exists());
         assert!(!directory.path().join("final-staging").exists());
         drop(directory);
-        assert_eq!(fs::read_dir(cache_root).unwrap().count(), 0);
+        assert_cache_root_eventually_empty(&cache_root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_run_cache_cleanup_retries_a_transient_busy_child() {
+        use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt as _, sync::Arc};
+
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let root = TempDir::new().unwrap();
+        let cache_root = private_cache_root(&root, "busy-cleanup-cache");
+        let context = test_context(test_request(SigningMode::UnsignedCompileOnly));
+        let directory = create_run_directory(&cache_root, &context).unwrap();
+        let busy_path = directory.path().join("busy.txt");
+        write_private_file(&busy_path, b"busy").unwrap();
+        let busy = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&busy_path)
+            .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let release_barrier = Arc::clone(&barrier);
+        let release = std::thread::spawn(move || {
+            release_barrier.wait();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(busy);
+        });
+
+        barrier.wait();
+        drop(directory);
+        release.join().unwrap();
+        assert_cache_root_eventually_empty(&cache_root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cleanup_removes_inherited_nested_tree_below_strict_root() {
+        let root = TempDir::new().unwrap();
+        let cache_root = private_cache_root(&root, "nested-cleanup-cache");
+        let context = test_context(test_request(SigningMode::UnsignedCompileOnly));
+        let directory = create_run_directory(&cache_root, &context).unwrap();
+        let extraction = directory.path().join("unsigned-xcarchive");
+        let extraction_guard = create_private_directory(&extraction).unwrap();
+        let nested = extraction.join("Products/Applications/App.app");
+        fs::create_dir_all(&nested).unwrap();
+        let inherited_file = nested.join("App");
+        fs::write(&inherited_file, b"ordinary inherited child").unwrap();
+        assert!(matches!(
+            open_regular_file(&inherited_file),
+            Err(GithubArtifactStoreError::InvalidCacheRoot)
+        ));
+        drop(extraction_guard);
+
+        remove_exact_cache_entry(directory.path(), &extraction).unwrap();
+        assert!(!extraction.exists());
+        drop(directory);
+        assert_cache_root_eventually_empty(&cache_root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cleanup_rejects_nested_reparse_without_touching_target() {
+        let root = TempDir::new().unwrap();
+        let cache_root = private_cache_root(&root, "reparse-cleanup-cache");
+        let context = test_context(test_request(SigningMode::UnsignedCompileOnly));
+        let directory = create_run_directory(&cache_root, &context).unwrap();
+        let extraction = directory.path().join("unsigned-xcarchive");
+        let extraction_guard = create_private_directory(&extraction).unwrap();
+        let external = canonical_temp_root(&root).join("external.txt");
+        fs::write(&external, b"preserve").unwrap();
+        let linked = extraction.join("linked.txt");
+        match std::os::windows::fs::symlink_file(&external, &linked) {
+            Ok(()) => {
+                drop(extraction_guard);
+                assert_eq!(
+                    remove_exact_cache_entry(directory.path(), &extraction),
+                    Err(GithubArtifactStoreError::CleanupUncertain)
+                );
+                assert_eq!(fs::read(&external).unwrap(), b"preserve");
+                fs::remove_file(&linked).unwrap();
+                remove_exact_cache_entry(directory.path(), &extraction).unwrap();
+            }
+            Err(error) if error.raw_os_error() == Some(1314) => drop(extraction_guard),
+            Err(error) => panic!("create nested test reparse point: {error}"),
+        }
+        drop(directory);
     }
 
     #[test]
@@ -2084,7 +2860,7 @@ mod tests {
         let root = TempDir::new().unwrap();
         let root_path = canonical_temp_root(&root);
         let source = root_path.join("cached.zip");
-        fs::write(&source, b"tampered").unwrap();
+        write_private_file(&source, b"tampered").unwrap();
         let destination = root_path.join("download.zip");
         let destination_protocol = ProtocolPath::new(
             ProtocolPathSemantics::ClientAbsolute,
@@ -2119,7 +2895,7 @@ mod tests {
         let root = TempDir::new().unwrap();
         let root_path = canonical_temp_root(&root);
         let source = root_path.join("cached.zip");
-        fs::write(&source, b"trusted").unwrap();
+        write_private_file(&source, b"trusted").unwrap();
         let destination = root_path.join("download.zip");
         let destination_protocol = ProtocolPath::new(
             ProtocolPathSemantics::ClientAbsolute,
@@ -2168,12 +2944,31 @@ mod tests {
     }
 
     #[test]
+    fn publication_identity_uses_the_retained_file_after_staging_unlink() {
+        let root = TempDir::new().unwrap();
+        let temporary = Utf8PathBuf::from_path_buf(root.path().join("temporary")).unwrap();
+        let destination = Utf8PathBuf::from_path_buf(root.path().join("destination")).unwrap();
+        fs::write(&temporary, b"published").unwrap();
+        let linked_file = File::open(&temporary).unwrap();
+        let publication =
+            ExactPublicationGuard::link(&temporary, &destination, linked_file).unwrap();
+
+        fs::remove_file(&temporary).unwrap();
+        assert_eq!(
+            publication.identity().unwrap(),
+            RegularFileFilesystemIdentity::capture(destination.as_std_path()).unwrap()
+        );
+        publication.rollback().unwrap();
+        assert!(!destination.exists());
+    }
+
+    #[test]
     fn sanitized_log_download_is_verified_and_never_clobbers() {
         let root = TempDir::new().unwrap();
         let root_path = canonical_temp_root(&root);
         let bytes = b"sanitized build output\n";
         let source = root_path.join("cached-log.txt");
-        fs::write(&source, bytes).unwrap();
+        write_private_file(&source, bytes).unwrap();
         let record = ArtifactRecord {
             artifact_id: SANITIZED_BUILD_LOG_ID.to_owned(),
             kind: ArtifactKind::SanitizedLog,
@@ -2189,13 +2984,277 @@ mod tests {
         )
         .unwrap();
 
-        atomic_verified_copy(&source, &record, &destination_protocol).unwrap();
+        let local_file_identity = atomic_verified_copy_with_unlink(
+            &source,
+            &record,
+            &destination_protocol,
+            |published| {
+                assert_eq!(fs::read(published).unwrap(), bytes);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let retained = File::open(&destination).unwrap();
+        assert_eq!(
+            local_file_identity,
+            regular_file_identity_from_file(&retained).unwrap()
+        );
         assert_eq!(fs::read(&destination).unwrap(), bytes);
         assert_eq!(
             atomic_verified_copy(&source, &record, &destination_protocol),
             Err(GithubArtifactStoreError::InvalidDestination)
         );
         assert_eq!(fs::read(destination).unwrap(), bytes);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_private_cache_rejects_inherited_objects_hardlinks_and_reparse_points() {
+        let root = TempDir::new().unwrap();
+        let root_path = canonical_temp_root(&root);
+        let inherited_directory = root_path.join("inherited-directory");
+        fs::create_dir(&inherited_directory).unwrap();
+        assert!(matches!(
+            bind_private_cache_root(inherited_directory.as_std_path()),
+            Err(GithubArtifactStoreError::InvalidCacheRoot)
+        ));
+
+        let inherited_file = root_path.join("inherited-file");
+        fs::write(&inherited_file, b"ordinary").unwrap();
+        assert!(matches!(
+            open_regular_file(&inherited_file),
+            Err(GithubArtifactStoreError::InvalidCacheRoot)
+        ));
+
+        let private_file = root_path.join("private-file");
+        let second_link = root_path.join("second-link");
+        write_private_file(&private_file, b"private").unwrap();
+        fs::hard_link(&private_file, &second_link).unwrap();
+        assert!(matches!(
+            open_regular_file(&private_file),
+            Err(GithubArtifactStoreError::InvalidCacheRoot)
+        ));
+        fs::remove_file(&second_link).unwrap();
+
+        let reparse_path = root_path.join("reparse-file");
+        match std::os::windows::fs::symlink_file(&private_file, &reparse_path) {
+            Ok(()) => {
+                assert!(matches!(
+                    open_regular_file(&reparse_path),
+                    Err(GithubArtifactStoreError::InvalidCacheRoot)
+                ));
+            }
+            Err(error) if error.raw_os_error() == Some(1314) => {}
+            Err(error) => panic!("create test reparse point: {error}"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_publication_is_private_single_link_and_leaves_no_staging_file() {
+        let root = TempDir::new().unwrap();
+        let root_path = canonical_temp_root(&root);
+        let source = root_path.join("cached.zip");
+        write_private_file(&source, b"trusted").unwrap();
+        let destination = root_path.join("download.zip");
+        let destination_protocol = ProtocolPath::new(
+            ProtocolPathSemantics::ClientAbsolute,
+            destination.as_str().to_owned(),
+        )
+        .unwrap();
+        let record = ArtifactRecord {
+            artifact_id: UNSIGNED_ARTIFACT_ID.to_owned(),
+            kind: ArtifactKind::Xcarchive,
+            file_name: UNSIGNED_ARCHIVE_NAME.to_owned(),
+            size: 7,
+            sha256: sha256_bytes(b"trusted"),
+            media_type: Some("application/zip".to_owned()),
+        };
+
+        atomic_verified_copy(&source, &record, &destination_protocol).unwrap();
+        let published = open_windows_private_file(destination.as_std_path()).unwrap();
+        verify_windows_private_file_handle(published.as_handle()).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"trusted");
+        let names = fs::read_dir(&root_path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            names,
+            BTreeSet::from(["cached.zip".to_owned(), "download.zip".to_owned()])
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_publication_rollback_preserves_replacement() {
+        let root = TempDir::new().unwrap();
+        let root_path = canonical_temp_root(&root);
+        let source = root_path.join("cached.zip");
+        write_private_file(&source, b"trusted").unwrap();
+        let destination = root_path.join("download.zip");
+        let displaced = root_path.join("displaced.zip");
+        let destination_protocol = ProtocolPath::new(
+            ProtocolPathSemantics::ClientAbsolute,
+            destination.as_str().to_owned(),
+        )
+        .unwrap();
+        let record = ArtifactRecord {
+            artifact_id: UNSIGNED_ARTIFACT_ID.to_owned(),
+            kind: ArtifactKind::Xcarchive,
+            file_name: UNSIGNED_ARCHIVE_NAME.to_owned(),
+            size: 7,
+            sha256: sha256_bytes(b"trusted"),
+            media_type: Some("application/zip".to_owned()),
+        };
+
+        assert_eq!(
+            atomic_verified_copy_with_unlink(
+                &source,
+                &record,
+                &destination_protocol,
+                |published| {
+                    assert_eq!(fs::read(published).unwrap(), b"trusted");
+                    fs::rename(published, &displaced)
+                        .map_err(|error| io_store_error(error.kind()))?;
+                    fs::write(published, b"replacement")
+                        .map_err(|error| io_store_error(error.kind()))?;
+                    Err(io_store_error(io::ErrorKind::PermissionDenied))
+                },
+            ),
+            Err(GithubArtifactStoreError::Io(
+                io::ErrorKind::PermissionDenied
+            ))
+        );
+        assert_eq!(fs::read(&destination).unwrap(), b"replacement");
+        assert!(!displaced.exists());
+        assert_eq!(
+            fs::read_dir(&root_path)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().contains("rustferry"))
+                .count(),
+            0
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_stale_private_staging_directory_cannot_publish_partial_final() {
+        let root = TempDir::new().unwrap();
+        let root_path = canonical_temp_root(&root);
+        let source = root_path.join("cached.zip");
+        write_private_file(&source, b"trusted").unwrap();
+        let destination = root_path.join("download.zip");
+        let destination_protocol = ProtocolPath::new(
+            ProtocolPathSemantics::ClientAbsolute,
+            destination.as_str().to_owned(),
+        )
+        .unwrap();
+        let record = ArtifactRecord {
+            artifact_id: UNSIGNED_ARTIFACT_ID.to_owned(),
+            kind: ArtifactKind::Xcarchive,
+            file_name: UNSIGNED_ARCHIVE_NAME.to_owned(),
+            size: 7,
+            sha256: sha256_bytes(b"trusted"),
+            media_type: Some("application/zip".to_owned()),
+        };
+        let stale_directory_path = root_path.join(format!(
+            ".rustferry-client-{}-{}.tmp",
+            std::process::id(),
+            u64::MAX
+        ));
+        let stale_directory =
+            create_windows_private_directory(stale_directory_path.as_std_path()).unwrap();
+        let stale_path = stale_directory_path.join("artifact.tmp");
+        let mut stale_file = create_windows_private_staging_file(stale_path.as_std_path()).unwrap();
+        stale_file.write_all(b"partial").unwrap();
+        stale_file.sync_all().unwrap();
+
+        assert!(!destination.exists());
+        atomic_verified_copy(&source, &record, &destination_protocol).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"trusted");
+        assert_eq!(fs::read(&stale_path).unwrap(), b"partial");
+
+        remove_windows_private_file_handle(stale_file).unwrap();
+        remove_windows_private_directory_handle(stale_directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_post_seal_rehash_rejects_mutation_and_cleans_staging() {
+        let root = TempDir::new().unwrap();
+        let root_path = canonical_temp_root(&root);
+        let (directory, staging_path, mut writer) =
+            create_windows_client_staging(&root_path).unwrap();
+        writer.write_all(b"mutated").unwrap();
+        writer.sync_all().unwrap();
+        let (directory, mut sealed) = seal_windows_client_staging(directory, writer).unwrap();
+        let expected = ArtifactRecord {
+            artifact_id: UNSIGNED_ARTIFACT_ID.to_owned(),
+            kind: ArtifactKind::Xcarchive,
+            file_name: UNSIGNED_ARCHIVE_NAME.to_owned(),
+            size: 7,
+            sha256: sha256_bytes(b"trusted"),
+            media_type: Some("application/zip".to_owned()),
+        };
+
+        assert_eq!(
+            verify_sealed_staging_bytes(&mut sealed, &expected),
+            Err(GithubArtifactStoreError::InvalidSealedArchive)
+        );
+        cleanup_windows_client_staging(directory, sealed).unwrap();
+        assert!(!staging_path.exists());
+        assert_eq!(fs::read_dir(&root_path).unwrap().count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_publication_surfaces_uncertain_cleanup() {
+        let root = TempDir::new().unwrap();
+        let root_path = canonical_temp_root(&root);
+        let source = root_path.join("cached.zip");
+        write_private_file(&source, b"trusted").unwrap();
+        let destination = root_path.join("download.zip");
+        let extra_link = root_path.join("extra-link.zip");
+        let destination_protocol = ProtocolPath::new(
+            ProtocolPathSemantics::ClientAbsolute,
+            destination.as_str().to_owned(),
+        )
+        .unwrap();
+        let record = ArtifactRecord {
+            artifact_id: UNSIGNED_ARTIFACT_ID.to_owned(),
+            kind: ArtifactKind::Xcarchive,
+            file_name: UNSIGNED_ARCHIVE_NAME.to_owned(),
+            size: 7,
+            sha256: sha256_bytes(b"trusted"),
+            media_type: Some("application/zip".to_owned()),
+        };
+
+        assert_eq!(
+            atomic_verified_copy_with_unlink(
+                &source,
+                &record,
+                &destination_protocol,
+                |temporary| {
+                    fs::hard_link(temporary, &extra_link)
+                        .map_err(|error| io_store_error(error.kind()))?;
+                    Err(io_store_error(io::ErrorKind::PermissionDenied))
+                },
+            ),
+            Err(GithubArtifactStoreError::CleanupUncertain)
+        );
+        assert!(destination.exists());
+        assert!(extra_link.exists());
+        assert!(
+            fs::read_dir(&root_path)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".rustferry-client-"))
+        );
     }
 
     #[test]
@@ -2271,7 +3330,7 @@ mod tests {
     }
 
     fn write_outer(path: &Utf8Path, names: &[&str]) {
-        let mut writer = ZipWriter::new(File::create(path).unwrap());
+        let mut writer = ZipWriter::new(create_private_file(path).unwrap());
         let options = SimpleFileOptions::default()
             .compression_method(CompressionMethod::Stored)
             .unix_permissions(0o600);
@@ -2286,6 +3345,24 @@ mod tests {
         let cache_root = canonical_temp_root(root).join(name);
         create_private_directory(&cache_root).unwrap();
         cache_root
+    }
+
+    fn assert_cache_root_eventually_empty(cache_root: &Utf8Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let entries = fs::read_dir(cache_root)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            if entries.is_empty() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "artifact cache entries remained after the store was dropped: {entries:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     fn canonical_temp_root(root: &TempDir) -> Utf8PathBuf {
@@ -2336,6 +3413,7 @@ mod tests {
             job_id: OPERATION_ID.to_owned(),
             operation_id: OPERATION_ID.to_owned(),
             repository,
+            execution_repository_id: Some(991),
             run,
             source_repository: "https://github.com/example/app".to_owned(),
             source_revision: CommitSha::new(SOURCE_REVISION).unwrap(),

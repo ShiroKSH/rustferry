@@ -287,6 +287,34 @@ mod tests {
     }
 
     #[test]
+    fn doctor_fails_closed_when_signing_is_required() {
+        let request = ProviderDoctorRequest {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            operation_id: "doctor-signing-1".to_owned(),
+            require_signing: true,
+        };
+        let checks = vec![WorkerHostCheck {
+            id: "host.macos".to_owned(),
+            required: true,
+            status: WorkerHostCheckStatus::Passed,
+            detail: "macOS host detected".to_owned(),
+        }];
+
+        let response = doctor_response(&request, checks);
+        let WorkerStdioResponse::ProviderDoctor(report) = response.response else {
+            panic!("expected doctor response");
+        };
+        assert!(!report.ready);
+        assert!(report.checks.iter().any(|check| {
+            check.code == "ssh.signing.unsupported" && check.status == ProviderCheckStatus::Error
+        }));
+        assert_eq!(
+            report.capabilities.signing_modes,
+            BTreeSet::from([SigningMode::UnsignedCompileOnly])
+        );
+    }
+
+    #[test]
     fn malformed_input_emits_one_strict_secret_free_error() {
         let options = WorkerHostOptions::from_environment(camino::Utf8PathBuf::from(
             "/tmp/rustferry-worker-test",

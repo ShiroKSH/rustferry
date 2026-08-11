@@ -14,6 +14,7 @@ import {
   eventDiagnostic,
   parseDeviceSnapshotResponse,
   parseHandshake,
+  parseJobsListResponse,
   parseJsonObject,
   parseProjectResponse,
   parseValidationResponse
@@ -23,6 +24,59 @@ const executable = process.env.RUSTFERRY_TEST_CLI;
 
 describe.runIf(executable !== undefined)("live cargo-ferry IDE protocol", () => {
   const workspace = path.resolve(process.cwd(), "../../examples/counter");
+
+  it("reads workspace-bound jobs through the negotiated IDE commands", async () => {
+    const handshake = parseHandshake(run(["ide", "handshake", "--json"]).stdout);
+    expect(handshake.supported_commands).toEqual(expect.arrayContaining([
+      "jobs-list",
+      "jobs-show",
+      "jobs-artifacts",
+      "jobs-logs"
+    ]));
+    expect(handshake.supported_commands.includes("remote-build-preview")).toBe(
+      handshake.supported_commands.includes("remote-build-submit")
+    );
+    const jobs = parseJobsListResponse(run([
+      "ide",
+      "jobs-list",
+      "--workspace",
+      workspace,
+      "--limit",
+      "50",
+      "--json"
+    ]).stdout);
+    expect(jobs.returned).toBe(jobs.jobs.length);
+    expect(jobs.limit).toBe(50);
+    expect(jobs.workspace.toLowerCase()).toContain(workspace.toLowerCase());
+
+    const runner = new ProcessRunner();
+    const client = new CliClient(
+      { executable: executable!, prefixArgs: [], source: "path" },
+      runner,
+      { appendLine: () => undefined } as unknown as vscode.OutputChannel,
+      1_048_576
+    );
+    try {
+      await expect(client.jobsList(workspace)).resolves.toMatchObject({
+        response: { limit: 50, returned: jobs.returned }
+      });
+      await expect(client.jobShow(workspace, "job-missing")).rejects.toMatchObject({
+        code: "job_not_found"
+      });
+      await expect(client.jobArtifacts(workspace, "job-missing")).rejects.toMatchObject({
+        code: "job_not_found"
+      });
+      if (handshake.supported_commands.includes("jobs-logs-page")) {
+        await expect(client.jobLogsPage(
+          workspace,
+          "job-missing",
+          { afterSequence: "0", limit: 256 }
+        )).rejects.toMatchObject({ code: "job_not_found" });
+      }
+    } finally {
+      runner.dispose();
+    }
+  });
 
   it("aligns handshake, project, validation, schema, and failed stream output", () => {
     const handshake = parseHandshake(run(["ide", "handshake", "--json"]).stdout);

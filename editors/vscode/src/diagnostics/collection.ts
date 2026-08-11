@@ -38,7 +38,7 @@ export class RustFerryDiagnostics implements vscode.CodeActionProvider, vscode.D
     this.clearProject(project);
     const grouped = new Map<string, { uri: vscode.Uri; values: vscode.Diagnostic[] }>();
     for (const source of response.diagnostics) {
-      const uri = vscode.Uri.file(source.file);
+      const uri = diagnosticFileUri(source.file);
       const key = uri.toString();
       const group = grouped.get(key) ?? { uri, values: [] };
       const diagnostic = toDiagnostic(source);
@@ -223,4 +223,16 @@ function severity(value: ProtocolDiagnostic["severity"]): vscode.DiagnosticSever
 function fixKey(uri: vscode.Uri, diagnostic: vscode.Diagnostic): string {
   const code = typeof diagnostic.code === "object" ? diagnostic.code.value : diagnostic.code;
   return `${uri.toString()}:${diagnostic.range.start.line}:${diagnostic.range.start.character}:${diagnostic.range.end.line}:${diagnostic.range.end.character}:${String(code)}`;
+}
+
+function diagnosticFileUri(file: string): vscode.Uri {
+  if (process.platform === "win32") {
+    if (file.startsWith("\\\\?\\UNC\\")) {
+      return vscode.Uri.file(`\\\\${file.slice(8)}`);
+    }
+    if (/^\\\\\?\\[A-Za-z]:\\/u.test(file)) {
+      return vscode.Uri.file(file.slice(4));
+    }
+  }
+  return vscode.Uri.file(file);
 }

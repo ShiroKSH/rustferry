@@ -990,8 +990,11 @@ fn extract_archive_entry(
         .map_err(|source| io_error("synchronize extracted IPA file", source))?;
     let executable = entry.unix_mode().is_some_and(|mode| mode & 0o111 != 0)
         || is_inspected_executable(&name, inspection);
+    #[cfg(unix)]
     set_extracted_permissions(&output, executable)
         .map_err(|source| io_error("secure extracted IPA file", source))?;
+    #[cfg(not(unix))]
+    let _ = executable;
     Ok(())
 }
 
@@ -1070,11 +1073,6 @@ fn set_extracted_permissions(file: &cap_std::fs::File, executable: bool) -> io::
 
     let mode = if executable { 0o755 } else { 0o644 };
     file.set_permissions(cap_std::fs::Permissions::from_mode(mode))
-}
-
-#[cfg(not(unix))]
-fn set_extracted_permissions(_file: &cap_std::fs::File, _executable: bool) -> io::Result<()> {
-    Ok(())
 }
 
 fn describe_open_file(file: &mut File) -> Result<(u64, String), SignedIpaValidationError> {
@@ -1234,6 +1232,7 @@ fn validate_extracted_ipa(
     {
         return Err(SignedIpaValidationError::UnsafeIpaArchive);
     }
+    #[cfg(unix)]
     secure_private_directory(&certificate_directory)?;
 
     let mut ordered = code_objects.iter().collect::<Vec<_>>();
@@ -2163,11 +2162,6 @@ fn secure_private_directory(path: &Utf8Path) -> Result<(), SignedIpaValidationEr
 
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
         .map_err(|source| io_error("secure certificate evidence directory", source))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn secure_private_directory(_path: &Utf8Path) -> Result<(), SignedIpaValidationError> {
     Ok(())
 }
 

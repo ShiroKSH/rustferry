@@ -36,6 +36,10 @@
       "$ref": "#/$defs/SourceBundleDescriptor"
     },
     {
+      "description": "Operation-bound descriptor for one GitHub dirty-source snapshot.",
+      "$ref": "#/$defs/GitSnapshotDescriptor"
+    },
+    {
       "description": "Worker acknowledgement for one snapshot job.",
       "$ref": "#/$defs/SnapshotJobAccepted"
     },
@@ -238,6 +242,10 @@
       "description": "Verified result of one provider artifact download.",
       "type": "object",
       "properties": {
+        "local_file_identity": {
+          "description": "Canonical, secret-free identity captured from the retained published file object.",
+          "type": "string"
+        },
         "local_path": {
           "description": "Absolute client path containing verified bytes.",
           "$ref": "#/$defs/ProtocolPath"
@@ -249,7 +257,8 @@
       },
       "required": [
         "manifest",
-        "local_path"
+        "local_path",
+        "local_file_identity"
       ]
     },
     "ArtifactKind": {
@@ -1028,6 +1037,47 @@
         "limit"
       ]
     },
+    "GitSnapshotDescriptor": {
+      "description": "Strict binding for one operation-scoped GitHub dirty-source snapshot.\n\nThe orphan commit containing this descriptor has exactly the two paths in\n[`GIT_SNAPSHOT_TREE_PATHS`]. The full request hash cannot be embedded because\nits `source_revision` is the SHA of that commit; `request_template_sha256`\ntherefore covers the canonical request with only `source_revision` omitted.",
+      "type": "object",
+      "properties": {
+        "bundle": {
+          "description": "Deterministic ZIP transport and exact source manifest.",
+          "$ref": "#/$defs/SourceBundleDescriptor"
+        },
+        "operation_id": {
+          "description": "Exact operation identifier used to derive `snapshot_ref`.",
+          "type": "string"
+        },
+        "request_template_sha256": {
+          "description": "Canonical request SHA-256 with only `source_revision` omitted.",
+          "type": "string"
+        },
+        "schema_version": {
+          "description": "Git snapshot descriptor schema version.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "snapshot_ref": {
+          "description": "Exact operation-derived heads ref carrying the orphan commit.",
+          "type": "string"
+        },
+        "source_repository": {
+          "description": "Exact normalized credential-free HTTPS GitHub source repository.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "operation_id",
+        "source_repository",
+        "snapshot_ref",
+        "request_template_sha256",
+        "bundle"
+      ]
+    },
     "HandshakeRequest": {
       "description": "Versioned client handshake request.",
       "type": "object",
@@ -1167,7 +1217,7 @@
           "$ref": "#/$defs/SigningPlan"
         },
         "source": {
-          "description": "Required deterministic integrity and shape manifest for either source mode.",
+          "description": "Required deterministic integrity and shape manifest for every source mode.",
           "$ref": "#/$defs/SourceManifest"
         },
         "source_mode": {
@@ -1175,14 +1225,14 @@
           "$ref": "#/$defs/SourceMode"
         },
         "source_repository": {
-          "description": "Normalized HTTPS GitHub repository URL in Git mode.",
+          "description": "Normalized HTTPS GitHub repository URL in Git-backed source modes.",
           "type": [
             "string",
             "null"
           ]
         },
         "source_revision": {
-          "description": "Exact lowercase 40-hex commit SHA in Git mode.",
+          "description": "Exact lowercase 40-hex commit SHA in Git-backed source modes.",
           "type": [
             "string",
             "null"
@@ -3470,6 +3520,11 @@
           "description": "The worker checks out a pinned Git revision.",
           "type": "string",
           "const": "git"
+        },
+        {
+          "description": "The worker checks out an operation-scoped orphan commit containing a verified source ZIP.",
+          "type": "string",
+          "const": "git_snapshot"
         },
         {
           "description": "The client sends a verified content snapshot.",

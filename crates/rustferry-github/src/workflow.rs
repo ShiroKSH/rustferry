@@ -817,6 +817,16 @@ pub struct WorkflowLimits {
     retention_days: u16,
 }
 
+/// GitHub event that starts one generated worker workflow.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WorkflowRunTrigger {
+    /// A push below the temporary operation branch namespace.
+    #[default]
+    Push,
+    /// One explicitly authenticated API dispatch with exact public inputs.
+    WorkflowDispatch,
+}
+
 impl WorkflowLimits {
     /// Construct bounded compile/signing timeouts and artifact retention.
     ///
@@ -876,12 +886,13 @@ pub struct WorkflowConfig {
     temporary_branch_namespace: TemporaryBranchNamespace,
     developer_directory: DeveloperDirectory,
     limits: WorkflowLimits,
+    run_trigger: WorkflowRunTrigger,
 }
 
 impl WorkflowConfig {
     /// Bind the security-sensitive workflow configuration.
     ///
-    /// Push dispatch through the temporary branch namespace is always enabled.
+    /// Defaults to push dispatch through the temporary branch namespace.
     ///
     /// # Errors
     ///
@@ -894,6 +905,37 @@ impl WorkflowConfig {
         public_source_repository: PublicSourceRepository,
         trusted_source_ref: TrustedSourceRef,
         temporary_branch_namespace: TemporaryBranchNamespace,
+    ) -> Result<Self, WorkflowConfigError> {
+        Self::new_with_run_trigger(
+            filename,
+            protected_environment,
+            secret_names,
+            worker,
+            public_source_repository,
+            trusted_source_ref,
+            temporary_branch_namespace,
+            WorkflowRunTrigger::default(),
+        )
+    }
+
+    /// Bind the security-sensitive workflow configuration and one exact run trigger.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a trusted branch that lives inside the temporary job namespace.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the trigger is an additive part of the already-typed workflow configuration"
+    )]
+    pub fn new_with_run_trigger(
+        filename: WorkflowFileName,
+        protected_environment: ProtectedEnvironment,
+        secret_names: SigningSecretNames,
+        worker: WorkerDistribution,
+        public_source_repository: PublicSourceRepository,
+        trusted_source_ref: TrustedSourceRef,
+        temporary_branch_namespace: TemporaryBranchNamespace,
+        run_trigger: WorkflowRunTrigger,
     ) -> Result<Self, WorkflowConfigError> {
         let temporary_prefix = temporary_branch_namespace.full_ref_prefix();
         let trusted_source = trusted_source_ref.as_str();
@@ -914,6 +956,7 @@ impl WorkflowConfig {
             temporary_branch_namespace,
             developer_directory: DeveloperDirectory::github_default(),
             limits: WorkflowLimits::secure_defaults(),
+            run_trigger,
         })
     }
 
@@ -974,6 +1017,11 @@ impl WorkflowConfig {
     /// Bounded execution policy.
     pub const fn limits(&self) -> WorkflowLimits {
         self.limits
+    }
+
+    /// Exact GitHub event admitted by the generated workflow.
+    pub const fn run_trigger(&self) -> WorkflowRunTrigger {
+        self.run_trigger
     }
 }
 
@@ -1054,17 +1102,23 @@ pub fn generate_workflow(config: &WorkflowConfig) -> GeneratedWorkflow {
 }
 
 fn render_header(yaml: &mut String, config: &WorkflowConfig) {
-    push(
-        yaml,
-        "name: RustFerry physical iPhone\n\non:\n  push:\n    branches:\n",
-    );
-    line(
-        yaml,
-        format_args!(
-            "      - '{}'",
-            config.temporary_branch_namespace.trigger_pattern()
+    match config.run_trigger {
+        WorkflowRunTrigger::Push => {
+            push(yaml, "name: RustFerry physical iPhone\n\non:\n");
+            push(yaml, "  push:\n    branches:\n");
+            line(
+                yaml,
+                format_args!(
+                    "      - '{}'",
+                    config.temporary_branch_namespace.trigger_pattern()
+                ),
+            );
+        }
+        WorkflowRunTrigger::WorkflowDispatch => push(
+            yaml,
+            "name: RustFerry physical iPhone\n\nrun-name: 'rustferry-v1|${{ inputs.operation_id }}|${{ inputs.request_sha256 }}|${{ inputs.source_revision }}|${{ inputs.dispatch_revision }}'\n\non:\n  workflow_dispatch:\n    inputs:\n      operation_id:\n        description: 'Exact provider operation identifier'\n        required: true\n        type: string\n      request_sha256:\n        description: 'Canonical request SHA-256'\n        required: true\n        type: string\n      source_revision:\n        description: 'Exact trusted source revision'\n        required: true\n        type: string\n      dispatch_revision:\n        description: 'Exact temporary ref revision'\n        required: true\n        type: string\n",
         ),
-    );
+    }
     push(
         yaml,
         "\npermissions: {}\n\nconcurrency:\n  group: 'rustferry-iphone-${{ github.repository_id }}'\n  cancel-in-progress: false\n\nenv:\n",
@@ -1856,6 +1910,25 @@ mod tests {
         .unwrap()
     }
 
+    fn fixture_dispatch_config() -> WorkflowConfig {
+        WorkflowConfig::new_with_run_trigger(
+            WorkflowFileName::new("rustferry-goal3-iphone.yml").unwrap(),
+            ProtectedEnvironment::new("rustferry-goal3-signing").unwrap(),
+            SigningSecretNames::goal3_defaults(),
+            WorkerDistribution::new(
+                "https://github.com/ShiroKSH/rustferry/releases/download/v0.1.0/ferry-worker-macos",
+                WORKER_SHA256,
+                "0.1.0",
+            )
+            .unwrap(),
+            fixture_public_source(),
+            TrustedSourceRef::new("refs/heads/goal3/macless-iphone-builds").unwrap(),
+            TemporaryBranchNamespace::new("rustferry/goal3/builds").unwrap(),
+            WorkflowRunTrigger::WorkflowDispatch,
+        )
+        .unwrap()
+    }
+
     fn fixture_multi_profile_config() -> WorkflowConfig {
         let mut config = fixture_config();
         config.secret_names = SigningSecretNames::for_targets(&[
@@ -1934,6 +2007,26 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.yaml().lines().count(), 369);
         assert_eq!(fnv1a64(first.yaml().as_bytes()), 0x58cf_50e3_6f3d_c831);
+    }
+
+    #[test]
+    fn deterministic_workflow_dispatch_snapshot() {
+        let first = generate_workflow(&fixture_dispatch_config());
+        let second = generate_workflow(&fixture_dispatch_config());
+
+        assert_eq!(first, second);
+        assert_eq!(first.yaml().lines().count(), 297);
+        assert_eq!(fnv1a64(first.yaml().as_bytes()), 0xb2c0_73ff_cf01_660d);
+        let (header, _) = first
+            .yaml()
+            .split_once("\npermissions: {}\n")
+            .expect("permissions follow trigger");
+        assert_eq!(
+            header,
+            "name: RustFerry physical iPhone\n\nrun-name: 'rustferry-v1|${{ inputs.operation_id }}|${{ inputs.request_sha256 }}|${{ inputs.source_revision }}|${{ inputs.dispatch_revision }}'\n\non:\n  workflow_dispatch:\n    inputs:\n      operation_id:\n        description: 'Exact provider operation identifier'\n        required: true\n        type: string\n      request_sha256:\n        description: 'Canonical request SHA-256'\n        required: true\n        type: string\n      source_revision:\n        description: 'Exact trusted source revision'\n        required: true\n        type: string\n      dispatch_revision:\n        description: 'Exact temporary ref revision'\n        required: true\n        type: string\n"
+        );
+        assert!(!header.contains("push:"));
+        assert!(!header.contains("${{ secrets."));
     }
 
     #[test]

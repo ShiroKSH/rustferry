@@ -9,13 +9,20 @@ import { ProtocolError } from "./cli/protocol.js";
 import { registerCommands } from "./commands/index.js";
 import type { CommandServices } from "./commands/types.js";
 import { settings } from "./config/settings.js";
-import { commands, INSTALLATION_URL, LOGS_CHANNEL, OUTPUT_CHANNEL } from "./constants.js";
+import {
+  commands,
+  INSTALLATION_URL,
+  JOB_LOGS_CHANNEL,
+  LOGS_CHANNEL,
+  OUTPUT_CHANNEL
+} from "./constants.js";
 import { RustFerryDiagnostics } from "./diagnostics/collection.js";
 import { ConfigValidationCoordinator } from "./diagnostics/configValidation.js";
 import { RustFerryTaskProvider } from "./tasks/provider.js";
 import { RustFerryStatusBar } from "./ui/statusBar.js";
 import { ArtifactsTreeProvider } from "./views/artifactsTree.js";
 import { DevicesTreeProvider } from "./views/devicesTree.js";
+import { JobsTreeProvider } from "./views/jobsTree.js";
 import { ProjectTreeProvider } from "./views/projectTree.js";
 import { WorkspaceProjects } from "./workspace/discovery.js";
 import type { WorkspaceProject } from "./workspace/project.js";
@@ -55,6 +62,7 @@ class ExtensionController implements vscode.Disposable {
   readonly #runner = new ProcessRunner();
   readonly #output = vscode.window.createOutputChannel(OUTPUT_CHANNEL, { log: true });
   readonly #logs = vscode.window.createOutputChannel(LOGS_CHANNEL);
+  readonly #jobLogs = vscode.window.createOutputChannel(JOB_LOGS_CHANNEL);
   readonly #projects: WorkspaceProjects;
   readonly #diagnostics = new RustFerryDiagnostics();
   readonly #validation: ConfigValidationCoordinator;
@@ -79,21 +87,29 @@ class ExtensionController implements vscode.Disposable {
     const projectTree = new ProjectTreeProvider(this.#projects);
     const devicesTree = new DevicesTreeProvider(this.#projects);
     const artifactsTree = new ArtifactsTreeProvider(this.#projects);
+    const jobsTree = new JobsTreeProvider(
+      this.#projects,
+      async (project) => await this.clientFor(project),
+      this.#output
+    );
     const statusBar = new RustFerryStatusBar(this.#projects);
     this.#disposables.push(
       this.#runner,
       this.#output,
       this.#logs,
+      this.#jobLogs,
       this.#projects,
       this.#diagnostics,
       this.#validation,
       projectTree,
       devicesTree,
       artifactsTree,
+      jobsTree,
       statusBar,
       vscode.window.createTreeView("rustferry.project", { treeDataProvider: projectTree, showCollapseAll: true }),
       vscode.window.createTreeView("rustferry.devices", { treeDataProvider: devicesTree, showCollapseAll: true }),
       vscode.window.createTreeView("rustferry.artifacts", { treeDataProvider: artifactsTree, showCollapseAll: true }),
+      vscode.window.createTreeView("rustferry.jobs", { treeDataProvider: jobsTree, showCollapseAll: true }),
       vscode.languages.registerCodeActionsProvider(
         { language: "toml", pattern: "**/ferry.toml" },
         this.#diagnostics,
@@ -108,11 +124,14 @@ class ExtensionController implements vscode.Disposable {
       validation: this.#validation,
       output: this.#output,
       logs: this.#logs,
+      jobLogs: this.#jobLogs,
       clientFor: async (project) => await this.clientFor(project),
       clientAt: async (cwd, resource) => await this.clientAt(cwd, resource),
       invocationFor: async (project) => await this.invocationFor(project),
       refreshProject: async (project) => await this.refreshProject(project),
-      refreshAll: async () => await this.refreshAll()
+      refreshAll: async () => await this.refreshAll(),
+      refreshJobs: () => jobsTree.refresh(),
+      loadMoreJobLogs: async (argument) => await jobsTree.loadMoreLogs(argument)
     };
     this.#disposables.push(
       ...registerCommands(services),

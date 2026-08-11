@@ -15,6 +15,12 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 
+#[cfg(windows)]
+use rustferry_core::windows_private_directory::{
+    create_private_directory as create_private_directory_handle,
+    remove_private_directory_tree_handle,
+};
+
 use camino::{Utf8Path, Utf8PathBuf};
 use cap_std::{ambient_authority, fs::Dir as CapabilityDir};
 use rustferry_remote::{
@@ -26,7 +32,7 @@ use rustferry_remote::{
     WorkerDataPlaneFrameError, WorkerDataPlaneFrameHeader, WorkerDataPlaneFrameKind,
     WorkerDataPlaneSequence, canonical_request_sha256, copy_worker_data_plane_payload,
     read_worker_data_plane_header, read_worker_data_plane_payload,
-    verify_and_extract_source_bundle, write_worker_data_plane_frame,
+    verify_and_extract_source_bundle_with_parent_handle, write_worker_data_plane_frame,
     write_worker_data_plane_stream,
 };
 use same_file::Handle;
@@ -474,11 +480,13 @@ impl<'a, W: Write> Session<'a, W> {
             .ok_or_else(|| SessionFailure::internal("job_root_missing"))?;
         root.verify()?;
         let source_root = root.path().join(SOURCE_DIRECTORY_NAME);
-        verify_and_extract_source_bundle(
+        let destination_parent = root.clone_directory_handle()?;
+        verify_and_extract_source_bundle_with_parent_handle(
             &source_archive_path,
             &descriptor.archive,
             &descriptor.manifest,
             &source_root,
+            destination_parent,
             SourceArchiveLimits::default(),
         )
         .map_err(|_| SessionFailure::invalid("source_archive_invalid"))?;
@@ -745,17 +753,21 @@ impl<'a, W: Write> Session<'a, W> {
     }
 
     fn cleanup_root(&mut self) -> Result<CleanupConfirmation, SessionFailure> {
-        let root = self
-            .root
-            .as_mut()
-            .ok_or_else(|| SessionFailure::internal("job_root_missing"))?;
         let job_id = self
             .job_id
-            .as_deref()
+            .clone()
             .ok_or_else(|| SessionFailure::internal("job_id_missing"))?;
-        root.cleanup()?;
+        let mut root = self
+            .root
+            .take()
+            .ok_or_else(|| SessionFailure::internal("job_root_missing"))?;
+        if let Err(error) = root.cleanup() {
+            self.root = Some(root);
+            return Err(error);
+        }
+        drop(root);
         Ok(CleanupConfirmation {
-            job_id: job_id.to_owned(),
+            job_id,
             completed_at_ms: unix_time_ms(),
             workspace_removed: true,
             signing_material_removed: true,
@@ -949,10 +961,11 @@ struct JobRootGuard {
     worker_root: Utf8PathBuf,
     worker_root_directory: CapabilityDir,
     worker_root_identity: Handle,
+    #[cfg(not(windows))]
     name: String,
     path: Utf8PathBuf,
     directory: Option<CapabilityDir>,
-    identity: Handle,
+    identity: Option<Handle>,
     owned: bool,
 }
 
@@ -973,14 +986,10 @@ impl JobRootGuard {
         }
         let name = format!("rustferry-compile-{job_id}");
         let path = worker_root.join(&name);
-        create_private_capability_directory(&worker_root_directory, &name)
+        let directory = create_private_capability_directory(&worker_root_directory, &path, &name)
             .map_err(|_| SessionFailure::internal("job_root_create_failed"))?;
-        let Ok(directory) = worker_root_directory.open_dir(&name) else {
-            let _ = worker_root_directory.remove_dir(&name);
-            return Err(SessionFailure::internal("job_root_create_failed"));
-        };
         let Ok(identity) = capability_directory_identity(&directory) else {
-            let _ = directory.remove_open_dir_all();
+            let _ = remove_private_capability_directory_tree(directory);
             return Err(SessionFailure::internal("job_root_create_failed"));
         };
         let named_metadata = worker_root_directory.symlink_metadata(&name);
@@ -989,17 +998,19 @@ impl JobRootGuard {
             || !matches!(opened_metadata, Ok(metadata) if metadata.is_dir() && !metadata.is_symlink())
             || Handle::from_path(&path).ok().as_ref() != Some(&identity)
         {
-            let _ = directory.remove_open_dir_all();
+            drop(identity);
+            let _ = remove_private_capability_directory_tree(directory);
             return Err(SessionFailure::internal("job_root_create_failed"));
         }
         let mut guard = Self {
             worker_root: worker_root.to_owned(),
             worker_root_directory,
             worker_root_identity,
+            #[cfg(not(windows))]
             name,
             path,
             directory: Some(directory),
-            identity,
+            identity: Some(identity),
             owned: true,
         };
         let marker = serde_json::json!({
@@ -1034,25 +1045,42 @@ impl JobRootGuard {
         self.owned
     }
 
+    fn clone_directory_handle(&self) -> Result<File, SessionFailure> {
+        self.verify()?;
+        self.directory
+            .as_ref()
+            .ok_or_else(|| SessionFailure::cleanup("job_root_changed"))?
+            .try_clone()
+            .map(CapabilityDir::into_std_file)
+            .map_err(|_| SessionFailure::cleanup("job_root_changed"))
+    }
+
     fn verify(&self) -> Result<(), SessionFailure> {
         let directory = self
             .directory
             .as_ref()
             .ok_or_else(|| SessionFailure::cleanup("job_root_changed"))?;
+        let identity = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| SessionFailure::cleanup("job_root_changed"))?;
         let open_worker_root = capability_directory_identity(&self.worker_root_directory).ok();
         let open_job_root = capability_directory_identity(directory).ok();
+        #[cfg(not(windows))]
         let named_job_root = self
             .worker_root_directory
             .open_dir(&self.name)
             .ok()
             .and_then(|directory| capability_directory_identity(&directory).ok());
+        #[cfg(windows)]
+        let named_job_root = Handle::from_path(&self.path).ok();
         if !self.owned
             || open_worker_root.as_ref() != Some(&self.worker_root_identity)
             || Handle::from_path(&self.worker_root).ok().as_ref()
                 != Some(&self.worker_root_identity)
-            || open_job_root.as_ref() != Some(&self.identity)
-            || named_job_root.as_ref() != Some(&self.identity)
-            || Handle::from_path(&self.path).ok().as_ref() != Some(&self.identity)
+            || open_job_root.as_ref() != Some(identity)
+            || named_job_root.as_ref() != Some(identity)
+            || Handle::from_path(&self.path).ok().as_ref() != Some(identity)
         {
             return Err(SessionFailure::cleanup("job_root_changed"));
         }
@@ -1060,26 +1088,50 @@ impl JobRootGuard {
     }
 
     fn cleanup(&mut self) -> Result<(), SessionFailure> {
+        self.cleanup_with_boundary(|| {})
+    }
+
+    fn cleanup_with_boundary(
+        &mut self,
+        before_remove: impl FnOnce(),
+    ) -> Result<(), SessionFailure> {
         if !self.owned {
             return Err(SessionFailure::cleanup("job_root_changed"));
         }
+        let identity = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| SessionFailure::cleanup("job_root_changed"))?;
         let directory = self
             .directory
             .take()
             .ok_or_else(|| SessionFailure::cleanup("job_root_changed"))?;
-        if capability_directory_identity(&directory).ok().as_ref() != Some(&self.identity) {
+        if capability_directory_identity(&directory).ok().as_ref() != Some(identity) {
             self.directory = Some(directory);
             return Err(SessionFailure::cleanup("job_root_changed"));
         }
-        match directory.remove_open_dir_all() {
-            Ok(()) => {
-                self.owned = false;
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                self.owned = false;
-            }
+        #[cfg(windows)]
+        drop(self.identity.take());
+        #[cfg(not(windows))]
+        let retained_identity = self
+            .identity
+            .take()
+            .ok_or_else(|| SessionFailure::cleanup("job_root_changed"))?;
+        before_remove();
+        match remove_private_capability_directory_tree(directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(_) => return Err(SessionFailure::cleanup("worker_cleanup_failed")),
         }
+        #[cfg(unix)]
+        if !retained_directory_is_unlinked(&retained_identity)
+            .map_err(|_| SessionFailure::cleanup("worker_cleanup_failed"))?
+        {
+            return Err(SessionFailure::cleanup("worker_cleanup_failed"));
+        }
+        #[cfg(not(windows))]
+        drop(retained_identity);
+        self.owned = false;
         sync_capability_directory(&self.worker_root_directory)
             .map_err(|_| SessionFailure::cleanup("worker_cleanup_failed"))
     }
@@ -1130,19 +1182,76 @@ fn capability_directory_identity(directory: &CapabilityDir) -> io::Result<Handle
 }
 
 #[cfg(unix)]
-fn create_private_capability_directory(parent: &CapabilityDir, name: &str) -> io::Result<()> {
+fn create_private_capability_directory(
+    parent: &CapabilityDir,
+    _path: &Utf8Path,
+    name: &str,
+) -> io::Result<CapabilityDir> {
     use cap_std::fs::DirBuilderExt as _;
 
     let mut builder = cap_std::fs::DirBuilder::new();
     builder.mode(0o700);
-    parent.create_dir_with(name, &builder)
+    parent.create_dir_with(name, &builder)?;
+    parent.open_dir(name)
 }
 
-#[cfg(not(unix))]
-fn create_private_capability_directory(parent: &CapabilityDir, name: &str) -> io::Result<()> {
-    parent.create_dir(name)
+#[cfg(windows)]
+fn create_private_capability_directory(
+    _parent: &CapabilityDir,
+    path: &Utf8Path,
+    _name: &str,
+) -> io::Result<CapabilityDir> {
+    create_private_directory_handle(path.as_std_path())
+        .map(CapabilityDir::from_std_file)
+        .map_err(io::Error::other)
 }
 
+#[cfg(not(any(unix, windows)))]
+fn create_private_capability_directory(
+    parent: &CapabilityDir,
+    _path: &Utf8Path,
+    name: &str,
+) -> io::Result<CapabilityDir> {
+    parent.create_dir(name)?;
+    parent.open_dir(name)
+}
+
+#[cfg(unix)]
+fn remove_private_capability_directory_tree(directory: CapabilityDir) -> io::Result<()> {
+    // cap-std keeps traversal rooted in open descriptors, but its final parent search and unlink
+    // are not atomic against a malicious same-UID renamer. The retained identity's link-count
+    // postcondition makes that ambiguity fail uncertain instead of confirming cleanup. This
+    // transport remains unsigned-only until the compiler is isolated from the worker namespace.
+    directory.remove_open_dir_all()
+}
+
+#[cfg(unix)]
+fn retained_directory_is_unlinked(identity: &Handle) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    identity
+        .as_file()
+        .metadata()
+        .map(|metadata| metadata.nlink() == 0)
+}
+
+#[cfg(windows)]
+fn remove_private_capability_directory_tree(directory: CapabilityDir) -> io::Result<()> {
+    remove_private_directory_tree_handle(directory.into_std_file()).map_err(io::Error::other)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn remove_private_capability_directory_tree(directory: CapabilityDir) -> io::Result<()> {
+    directory.remove_open_dir_all()
+}
+
+#[cfg_attr(
+    not(unix),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "directory sync is a durability operation with no Windows equivalent"
+    )
+)]
 fn sync_capability_directory(directory: &CapabilityDir) -> io::Result<()> {
     #[cfg(unix)]
     directory.try_clone()?.into_std_file().sync_all()?;
@@ -1170,6 +1279,13 @@ fn remove_exact_file(path: &Utf8Path) -> Result<(), SessionFailure> {
     fs::remove_file(path).map_err(|_| SessionFailure::internal("source_archive_cleanup_failed"))
 }
 
+#[cfg_attr(
+    not(unix),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "directory sync is a durability operation with no Windows equivalent"
+    )
+)]
 fn sync_directory(path: &Utf8Path) -> Result<(), SessionFailure> {
     #[cfg(unix)]
     File::open(path)
@@ -1582,6 +1698,9 @@ mod tests {
                 .expect("worker root");
             #[cfg(not(unix))]
             fs::create_dir(&worker_root).expect("worker root");
+            let worker_root = worker_root
+                .canonicalize_utf8()
+                .expect("canonical worker root");
             Self {
                 _directory: directory,
                 worker_root,
@@ -2254,10 +2373,11 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn cleanup_removes_open_job_root_without_deleting_path_replacement() {
+    fn cleanup_follows_a_previously_renamed_open_job_root() {
         let fixture = Fixture::new();
         let mut guard = JobRootGuard::create(&fixture.worker_root, JOB_ID, "operation-1")
             .expect("job root guard");
+        guard.verify().expect("created guard remains bound");
         let original = guard.path().to_owned();
         let displaced = fixture.worker_root.join("displaced-owned-job");
         fs::rename(&original, &displaced).expect("displace owned job directory");
@@ -2274,6 +2394,58 @@ mod tests {
         assert!(!displaced.exists());
         assert_eq!(
             fs::read(sentinel).expect("replacement preserved"),
+            b"replacement"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_confirmation_requires_the_retained_directory_to_be_unlinked() {
+        let temporary = tempfile::tempdir().expect("fixture root");
+        let directory = temporary.path().join("owned");
+        fs::create_dir(&directory).expect("owned directory");
+        let identity = Handle::from_path(&directory).expect("retained identity");
+
+        assert!(!retained_directory_is_unlinked(&identity).expect("live link state"));
+        fs::remove_dir(&directory).expect("unlink owned directory");
+        assert!(retained_directory_is_unlinked(&identity).expect("removed link state"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cleanup_exact_handle_blocks_replacement_at_removal_boundary() {
+        use std::cell::RefCell;
+
+        let fixture = Fixture::new();
+        let mut guard = JobRootGuard::create(&fixture.worker_root, JOB_ID, "operation-1")
+            .expect("job root guard");
+        guard.verify().expect("created guard remains bound");
+        let original = guard.path().to_owned();
+        let moved = fixture.worker_root.join("displaced-owned-job");
+        let replacement = fixture.worker_root.join("replacement");
+        let replacement_marker = replacement.join("must-survive.txt");
+        fs::write(original.join("owned.txt"), b"owned").expect("owned file");
+        fs::create_dir(&replacement).expect("replacement directory");
+        fs::write(&replacement_marker, b"replacement").expect("replacement sentinel");
+        let attempts = RefCell::new(None);
+
+        guard
+            .cleanup_with_boundary(|| {
+                let move_owned = fs::rename(&original, &moved);
+                let install_replacement = fs::rename(&replacement, &original);
+                attempts.replace(Some((move_owned, install_replacement)));
+            })
+            .expect("exact handle cleanup");
+
+        let (move_owned, install_replacement) = attempts
+            .into_inner()
+            .expect("replacement attempts recorded");
+        assert!(move_owned.is_err());
+        assert!(install_replacement.is_err());
+        assert!(!original.exists());
+        assert!(!moved.exists());
+        assert_eq!(
+            fs::read(replacement_marker).expect("replacement preserved"),
             b"replacement"
         );
     }

@@ -20,3 +20,42 @@ fn protocol_schema_contains_every_required_event() {
         );
     }
 }
+
+#[test]
+fn artifact_download_result_requires_local_file_identity() {
+    let schema: serde_json::Value = serde_json::from_str(CHECKED_IN_SCHEMA).unwrap();
+    let definition = &schema["$defs"]["ArtifactDownloadResult"];
+    assert!(definition["properties"]["local_file_identity"].is_object());
+    assert!(
+        definition["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "local_file_identity")
+    );
+}
+
+#[test]
+fn protocol_schema_exposes_strict_git_snapshot_descriptor() {
+    let schema: serde_json::Value = serde_json::from_str(CHECKED_IN_SCHEMA).unwrap();
+    let definition = &schema["$defs"]["GitSnapshotDescriptor"];
+    let required = definition["required"].as_array().unwrap();
+    for field in [
+        "schema_version",
+        "operation_id",
+        "source_repository",
+        "snapshot_ref",
+        "request_template_sha256",
+        "bundle",
+    ] {
+        assert!(required.iter().any(|required| required == field));
+    }
+    assert_eq!(definition["additionalProperties"], false);
+    assert!(
+        schema["$defs"]["SourceMode"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|mode| mode["const"] == "git_snapshot")
+    );
+}

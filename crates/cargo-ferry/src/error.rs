@@ -70,7 +70,7 @@ pub enum CliError {
     },
     /// Android discovery, build, signing, or validation failed.
     #[error(transparent)]
-    Android(#[from] rustferry_android::AndroidError),
+    Android(Box<rustferry_android::AndroidError>),
     /// Apple discovery, build, or validation failed.
     #[error(transparent)]
     Apple(#[from] rustferry_apple::AppleError),
@@ -89,7 +89,7 @@ pub enum CliError {
         /// Sanitized captured diagnostic.
         stderr: String,
         /// Full diagnostic log, when one was written.
-        log: Option<Utf8PathBuf>,
+        log: Option<Box<Utf8PathBuf>>,
         /// Concrete recovery step.
         help: String,
     },
@@ -154,6 +154,21 @@ pub enum CliError {
         /// Additional public provider/job context.
         details: Vec<String>,
     },
+    /// Durable local job storage could not satisfy a jobs command.
+    #[error(transparent)]
+    JobStore(Box<cargo_ferry::job_store::JobStoreError>),
+    /// A durable jobs lifecycle request could not proceed safely.
+    #[error("{message}")]
+    JobsLifecycle {
+        /// Stable machine-readable failure code.
+        code: &'static str,
+        /// Secret-free failure summary.
+        message: String,
+        /// Concrete prerequisite or recovery action.
+        help: String,
+        /// Additional public job context.
+        details: Vec<String>,
+    },
     /// Operation is deliberately unavailable rather than falsely succeeding.
     #[error("{message}")]
     Unsupported {
@@ -206,7 +221,8 @@ impl CliError {
             Self::CommandInterrupted { .. } => "external_command_interrupted",
             Self::InterruptHandler { .. } => "interrupt_handler_failed",
             Self::ToolMissing { .. } => "tool_missing",
-            Self::Remote { code, .. } => code,
+            Self::Remote { code, .. } | Self::JobsLifecycle { code, .. } => code,
+            Self::JobStore(error) => job_store_error_code(error),
             Self::Unsupported { .. } => "unsupported",
             Self::UnsafeCleanPath { .. } => "unsafe_clean_path",
             Self::EditConfig { .. } => "configuration_edit_failed",
@@ -227,7 +243,9 @@ impl CliError {
             | Self::Config(_)
             | Self::ProjectManifest { .. }
             | Self::EditConfig { .. } => 2,
-            Self::ToolMissing { .. }
+            Self::JobStore(error) => job_store_exit_code(error),
+            Self::JobsLifecycle { .. }
+            | Self::ToolMissing { .. }
             | Self::Unsupported { .. }
             | Self::Deployment(
                 cargo_ferry::deployment::DeploymentError::DeviceNotFound { .. }
@@ -282,7 +300,9 @@ impl CliError {
             Self::CommandFailed { help, .. }
             | Self::ToolMissing { help, .. }
             | Self::Remote { help, .. }
+            | Self::JobsLifecycle { help, .. }
             | Self::Unsupported { help, .. } => Some(help.clone()),
+            Self::JobStore(error) => job_store_help(error),
             Self::UnsafeCleanPath { .. } => Some(
                 "Only paths below the project's `target/ferry` directory can be cleaned."
                     .to_owned(),
@@ -341,7 +361,7 @@ impl CliError {
                 details
             }
             Self::ToolMissing { searched, .. } => searched.clone(),
-            Self::Remote { details, .. } => details.clone(),
+            Self::Remote { details, .. } | Self::JobsLifecycle { details, .. } => details.clone(),
             Self::Deployment(
                 cargo_ferry::deployment::DeploymentError::DeviceSelectionRequired { device_ids },
             ) => device_ids
@@ -360,6 +380,108 @@ impl CliError {
             }
             _ => Vec::new(),
         }
+    }
+}
+
+impl From<cargo_ferry::job_store::JobStoreError> for CliError {
+    fn from(error: cargo_ferry::job_store::JobStoreError) -> Self {
+        Self::JobStore(Box::new(error))
+    }
+}
+
+impl From<rustferry_android::AndroidError> for CliError {
+    fn from(error: rustferry_android::AndroidError) -> Self {
+        Self::Android(Box::new(error))
+    }
+}
+
+const fn job_store_error_code(error: &cargo_ferry::job_store::JobStoreError) -> &'static str {
+    use cargo_ferry::job_store::JobStoreError;
+
+    match error {
+        JobStoreError::ConfigHomeUnavailable | JobStoreError::InvalidConfigHome => {
+            "job_store_unavailable"
+        }
+        JobStoreError::InvalidIdentifier { .. } | JobStoreError::MalformedLayout { .. } => {
+            "malformed_job_store"
+        }
+        JobStoreError::InvalidRecord { .. } => "invalid_job_record",
+        JobStoreError::UnsupportedSchema { .. } => "unsupported_job_schema",
+        JobStoreError::BoundExceeded { .. } => "job_store_bound_exceeded",
+        JobStoreError::JobNotFound { .. } => "job_not_found",
+        JobStoreError::RevisionNotFound { .. } => "job_revision_not_found",
+        JobStoreError::ArtifactReferenceAmbiguous { .. } => "artifact_reference_ambiguous",
+        JobStoreError::ArtifactNotFound { .. } => "artifact_not_found",
+        JobStoreError::ArtifactRemovalUnsupported => "platform_unsupported",
+        JobStoreError::JobBusy { .. } => "job_busy",
+        JobStoreError::RevisionConflict { .. } => "job_revision_conflict",
+        JobStoreError::MalformedRevision { .. } => "malformed_job_revision",
+        JobStoreError::RecoveryRequired { .. } => "job_store_recovery_required",
+        JobStoreError::Security { .. } => "job_store_security_failed",
+        JobStoreError::Serialization { .. } => "job_store_serialization_failed",
+        JobStoreError::Io { .. } => "job_store_io_failed",
+        JobStoreError::CommitUncertain { .. } => "job_store_commit_uncertain",
+        JobStoreError::ReadOnly => "job_store_read_only",
+    }
+}
+
+fn job_store_help(error: &cargo_ferry::job_store::JobStoreError) -> Option<String> {
+    use cargo_ferry::job_store::JobStoreError;
+
+    match error {
+        JobStoreError::JobNotFound { .. } => {
+            Some("Run `cargo ferry jobs list` to select an existing local job ID.".to_owned())
+        }
+        JobStoreError::ArtifactReferenceAmbiguous { .. } => Some(
+            "Qualify the artifact with `--job <local-job-id>` before retrying.".to_owned(),
+        ),
+        JobStoreError::ArtifactNotFound { .. } => Some(
+            "Run `cargo ferry jobs artifacts <local-job-id>` to select a recorded artifact."
+                .to_owned(),
+        ),
+        JobStoreError::ArtifactRemovalUnsupported => Some(
+            "Use `cargo ferry artifact show` to locate the file. RustFerry will not mutate it until identity-bound removal is supported on this platform."
+                .to_owned(),
+        ),
+        JobStoreError::JobBusy { .. } => Some(
+            "Wait for the other local RustFerry process to release this job, then retry.".to_owned(),
+        ),
+        JobStoreError::UnsupportedSchema { .. } => {
+            Some("Upgrade cargo-ferry before reading jobs written by a newer schema.".to_owned())
+        }
+        JobStoreError::RecoveryRequired { .. } => Some(
+            "Preserve the RustFerry config directory and inspect the reported recovery state before retrying."
+                .to_owned(),
+        ),
+        _ => None,
+    }
+}
+
+const fn job_store_exit_code(error: &cargo_ferry::job_store::JobStoreError) -> u8 {
+    use cargo_ferry::job_store::JobStoreError;
+
+    match error {
+        JobStoreError::UnsupportedSchema { .. }
+        | JobStoreError::JobNotFound { .. }
+        | JobStoreError::RevisionNotFound { .. }
+        | JobStoreError::ArtifactReferenceAmbiguous { .. }
+        | JobStoreError::ArtifactNotFound { .. }
+        | JobStoreError::ArtifactRemovalUnsupported
+        | JobStoreError::JobBusy { .. } => 3,
+        JobStoreError::ConfigHomeUnavailable
+        | JobStoreError::InvalidConfigHome
+        | JobStoreError::InvalidIdentifier { .. }
+        | JobStoreError::InvalidRecord { .. }
+        | JobStoreError::BoundExceeded { .. }
+        | JobStoreError::RevisionConflict { .. }
+        | JobStoreError::MalformedLayout { .. }
+        | JobStoreError::MalformedRevision { .. }
+        | JobStoreError::RecoveryRequired { .. }
+        | JobStoreError::Security { .. }
+        | JobStoreError::Serialization { .. }
+        | JobStoreError::Io { .. }
+        | JobStoreError::CommitUncertain { .. }
+        | JobStoreError::ReadOnly => 5,
     }
 }
 
@@ -396,5 +518,47 @@ fn deployment_help(error: &cargo_ferry::deployment::DeploymentError) -> Option<S
                 .to_owned(),
         ),
         DeploymentError::InvalidToolOutput { .. } | DeploymentError::Io { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use cargo_ferry::job_store::JobStoreError;
+
+    use super::CliError;
+
+    #[test]
+    fn cli_error_stays_within_the_large_result_threshold() {
+        assert!(size_of::<CliError>() <= 128);
+    }
+
+    #[test]
+    fn runtime_store_integrity_and_config_failures_are_not_argument_errors() {
+        let cases = [
+            (
+                JobStoreError::ConfigHomeUnavailable,
+                "job_store_unavailable",
+            ),
+            (JobStoreError::InvalidConfigHome, "job_store_unavailable"),
+            (
+                JobStoreError::InvalidIdentifier {
+                    field: "local_job_id",
+                    reason: "invalid stored directory component",
+                },
+                "malformed_job_store",
+            ),
+            (
+                JobStoreError::BoundExceeded {
+                    kind: "stored jobs",
+                    maximum: 1_000,
+                },
+                "job_store_bound_exceeded",
+            ),
+        ];
+        for (error, expected_code) in cases {
+            let error = CliError::from(error);
+            assert_eq!(error.exit_code(), 5);
+            assert_eq!(error.code(), expected_code);
+        }
     }
 }

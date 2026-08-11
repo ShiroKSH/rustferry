@@ -10,6 +10,18 @@ const EXTENSION_ID = "shiroksh.rustferry-vscode";
 const EXPECTED_COMMANDS = [
   "rustferry.check",
   "rustferry.doctor",
+  "rustferry.jobs.artifact.remove",
+  "rustferry.jobs.artifact.reveal",
+  "rustferry.jobs.artifact.verify",
+  "rustferry.jobs.cancel",
+  "rustferry.jobs.logs",
+  "rustferry.jobs.logs.follow",
+  "rustferry.jobs.logs.loadMore",
+  "rustferry.jobs.refresh",
+  "rustferry.jobs.retry",
+  "rustferry.jobs.remoteSnapshotBuild",
+  "rustferry.jobs.signingReadiness",
+  "rustferry.jobs.show",
   "rustferry.openConfig",
   "rustferry.refresh"
 ];
@@ -37,6 +49,8 @@ async function run() {
   for (const command of EXPECTED_COMMANDS) {
     assert.ok(commands.includes(command), `Activated extension did not register ${command}`);
   }
+  await vscode.commands.executeCommand("rustferry.jobs.refresh");
+  await vscode.commands.executeCommand("rustferry.jobs.logs.loadMore");
 
   const snapshot = api.performanceSnapshot();
   assert.equal(snapshot.projectCount, 1, "ferry fixture was not discovered as one project");
@@ -58,7 +72,7 @@ async function run() {
   assert.ok(expectedManifest, "RUSTFERRY_EXPECTED_MANIFEST was not supplied");
   const activeDocument = vscode.window.activeTextEditor?.document;
   assert.ok(activeDocument, "Open ferry.toml command did not create an active editor");
-  assert.equal(path.resolve(activeDocument.uri.fsPath), path.resolve(expectedManifest));
+  assert.equal(comparablePath(activeDocument.uri.fsPath), comparablePath(expectedManifest));
   await waitFor(
     () => api.performanceSnapshot().validProjectCount === 1,
     20_000,
@@ -111,6 +125,11 @@ async function run() {
 
 function diagnosticCode(diagnostic) {
   return typeof diagnostic.code === "object" ? diagnostic.code.value : diagnostic.code;
+}
+
+function comparablePath(value) {
+  const resolved = path.resolve(value);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 
 function performanceApi(value) {

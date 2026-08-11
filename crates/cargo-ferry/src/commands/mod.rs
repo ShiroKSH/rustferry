@@ -1,3 +1,4 @@
+pub(crate) mod artifact;
 mod assets;
 mod capability;
 mod check;
@@ -7,8 +8,10 @@ mod config;
 mod deployment;
 mod devices;
 mod doctor;
+mod github_snapshot;
 pub(crate) mod ide;
 mod info;
+pub(crate) mod jobs;
 mod new;
 pub(crate) mod platform_build;
 mod remote;
@@ -26,12 +29,14 @@ pub fn run(
     reporter: &Reporter,
 ) -> Result<(), CliError> {
     match command {
+        Command::Artifact(arguments) => artifact::run(&arguments, dry_run, reporter),
         Command::New(arguments) => new::run(arguments, dry_run, reporter),
         Command::Add(arguments) => capability::run(&arguments, true, dry_run, reporter),
         Command::Remove(arguments) => capability::run(&arguments, false, dry_run, reporter),
         Command::Check(arguments) => check::run(&arguments, dry_run, reporter),
         Command::Doctor(arguments) => doctor::run(&arguments, dry_run, reporter),
         Command::Remote(arguments) => remote::run(arguments, dry_run, reporter),
+        Command::Jobs(arguments) => jobs::run(&arguments, dry_run, json_stream, reporter),
         Command::Signing(arguments) => signing::run(arguments, dry_run, reporter),
         Command::Build(arguments) => platform_build::run(arguments, dry_run, reporter),
         Command::Devices(arguments) => devices::run(arguments, dry_run, json_stream, reporter),

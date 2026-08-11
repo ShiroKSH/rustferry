@@ -39,7 +39,7 @@ rustferry-android = { version = "=0.1.0", path = "../rustferry-android" }
 rustferry-apple = { version = "=0.1.0", path = "../rustferry-apple" }
 rustferry-codegen = { version = "=0.1.0", path = "../rustferry-codegen" }
 rustferry-core = { version = "=0.1.0", path = "../rustferry-core" }
-rustferry-github = { version = "=0.1.0", path = "../rustferry-github" }
+rustferry-github = { version = "=0.1.0", path = "../rustferry-github", features = ["secure-job-log-http"] }
 rustferry-remote = { version = "=0.1.0", path = "../rustferry-remote" }
 rustferry-ssh = { version = "=0.1.0", path = "../rustferry-ssh" }
 rustferry-runtime-contract = { package = "rustferry", version = "=0.1.0", path = "../rustferry", default-features = false }

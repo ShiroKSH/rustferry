@@ -3,8 +3,11 @@
 mod artifact;
 mod assets;
 mod config;
+mod file_streams;
 mod filesystem_identity;
 mod naming;
+#[cfg(windows)]
+mod windows_environment;
 
 #[doc(hidden)]
 pub mod process_control;
@@ -20,13 +23,22 @@ pub use config::{
     NotificationCapability, Orientation, PermissionConfig, PermissionsConfig, TargetPlatform,
     Theme, ValidationIssue, WidgetConfig,
 };
+pub use file_streams::{
+    RegularFileStreamError, RegularFileStreamErrorKind, verify_regular_file_has_no_named_streams,
+};
 pub use filesystem_identity::{
     DirectoryFilesystemIdentity, DirectoryIdentityError, DirectoryIdentityErrorKind,
-    DirectoryIdentityOperation, verify_directory_identity,
+    DirectoryIdentityOperation, RegularFileFilesystemIdentity, RetainedDirectoryIdentity,
+    RetainedRegularFileIdentity, directory_identity_from_file, regular_file_identity_from_file,
+    verify_directory_identity, verify_regular_file_identity,
 };
+#[cfg(windows)]
+pub use filesystem_identity::{ExactRegularFileRemoval, open_regular_file_for_exact_removal};
 pub use naming::{
     NamingError, ProjectNames, derive_project_names, validate_application_identifier,
 };
+#[cfg(windows)]
+pub use windows_environment::windows_system_root;
 
 /// Current stable `ferry.toml` schema version.
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
