@@ -241,7 +241,7 @@ fn run_command_with_output_limit(
                 || "terminated by signal".to_owned(),
                 |code| code.to_string(),
             ),
-            summary: command_summary(&output.stdout, &output.stderr),
+            summary: Box::new(command_summary(&output.stdout, &output.stderr)),
             log: log_path.map(Utf8Path::to_owned),
         });
     }

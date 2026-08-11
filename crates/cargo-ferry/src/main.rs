@@ -50,10 +50,13 @@ fn main() -> ExitCode {
             crate::cli::Command::Ide(_)
                 | crate::cli::Command::Devices(_)
                 | crate::cli::Command::Logs(_)
+                | crate::cli::Command::Jobs(crate::cli::JobsArgs {
+                    command: crate::cli::JobsCommand::Logs(_),
+                })
         )
     {
         Reporter::new(true, false, false).argument_error(
-            "--json-stream is supported only by `ide` operations, `devices`, and `logs`; use --json for this command",
+            "--json-stream is supported only by `ide` operations, `devices`, `logs`, and `jobs logs`; use --json for this command",
         );
         return ExitCode::from(2);
     }

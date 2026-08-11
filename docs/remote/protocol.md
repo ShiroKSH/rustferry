@@ -18,6 +18,37 @@ versions match. Different major versions fail before source transfer. A protocol
 UTF-8 text only; every identifier, path, source manifest, signing plan, and event is validated again
 by the receiving boundary.
 
+## SSH snapshot session v1
+
+Handshake and doctor use strict JSON stdio envelopes. An unsigned SSH build then invokes only
+`ferry-worker-macos serve --stdio-session-v1` and switches to a full-duplex framed stream. Each
+24-byte big-endian header contains `RFDP`, schema `1`, a typed frame kind, a per-direction sequence,
+and the exact following payload length. Sequences start at zero and reject gaps, duplicates,
+replay, and exhaustion.
+
+The client sends `BuildRequest`, `SourceDescriptor`, and streamed `SourceArchive` frames. The worker
+returns `JobAccepted`, zero or more ordered `Event` frames, one `ArtifactDescriptor`, and the
+streamed `Artifact`. Only after the client has rehashed, safely extracted, independently inspected,
+durably published, and rebound the returned unsigned XCArchive does it send `ArtifactReceipt`.
+The worker then removes the exact capability-bound job root and returns `Complete` with
+non-retention cleanup proof. `Error` is terminal; `Cancel` is valid only at a clean client frame
+boundary. Disconnect, cancellation, timeout, malformed order, identity mismatch, or missing receipt
+cannot become success.
+
+JSON requests are limited to 1 MiB, snapshot descriptors to 8 MiB, control frames to 64 KiB,
+events to the protocol event-line bound, source ZIPs to 640 MiB, and sealed XCArchive ZIPs to 2 GiB.
+Large source and artifact payloads are copied with fixed memory. Bootstrap input has both total and
+inactivity deadlines; the complete OpenSSH build session also has a finite deadline and bounded
+process cleanup.
+
+Snapshot session v1 accepts only `snapshot` source mode, `unsigned-compile-only` signing, and exactly
+one XCArchive artifact. It carries no signing key, password, provisioning profile, IPA, device
+operation, or arbitrary command.
+
+These dedicated session capabilities are negotiated only by SSH handshake/doctor. The generic
+`BuildProvider` view does not advertise snapshot submit/events/cancel/download operations that its
+generic methods do not implement; those methods return typed unsupported errors.
+
 ## Build request
 
 An iPhone request fixes:
@@ -107,6 +138,23 @@ subset; it cannot re-include built-in sensitive paths.
 overwrite on drop is defense in depth, not guaranteed erasure. `SecretReference` serializes only a
 validated environment, credential-store, GitHub Actions, or worker-owned handle.
 
+Protected GitHub signing supports at most three application/extension provisioning profiles. A
+multi-profile worker invocation receives only the bounded `RFSIGNV2` stdin frame: eight-byte magic,
+big-endian record count, then records containing a 16-bit reference-name length, 32-bit value length,
+and the exact reference/value bytes. The immutable signing plan defines the expected two
+certificate/password references plus one profile reference per target. Missing, duplicate, unknown,
+oversized, non-canonical, truncated, or trailing records fail before signing; values are resolved
+once and input storage is wiped on every exit. The legacy three-field NUL-delimited input remains
+available only for a single application profile. Secret values never enter the remote JSON protocol,
+arguments, events, reports, or workflow source.
+
+The modern GitHub signing workflow also binds the complete public signing-target graph, including
+application, extension, framework, and dynamic-library names, bundle identifiers, and target kinds.
+Shared canonical encoding produces a domain-separated lowercase SHA-256. The provider checks exact
+graph equality without depending on order, and the worker recomputes the digest before checkout of
+the requested project revision or compilation. The digest is public policy metadata; it contains no
+secret values.
+
 Each signed request binds the expected certificate common name, Team ID, SHA-256 fingerprint, and
 expiry to an opaque private-key reference. The protected worker derives the imported identity again
 and rejects any mismatch before profiles or application code are signed.
@@ -127,6 +175,22 @@ each downloadable file's byte size and SHA-256. Client downloads must verify the
 SHA-256 before placement. IPA inspection additionally validates ZIP safety, `Payload/<App>.app`,
 plist identity, arm64 Mach-O slices, and `LC_BUILD_VERSION` platform metadata. An arm64 Simulator
 binary is rejected explicitly; arm64 alone is not device proof.
+
+The default protected GitHub result is an exact five-file transport set: development IPA, artifact
+manifest, signing report, validation report, and `sanitized-build-log.txt`. The fixed sanitized log
+is created only after protected signing, IPA export, validation, and signing-material cleanup are
+confirmed; its size and SHA-256 are part of the immutable worker manifest. The client publishes the
+IPA, manifest, validation report, and sanitized log by default after verifying all five transport
+files.
+
+Signed optional products extend that exact set only when declared by the request.
+`--artifact app` adds `application.app.zip`, `--artifact archive` adds
+`application.xcarchive.zip`, and `--artifact all` adds both. `--include-dsym` separately adds
+`application.dSYM.zip`; `all` does not imply dSYM. The application and reconstructed XCArchive must
+contain the exact signed app tree independently validated from the IPA. A requested dSYM is limited
+to the main application executable, must contain real DWARF debug information, and must have the
+same nonzero arm64 Mach-O UUID as the signed executable. Every selected file is size- and
+SHA-256-bound in the manifest; absence, extras, or substitution fail the operation.
 
 A successful build and successful cleanup are distinct states. Cleanup proof records isolated
 workspace removal, signing-material/keychain removal, and intentional artifact retention. Cleanup

@@ -1,0 +1,41 @@
+[package]
+name = "rustferry-ssh"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/rustferry-ssh"
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Hardened OpenSSH transport for RustFerry macOS workers"
+include = [
+    "src/**",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+]
+
+[dependencies]
+base64.workspace = true
+camino.workspace = true
+rustferry-core = { version = "=0.1.0", path = "../rustferry-core" }
+rustferry-remote = { version = "=0.1.0", path = "../rustferry-remote" }
+same-file.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+semver.workspace = true
+
+[lints]
+workspace = true

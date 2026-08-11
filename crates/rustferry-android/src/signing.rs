@@ -299,6 +299,7 @@ fn ensure_debug_keystore(
     })?;
     fs::create_dir_all(parent)
         .map_err(|source| io_error("create signing configuration directory", parent, source))?;
+    #[cfg(unix)]
     secure_directory(parent)?;
     let lock = OpenOptions::new()
         .create(true)
@@ -319,6 +320,7 @@ fn ensure_debug_keystore(
     if !paths.password_file.exists() {
         create_password_file(&paths.password_file)?;
     }
+    #[cfg(unix)]
     secure_file(&paths.password_file)?;
 
     if !paths.keystore.exists() {
@@ -348,6 +350,7 @@ fn ensure_debug_keystore(
             "-noprompt".to_owned(),
         ];
         run_command(&command, &log_dir.join("keytool-create.log"))?;
+        #[cfg(unix)]
         secure_file(&paths.keystore)?;
     }
 
@@ -496,6 +499,7 @@ fn create_password_file(path: &Utf8Path) -> Result<(), AndroidError> {
         .create_new(true)
         .open(path)
         .map_err(|source| io_error("create debug keystore password file", path, source))?;
+    #[cfg(unix)]
     secure_file(path)?;
     writeln!(
         file,
@@ -513,21 +517,11 @@ fn secure_directory(path: &Utf8Path) -> Result<(), AndroidError> {
         .map_err(|source| io_error("set signing directory permissions", path, source))
 }
 
-#[cfg(not(unix))]
-fn secure_directory(_path: &Utf8Path) -> Result<(), AndroidError> {
-    Ok(())
-}
-
 #[cfg(unix)]
 fn secure_file(path: &Utf8Path) -> Result<(), AndroidError> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
         .map_err(|source| io_error("set signing file permissions", path, source))
-}
-
-#[cfg(not(unix))]
-fn secure_file(_path: &Utf8Path) -> Result<(), AndroidError> {
-    Ok(())
 }
 
 #[cfg(test)]

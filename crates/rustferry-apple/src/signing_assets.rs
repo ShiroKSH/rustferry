@@ -123,6 +123,38 @@ pub struct ManualSigningAssetsInput {
     provisioning_profile: SecretBytes,
 }
 
+/// Secret, bounded PKCS#12 identity input retained for one remote upload.
+///
+/// This separates the identity from target profiles so multi-target validation
+/// never duplicates the private key or password in memory.
+pub struct ManualSigningIdentityInput {
+    certificate_pkcs12: SecretBytes,
+    certificate_password: SecretBytes,
+}
+
+impl ManualSigningIdentityInput {
+    /// Validate structural bounds and take ownership of one signing identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a field-only error without retaining caller-controlled content.
+    pub fn new(
+        certificate_pkcs12: SecretBytes,
+        certificate_password: SecretBytes,
+    ) -> Result<Self, ManualSigningAssetError> {
+        validate_identity_input(&certificate_pkcs12, &certificate_password)?;
+        Ok(Self {
+            certificate_pkcs12,
+            certificate_password,
+        })
+    }
+
+    /// Consume the identity into its exact secret buffers.
+    pub fn into_parts(self) -> (SecretBytes, SecretBytes) {
+        (self.certificate_pkcs12, self.certificate_password)
+    }
+}
+
 impl ManualSigningAssetsInput {
     /// Validate input bounds and take ownership of all secret buffers.
     ///
@@ -137,29 +169,7 @@ impl ManualSigningAssetsInput {
         certificate_password: SecretBytes,
         provisioning_profile: SecretBytes,
     ) -> Result<Self, ManualSigningAssetError> {
-        validate_nonempty_size(
-            &certificate_pkcs12,
-            MAX_MANUAL_SIGNING_PKCS12_BYTES,
-            ManualSigningAssetField::CertificatePkcs12,
-        )?;
-        if certificate_password.len() > MAX_MANUAL_SIGNING_PASSWORD_BYTES {
-            return Err(ManualSigningAssetError::InvalidInput {
-                field: ManualSigningAssetField::CertificatePassword,
-                reason: ManualSigningAssetInputError::TooLarge,
-            });
-        }
-        if str::from_utf8(certificate_password.expose_secret_bytes()).is_err() {
-            return Err(ManualSigningAssetError::InvalidInput {
-                field: ManualSigningAssetField::CertificatePassword,
-                reason: ManualSigningAssetInputError::PasswordEncoding,
-            });
-        }
-        if certificate_password.expose_secret_bytes().contains(&0) {
-            return Err(ManualSigningAssetError::InvalidInput {
-                field: ManualSigningAssetField::CertificatePassword,
-                reason: ManualSigningAssetInputError::PasswordContainsNul,
-            });
-        }
+        validate_identity_input(&certificate_pkcs12, &certificate_password)?;
         validate_nonempty_size(
             &provisioning_profile,
             MAX_MANUAL_SIGNING_PROFILE_BYTES,
@@ -184,6 +194,36 @@ impl ManualSigningAssetsInput {
             self.provisioning_profile,
         )
     }
+}
+
+fn validate_identity_input(
+    certificate_pkcs12: &SecretBytes,
+    certificate_password: &SecretBytes,
+) -> Result<(), ManualSigningAssetError> {
+    validate_nonempty_size(
+        certificate_pkcs12,
+        MAX_MANUAL_SIGNING_PKCS12_BYTES,
+        ManualSigningAssetField::CertificatePkcs12,
+    )?;
+    if certificate_password.len() > MAX_MANUAL_SIGNING_PASSWORD_BYTES {
+        return Err(ManualSigningAssetError::InvalidInput {
+            field: ManualSigningAssetField::CertificatePassword,
+            reason: ManualSigningAssetInputError::TooLarge,
+        });
+    }
+    if str::from_utf8(certificate_password.expose_secret_bytes()).is_err() {
+        return Err(ManualSigningAssetError::InvalidInput {
+            field: ManualSigningAssetField::CertificatePassword,
+            reason: ManualSigningAssetInputError::PasswordEncoding,
+        });
+    }
+    if certificate_password.expose_secret_bytes().contains(&0) {
+        return Err(ManualSigningAssetError::InvalidInput {
+            field: ManualSigningAssetField::CertificatePassword,
+            reason: ManualSigningAssetInputError::PasswordContainsNul,
+        });
+    }
+    Ok(())
 }
 
 /// Public metadata proven by PKCS#12, X.509, CMS, and profile validation.
@@ -334,6 +374,64 @@ pub fn validate_manual_signing_assets(
     )
 }
 
+/// Validate one PKCS#12 identity without provisioning-profile bytes.
+///
+/// The exact input buffers are returned on success for one later upload.
+///
+/// # Errors
+///
+/// Returns a secret-free identity-validation error.
+pub fn validate_manual_signing_identity(
+    input: ManualSigningIdentityInput,
+) -> Result<(SigningCertificate, ManualSigningIdentityInput), ManualSigningAssetError> {
+    let now_unix_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ManualSigningAssetError::Clock)?
+        .as_secs();
+    let certificate = validate_manual_signing_identity_with_policy(
+        &input.certificate_pkcs12,
+        &input.certificate_password,
+        &SigningAssetPolicy {
+            trust_anchors: &PRODUCTION_TRUST_ANCHORS,
+            accepted_common_name_prefixes: &[APPLE_DEVELOPMENT_PREFIX, IPHONE_DEVELOPER_PREFIX],
+            now_unix_seconds,
+        },
+    )?;
+    Ok((certificate, input))
+}
+
+/// Validate one CMS provisioning profile against an already validated identity.
+///
+/// The exact profile buffer is returned on success for one later upload.
+///
+/// # Errors
+///
+/// Returns a secret-free CMS, metadata, team, or certificate-membership error.
+pub fn validate_manual_signing_profile(
+    profile: SecretBytes,
+    certificate: &SigningCertificate,
+) -> Result<(ProvisioningProfile, SecretBytes), ManualSigningAssetError> {
+    validate_nonempty_size(
+        &profile,
+        MAX_MANUAL_SIGNING_PROFILE_BYTES,
+        ManualSigningAssetField::ProvisioningProfile,
+    )?;
+    let now_unix_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ManualSigningAssetError::Clock)?
+        .as_secs();
+    let parsed = validate_manual_signing_profile_with_policy(
+        &profile,
+        certificate,
+        &SigningAssetPolicy {
+            trust_anchors: &PRODUCTION_TRUST_ANCHORS,
+            accepted_common_name_prefixes: &[APPLE_DEVELOPMENT_PREFIX, IPHONE_DEVELOPER_PREFIX],
+            now_unix_seconds,
+        },
+    )?;
+    Ok((parsed, profile))
+}
+
 #[derive(Clone, Copy)]
 struct TrustAnchor<'a> {
     pem: &'a [u8],
@@ -350,10 +448,34 @@ fn validate_manual_signing_assets_with_policy(
     input: ManualSigningAssetsInput,
     policy: &SigningAssetPolicy<'_>,
 ) -> Result<(ValidatedManualSigningAssets, ManualSigningAssetsInput), ManualSigningAssetError> {
-    if !is_exact_der_sequence(input.certificate_pkcs12.expose_secret_bytes()) {
+    let certificate_metadata = validate_manual_signing_identity_with_policy(
+        &input.certificate_pkcs12,
+        &input.certificate_password,
+        policy,
+    )?;
+    let profile = validate_manual_signing_profile_with_policy(
+        &input.provisioning_profile,
+        &certificate_metadata,
+        policy,
+    )?;
+    Ok((
+        ValidatedManualSigningAssets {
+            certificate: certificate_metadata,
+            profile,
+        },
+        input,
+    ))
+}
+
+fn validate_manual_signing_identity_with_policy(
+    certificate_pkcs12: &SecretBytes,
+    certificate_password: &SecretBytes,
+    policy: &SigningAssetPolicy<'_>,
+) -> Result<SigningCertificate, ManualSigningAssetError> {
+    if !is_exact_der_sequence(certificate_pkcs12.expose_secret_bytes()) {
         return Err(ManualSigningAssetError::Pkcs12Malformed);
     }
-    let pkcs12 = Pkcs12::from_der(input.certificate_pkcs12.expose_secret_bytes())
+    let pkcs12 = Pkcs12::from_der(certificate_pkcs12.expose_secret_bytes())
         .map_err(|_| ManualSigningAssetError::Pkcs12Malformed)?;
 
     // Legacy algorithms are available only for the bounded import operation.
@@ -361,7 +483,7 @@ fn validate_manual_signing_assets_with_policy(
     let legacy_provider = Provider::try_load(None, "legacy", true)
         .map_err(|_| ManualSigningAssetError::CryptoUnavailable)?;
     let parse_result = {
-        let password = str::from_utf8(input.certificate_password.expose_secret_bytes())
+        let password = str::from_utf8(certificate_password.expose_secret_bytes())
             .map_err(|_| ManualSigningAssetError::Pkcs12Decrypt)?;
         pkcs12.parse2(password)
     };
@@ -375,12 +497,18 @@ fn validate_manual_signing_assets_with_policy(
         .ok_or(ManualSigningAssetError::MissingCertificate)?;
     validate_private_key_match(&certificate, &private_key)?;
 
-    let certificate_metadata = validate_certificate(&certificate, parsed.ca.as_ref(), policy)?;
+    validate_certificate(&certificate, parsed.ca.as_ref(), policy)
+}
 
-    if !is_exact_der_sequence(input.provisioning_profile.expose_secret_bytes()) {
+fn validate_manual_signing_profile_with_policy(
+    provisioning_profile: &SecretBytes,
+    certificate: &SigningCertificate,
+    policy: &SigningAssetPolicy<'_>,
+) -> Result<ProvisioningProfile, ManualSigningAssetError> {
+    if !is_exact_der_sequence(provisioning_profile.expose_secret_bytes()) {
         return Err(ManualSigningAssetError::ProvisioningProfileCmsMalformed);
     }
-    let mut cms = CmsContentInfo::from_der(input.provisioning_profile.expose_secret_bytes())
+    let mut cms = CmsContentInfo::from_der(provisioning_profile.expose_secret_bytes())
         .map_err(|_| ManualSigningAssetError::ProvisioningProfileCmsMalformed)?;
     let cms_store = build_trust_store(policy, None)?;
     let mut decoded_profile = Vec::new();
@@ -405,24 +533,17 @@ fn validate_manual_signing_assets_with_policy(
     if profile.expires_at_unix_seconds <= policy.now_unix_seconds {
         return Err(ManualSigningAssetError::ProvisioningProfileExpired);
     }
-    if profile.team.id() != certificate_metadata.team.id() {
+    if profile.team.id() != certificate.team.id() {
         return Err(ManualSigningAssetError::ProvisioningProfileTeamMismatch);
     }
     if !profile
         .certificate_fingerprints
         .iter()
-        .any(|fingerprint| fingerprint == &certificate_metadata.sha256_fingerprint)
+        .any(|fingerprint| fingerprint == &certificate.sha256_fingerprint)
     {
         return Err(ManualSigningAssetError::ProvisioningProfileCertificateMismatch);
     }
-
-    Ok((
-        ValidatedManualSigningAssets {
-            certificate: certificate_metadata,
-            profile,
-        },
-        input,
-    ))
+    Ok(profile)
 }
 
 fn validate_private_key_match(
@@ -719,6 +840,105 @@ mod tests {
         assert_eq!(pkcs12.expose_secret_bytes(), fixture.pkcs12);
         assert_eq!(password.expose_secret_bytes(), PASSWORD.as_bytes());
         assert_eq!(profile.expose_secret_bytes(), fixture.profile_cms);
+    }
+
+    #[test]
+    fn split_identity_and_multiple_profile_validation_retains_each_secret_once() {
+        let fixture = fixture(false, LeafUsage::CodeSigning);
+        let anchors = [TrustAnchor {
+            pem: &fixture.root_pem,
+            sha256: &fixture.root_fingerprint,
+        }];
+        let policy = SigningAssetPolicy {
+            trust_anchors: &anchors,
+            accepted_common_name_prefixes: &[APPLE_DEVELOPMENT_PREFIX, IPHONE_DEVELOPER_PREFIX],
+            now_unix_seconds: TEST_NOW_UNIX_SECONDS,
+        };
+        let identity = ManualSigningIdentityInput::new(
+            SecretBytes::new(fixture.pkcs12.clone()),
+            SecretBytes::new(PASSWORD.as_bytes().to_vec()),
+        )
+        .expect("bounded identity");
+        let certificate = validate_manual_signing_identity_with_policy(
+            &identity.certificate_pkcs12,
+            &identity.certificate_password,
+            &policy,
+        )
+        .expect("identity validates once");
+
+        let first = SecretBytes::new(fixture.profile_cms.clone());
+        let second = SecretBytes::new(fixture.profile_cms.clone());
+        let first_metadata =
+            validate_manual_signing_profile_with_policy(&first, &certificate, &policy)
+                .expect("first profile");
+        let second_metadata =
+            validate_manual_signing_profile_with_policy(&second, &certificate, &policy)
+                .expect("second profile");
+        assert_eq!(first_metadata, second_metadata);
+        assert_eq!(first.expose_secret_bytes(), fixture.profile_cms);
+        assert_eq!(second.expose_secret_bytes(), fixture.profile_cms);
+
+        let (pkcs12, password) = identity.into_parts();
+        assert_eq!(pkcs12.expose_secret_bytes(), fixture.pkcs12);
+        assert_eq!(password.expose_secret_bytes(), PASSWORD.as_bytes());
+
+        let mut wrong_team = certificate.clone();
+        wrong_team.team = DevelopmentTeam::new("OTHERTEAM1", None).expect("other team");
+        assert_eq!(
+            validate_manual_signing_profile_with_policy(&first, &wrong_team, &policy)
+                .expect_err("wrong team"),
+            ManualSigningAssetError::ProvisioningProfileTeamMismatch
+        );
+        let mut wrong_certificate = certificate.clone();
+        wrong_certificate.sha256_fingerprint = "F".repeat(64);
+        assert_eq!(
+            validate_manual_signing_profile_with_policy(&first, &wrong_certificate, &policy)
+                .expect_err("wrong certificate"),
+            ManualSigningAssetError::ProvisioningProfileCertificateMismatch
+        );
+
+        let expired = fixture_with_profile_window(
+            false,
+            LeafUsage::CodeSigning,
+            TEST_NOW_UNIX_SECONDS - 3_600,
+            TEST_NOW_UNIX_SECONDS,
+        );
+        let expired_anchors = [TrustAnchor {
+            pem: &expired.root_pem,
+            sha256: &expired.root_fingerprint,
+        }];
+        let expired_policy = SigningAssetPolicy {
+            trust_anchors: &expired_anchors,
+            accepted_common_name_prefixes: &[APPLE_DEVELOPMENT_PREFIX, IPHONE_DEVELOPER_PREFIX],
+            now_unix_seconds: TEST_NOW_UNIX_SECONDS,
+        };
+        let expired_certificate = validate_manual_signing_identity_with_policy(
+            &SecretBytes::new(expired.pkcs12.clone()),
+            &SecretBytes::new(PASSWORD.as_bytes().to_vec()),
+            &expired_policy,
+        )
+        .expect("expired fixture identity remains valid");
+        let expired_error = validate_manual_signing_profile_with_policy(
+            &SecretBytes::new(expired.profile_cms),
+            &expired_certificate,
+            &expired_policy,
+        )
+        .expect_err("expired profile");
+        assert_eq!(
+            expired_error,
+            ManualSigningAssetError::ProvisioningProfileExpired
+        );
+        let malformed = validate_manual_signing_profile_with_policy(
+            &SecretBytes::new(b"canary-profile".to_vec()),
+            &certificate,
+            &policy,
+        )
+        .expect_err("malformed profile");
+        assert_eq!(
+            malformed,
+            ManualSigningAssetError::ProvisioningProfileCmsMalformed
+        );
+        assert!(!malformed.to_string().contains("canary"));
     }
 
     #[test]

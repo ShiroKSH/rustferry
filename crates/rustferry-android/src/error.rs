@@ -142,7 +142,7 @@ pub enum AndroidError {
         /// Process status code or signal description.
         status: String,
         /// Short stderr/stdout excerpt.
-        summary: String,
+        summary: Box<String>,
         /// Diagnostic log, when requested.
         log: Option<Utf8PathBuf>,
     },

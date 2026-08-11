@@ -1,5 +1,8 @@
 use camino::Utf8PathBuf;
+use cargo_ferry::job_store::{LocalJobId, MAX_LISTED_JOBS, MAX_PRUNE_JOBS};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+
+use crate::commands::artifact::ArtifactArgs;
 
 /// Build Rust applications for Android and iOS without user-maintained native projects.
 #[derive(Debug, Parser)]
@@ -48,6 +51,8 @@ pub struct Cli {
 /// Top-level cargo-ferry operation.
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Inspect local files or manage retained build artifacts.
+    Artifact(ArtifactArgs),
     /// Create a complete Rust mobile application.
     New(NewArgs),
     /// Add a runtime or platform capability safely.
@@ -60,6 +65,8 @@ pub enum Command {
     Doctor(DoctorArgs),
     /// Configure and inspect remote Apple build providers.
     Remote(RemoteArgs),
+    /// Inspect and manage durable remote-build jobs stored on this machine.
+    Jobs(JobsArgs),
     /// Configure remote Apple signing or inspect local development identities.
     Signing(SigningArgs),
     /// Build a mobile artifact without installing or launching it.
@@ -90,6 +97,189 @@ pub enum Command {
     Ide(IdeArgs),
 }
 
+/// Local durable-job operations.
+#[derive(Debug, Args)]
+pub struct JobsArgs {
+    /// Durable job operation.
+    #[command(subcommand)]
+    pub command: JobsCommand,
+}
+
+/// Durable-job operation.
+#[derive(Debug, Subcommand)]
+pub enum JobsCommand {
+    /// List the newest local job records.
+    List(JobsListArgs),
+    /// Show one local job without exposing provider resume internals.
+    Show(JobsJobArgs),
+    /// List artifact metadata recorded for one local job.
+    Artifacts(JobsJobArgs),
+    /// Read the durable sanitized lifecycle-event journal.
+    Logs(JobsLogsArgs),
+    /// Validate and request cancellation of one active provider job.
+    Cancel(JobsJobArgs),
+    /// Validate and create a retry from one terminal job.
+    Retry(JobsRetryArgs),
+    /// Remove exact old terminal lineages through the managed job store.
+    Prune(JobsPruneArgs),
+}
+
+/// Bounded local job listing options.
+#[derive(Debug, Args)]
+pub struct JobsListArgs {
+    /// Maximum number of newest jobs to return.
+    #[arg(long, default_value_t = 50, value_parser = parse_jobs_limit)]
+    pub limit: usize,
+}
+
+/// Exact local job selector.
+#[derive(Debug, Args)]
+pub struct JobsJobArgs {
+    /// Stable local job identifier (`job-...`).
+    #[arg(value_parser = parse_local_job_id)]
+    pub local_job_id: LocalJobId,
+}
+
+/// Durable lifecycle-event journal options.
+#[derive(Debug, Args)]
+pub struct JobsLogsArgs {
+    /// Stable local job identifier (`job-...`).
+    #[arg(value_parser = parse_local_job_id)]
+    pub local_job_id: LocalJobId,
+    /// Continue until the stored lifecycle reaches an exact terminal state.
+    #[arg(long, conflicts_with_all = ["json", "quiet"])]
+    pub follow: bool,
+    /// Include events at or after this Unix millisecond timestamp.
+    #[arg(long, default_value_t = 0)]
+    pub since: u64,
+    /// Include only events with this exact lifecycle phase.
+    #[arg(long, value_parser = parse_job_phase)]
+    pub phase: Option<String>,
+    /// Also write the sanitized event rendering to a new file.
+    #[arg(long, value_name = "PATH")]
+    pub output: Option<Utf8PathBuf>,
+}
+
+/// Retry policy options.
+#[derive(Debug, Args)]
+pub struct JobsRetryArgs {
+    /// Stable local job identifier (`job-...`).
+    #[arg(value_parser = parse_local_job_id)]
+    pub local_job_id: LocalJobId,
+    /// Explicitly permit retrying a fully evidenced successful job.
+    #[arg(long)]
+    pub force: bool,
+    /// Recapture the current canonical project `GitSnapshot` instead of the exact stored source.
+    #[arg(long, requires = "yes")]
+    pub use_current_source: bool,
+    /// Confirm public `GitSnapshot` recapture from the exact current project source.
+    #[arg(long, requires = "use_current_source")]
+    pub yes: bool,
+}
+
+/// Managed terminal-job pruning options.
+#[derive(Debug, Args)]
+pub struct JobsPruneArgs {
+    /// Select complete terminal lineages updated strictly before this Unix millisecond timestamp.
+    #[arg(long, value_name = "UNIX_MS", value_parser = parse_positive_timestamp)]
+    pub before: u64,
+    /// Maximum number of jobs in the exact prune transaction.
+    #[arg(long, default_value_t = 100, value_parser = parse_prune_limit)]
+    pub max_jobs: usize,
+    /// Confirm execution of the exact revalidated plan.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+fn parse_jobs_limit(value: &str) -> Result<usize, String> {
+    let limit = value
+        .parse::<usize>()
+        .map_err(|_| "limit must be an integer from 1 through 1000".to_owned())?;
+    if !(1..=MAX_LISTED_JOBS).contains(&limit) {
+        return Err("limit must be an integer from 1 through 1000".to_owned());
+    }
+    Ok(limit)
+}
+
+fn parse_local_job_id(value: &str) -> Result<LocalJobId, String> {
+    LocalJobId::new(value.to_owned()).map_err(|error| error.to_string())
+}
+
+fn parse_job_phase(value: &str) -> Result<String, String> {
+    let valid_length = !value.is_empty() && value.len() <= 160;
+    let mut characters = value.bytes();
+    let valid_first = characters
+        .next()
+        .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit());
+    let valid_rest = characters.all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+    });
+    if valid_length && valid_first && valid_rest {
+        Ok(value.to_owned())
+    } else {
+        Err("phase must be 1 to 160 lowercase ASCII letters, digits, '-' or '_'".to_owned())
+    }
+}
+
+fn parse_ide_job_phase(value: &str) -> Result<String, String> {
+    let has_control = value
+        .chars()
+        .any(|character| (character as u32) < 32 || character as u32 == 127);
+    if !value.is_empty() && value.len() <= 4_096 && !has_control {
+        Ok(value.to_owned())
+    } else {
+        Err("phase must be 1-4096 bytes of text without control characters".to_owned())
+    }
+}
+
+fn parse_decimal_u64(value: &str) -> Result<u64, String> {
+    if value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err("sequence must be a canonical unsigned decimal integer".to_owned());
+    }
+    value
+        .parse::<u64>()
+        .map_err(|_| "sequence must fit an unsigned 64-bit integer".to_owned())
+}
+
+fn parse_provider_artifact_id(value: &str) -> Result<String, String> {
+    let valid = !value.is_empty()
+        && value.len() <= 160
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'));
+    if valid {
+        Ok(value.to_owned())
+    } else {
+        Err(
+            "provider artifact ID must be 1-160 ASCII letters, digits, '-', '_', '.', or ':'"
+                .to_owned(),
+        )
+    }
+}
+
+fn parse_positive_timestamp(value: &str) -> Result<u64, String> {
+    let timestamp = value
+        .parse::<u64>()
+        .map_err(|_| "before must be a positive Unix millisecond timestamp".to_owned())?;
+    if timestamp == 0 {
+        return Err("before must be a positive Unix millisecond timestamp".to_owned());
+    }
+    Ok(timestamp)
+}
+
+fn parse_prune_limit(value: &str) -> Result<usize, String> {
+    let limit = value
+        .parse::<usize>()
+        .map_err(|_| "max-jobs must be an integer from 1 through 1000".to_owned())?;
+    if !(1..=MAX_PRUNE_JOBS).contains(&limit) {
+        return Err("max-jobs must be an integer from 1 through 1000".to_owned());
+    }
+    Ok(limit)
+}
+
 /// Stable editor-integration interface.
 #[derive(Debug, Args)]
 pub struct IdeArgs {
@@ -113,6 +303,32 @@ pub enum IdeCommand {
     Devices(IdeDevicesArgs),
     /// List usable Apple Development teams for signing UI.
     SigningTeams(IdeWorkspaceArgs),
+    /// List durable remote-build jobs owned by the exact workspace.
+    JobsList(IdeJobsListArgs),
+    /// Show one durable remote-build job owned by the exact workspace.
+    JobsShow(IdeJobArgs),
+    /// List recorded artifacts for one job owned by the exact workspace.
+    JobsArtifacts(IdeJobArgs),
+    /// Read sanitized lifecycle events for one job owned by the exact workspace.
+    JobsLogs(IdeJobLogsArgs),
+    /// Read one bounded cursor page of sanitized lifecycle events.
+    JobsLogsPage(IdeJobLogsPageArgs),
+    /// Durably cancel one workspace-owned remote build.
+    JobsCancel(IdeJobArgs),
+    /// Create or resume one exact retry child for a workspace-owned job.
+    JobsRetry(IdeJobArgs),
+    /// Verify one workspace-owned retained artifact against durable evidence.
+    JobsArtifactVerify(IdeJobArtifactArgs),
+    /// Reveal one revalidated retained artifact through the platform file manager.
+    JobsArtifactReveal(IdeJobArtifactArgs),
+    /// Remove one exact retained artifact after explicit confirmation.
+    JobsArtifactRemove(IdeJobArtifactRemoveArgs),
+    /// Preview an exact public GitHub snapshot build without writing state.
+    RemoteBuildPreview(IdeRemoteBuildPreviewArgs),
+    /// Submit the exact preview authorized by bounded JSON on standard input.
+    RemoteBuildSubmit(IdeRemoteBuildSubmitArgs),
+    /// Report sanitized GitHub physical-iPhone signing readiness.
+    SigningReadiness(IdeSigningReadinessArgs),
     /// Check Rust sources and stream compiler diagnostics.
     Check(IdeCheckArgs),
     /// Build and stream progress plus artifact metadata.
@@ -133,6 +349,164 @@ pub struct IdeWorkspaceArgs {
     /// Project root or a child directory.
     #[arg(long)]
     pub workspace: Utf8PathBuf,
+}
+
+/// Bounded workspace-owned IDE job listing.
+#[derive(Debug, Args)]
+pub struct IdeJobsListArgs {
+    /// Project root or a child directory.
+    #[arg(long)]
+    pub workspace: Utf8PathBuf,
+    /// Maximum number of newest jobs to return.
+    #[arg(long, default_value_t = 50, value_parser = parse_jobs_limit)]
+    pub limit: usize,
+}
+
+/// Exact workspace-owned IDE job selector.
+#[derive(Debug, Args)]
+pub struct IdeJobArgs {
+    /// Project root or a child directory.
+    #[arg(long)]
+    pub workspace: Utf8PathBuf,
+    /// Stable local job identifier (`job-...`).
+    #[arg(long, value_parser = parse_local_job_id)]
+    pub job: LocalJobId,
+}
+
+/// Workspace-owned durable lifecycle-event journal request.
+#[derive(Debug, Args)]
+pub struct IdeJobLogsArgs {
+    /// Project root or a child directory.
+    #[arg(long)]
+    pub workspace: Utf8PathBuf,
+    /// Stable local job identifier (`job-...`).
+    #[arg(long, value_parser = parse_local_job_id)]
+    pub job: LocalJobId,
+    /// Include events at or after this Unix millisecond timestamp.
+    #[arg(long, default_value_t = 0)]
+    pub since: u64,
+    /// Include only events with this exact lifecycle phase.
+    #[arg(long, value_parser = parse_ide_job_phase, allow_hyphen_values = true)]
+    pub phase: Option<String>,
+}
+
+/// One bounded workspace-owned lifecycle-event journal page.
+#[derive(Debug, Args)]
+pub struct IdeJobLogsPageArgs {
+    /// Project root or a child directory.
+    #[arg(long)]
+    pub workspace: Utf8PathBuf,
+    /// Stable local job identifier (`job-...`).
+    #[arg(long, value_parser = parse_local_job_id)]
+    pub job: LocalJobId,
+    /// Return events strictly after this canonical decimal sequence.
+    #[arg(long, default_value = "0", value_parser = parse_decimal_u64)]
+    pub after_sequence: u64,
+    /// Maximum events returned in this page.
+    #[arg(long, default_value_t = 256, value_parser = parse_jobs_limit)]
+    pub limit: usize,
+    /// Perform at most one bounded provider refresh before reading.
+    #[arg(long)]
+    pub refresh: bool,
+    /// Perform at most one bounded wait when no matching event is available.
+    #[arg(long)]
+    pub wait: bool,
+    /// Include only events with this exact lifecycle phase.
+    #[arg(long, value_parser = parse_ide_job_phase, allow_hyphen_values = true)]
+    pub phase: Option<String>,
+}
+
+/// Exact workspace-owned IDE artifact selector.
+#[derive(Debug, Args)]
+pub struct IdeJobArtifactArgs {
+    /// Project root or a child directory.
+    #[arg(long)]
+    pub workspace: Utf8PathBuf,
+    /// Stable local job identifier (`job-...`).
+    #[arg(long, value_parser = parse_local_job_id)]
+    pub job: LocalJobId,
+    /// Provider-scoped artifact identifier.
+    #[arg(long, value_parser = parse_provider_artifact_id)]
+    pub artifact: String,
+}
+
+/// Exact confirmed workspace-owned IDE artifact removal.
+#[derive(Debug, Args)]
+pub struct IdeJobArtifactRemoveArgs {
+    /// Project root or a child directory.
+    #[arg(long)]
+    pub workspace: Utf8PathBuf,
+    /// Stable local job identifier (`job-...`).
+    #[arg(long, value_parser = parse_local_job_id)]
+    pub job: LocalJobId,
+    /// Provider-scoped artifact identifier.
+    #[arg(long, value_parser = parse_provider_artifact_id)]
+    pub artifact: String,
+    /// Confirm exact removal after write-time revalidation.
+    #[arg(long, required = true)]
+    pub yes: bool,
+}
+
+/// IDE remote provider selector.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum IdeRemoteProvider {
+    /// GitHub Actions.
+    Github,
+}
+
+/// IDE remote build target selector.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum IdeRemoteTarget {
+    /// Physical iPhone compile target.
+    IosDevice,
+}
+
+/// Zero-write public GitHub snapshot preview.
+#[derive(Debug, Args)]
+pub struct IdeRemoteBuildPreviewArgs {
+    /// Exact project root passed by the editor.
+    #[arg(long)]
+    pub workspace: Utf8PathBuf,
+    /// Remote provider.
+    #[arg(long, value_enum)]
+    pub provider: IdeRemoteProvider,
+    /// Remote compile target.
+    #[arg(long, value_enum)]
+    pub target: IdeRemoteTarget,
+    /// Build optimization profile.
+    #[arg(long, value_enum)]
+    pub profile: IdeProfile,
+    /// Require unsigned compile-only output.
+    #[arg(long, required = true)]
+    pub unsigned: bool,
+    /// Require explicit dirty-tree snapshot mode.
+    #[arg(long, required = true)]
+    pub snapshot: bool,
+}
+
+/// Exact public GitHub snapshot submission.
+#[derive(Debug, Args)]
+pub struct IdeRemoteBuildSubmitArgs {
+    /// Exact project root passed by the editor.
+    #[arg(long)]
+    pub workspace: Utf8PathBuf,
+    /// Read one bounded consent object from standard input.
+    #[arg(long, required = true)]
+    pub consent_stdin: bool,
+}
+
+/// Sanitized GitHub physical-iPhone signing readiness request.
+#[derive(Debug, Args)]
+pub struct IdeSigningReadinessArgs {
+    /// Exact project root passed by the editor.
+    #[arg(long)]
+    pub workspace: Utf8PathBuf,
+    /// Remote provider.
+    #[arg(long, value_enum)]
+    pub provider: IdeRemoteProvider,
+    /// Remote compile target.
+    #[arg(long, value_enum)]
+    pub target: IdeRemoteTarget,
 }
 
 /// IDE configuration-validation input.
@@ -422,6 +796,10 @@ pub struct DoctorArgs {
 
 /// Artifact build options.
 #[derive(Debug, Args)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "Clap models these independent public build switches as booleans"
+)]
 pub struct BuildArgs {
     /// Target platform.
     #[command(subcommand)]
@@ -430,14 +808,42 @@ pub struct BuildArgs {
     #[arg(long, global = true)]
     pub release: bool,
     /// Remote provider for a physical-iPhone build.
-    #[arg(long, global = true, value_enum)]
-    pub remote: Option<RemoteProviderChoice>,
+    #[arg(long, global = true, value_name = "REMOTE")]
+    pub remote: Option<BuildRemoteTarget>,
+    /// Optional absolute `RustFerry` user-config root override for a named SSH remote.
+    #[arg(long, global = true, value_name = "ABSOLUTE_PATH")]
+    pub config_dir: Option<Utf8PathBuf>,
     /// Compile a physical-iPhone archive without signing or provisioning.
     #[arg(long, global = true)]
     pub unsigned: bool,
+    /// Build the exact current source as an operation-scoped GitHub snapshot.
+    #[arg(long, global = true)]
+    pub snapshot: bool,
+    /// Confirm the exact snapshot plan without an interactive prompt.
+    #[arg(long, global = true, requires = "snapshot")]
+    pub yes: bool,
+    /// Select physical-iPhone artifacts to download.
+    #[arg(long, global = true, value_enum, value_name = "ARTIFACT")]
+    pub artifact: Option<BuildArtifactSelection>,
+    /// Include compressed dSYM debug symbols in a signed physical-iPhone build.
+    #[arg(long, global = true)]
+    pub include_dsym: bool,
     /// Project root or a child directory.
     #[arg(long, visible_alias = "project", global = true)]
     pub project_dir: Option<Utf8PathBuf>,
+}
+
+/// Physical-iPhone artifact selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum BuildArtifactSelection {
+    /// Download the installable IPA and default evidence.
+    Ipa,
+    /// Also download the signed application bundle.
+    App,
+    /// Also download the signed Xcode archive.
+    Archive,
+    /// Also download the signed application bundle and Xcode archive.
+    All,
 }
 
 /// Platform-specific build mode.
@@ -698,8 +1104,21 @@ pub struct SigningArgs {
 pub enum SigningCommand {
     /// Configure signing assets for a remote build provider.
     Setup(SigningSetupArgs),
+    /// Check sanitized remote iPhone-signing readiness without uploading assets.
+    Doctor(SigningDoctorArgs),
     /// List usable Apple Development identities grouped by Team ID.
     Teams(ProjectArgs),
+}
+
+/// Read-only remote signing-readiness arguments.
+#[derive(Debug, Args)]
+pub struct SigningDoctorArgs {
+    /// Remote provider whose protected signing readiness is checked.
+    #[arg(long, value_enum)]
+    pub remote: RemoteProviderChoice,
+    /// Project root or a child directory.
+    #[arg(long, visible_alias = "project")]
+    pub project_dir: Option<Utf8PathBuf>,
 }
 
 /// Asset pipeline wrapper.
@@ -741,12 +1160,118 @@ pub struct RemoteArgs {
 /// Supported remote-provider operations.
 #[derive(Debug, Subcommand)]
 pub enum RemoteCommand {
+    /// Add a named remote build endpoint without storing private-key bytes.
+    Add(RemoteAddArgs),
     /// Authenticate, verify, and create-only install the GitHub workflow and local provider config.
     Setup(RemoteSetupArgs),
     /// Run bounded authentication, repository, workflow, and artifact-store checks.
     Doctor(RemoteDoctorArgs),
     /// Show local provider configuration and workflow integrity without mutation.
     Status(RemoteStatusArgs),
+    /// Inspect, create, or independently verify a deterministic source snapshot.
+    Bundle(RemoteBundleArgs),
+}
+
+/// Named remote endpoint command wrapper.
+#[derive(Debug, Args)]
+pub struct RemoteAddArgs {
+    /// Remote endpoint kind.
+    #[command(subcommand)]
+    pub provider: RemoteAddProvider,
+}
+
+/// Remote endpoint kinds accepted by `remote add`.
+#[derive(Debug, Subcommand)]
+pub enum RemoteAddProvider {
+    /// Add a pinned OpenSSH endpoint running `ferry-worker-macos serve --stdio`.
+    #[command(name = "ssh-mac")]
+    SshMac(RemoteAddSshMacArgs),
+}
+
+/// Trusted SSH Mac endpoint arguments.
+#[derive(Debug, Args)]
+pub struct RemoteAddSshMacArgs {
+    /// Stable endpoint name used by later commands.
+    pub name: String,
+    /// Exact DNS name or IP address present in the dedicated known-hosts entry.
+    #[arg(long)]
+    pub host: String,
+    /// Remote login user.
+    #[arg(long)]
+    pub user: String,
+    /// Remote SSH port.
+    #[arg(long, default_value_t = 22)]
+    pub port: u16,
+    /// Absolute dedicated known-hosts file containing exactly this endpoint key.
+    #[arg(long)]
+    pub known_hosts: Utf8PathBuf,
+    /// Canonical pinned OpenSSH host-key fingerprint (`SHA256:` plus unpadded base64).
+    #[arg(long)]
+    pub host_key_sha256: String,
+    /// Optional absolute private-key path reference; key bytes are never stored.
+    #[arg(long)]
+    pub identity_file: Option<Utf8PathBuf>,
+    /// Optional absolute `RustFerry` user-config root override.
+    #[arg(long)]
+    pub config_dir: Option<Utf8PathBuf>,
+}
+
+/// Deterministic source-bundle command wrapper.
+#[derive(Debug, Args)]
+pub struct RemoteBundleArgs {
+    /// Source-bundle operation.
+    #[command(subcommand)]
+    pub command: RemoteBundleCommand,
+}
+
+/// Supported deterministic source-bundle operations.
+#[derive(Debug, Subcommand)]
+pub enum RemoteBundleCommand {
+    /// Show the exact allowlisted files, sizes, modes, and SHA-256 digests.
+    Inspect(RemoteBundleInspectArgs),
+    /// Create a deterministic ZIP plus its separately verified descriptor.
+    Create(RemoteBundleCreateArgs),
+    /// Verify an untrusted ZIP against its descriptor using bounded extraction.
+    Verify(RemoteBundleVerifyArgs),
+}
+
+/// Source selection shared by inspection and creation.
+#[derive(Debug, Args)]
+pub struct RemoteBundleInspectArgs {
+    /// Project root or a child directory.
+    #[arg(long, visible_alias = "project")]
+    pub project_dir: Option<Utf8PathBuf>,
+    /// Workspace-relative file whose executable bit must be preserved on hosts without Unix modes.
+    #[arg(long, value_name = "WORKSPACE_PATH")]
+    pub executable: Vec<Utf8PathBuf>,
+}
+
+/// Deterministic source-bundle creation arguments.
+#[derive(Debug, Args)]
+pub struct RemoteBundleCreateArgs {
+    /// New ZIP path outside the selected Cargo workspace; existing files are never overwritten.
+    #[arg(long)]
+    pub output: Utf8PathBuf,
+    /// New descriptor path outside the workspace; defaults to `<output>.manifest.json`.
+    #[arg(long)]
+    pub descriptor: Option<Utf8PathBuf>,
+    /// Project root or a child directory.
+    #[arg(long, visible_alias = "project")]
+    pub project_dir: Option<Utf8PathBuf>,
+    /// Workspace-relative file whose executable bit must be preserved on hosts without Unix modes.
+    #[arg(long, value_name = "WORKSPACE_PATH")]
+    pub executable: Vec<Utf8PathBuf>,
+}
+
+/// Deterministic source-bundle verification arguments.
+#[derive(Debug, Args)]
+pub struct RemoteBundleVerifyArgs {
+    /// Untrusted source ZIP to verify.
+    #[arg(long)]
+    pub archive: Utf8PathBuf,
+    /// JSON descriptor created alongside the ZIP.
+    #[arg(long)]
+    pub descriptor: Utf8PathBuf,
 }
 
 /// Remote providers implemented by this CLI surface.
@@ -754,6 +1279,38 @@ pub enum RemoteCommand {
 pub enum RemoteProviderChoice {
     /// GitHub Actions on a GitHub-hosted macOS runner.
     Github,
+}
+
+/// GitHub event used to start the generated worker workflow.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum GithubWorkflowTriggerChoice {
+    /// A create-only push below the configured temporary branch namespace.
+    #[default]
+    Push,
+    /// An authenticated API dispatch after the temporary ref is published.
+    WorkflowDispatch,
+}
+
+/// Built-in or named remote selected only by physical-iPhone build commands.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BuildRemoteTarget {
+    /// GitHub Actions on a GitHub-hosted macOS runner.
+    Github,
+    /// A configured named OpenSSH Mac endpoint.
+    SshMac(rustferry_ssh::SshRemoteName),
+}
+
+impl std::str::FromStr for BuildRemoteTarget {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value == "github" {
+            return Ok(Self::Github);
+        }
+        rustferry_ssh::SshRemoteName::new(value)
+            .map(Self::SshMac)
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// Signing-setup mode wrapper.
@@ -777,9 +1334,9 @@ pub struct ManualSigningSetupArgs {
     /// PKCS#12 Apple Development certificate and private-key archive.
     #[arg(long)]
     pub certificate: Utf8PathBuf,
-    /// Development provisioning-profile file.
-    #[arg(long)]
-    pub profile: Utf8PathBuf,
+    /// Development profile as PATH, or TARGET=PATH for every app/extension target.
+    #[arg(long, required = true, value_name = "TARGET=PATH|PATH")]
+    pub profile: Vec<String>,
     /// Remote provider that will receive the validated signing assets.
     #[arg(long, value_enum)]
     pub remote: RemoteProviderChoice,
@@ -833,20 +1390,25 @@ pub struct RemoteSetupArgs {
     /// Compatible worker semantic version.
     #[arg(long, default_value = env!("CARGO_PKG_VERSION"))]
     pub worker_version: String,
+    /// GitHub event used to start the generated worker workflow.
+    #[arg(long, value_enum, default_value_t)]
+    pub run_trigger: GithubWorkflowTriggerChoice,
     /// Print the deterministic workflow and config plan without installing either file.
     #[arg(long)]
     pub preview: bool,
 }
 
-/// GitHub provider doctor arguments.
+/// Remote provider or named-endpoint doctor arguments.
 #[derive(Debug, Args)]
 pub struct RemoteDoctorArgs {
-    /// Provider to inspect.
-    #[arg(value_enum)]
-    pub provider: RemoteProviderChoice,
+    /// Built-in provider (`github`) or configured endpoint name.
+    pub target: String,
     /// Project root or a child directory.
     #[arg(long, visible_alias = "project")]
     pub project_dir: Option<Utf8PathBuf>,
+    /// Optional absolute `RustFerry` user-config root override for named endpoints.
+    #[arg(long)]
+    pub config_dir: Option<Utf8PathBuf>,
 }
 
 /// GitHub provider status arguments.
@@ -938,9 +1500,395 @@ mod tests {
     use clap::Parser as _;
 
     use super::{
-        BuildPlatform, Cli, Command, RemoteCommand, RemoteProviderChoice, SigningCommand,
+        BuildArtifactSelection, BuildPlatform, BuildRemoteTarget, Cli, Command, IdeCommand,
+        JobsCommand, RemoteBundleCommand, RemoteCommand, RemoteProviderChoice, SigningCommand,
         SigningSetupMode,
     };
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one parser matrix keeps the related jobs grammar and rejection cases together"
+    )]
+    fn jobs_grammars_validate_bounds_and_local_identifiers() {
+        let parsed = Cli::try_parse_from(["cargo-ferry", "jobs", "list"])
+            .expect("default jobs list grammar");
+        let Command::Jobs(jobs) = parsed.command else {
+            panic!("expected jobs command");
+        };
+        let JobsCommand::List(arguments) = jobs.command else {
+            panic!("expected jobs list command");
+        };
+        assert_eq!(arguments.limit, 50);
+
+        let parsed = Cli::try_parse_from(["cargo-ferry", "jobs", "show", "job-0123456789abcdef"])
+            .expect("jobs show grammar");
+        let Command::Jobs(jobs) = parsed.command else {
+            panic!("expected jobs command");
+        };
+        let JobsCommand::Show(arguments) = jobs.command else {
+            panic!("expected jobs show command");
+        };
+        assert_eq!(arguments.local_job_id.as_str(), "job-0123456789abcdef");
+
+        let parsed = Cli::try_parse_from(["cargo-ferry", "jobs", "artifacts", "job-artifacts-1"])
+            .expect("jobs artifacts grammar");
+        let Command::Jobs(jobs) = parsed.command else {
+            panic!("expected jobs command");
+        };
+        assert!(matches!(jobs.command, JobsCommand::Artifacts(_)));
+
+        let parsed = Cli::try_parse_from([
+            "cargo-ferry",
+            "jobs",
+            "logs",
+            "job-logs-1",
+            "--follow",
+            "--since",
+            "17",
+            "--phase",
+            "compile",
+            "--output",
+            "events.ndjson",
+        ])
+        .expect("jobs logs grammar");
+        let Command::Jobs(jobs) = parsed.command else {
+            panic!("expected jobs command");
+        };
+        let JobsCommand::Logs(arguments) = jobs.command else {
+            panic!("expected jobs logs command");
+        };
+        assert!(arguments.follow);
+        assert_eq!(arguments.since, 17);
+        assert_eq!(arguments.phase.as_deref(), Some("compile"));
+        assert_eq!(
+            arguments.output.as_ref().map(|path| path.as_str()),
+            Some("events.ndjson")
+        );
+
+        let parsed = Cli::try_parse_from([
+            "cargo-ferry",
+            "jobs",
+            "retry",
+            "job-retry-1",
+            "--force",
+            "--use-current-source",
+            "--yes",
+        ])
+        .expect("jobs retry grammar");
+        let Command::Jobs(jobs) = parsed.command else {
+            panic!("expected jobs command");
+        };
+        let JobsCommand::Retry(arguments) = jobs.command else {
+            panic!("expected jobs retry command");
+        };
+        assert!(arguments.force);
+        assert!(arguments.use_current_source);
+        assert!(arguments.yes);
+        assert!(
+            Cli::try_parse_from([
+                "cargo-ferry",
+                "jobs",
+                "retry",
+                "job-retry-1",
+                "--use-current-source",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["cargo-ferry", "jobs", "retry", "job-retry-1", "--yes",]).is_err()
+        );
+
+        let parsed = Cli::try_parse_from([
+            "cargo-ferry",
+            "jobs",
+            "prune",
+            "--before",
+            "123456789",
+            "--max-jobs",
+            "25",
+            "--yes",
+        ])
+        .expect("jobs prune grammar");
+        let Command::Jobs(jobs) = parsed.command else {
+            panic!("expected jobs command");
+        };
+        let JobsCommand::Prune(arguments) = jobs.command else {
+            panic!("expected jobs prune command");
+        };
+        assert_eq!(arguments.before, 123_456_789);
+        assert_eq!(arguments.max_jobs, 25);
+        assert!(arguments.yes);
+
+        for invalid_limit in ["0", "1001", "not-a-number"] {
+            assert!(
+                Cli::try_parse_from(["cargo-ferry", "jobs", "list", "--limit", invalid_limit,])
+                    .is_err(),
+                "accepted limit {invalid_limit}"
+            );
+        }
+        for invalid_id in ["../job", "JOB-UPPER", "job/child", "con"] {
+            assert!(
+                Cli::try_parse_from(["cargo-ferry", "jobs", "show", invalid_id]).is_err(),
+                "accepted local job ID {invalid_id}"
+            );
+        }
+        for invalid_phase in ["Compile", "../compile", "compile phase", ""] {
+            assert!(
+                Cli::try_parse_from([
+                    "cargo-ferry",
+                    "jobs",
+                    "logs",
+                    "job-logs-1",
+                    "--phase",
+                    invalid_phase,
+                ])
+                .is_err(),
+                "accepted phase {invalid_phase:?}"
+            );
+        }
+        for invalid_max_jobs in ["0", "1001", "not-a-number"] {
+            assert!(
+                Cli::try_parse_from([
+                    "cargo-ferry",
+                    "jobs",
+                    "prune",
+                    "--before",
+                    "1",
+                    "--max-jobs",
+                    invalid_max_jobs,
+                ])
+                .is_err(),
+                "accepted max-jobs {invalid_max_jobs:?}"
+            );
+        }
+        assert!(Cli::try_parse_from(["cargo-ferry", "jobs", "prune", "--before", "0",]).is_err());
+    }
+
+    #[test]
+    fn ide_job_reads_require_workspace_and_exact_bounded_selectors() {
+        let parsed = Cli::try_parse_from([
+            "cargo-ferry",
+            "ide",
+            "jobs-logs",
+            "--workspace",
+            "project",
+            "--job",
+            "job-ide-1",
+            "--since",
+            "42",
+            "--phase",
+            "compile",
+        ])
+        .expect("IDE jobs logs grammar");
+        let Command::Ide(ide) = parsed.command else {
+            panic!("expected IDE command");
+        };
+        let IdeCommand::JobsLogs(arguments) = ide.command else {
+            panic!("expected IDE jobs logs command");
+        };
+        assert_eq!(arguments.workspace, Utf8PathBuf::from("project"));
+        assert_eq!(arguments.job.as_str(), "job-ide-1");
+        assert_eq!(arguments.since, 42);
+        assert_eq!(arguments.phase.as_deref(), Some("compile"));
+
+        for command in ["jobs-list", "jobs-show", "jobs-artifacts", "jobs-logs"] {
+            assert!(
+                Cli::try_parse_from(["cargo-ferry", "ide", command]).is_err(),
+                "accepted {command} without --workspace"
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "cargo-ferry",
+                "ide",
+                "jobs-show",
+                "--workspace",
+                "project",
+                "--job",
+                "../foreign",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "cargo-ferry",
+                "ide",
+                "jobs-list",
+                "--workspace",
+                "project",
+                "--limit",
+                "1001",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one parser matrix keeps every frozen IDE-v1 command grammar adjacent"
+    )]
+    fn ide_goal3_commands_preserve_distinct_bounded_grammars() {
+        let parsed = Cli::try_parse_from([
+            "cargo-ferry",
+            "ide",
+            "jobs-logs-page",
+            "--workspace",
+            r"C:\work\Ferry App",
+            "--job",
+            "job-ide-1",
+            "--after-sequence",
+            "18446744073709551615",
+            "--limit",
+            "1000",
+            "--refresh",
+            "--wait",
+            "--phase",
+            "-Provider wait β",
+        ])
+        .expect("paged IDE job logs grammar");
+        let Command::Ide(ide) = parsed.command else {
+            panic!("expected IDE command");
+        };
+        let IdeCommand::JobsLogsPage(arguments) = ide.command else {
+            panic!("expected paged IDE job logs");
+        };
+        assert_eq!(arguments.after_sequence, u64::MAX);
+        assert_eq!(arguments.limit, 1000);
+        assert!(arguments.refresh);
+        assert!(arguments.wait);
+        assert_eq!(arguments.phase.as_deref(), Some("-Provider wait β"));
+
+        assert!(
+            Cli::try_parse_from([
+                "cargo-ferry",
+                "ide",
+                "jobs-logs-page",
+                "--workspace",
+                "project",
+                "--job",
+                "job-ide-1",
+                "--phase",
+                "provider\nwait",
+            ])
+            .is_err()
+        );
+
+        for sequence in ["", "00", "01", "+1", "-1", "18446744073709551616"] {
+            assert!(
+                Cli::try_parse_from([
+                    "cargo-ferry",
+                    "ide",
+                    "jobs-logs-page",
+                    "--workspace",
+                    "project",
+                    "--job",
+                    "job-ide-1",
+                    "--after-sequence",
+                    sequence,
+                ])
+                .is_err(),
+                "accepted non-canonical sequence {sequence:?}"
+            );
+        }
+
+        for command in [
+            "jobs-cancel",
+            "jobs-retry",
+            "jobs-artifact-verify",
+            "jobs-artifact-reveal",
+        ] {
+            let mut args = vec![
+                "cargo-ferry",
+                "ide",
+                command,
+                "--workspace",
+                "project",
+                "--job",
+                "job-ide-1",
+            ];
+            if command.starts_with("jobs-artifact-") {
+                args.extend(["--artifact", "artifact:123"]);
+            }
+            assert!(Cli::try_parse_from(args).is_ok(), "rejected {command}");
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "cargo-ferry",
+                "ide",
+                "jobs-artifact-remove",
+                "--workspace",
+                "project",
+                "--job",
+                "job-ide-1",
+                "--artifact",
+                "artifact:123",
+            ])
+            .is_err(),
+            "accepted IDE artifact removal without --yes"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "cargo-ferry",
+                "ide",
+                "jobs-artifact-remove",
+                "--workspace",
+                "project",
+                "--job",
+                "job-ide-1",
+                "--artifact",
+                "artifact:123",
+                "--yes",
+            ])
+            .is_ok()
+        );
+
+        assert!(
+            Cli::try_parse_from([
+                "cargo-ferry",
+                "ide",
+                "remote-build-preview",
+                "--workspace",
+                "project",
+                "--provider",
+                "github",
+                "--target",
+                "ios-device",
+                "--profile",
+                "release",
+                "--unsigned",
+                "--snapshot",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "cargo-ferry",
+                "ide",
+                "remote-build-submit",
+                "--workspace",
+                "project",
+                "--consent-stdin",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "cargo-ferry",
+                "ide",
+                "signing-readiness",
+                "--workspace",
+                "project",
+                "--provider",
+                "github",
+                "--target",
+                "ios-device",
+            ])
+            .is_ok()
+        );
+    }
 
     #[test]
     fn iphone_and_ios_device_grammars_share_the_github_selector() {
@@ -957,7 +1905,7 @@ mod tests {
             panic!("expected build command");
         };
         assert!(matches!(iphone.platform, BuildPlatform::Iphone(_)));
-        assert_eq!(iphone.remote, Some(RemoteProviderChoice::Github));
+        assert_eq!(iphone.remote, Some(BuildRemoteTarget::Github));
         assert!(iphone.unsigned);
 
         let ios = Cli::try_parse_from([
@@ -973,7 +1921,88 @@ mod tests {
             panic!("expected build command");
         };
         assert!(matches!(ios.platform, BuildPlatform::Ios(_)));
-        assert_eq!(ios.remote, Some(RemoteProviderChoice::Github));
+        assert_eq!(ios.remote, Some(BuildRemoteTarget::Github));
+    }
+
+    #[test]
+    fn github_iphone_snapshot_grammar_requires_explicit_confirmation_scope() {
+        let parsed = Cli::try_parse_from([
+            "cargo-ferry",
+            "build",
+            "iphone",
+            "--remote",
+            "github",
+            "--snapshot",
+            "--unsigned",
+            "--yes",
+        ])
+        .expect("GitHub snapshot grammar");
+        let Command::Build(arguments) = parsed.command else {
+            panic!("expected build command");
+        };
+        assert!(matches!(arguments.platform, BuildPlatform::Iphone(_)));
+        assert_eq!(arguments.remote, Some(BuildRemoteTarget::Github));
+        assert!(arguments.snapshot);
+        assert!(arguments.unsigned);
+        assert!(arguments.yes);
+
+        assert!(
+            Cli::try_parse_from(["cargo-ferry", "build", "iphone", "--yes", "--unsigned"]).is_err()
+        );
+    }
+
+    #[test]
+    fn physical_iphone_artifact_flags_parse_after_the_platform() {
+        let parsed = Cli::try_parse_from([
+            "cargo-ferry",
+            "build",
+            "iphone",
+            "--artifact",
+            "all",
+            "--include-dsym",
+        ])
+        .expect("physical-iPhone artifact flags");
+        let Command::Build(arguments) = parsed.command else {
+            panic!("expected build command");
+        };
+        assert_eq!(arguments.artifact, Some(BuildArtifactSelection::All));
+        assert!(arguments.include_dsym);
+    }
+
+    #[test]
+    fn build_remote_accepts_validated_named_ssh_endpoints_and_config_roots() {
+        let parsed = Cli::try_parse_from([
+            "cargo-ferry",
+            "build",
+            "iphone",
+            "--remote",
+            "office-mac",
+            "--config-dir",
+            "/tmp/rustferry-config",
+        ])
+        .expect("named SSH build grammar");
+        let Command::Build(arguments) = parsed.command else {
+            panic!("expected build command");
+        };
+        let Some(BuildRemoteTarget::SshMac(name)) = arguments.remote else {
+            panic!("expected named SSH build target");
+        };
+        assert_eq!(name.as_str(), "office-mac");
+        assert_eq!(
+            arguments.config_dir,
+            Some(Utf8PathBuf::from("/tmp/rustferry-config"))
+        );
+
+        assert!(
+            Cli::try_parse_from([
+                "cargo-ferry",
+                "build",
+                "iphone",
+                "--remote",
+                "../office-mac",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -996,6 +2025,113 @@ mod tests {
                 RemoteCommand::Setup(_) | RemoteCommand::Doctor(_) | RemoteCommand::Status(_)
             ));
         }
+    }
+
+    #[test]
+    fn ssh_remote_add_and_named_doctor_grammars_are_explicit() {
+        let parsed = Cli::try_parse_from([
+            "cargo-ferry",
+            "remote",
+            "add",
+            "ssh-mac",
+            "office-mac",
+            "--host",
+            "builder.example",
+            "--user",
+            "builder",
+            "--known-hosts",
+            "/tmp/rustferry-known-hosts",
+            "--host-key-sha256",
+            "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "--identity-file",
+            "/tmp/rustferry-identity",
+            "--config-dir",
+            "/tmp/rustferry-config",
+        ])
+        .expect("SSH endpoint grammar");
+        let Command::Remote(remote) = parsed.command else {
+            panic!("expected remote command");
+        };
+        let RemoteCommand::Add(add) = remote.command else {
+            panic!("expected remote add command");
+        };
+        let super::RemoteAddProvider::SshMac(arguments) = add.provider;
+        assert_eq!(arguments.name, "office-mac");
+        assert_eq!(arguments.host, "builder.example");
+        assert_eq!(arguments.user, "builder");
+        assert_eq!(arguments.port, 22);
+
+        let parsed = Cli::try_parse_from([
+            "cargo-ferry",
+            "remote",
+            "doctor",
+            "office-mac",
+            "--config-dir",
+            "/tmp/rustferry-config",
+        ])
+        .expect("named SSH doctor grammar");
+        let Command::Remote(remote) = parsed.command else {
+            panic!("expected remote command");
+        };
+        let RemoteCommand::Doctor(arguments) = remote.command else {
+            panic!("expected remote doctor command");
+        };
+        assert_eq!(arguments.target, "office-mac");
+    }
+
+    #[test]
+    fn source_bundle_grammar_requires_explicit_create_and_verify_paths() {
+        let inspect = Cli::try_parse_from([
+            "cargo-ferry",
+            "remote",
+            "bundle",
+            "inspect",
+            "--project",
+            "weather",
+        ])
+        .expect("source bundle inspect grammar");
+        let Command::Remote(inspect) = inspect.command else {
+            panic!("expected remote command");
+        };
+        assert!(matches!(
+            inspect.command,
+            RemoteCommand::Bundle(super::RemoteBundleArgs {
+                command: RemoteBundleCommand::Inspect(_)
+            })
+        ));
+
+        Cli::try_parse_from([
+            "cargo-ferry",
+            "remote",
+            "bundle",
+            "create",
+            "--output",
+            "source.zip",
+        ])
+        .expect("source bundle create grammar");
+        Cli::try_parse_from([
+            "cargo-ferry",
+            "remote",
+            "bundle",
+            "verify",
+            "--archive",
+            "source.zip",
+            "--descriptor",
+            "source.zip.manifest.json",
+        ])
+        .expect("source bundle verify grammar");
+        assert!(Cli::try_parse_from(["cargo-ferry", "remote", "bundle", "create"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "cargo-ferry",
+                "remote",
+                "bundle",
+                "verify",
+                "--archive",
+                "source.zip",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -1050,16 +2186,63 @@ mod tests {
         };
         let SigningSetupMode::Manual(arguments) = setup.mode;
         assert_eq!(arguments.certificate, Utf8PathBuf::from("development.p12"));
-        assert_eq!(
-            arguments.profile,
-            Utf8PathBuf::from("Weather.mobileprovision")
-        );
+        assert_eq!(arguments.profile, vec!["Weather.mobileprovision"]);
         assert_eq!(arguments.remote, RemoteProviderChoice::Github);
         assert!(!arguments.password_stdin);
         assert!(arguments.password_env.is_none());
         assert!(arguments.password_credential.is_none());
         assert!(arguments.device_sha256.is_none());
         assert!(!arguments.yes);
+    }
+
+    #[test]
+    fn signing_doctor_requires_the_named_github_remote() {
+        let parsed = Cli::try_parse_from([
+            "cargo-ferry",
+            "signing",
+            "doctor",
+            "--remote",
+            "github",
+            "--project-dir",
+            ".",
+        ])
+        .expect("signing doctor grammar");
+        let Command::Signing(signing) = parsed.command else {
+            panic!("expected signing command");
+        };
+        let SigningCommand::Doctor(arguments) = signing.command else {
+            panic!("expected signing doctor command");
+        };
+        assert_eq!(arguments.remote, RemoteProviderChoice::Github);
+        assert_eq!(arguments.project_dir, Some(Utf8PathBuf::from(".")));
+
+        assert!(
+            Cli::try_parse_from(["cargo-ferry", "signing", "doctor", "github"]).is_err(),
+            "the provider must use the explicit --remote boundary"
+        );
+        assert!(
+            Cli::try_parse_from(["cargo-ferry", "signing", "doctor"]).is_err(),
+            "the provider is mandatory"
+        );
+        assert!(
+            Cli::try_parse_from(["cargo-ferry", "signing", "doctor", "--remote", "gitlab",])
+                .is_err(),
+            "only the typed GitHub provider is accepted"
+        );
+    }
+
+    #[test]
+    fn signing_doctor_help_is_read_only_and_provider_scoped() {
+        let error = Cli::try_parse_from(["cargo-ferry", "signing", "doctor", "--help"])
+            .expect_err("help exits through clap");
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        let help = error.to_string();
+        assert!(help.contains("--remote <REMOTE>"));
+        assert!(help.contains("--project-dir <PROJECT_DIR>"));
+        assert!(help.contains("github"));
+        assert!(!help.contains("--certificate"));
+        assert!(!help.contains("--profile"));
+        assert!(!help.contains("--yes"));
     }
 
     #[test]

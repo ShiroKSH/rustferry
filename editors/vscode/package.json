@@ -48,6 +48,7 @@
     "onView:rustferry.project",
     "onView:rustferry.devices",
     "onView:rustferry.artifacts",
+    "onView:rustferry.jobs",
     "onCommand:rustferry.createProject",
     "onCommand:rustferry.openDocumentation"
   ],
@@ -228,6 +229,78 @@
         "command": "rustferry.selectCli",
         "title": "Select cargo-ferry Executable",
         "category": "RustFerry"
+      },
+      {
+        "command": "rustferry.jobs.refresh",
+        "title": "Refresh Jobs",
+        "category": "RustFerry",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "rustferry.jobs.show",
+        "title": "Show Job Details",
+        "category": "RustFerry",
+        "icon": "$(json)"
+      },
+      {
+        "command": "rustferry.jobs.logs",
+        "title": "Open Job Logs",
+        "category": "RustFerry",
+        "icon": "$(output)"
+      },
+      {
+        "command": "rustferry.jobs.logs.loadMore",
+        "title": "Load More Job Logs",
+        "category": "RustFerry",
+        "icon": "$(chevron-down)"
+      },
+      {
+        "command": "rustferry.jobs.logs.follow",
+        "title": "Follow Job Logs...",
+        "category": "RustFerry",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "rustferry.jobs.cancel",
+        "title": "Cancel Job...",
+        "category": "RustFerry",
+        "icon": "$(circle-slash)"
+      },
+      {
+        "command": "rustferry.jobs.retry",
+        "title": "Retry Exact Source...",
+        "category": "RustFerry",
+        "icon": "$(debug-rerun)"
+      },
+      {
+        "command": "rustferry.jobs.artifact.verify",
+        "title": "Verify Job Artifact",
+        "category": "RustFerry",
+        "icon": "$(verified-filled)"
+      },
+      {
+        "command": "rustferry.jobs.artifact.reveal",
+        "title": "Reveal Job Artifact",
+        "category": "RustFerry",
+        "icon": "$(folder-opened)"
+      },
+      {
+        "command": "rustferry.jobs.artifact.remove",
+        "title": "Remove Job Artifact...",
+        "category": "RustFerry",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "rustferry.jobs.remoteSnapshotBuild",
+        "title": "Build Unsigned iPhone Snapshot Remotely...",
+        "category": "RustFerry",
+        "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "rustferry.jobs.signingReadiness",
+        "title": "Show Remote Signing Readiness",
+        "category": "RustFerry",
+        "icon": "$(shield)"
       }
     ],
     "configuration": {
@@ -316,6 +389,10 @@
         {
           "id": "rustferry.artifacts",
           "name": "Artifacts"
+        },
+        {
+          "id": "rustferry.jobs",
+          "name": "Jobs"
         }
       ]
     },
@@ -329,6 +406,11 @@
         "view": "rustferry.project",
         "contents": "RustFerry commands are disabled until this workspace is trusted.\n[Manage Workspace Trust](command:rustferry.trustWorkspace)",
         "when": "rustferry.hasProjects && !isWorkspaceTrusted"
+      },
+      {
+        "view": "rustferry.jobs",
+        "contents": "Open a folder containing `ferry.toml` to inspect its remote-build jobs.\n[Create RustFerry Project](command:rustferry.createProject)",
+        "when": "!rustferry.hasProjects"
       }
     ],
     "menus": {
@@ -346,6 +428,11 @@
         {
           "command": "rustferry.refreshDevices",
           "when": "view == rustferry.devices && isWorkspaceTrusted && rustferry.executionAvailable",
+          "group": "navigation"
+        },
+        {
+          "command": "rustferry.jobs.refresh",
+          "when": "view == rustferry.jobs && isWorkspaceTrusted && rustferry.executionAvailable",
           "group": "navigation"
         }
       ],
@@ -389,6 +476,102 @@
           "command": "rustferry.deleteArtifact",
           "when": "view == rustferry.artifacts && viewItem == rustferry.artifact && isWorkspaceTrusted",
           "group": "rustferry@9"
+        },
+        {
+          "command": "rustferry.jobs.show",
+          "when": "view == rustferry.jobs && viewItem =~ /(^|\\.)jobs-show(\\.|$)/ && isWorkspaceTrusted",
+          "group": "inline@1"
+        },
+        {
+          "command": "rustferry.jobs.logs",
+          "when": "view == rustferry.jobs && viewItem =~ /(^|\\.)jobs-logs-page(\\.|$)/ && isWorkspaceTrusted",
+          "group": "inline@2"
+        },
+        {
+          "command": "rustferry.jobs.logs.follow",
+          "when": "view == rustferry.jobs && viewItem =~ /(^|\\.)jobs-logs-page(\\.|$)/ && isWorkspaceTrusted",
+          "group": "rustferry@3"
+        },
+        {
+          "command": "rustferry.jobs.cancel",
+          "when": "view == rustferry.jobs && viewItem =~ /(^|\\.)jobs-cancel(\\.|$)/ && isWorkspaceTrusted",
+          "group": "rustferry@4"
+        },
+        {
+          "command": "rustferry.jobs.retry",
+          "when": "view == rustferry.jobs && viewItem =~ /(^|\\.)jobs-retry(\\.|$)/ && isWorkspaceTrusted",
+          "group": "rustferry@5"
+        },
+        {
+          "command": "rustferry.jobs.artifact.verify",
+          "when": "view == rustferry.jobs && viewItem =~ /(^|\\.)jobs-artifact-verify(\\.|$)/ && isWorkspaceTrusted",
+          "group": "inline@1"
+        },
+        {
+          "command": "rustferry.jobs.artifact.reveal",
+          "when": "view == rustferry.jobs && viewItem =~ /(^|\\.)jobs-artifact-reveal(\\.|$)/ && isWorkspaceTrusted",
+          "group": "inline@2"
+        },
+        {
+          "command": "rustferry.jobs.artifact.remove",
+          "when": "view == rustferry.jobs && viewItem =~ /(^|\\.)jobs-artifact-remove(\\.|$)/ && isWorkspaceTrusted",
+          "group": "rustferry@9"
+        },
+        {
+          "command": "rustferry.jobs.remoteSnapshotBuild",
+          "when": "view == rustferry.jobs && viewItem =~ /(^|\\.)remote-build-preview(\\.|$)/ && viewItem =~ /(^|\\.)remote-build-submit(\\.|$)/ && isWorkspaceTrusted",
+          "group": "rustferry@1"
+        },
+        {
+          "command": "rustferry.jobs.signingReadiness",
+          "when": "view == rustferry.jobs && viewItem =~ /(^|\\.)signing-readiness(\\.|$)/ && isWorkspaceTrusted",
+          "group": "rustferry@2"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "rustferry.jobs.show",
+          "when": "false"
+        },
+        {
+          "command": "rustferry.jobs.logs",
+          "when": "false"
+        },
+        {
+          "command": "rustferry.jobs.logs.loadMore",
+          "when": "false"
+        },
+        {
+          "command": "rustferry.jobs.logs.follow",
+          "when": "false"
+        },
+        {
+          "command": "rustferry.jobs.cancel",
+          "when": "false"
+        },
+        {
+          "command": "rustferry.jobs.retry",
+          "when": "false"
+        },
+        {
+          "command": "rustferry.jobs.artifact.verify",
+          "when": "false"
+        },
+        {
+          "command": "rustferry.jobs.artifact.reveal",
+          "when": "false"
+        },
+        {
+          "command": "rustferry.jobs.artifact.remove",
+          "when": "false"
+        },
+        {
+          "command": "rustferry.jobs.remoteSnapshotBuild",
+          "when": "false"
+        },
+        {
+          "command": "rustferry.jobs.signingReadiness",
+          "when": "false"
         }
       ]
     },

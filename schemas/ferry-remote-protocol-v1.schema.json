@@ -28,6 +28,38 @@
       "$ref": "#/$defs/CompileHandoff"
     },
     {
+      "description": "Initial declaration for one SSH snapshot session.",
+      "$ref": "#/$defs/SnapshotBuildStart"
+    },
+    {
+      "description": "Separately framed deterministic source descriptor.",
+      "$ref": "#/$defs/SourceBundleDescriptor"
+    },
+    {
+      "description": "Operation-bound descriptor for one GitHub dirty-source snapshot.",
+      "$ref": "#/$defs/GitSnapshotDescriptor"
+    },
+    {
+      "description": "Worker acknowledgement for one snapshot job.",
+      "$ref": "#/$defs/SnapshotJobAccepted"
+    },
+    {
+      "description": "Unsigned archive descriptor and compile evidence.",
+      "$ref": "#/$defs/SnapshotArtifactDescriptor"
+    },
+    {
+      "description": "Client proof of durable independent artifact verification.",
+      "$ref": "#/$defs/SnapshotArtifactReceipt"
+    },
+    {
+      "description": "Terminal non-retaining snapshot cleanup proof.",
+      "$ref": "#/$defs/SnapshotBuildComplete"
+    },
+    {
+      "description": "Secret-free terminal snapshot failure.",
+      "$ref": "#/$defs/SnapshotSessionError"
+    },
+    {
       "description": "Public credential-free compile evidence.",
       "$ref": "#/$defs/CompilePhaseEvidence"
     },
@@ -210,6 +242,10 @@
       "description": "Verified result of one provider artifact download.",
       "type": "object",
       "properties": {
+        "local_file_identity": {
+          "description": "Canonical, secret-free identity captured from the retained published file object.",
+          "type": "string"
+        },
         "local_path": {
           "description": "Absolute client path containing verified bytes.",
           "$ref": "#/$defs/ProtocolPath"
@@ -221,7 +257,8 @@
       },
       "required": [
         "manifest",
-        "local_path"
+        "local_path",
+        "local_file_identity"
       ]
     },
     "ArtifactKind": {
@@ -1000,6 +1037,47 @@
         "limit"
       ]
     },
+    "GitSnapshotDescriptor": {
+      "description": "Strict binding for one operation-scoped GitHub dirty-source snapshot.\n\nThe orphan commit containing this descriptor has exactly the two paths in\n[`GIT_SNAPSHOT_TREE_PATHS`]. The full request hash cannot be embedded because\nits `source_revision` is the SHA of that commit; `request_template_sha256`\ntherefore covers the canonical request with only `source_revision` omitted.",
+      "type": "object",
+      "properties": {
+        "bundle": {
+          "description": "Deterministic ZIP transport and exact source manifest.",
+          "$ref": "#/$defs/SourceBundleDescriptor"
+        },
+        "operation_id": {
+          "description": "Exact operation identifier used to derive `snapshot_ref`.",
+          "type": "string"
+        },
+        "request_template_sha256": {
+          "description": "Canonical request SHA-256 with only `source_revision` omitted.",
+          "type": "string"
+        },
+        "schema_version": {
+          "description": "Git snapshot descriptor schema version.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "snapshot_ref": {
+          "description": "Exact operation-derived heads ref carrying the orphan commit.",
+          "type": "string"
+        },
+        "source_repository": {
+          "description": "Exact normalized credential-free HTTPS GitHub source repository.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "operation_id",
+        "source_repository",
+        "snapshot_ref",
+        "request_template_sha256",
+        "bundle"
+      ]
+    },
     "HandshakeRequest": {
       "description": "Versioned client handshake request.",
       "type": "object",
@@ -1078,6 +1156,11 @@
           "const": "app_bundle"
         },
         {
+          "description": "Compressed debug symbols for the main application executable.",
+          "type": "string",
+          "const": "dsym"
+        },
+        {
           "description": "Sanitized signing validation report.",
           "type": "string",
           "const": "signing_report"
@@ -1134,7 +1217,7 @@
           "$ref": "#/$defs/SigningPlan"
         },
         "source": {
-          "description": "Required deterministic integrity and shape manifest for either source mode.",
+          "description": "Required deterministic integrity and shape manifest for every source mode.",
           "$ref": "#/$defs/SourceManifest"
         },
         "source_mode": {
@@ -1142,14 +1225,14 @@
           "$ref": "#/$defs/SourceMode"
         },
         "source_repository": {
-          "description": "Normalized HTTPS GitHub repository URL in Git mode.",
+          "description": "Normalized HTTPS GitHub repository URL in Git-backed source modes.",
           "type": [
             "string",
             "null"
           ]
         },
         "source_revision": {
-          "description": "Exact lowercase 40-hex commit SHA in Git mode.",
+          "description": "Exact lowercase 40-hex commit SHA in Git-backed source modes.",
           "type": [
             "string",
             "null"
@@ -2980,6 +3063,337 @@
         }
       ]
     },
+    "SnapshotArtifactDescriptor": {
+      "description": "Exact unsigned archive record and compile evidence preceding artifact bytes.",
+      "type": "object",
+      "properties": {
+        "artifact": {
+          "description": "Exact returned file name, size, and SHA-256.",
+          "$ref": "#/$defs/ArtifactRecord"
+        },
+        "compile": {
+          "description": "Credential-free physical-iPhone compile evidence.",
+          "$ref": "#/$defs/CompilePhaseEvidence"
+        },
+        "job_id": {
+          "description": "Provider-owned job identifier.",
+          "type": "string"
+        },
+        "operation_id": {
+          "description": "Operation identifier from the submitted request.",
+          "type": "string"
+        },
+        "protocol_version": {
+          "description": "Negotiated Ferry Remote Build Protocol version.",
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "schema_version": {
+          "description": "Snapshot-session message schema.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "protocol_version",
+        "operation_id",
+        "job_id",
+        "artifact",
+        "compile"
+      ]
+    },
+    "SnapshotArtifactReceipt": {
+      "description": "Client acknowledgement after exact artifact bytes are safely verified.",
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "description": "Exact artifact identifier.",
+          "type": "string"
+        },
+        "job_id": {
+          "description": "Provider-owned job identifier.",
+          "type": "string"
+        },
+        "local_path": {
+          "description": "Absolute create-only client destination containing the verified bytes.",
+          "$ref": "#/$defs/ProtocolPath"
+        },
+        "operation_id": {
+          "description": "Operation identifier from the submitted request.",
+          "type": "string"
+        },
+        "protocol_version": {
+          "description": "Negotiated Ferry Remote Build Protocol version.",
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "schema_version": {
+          "description": "Snapshot-session message schema.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "sha256": {
+          "description": "Verified local lowercase SHA-256.",
+          "type": "string"
+        },
+        "size": {
+          "description": "Verified local byte length.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "protocol_version",
+        "operation_id",
+        "job_id",
+        "artifact_id",
+        "size",
+        "sha256",
+        "local_path"
+      ]
+    },
+    "SnapshotBuildComplete": {
+      "description": "Successful terminal message emitted only after verified client receipt and cleanup.",
+      "type": "object",
+      "properties": {
+        "cleanup": {
+          "description": "Exact remote cleanup proof.",
+          "$ref": "#/$defs/CleanupConfirmation"
+        },
+        "job_id": {
+          "description": "Provider-owned job identifier.",
+          "type": "string"
+        },
+        "operation_id": {
+          "description": "Operation identifier from the submitted request.",
+          "type": "string"
+        },
+        "protocol_version": {
+          "description": "Negotiated Ferry Remote Build Protocol version.",
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "schema_version": {
+          "description": "Snapshot-session message schema.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "protocol_version",
+        "operation_id",
+        "job_id",
+        "cleanup"
+      ]
+    },
+    "SnapshotBuildParameters": {
+      "description": "Compact build fields sent before the separately framed source descriptor.\n\nThis deliberately excludes `source`, `source_mode`, `source_repository`, and\n`source_revision`. The worker reconstructs the complete request only after\nvalidating the separately transported [`SourceBundleDescriptor`].",
+      "type": "object",
+      "properties": {
+        "bundle_identifier": {
+          "description": "Exact Apple application bundle identifier.",
+          "type": "string"
+        },
+        "minimum_ios_version": {
+          "description": "Minimum supported iOS version.",
+          "type": "string"
+        },
+        "operation_id": {
+          "description": "Caller-owned operation identifier.",
+          "type": "string"
+        },
+        "product": {
+          "description": "Client-derived product identity.",
+          "$ref": "#/$defs/IosDeviceProductExpectation"
+        },
+        "product_name": {
+          "description": "Human-readable product name.",
+          "type": "string"
+        },
+        "profile": {
+          "description": "Rust/Xcode optimization profile.",
+          "$ref": "#/$defs/BuildProfile"
+        },
+        "protocol_version": {
+          "description": "Requested Ferry Remote Build Protocol version.",
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "requested_artifacts": {
+          "description": "Exact requested artifact set; snapshot session v1 accepts only `xcarchive`.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/IosArtifactType"
+          },
+          "uniqueItems": true
+        },
+        "signing": {
+          "description": "Unsigned compile-only plan.",
+          "$ref": "#/$defs/SigningPlan"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "operation_id",
+        "product_name",
+        "bundle_identifier",
+        "minimum_ios_version",
+        "product",
+        "profile",
+        "signing",
+        "requested_artifacts"
+      ]
+    },
+    "SnapshotBuildStart": {
+      "description": "Initial control frame for one snapshot-build session.",
+      "type": "object",
+      "properties": {
+        "parameters": {
+          "description": "Compact request fields.",
+          "$ref": "#/$defs/SnapshotBuildParameters"
+        },
+        "schema_version": {
+          "description": "Snapshot-session message schema.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "source_archive": {
+          "description": "Exact separately framed deterministic ZIP size and SHA-256.",
+          "$ref": "#/$defs/SourceArchive"
+        },
+        "source_descriptor_sha256": {
+          "description": "SHA-256 of the exact separately framed descriptor JSON bytes.",
+          "type": "string"
+        },
+        "source_descriptor_size": {
+          "description": "Exact separately framed descriptor byte length.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "parameters",
+        "source_descriptor_size",
+        "source_descriptor_sha256",
+        "source_archive"
+      ]
+    },
+    "SnapshotJobAccepted": {
+      "description": "Worker acknowledgement after allocating one snapshot job.",
+      "type": "object",
+      "properties": {
+        "created_at_ms": {
+          "description": "Milliseconds since Unix epoch in UTC.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "job_id": {
+          "description": "Provider-owned job identifier.",
+          "type": "string"
+        },
+        "operation_id": {
+          "description": "Operation identifier copied from the build start.",
+          "type": "string"
+        },
+        "protocol_version": {
+          "description": "Negotiated Ferry Remote Build Protocol version.",
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "schema_version": {
+          "description": "Snapshot-session message schema.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "state": {
+          "description": "Initial state; always `created`.",
+          "$ref": "#/$defs/JobState"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "protocol_version",
+        "operation_id",
+        "job_id",
+        "state",
+        "created_at_ms"
+      ]
+    },
+    "SnapshotSessionError": {
+      "description": "Stable, secret-free terminal or pre-job session failure.",
+      "type": "object",
+      "properties": {
+        "cleanup": {
+          "description": "Cleanup proof when cleanup completed after the failure.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CleanupConfirmation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "code": {
+          "description": "Stable namespaced error code.",
+          "type": "string"
+        },
+        "job_id": {
+          "description": "Provider job identifier when one was allocated.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "description": "Bounded public summary, never raw subprocess or parser text.",
+          "type": "string"
+        },
+        "operation_id": {
+          "description": "Operation identifier when a build start was decoded.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "protocol_version": {
+          "description": "Ferry Remote Build Protocol version understood by the sender.",
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "retryable": {
+          "description": "Whether retrying unchanged inputs may succeed.",
+          "type": "boolean"
+        },
+        "schema_version": {
+          "description": "Snapshot-session message schema.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "protocol_version",
+        "code",
+        "message",
+        "retryable"
+      ]
+    },
     "SourceArchive": {
       "description": "Integrity descriptor for the deterministic source ZIP transport.",
       "type": "object",
@@ -2999,6 +3413,32 @@
       "required": [
         "size",
         "sha256"
+      ]
+    },
+    "SourceBundleDescriptor": {
+      "description": "Versioned binding between one deterministic source ZIP and its manifest.",
+      "type": "object",
+      "properties": {
+        "archive": {
+          "description": "Exact ZIP size and SHA-256 digest.",
+          "$ref": "#/$defs/SourceArchive"
+        },
+        "manifest": {
+          "description": "Exact paths, sizes, modes, and digests represented by the ZIP.",
+          "$ref": "#/$defs/SourceManifest"
+        },
+        "schema_version": {
+          "description": "Source-bundle descriptor schema version.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "archive",
+        "manifest"
       ]
     },
     "SourceManifest": {
@@ -3047,7 +3487,7 @@
       "type": "object",
       "properties": {
         "executable": {
-          "description": "Whether any executable bit was present on Unix; false on Windows.",
+          "description": "Whether extraction must restore an executable bit, from Unix mode or portable metadata.",
           "type": "boolean"
         },
         "path": {
@@ -3080,6 +3520,11 @@
           "description": "The worker checks out a pinned Git revision.",
           "type": "string",
           "const": "git"
+        },
+        {
+          "description": "The worker checks out an operation-scoped orphan commit containing a verified source ZIP.",
+          "type": "string",
+          "const": "git_snapshot"
         },
         {
           "description": "The client sends a verified content snapshot.",

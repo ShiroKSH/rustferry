@@ -9,6 +9,8 @@
 - Editor workspace trust, diagnostics, quick fixes, tasks, and extension settings.
 - Device identifiers, application logs, pairing state, and development-team metadata.
 - Remote request identity, trusted worker provenance, sealed unsigned handoff, and downloaded artifact integrity.
+- SSH endpoint and trust snapshots, identity-file path/handle, operation/job IDs, snapshot descriptor
+  and archive, local artifact spool/publication, receipt, and worker-root cleanup state.
 
 ## Trust boundaries and entry points
 
@@ -31,6 +33,9 @@
   Actions runner, artifact-store, and local publication boundaries. The source project and its
   build scripts are untrusted; the worker revision, workflow bytes, request envelope, temporary
   ref, run identity, and every downloaded byte require independent binding.
+- An SSH build crosses the local OpenSSH process, authenticated peer, full-duplex frame stream,
+  source/archive transport, worker filesystem, event stream, artifact/receipt, and cleanup proof.
+  Every peer byte remains untrusted after host authentication.
 
 ## Required controls
 
@@ -69,6 +74,30 @@
   generated workflow digest, request digest, operation ref, run/attempt, artifact metadata, and
   final file hashes. Reject replacement, traversal, links, collisions, expansion bombs, stale runs,
   moved refs, visibility drift, or ambiguous cleanup. See [GitHub macOS provider security](remote/github-security.md).
+- Snapshot source transport must select only workspace-contained Cargo inputs, apply non-overridable
+  sensitive-path exclusions, and bind a deterministic ZIP to a separately transported versioned
+  descriptor. Verification uses bounded fresh extraction and rejects path traversal, links,
+  normalization collisions, archive expansion abuse, input replacement, and partial extraction.
+  Archive and descriptor destinations remain outside the selected workspace so publication cannot
+  mutate its own source plan. Each output is no-clobber; if descriptor publication fails after the
+  archive is published, the client reports and retains that archive instead of deleting a path
+  whose filesystem identity it can no longer prove. See
+  [source bundles](remote/source-bundles.md).
+- SSH endpoint fields, trust files, worker stdout/stderr, frames, and connection timing are untrusted
+  at the client boundary. Require one exact pinned host key in a dedicated regular `known_hosts`
+  file, copy its canonical entry into a private operation-owned trust snapshot, and retain an
+  identity path plus no-follow handle without reading key bytes. Reject OpenSSH expansion tokens;
+  use one fixed argument array with forwarding and TTY disabled. Enforce versioned per-direction
+  frame and event sequences, fixed payload/deadline bounds, and exact operation/job/provider/request/
+  source/artifact bindings. Stream large payloads with fixed memory. Publish only an independently
+  inspected unsigned XCArchive through a create-only durable local inode before receipt; cancel on
+  local failure, terminate/reap the SSH process on cancellation or timeout, and require exact
+  non-retaining worker cleanup before success. Unix config/operation directories and files use
+  `0700`/`0600`. On Windows, managed endpoint directories, endpoint files, and each operation
+  directory use an owner-bound protected DACL for the current user, LocalSystem, and built-in
+  Administrators. Retained base/child/file handles, reparse and link-count checks, create-only
+  staging plus publication, and post-publication verification bind the object before its contents
+  are trusted. See [SSH Mac provider](remote/ssh-mac.md).
 - Validate PNG type, dimensions, opacity, byte bounds, canonical containment, and cache manifests
   before generating platform assets. Generate below `target/ferry`, reject symlink boundaries, and
   commit a complete fingerprint directory atomically.
@@ -78,11 +107,36 @@
 
 ## Residual risks
 
+- On cancellation or timeout, the SSH client sends a best-effort cancel frame, closes input, and
+  terminates/reaps OpenSSH within a bound. Local staging cleanup is checked, but the client does not
+  drain a terminal worker cleanup proof; inspect the worker retention root before retrying. Source
+  archive preparation and local post-receipt commit/cleanup also have bounded operations rather than
+  cancellation checkpoints at every filesystem step.
+- On Windows clients, every random operation directory has its own atomic protected DACL; the
+  project-local parent session root need not be private. `CreateDirectoryW` does not return a
+  handle, leaving a narrow create-to-open window. A replacement must still have the exact current
+  owner, protected allowlist DACL, ACL-capable filesystem, and non-reparse type to pass verification;
+  the retained handle then denies delete sharing through all pathname-based writes, and cleanup
+  marks that exact handle for deletion. Same-user or administrator interference remains inside the
+  trusted local boundary. Output-parent replacement is likewise outside the cross-user boundary.
+- Windows endpoint-config and operation ACL code has native runtime tests; core all-target and
+  strict Clippy plus `rustferry-ssh` library Windows cross-checks pass. Those tests were not executed on this
+  macOS host, and a full `cargo-ferry` cross-check stops in external vendored `openssl-sys` because
+  Darwin Perl cannot configure `VC-WIN64A`. Native Windows/OpenSSH interoperability remains a
+  validation gap, not an inferred security result.
+- The artifact receipt is accepted only after a validated artifact flush and client verification,
+  but session v1 has no server challenge that proves receipt freshness cryptographically. A pinned
+  worker that deliberately pre-buffers a valid receipt remains inside the trusted endpoint boundary.
 - Deployment rechecks the validator-owned artifact digest immediately before invoking the native
   installer. A separate process running as the same user can still replace a pathname after that
   check and before ADB, simctl, or devicectl opens it. Those tools do not expose one portable
   descriptor-based install API, so this final cross-process TOCTOU window cannot be eliminated by
   the current design. Do not build or deploy alongside untrusted same-user processes.
+- SSH snapshot builds execute Cargo build scripts and procedural macros as the worker account. The
+  reference mode is single-tenant and carries no signing secrets. Hostile multi-tenant operation
+  needs VM-equivalent isolation, an ephemeral filesystem/keychain, network and resource policy,
+  complete process-tree termination, no host credentials, and no cross-job cache; the current local
+  deterministic tests are not evidence for that deployment model.
 
 ## Out of scope
 

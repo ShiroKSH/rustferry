@@ -8,6 +8,18 @@ import { commands, INSTALLATION_URL, IOS_SIGNING_URL } from "../constants.js";
 import { deleteArtifact, inspectArtifact, copyArtifactPath, revealArtifact } from "./artifacts.js";
 import { changeCapability } from "./capabilities.js";
 import {
+  cancelJob,
+  removeJobArtifact,
+  revealJobArtifact,
+  retryJob,
+  runRemoteSnapshotBuild,
+  showJob,
+  showJobLogs,
+  showSigningReadiness,
+  followJobLogs,
+  verifyJobArtifact
+} from "./jobs.js";
+import {
   manageTrust,
   openApp,
   openConfig,
@@ -70,6 +82,18 @@ export function registerCommands(services: CommandServices): readonly vscode.Dis
   register(commands.applyValidatedFix, async (token) => await services.diagnostics.applyValidatedFix(token));
   register(commands.trustWorkspace, manageTrust);
   register(commands.selectCli, async () => await selectCli(services));
+  register(commands.refreshJobs, () => services.refreshJobs());
+  register(commands.showJob, async (argument) => await showJob(services, argument));
+  register(commands.showJobLogs, async (argument) => await showJobLogs(services, argument));
+  register(commands.loadMoreJobLogs, async (argument) => await services.loadMoreJobLogs(argument));
+  register(commands.followJobLogs, async (argument) => await followJobLogs(services, argument));
+  register(commands.cancelJob, async (argument) => await cancelJob(services, argument));
+  register(commands.retryJob, async (argument) => await retryJob(services, argument));
+  register(commands.verifyJobArtifact, async (argument) => await verifyJobArtifact(services, argument));
+  register(commands.revealJobArtifact, async (argument) => await revealJobArtifact(services, argument));
+  register(commands.removeJobArtifact, async (argument) => await removeJobArtifact(services, argument));
+  register(commands.remoteSnapshotBuild, async (argument) => await runRemoteSnapshotBuild(services, argument));
+  register(commands.signingReadiness, async (argument) => await showSigningReadiness(services, argument));
   return subscriptions;
 }
 

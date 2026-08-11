@@ -589,7 +589,8 @@ fn is_safe_target_name(value: &str) -> bool {
         && value.len() <= 128
         && value
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        && !value.contains("..")
 }
 
 #[allow(clippy::needless_pass_by_value)] // Owned signature is a direct `map_err` adapter.
@@ -611,7 +612,15 @@ mod tests {
         SigningPrivateKeyReference, SigningReference, SigningTarget, SigningTargetKind,
     };
 
-    use super::{DevelopmentExportError, lexically_below, profile_mapping};
+    use super::{DevelopmentExportError, is_safe_target_name, lexically_below, profile_mapping};
+
+    #[test]
+    fn target_names_match_the_signing_plan_identifier_grammar() {
+        assert!(is_safe_target_name("App.Extension"));
+        for invalid in ["App..Extension", "App/Extension", "App\\Extension"] {
+            assert!(!is_safe_target_name(invalid));
+        }
+    }
 
     #[test]
     fn lexical_job_paths_reject_root_and_parent_components() {

@@ -20,7 +20,7 @@
 RustFerry keeps application code and assets in an ordinary Rust project. When you build, it creates the required platform host below `target/ferry/`; that generated glue is disposable and stays out of your source tree.
 
 > [!IMPORTANT]
-> RustFerry is pre-release. Real signed/aligned arm64 Android APKs, arm64 iOS Simulator `.app`/`.appex` bundles, and an unsigned physical-iPhone `.xcarchive` built remotely from a Linux client have been independently inspected. Device discovery, install, run, logs, the VS Code extension, local physical-iOS development signing, and remote macOS compilation are implemented. A real development-signed remote IPA and runtime behavior on an emulator, Simulator, or physical device remain unvalidated. See the [support matrix](docs/support-matrix.md) and [evidence log](docs/STATUS.md).
+> RustFerry is pre-release. Real signed/aligned arm64 Android APKs, arm64 iOS Simulator `.app`/`.appex` bundles, and an unsigned physical-iPhone `.xcarchive` built through the GitHub provider from a Linux client have been independently inspected. Durable remote jobs, sanitized logs, cancellation, retry, managed artifacts, and explicit public GitHub snapshots are implemented and tested on Windows, but no Windows-originated GitHub/macOS build is live-validated. SSH snapshot v1 has deterministic local coverage but no live SSH-produced artifact. A real development-signed remote IPA and runtime behavior on an emulator, Simulator, or physical device remain unvalidated. See the [support matrix](docs/support-matrix.md) and [Goal 3 evidence log](docs/GOAL3_STATUS.md).
 
 ## What it does
 
@@ -28,6 +28,8 @@ RustFerry keeps application code and assets in an ordinary Rust project. When yo
 - Builds Android APKs directly with Cargo, the NDK, `aapt2`, `d8`, `zipalign`, and `apksigner`; no Gradle project to maintain.
 - Generates an Apple host under `target/ferry/` and invokes Xcode tooling for iOS Simulator builds; no Xcode project in application source.
 - Sends an exact physical-iPhone build request from Linux or Windows to a trusted GitHub-hosted macOS worker, then independently validates the downloaded artifact.
+- Persists private project-bound remote jobs across CLI/IDE restarts with sanitized logs, exact cancellation/retry, managed artifacts, and crash-safe pruning.
+- Submits an explicit dirty project as a consent-bound public GitHub snapshot without switching the caller branch, staging the index, or running hooks.
 - Discovers devices and composes artifact-validated builds with typed install and launch operations through ADB, simctl, and devicectl, with bounded application-filtered logs.
 - Provides a native, trust-aware Visual Studio Code extension driven by a stable versioned JSON/NDJSON protocol.
 - Generates deterministic Android density assets plus tested iOS compiled-catalog and SDK-only resources from validated opaque PNG sources.
@@ -49,7 +51,7 @@ cargo ferry new weather \
   --runtime-path "$PWD/crates/rustferry"
 ```
 
-`--runtime-source workspace` supports monorepo development. `CARGO_FERRY_RUNTIME_PATH` remains an optional contributor-only development override when no explicit source is supplied; normal published installations do not require it. Rust 1.92 or newer is required. Mobile builds also need the relevant Android SDK/NDK or a full Xcode installation.
+`--runtime-source workspace` supports monorepo development. `CARGO_FERRY_RUNTIME_PATH` remains an optional contributor-only development override when no explicit source is supplied; normal published installations do not require it. Rust 1.92 or newer is required. Local Android builds need the Android SDK/NDK, and local Apple builds need full Xcode. A Linux or Windows client using a configured remote physical-iPhone provider needs neither local Xcode nor an Apple SDK.
 
 After the coordinated crates are published, the normal installation will be `cargo install cargo-ferry`.
 
@@ -113,9 +115,71 @@ cargo ferry remote setup github \
 cargo ferry build iphone --remote github --unsigned
 ```
 
+An explicit dirty-source build is unsigned-only and uses a public GitSnapshot:
+
+```console
+cargo ferry --dry-run build iphone --remote github --snapshot --unsigned
+cargo ferry build iphone --remote github --snapshot --unsigned
+```
+
+Review the interactive `[y/N]` plan; JSON/non-interactive execution requires `--yes`. Source bytes enter the public Git object database. Temporary-ref deletion is cleanup, not erasure, and the retained local snapshot remains available for exact retry until explicit lineage pruning.
+
+On Linux and Windows, omitting `--remote` from a physical-iPhone build selects GitHub. Named SSH
+endpoints are never selected implicitly; pass their configured name explicitly. On macOS,
+`cargo ferry build ios --device` remains a local build unless a remote is requested (or unsigned
+remote mode is selected).
+
 Development signing additionally requires the protected private-repository setup and Apple assets
-described in [GitHub provider security](docs/remote/github-security.md). The unsigned remote path has
-live compile/download evidence; remote signed IPA export has not yet been accepted.
+described in [GitHub provider security](docs/remote/github-security.md). An app with Widget and Live
+Activity targets supplies one exact profile per generated target:
+
+```console
+cargo ferry signing setup manual \
+  --certificate /private/signing/development.p12 \
+  --profile weather=/private/signing/application.mobileprovision \
+  --profile FerryWidgetExtension=/private/signing/widget.mobileprovision \
+  --profile FerryLiveActivityExtension=/private/signing/live-activity.mobileprovision \
+  --remote github \
+  --device-sha256 <lowercase-sha256> \
+  --dry-run
+```
+
+The exact target names come from the generated signing plan. At most three profiles are accepted and
+they must share the selected device. The legacy unkeyed profile path remains available for a
+single-application project. The generated workflow and worker bind the complete application,
+extension, framework, and dynamic-library target graph through a canonical SHA-256. Multi-profile
+setup and transport pass the affected-package integration suite locally. The unsigned remote path
+has live compile/download evidence; protected secret upload and real signed IPA export have not run.
+
+## Remote jobs and artifacts
+
+```console
+cargo ferry jobs list
+cargo ferry jobs show <local-job-id>
+cargo ferry jobs logs <local-job-id> --follow
+cargo ferry jobs cancel <local-job-id>
+cargo ferry jobs retry <local-job-id>
+cargo ferry jobs artifacts <local-job-id>
+cargo ferry artifact verify <downloaded-path> --job <local-job-id>
+```
+
+Job records contain typed secret-free checkpoints, not tokens or raw provider payloads. Exact retry reuses the stored Git revision or retained GitSnapshot; `--use-current-source --yes` is a separate consent-bound recapture. Local artifact removal is distinct from GitHub Actions retention.
+
+For a dedicated Mac, add a pinned SSH endpoint and request the locally tested unsigned snapshot
+path:
+
+```console
+cargo ferry remote add ssh-mac production-mac \
+  --host build.example.com \
+  --user ferry \
+  --known-hosts /absolute/path/rustferry.known_hosts \
+  --host-key-sha256 SHA256:BASE64_WITHOUT_PADDING
+cargo ferry remote doctor production-mac
+cargo ferry build iphone --remote production-mac --unsigned
+```
+
+SSH snapshot v1 returns an independently verified unsigned XCArchive ZIP. No live SSH Mac build has
+been recorded, and this path does not sign, export an IPA, install, launch, or prove device runtime.
 
 Build never touches a device. Deployment is explicit:
 
@@ -150,7 +214,7 @@ cargo ferry new weather
 code weather
 ```
 
-In the opened workspace, run **RustFerry: Doctor**, then **RustFerry: Build Android**. The extension discovers trusted `ferry.toml` workspaces and exposes project/device/artifact trees, diagnostics, Check, Install, Run, Logs, capability changes, and a native Create Project wizard. It delegates all build and deployment logic to `cargo-ferry` protocol v1.
+In the opened workspace, run **RustFerry: Doctor**, then **RustFerry: Build Android**. The extension discovers trusted `ferry.toml` workspaces and exposes project/device/artifact/job trees, diagnostics, remote snapshot preview/consent, cancellation, retry, sanitized job logs, signing readiness, Check, Install, Run, Logs, capability changes, and a native Create Project wizard. It delegates build, job, artifact, and deployment logic to `cargo-ferry` protocol v1.
 
 ## Add capabilities
 
@@ -181,9 +245,13 @@ Configuration lives in `ferry.toml`. Generated platform files remain under `targ
 - [iOS Simulator setup](docs/ios/simulator.md)
 - [VS Code extension](docs/editors/vscode.md)
 - [Devices, install, run, and logs](docs/deployment/install-run-logs.md)
-- [Remote physical-iPhone builds](docs/remote/github-security.md)
+- [GitHub physical-iPhone provider](docs/remote/github-provider.md)
+- [GitHub provider security](docs/remote/github-security.md)
+- [Deterministic remote source bundles](docs/remote/source-bundles.md)
+- [SSH Mac control plane](docs/remote/ssh-mac.md)
 - [Support matrix](docs/support-matrix.md)
 - [Implementation evidence](docs/STATUS.md)
+- [Goal 3 Windows continuation evidence](docs/goal3-windows/README.md)
 - [Threat model](docs/THREAT_MODEL.md)
 
 ## Slint licensing

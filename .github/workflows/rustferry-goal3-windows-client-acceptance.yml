@@ -1,0 +1,1038 @@
+name: RustFerry Goal 3 Windows client acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_commit:
+        description: 'Exact lowercase 40-hex commit selected for this acceptance run'
+        required: true
+        type: string
+  push:
+    branches:
+      - 'goal3/windows-live-acceptance'
+    paths:
+      - '.github/workflows/rustferry-goal3-windows-client-acceptance.yml'
+      - '.github/workflows/rustferry-goal3-iphone.yml'
+
+permissions: {}
+
+concurrency:
+  group: 'rustferry-goal3-windows-client-${{ github.repository_id }}'
+  cancel-in-progress: false
+
+jobs:
+  windows-client:
+    name: Windows client to remote unsigned iPhone archive
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.repository == 'ShiroKSH/rustferry' &&
+      vars.RUSTFERRY_GOAL3_ACCEPTANCE_ENABLED == 'true' &&
+      github.ref == 'refs/heads/goal3/windows-live-acceptance' &&
+      github.actor == github.repository_owner &&
+      github.triggering_actor == github.repository_owner &&
+      vars.RUSTFERRY_GOAL3_ACCEPTANCE_COMMIT == github.sha &&
+      (github.event_name == 'push' || inputs.expected_commit == github.sha)
+    runs-on: windows-2025
+    timeout-minutes: 180
+    environment:
+      name: 'rustferry-goal3-windows-acceptance'
+    permissions:
+      actions: write
+      contents: read
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: 'never'
+      RUST_BACKTRACE: '0'
+      RUSTUP_TOOLCHAIN: '1.92.0'
+      RUSTFERRY_ACCEPTANCE_EXPECTED_COMMIT: '${{ vars.RUSTFERRY_GOAL3_ACCEPTANCE_COMMIT }}'
+      RUSTFERRY_ACCEPTANCE_EXPECTED_REF: 'refs/heads/goal3/windows-live-acceptance'
+      RUSTFERRY_WORKER_REVISION: '${{ vars.RUSTFERRY_GOAL3_ACCEPTANCE_WORKER_COMMIT }}'
+    steps:
+      - name: Checkout exact acceptance source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: '${{ github.sha }}'
+
+      - name: Record absence of callable Apple build tools
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evidence = Join-Path $env:RUNNER_TEMP 'rustferry-goal3-windows-evidence'
+          New-Item -ItemType Directory -Path $evidence | Out-Null
+          @(
+            "RUSTFERRY_CONFIG_HOME=$(Join-Path $env:RUNNER_TEMP 'rustferry-goal3-config')"
+            "RUSTFERRY_CACHE_DIR=$(Join-Path $env:RUNNER_TEMP 'rustferry-goal3-cache')"
+            "RUSTFERRY_ARTIFACT_DIR=$(Join-Path $env:RUNNER_TEMP 'rustferry-goal3-artifacts')"
+            "RUSTFERRY_LOG_DIR=$(Join-Path $env:RUNNER_TEMP 'rustferry-goal3-logs')"
+          ) | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+          if ($env:RUNNER_OS -ne 'Windows') { throw 'Acceptance client is not Windows.' }
+          if ($env:GITHUB_EVENT_NAME -cnotin @('push', 'workflow_dispatch') -or
+              $env:GITHUB_REPOSITORY -cne 'ShiroKSH/rustferry' -or
+              $env:GITHUB_REF -cne $env:RUSTFERRY_ACCEPTANCE_EXPECTED_REF -or
+              $env:GITHUB_ACTOR -cne $env:GITHUB_REPOSITORY_OWNER -or
+              $env:GITHUB_TRIGGERING_ACTOR -cne $env:GITHUB_REPOSITORY_OWNER -or
+              $env:RUSTFERRY_ACCEPTANCE_EXPECTED_COMMIT -cnotmatch '^[0-9a-f]{40}$' -or
+              $env:RUSTFERRY_ACCEPTANCE_EXPECTED_COMMIT -cne $env:GITHUB_SHA) {
+            throw 'Acceptance dispatch identity, ref, actor, or commit is not exact.'
+          }
+          if ($env:RUSTFERRY_WORKER_REVISION -cnotmatch '^[0-9a-f]{40}$') {
+            throw 'Acceptance worker revision is not an exact lowercase commit.'
+          }
+          foreach ($tool in @('xcodebuild', 'xcrun', 'codesign')) {
+            if (Get-Command $tool -ErrorAction SilentlyContinue) {
+              throw "Unexpected Apple tool on Windows client: $tool"
+            }
+          }
+          if ($env:SDKROOT -or $env:DEVELOPER_DIR) {
+            throw 'Apple developer environment variables are unexpectedly set.'
+          }
+          @(
+            'client_os=Windows'
+            'xcodebuild_on_path=absent'
+            'xcrun_on_path=absent'
+            'codesign_on_path=absent'
+            'SDKROOT=unset'
+            'DEVELOPER_DIR=unset'
+          ) | Set-Content -LiteralPath (Join-Path $evidence 'client-toolchain.txt') -Encoding utf8
+          [Environment]::OSVersion.VersionString |
+            Set-Content -LiteralPath (Join-Path $evidence 'windows-version.txt') -Encoding utf8
+          $sourceRevision = (git rev-parse --verify 'HEAD^{commit}').Trim()
+          if ($LASTEXITCODE -ne 0 -or
+              $sourceRevision -cne $env:RUSTFERRY_ACCEPTANCE_EXPECTED_COMMIT) {
+            throw 'Checked-out source is not the explicitly approved commit.'
+          }
+          $commitLine = (git rev-list --parents -n 1 $sourceRevision).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Could not bind the acceptance commit parent.' }
+          $commitParts = @($commitLine -split ' ')
+          if ($commitParts.Count -ne 2 -or
+              $commitParts[0] -cne $sourceRevision -or
+              $commitParts[1] -cne $env:RUSTFERRY_WORKER_REVISION) {
+            throw 'Acceptance commit must have the exact reviewed worker commit as its sole parent.'
+          }
+          $acceptanceCommitPaths = @(git diff-tree --no-commit-id --name-only --no-renames -r $sourceRevision)
+          if ($LASTEXITCODE -ne 0 -or
+              $acceptanceCommitPaths.Count -ne 2 -or
+              $acceptanceCommitPaths -cnotcontains '.github/workflows/rustferry-goal3-windows-client-acceptance.yml' -or
+              $acceptanceCommitPaths -cnotcontains '.github/workflows/rustferry-goal3-iphone.yml') {
+            throw 'Acceptance commit must change only the two exact workflow files.'
+          }
+          $acceptanceCommitPaths | Sort-Object -CaseSensitive |
+            Set-Content -LiteralPath (Join-Path $evidence 'acceptance-commit-paths.txt') -Encoding utf8
+          $generatedWorkflow = Get-Content -LiteralPath `
+            (Join-Path $env:GITHUB_WORKSPACE '.github\workflows\rustferry-goal3-iphone.yml')
+          if ($generatedWorkflow -cnotcontains "  RUSTFERRY_WORKER_REVISION: '$env:RUSTFERRY_WORKER_REVISION'" -or
+              $generatedWorkflow -cnotcontains "          ref: '$env:RUSTFERRY_WORKER_REVISION'" -or
+              $generatedWorkflow -cnotcontains "  RUSTFERRY_TRUSTED_SOURCE_REF: '$env:RUSTFERRY_ACCEPTANCE_EXPECTED_REF'") {
+            throw 'Tracked worker workflow is not bound to the reviewed worker and trusted branch.'
+          }
+          @(
+            "repository=$env:GITHUB_REPOSITORY"
+            "ref=$env:GITHUB_REF"
+            "commit=$sourceRevision"
+            "actor=$env:GITHUB_ACTOR"
+            "triggering_actor=$env:GITHUB_TRIGGERING_ACTOR"
+            "event=$env:GITHUB_EVENT_NAME"
+            "worker_commit=$env:RUSTFERRY_WORKER_REVISION"
+          ) | Set-Content -LiteralPath (Join-Path $evidence 'dispatch-binding.txt') -Encoding utf8
+          $sourceRevision |
+            Set-Content -LiteralPath (Join-Path $evidence 'source-revision.txt') -Encoding ascii
+          $status = git status --porcelain=v1 --untracked-files=all
+          if ($LASTEXITCODE -ne 0 -or $status) { throw 'Acceptance checkout is not clean.' }
+
+      - name: Install exact Rust toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain installation failed.' }
+          $actual = rustup run $env:RUSTUP_TOOLCHAIN rustc --version
+          if ($LASTEXITCODE -ne 0 -or -not $actual.StartsWith('rustc 1.92.0 ')) {
+            throw "Unexpected Rust compiler: $actual"
+          }
+          $actual | Set-Content -LiteralPath `
+            (Join-Path $env:RUNNER_TEMP 'rustferry-goal3-windows-evidence\rustc-version.txt') `
+            -Encoding utf8
+
+      - name: Build Windows cargo-ferry client
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --locked --package cargo-ferry
+          if ($LASTEXITCODE -ne 0) { throw 'cargo-ferry build failed.' }
+          $clientVersion = target\debug\cargo-ferry.exe --version
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace(($clientVersion -join "`n"))) {
+            throw 'Built cargo-ferry client did not report a version.'
+          }
+          $clientVersion | Set-Content -LiteralPath `
+            (Join-Path $env:RUNNER_TEMP 'rustferry-goal3-windows-evidence\cargo-ferry-version.txt') `
+            -Encoding utf8
+
+      - name: Run real GitHub provider and verify automatic download
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: '${{ github.token }}'
+          RUSTFERRY_ACCEPTANCE_SSH_PRIVATE_KEY: '${{ secrets.RUSTFERRY_GOAL3_ACCEPTANCE_SSH_PRIVATE_KEY }}'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $evidence = Join-Path $env:RUNNER_TEMP 'rustferry-goal3-windows-evidence'
+          if (-not $env:RUSTFERRY_ACCEPTANCE_SSH_PRIVATE_KEY) {
+            throw 'The controlled acceptance SSH credential is unavailable.'
+          }
+
+          function Get-RegularFileTreeSnapshot([string] $Path) {
+            $root = [System.IO.Path]::GetFullPath($Path)
+            $records = [System.Collections.Generic.List[string]]::new()
+            foreach ($item in Get-ChildItem -LiteralPath $root -Force -Recurse) {
+              if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw 'Caller Git evidence encountered a reparse-backed entry.'
+              }
+              if ($item.PSIsContainer) { continue }
+              $relative = [System.IO.Path]::GetRelativePath($root, $item.FullName).Replace('\', '/')
+              if ($relative.IndexOfAny([char[]] "`t`r`n") -ge 0) {
+                throw 'Caller Git evidence encountered an ambiguous relative path.'
+              }
+              $sha256 = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              $records.Add("$relative`t$($item.Length)`t$sha256")
+            }
+            $records.Sort([System.StringComparer]::Ordinal)
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes([string]::Join("`n", $records))
+            [pscustomobject]@{
+              Sha256 = [Convert]::ToHexString(
+                [System.Security.Cryptography.SHA256]::HashData($bytes)
+              ).ToLowerInvariant()
+              Records = $records.ToArray()
+            }
+          }
+
+          function Get-NormalizedWindowsPath([string] $Path) {
+            if ([string]::IsNullOrWhiteSpace($Path)) {
+              throw 'A required Windows path is absent.'
+            }
+            if ($Path.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) {
+              $Path = '\\' + $Path.Substring(8)
+            } elseif ($Path.StartsWith('\\?\', [StringComparison]::OrdinalIgnoreCase)) {
+              $Path = $Path.Substring(4)
+            }
+            if (-not [System.IO.Path]::IsPathFullyQualified($Path)) {
+              throw 'A required Windows path is not fully qualified.'
+            }
+            [System.IO.Path]::GetFullPath($Path)
+          }
+
+          function Get-SshAgentState {
+            $service = Get-CimInstance -ClassName Win32_Service -Filter "Name='ssh-agent'"
+            if ($null -eq $service -or
+                $service.State -cnotin @('Running', 'Stopped') -or
+                $service.StartMode -cnotin @('Auto', 'Manual', 'Disabled')) {
+              throw 'The Windows ssh-agent service state is unsupported.'
+            }
+            [pscustomobject]@{
+              Running = $service.State -ceq 'Running'
+              StartMode = [string] $service.StartMode
+            }
+          }
+
+          function Set-SshAgentStartMode([string] $StartMode) {
+            switch -CaseSensitive ($StartMode) {
+              'Auto' { Set-Service -Name ssh-agent -StartupType Automatic }
+              'Manual' { Set-Service -Name ssh-agent -StartupType Manual }
+              'Disabled' { Set-Service -Name ssh-agent -StartupType Disabled }
+              default { throw 'The recorded ssh-agent start mode is invalid.' }
+            }
+          }
+
+          function Wait-SshAgentState([bool] $Running) {
+            $expected = if ($Running) {
+              [System.ServiceProcess.ServiceControllerStatus]::Running
+            } else {
+              [System.ServiceProcess.ServiceControllerStatus]::Stopped
+            }
+            (Get-Service -Name ssh-agent).WaitForStatus($expected, [TimeSpan]::FromSeconds(15))
+          }
+
+          function Ensure-SshAgentRunning {
+            $current = Get-SshAgentState
+            if (-not $current.Running) {
+              if ($current.StartMode -ceq 'Disabled') {
+                Set-SshAgentStartMode 'Manual'
+              }
+              Start-Service -Name ssh-agent
+              Wait-SshAgentState $true
+            }
+          }
+
+          function Restore-SshAgentState([bool] $InitiallyRunning, [string] $InitialStartMode) {
+            $current = Get-SshAgentState
+            if ($InitiallyRunning -and -not $current.Running) {
+              if ($current.StartMode -ceq 'Disabled') {
+                Set-SshAgentStartMode 'Manual'
+              }
+              Start-Service -Name ssh-agent
+              Wait-SshAgentState $true
+            } elseif (-not $InitiallyRunning -and $current.Running) {
+              Stop-Service -Name ssh-agent
+              Wait-SshAgentState $false
+            }
+            $current = Get-SshAgentState
+            if ($current.StartMode -cne $InitialStartMode) {
+              Set-SshAgentStartMode $InitialStartMode
+            }
+            $restored = Get-SshAgentState
+            if ($restored.Running -ne $InitiallyRunning -or
+                $restored.StartMode -cne $InitialStartMode) {
+              throw 'The Windows ssh-agent service state was not restored exactly.'
+            }
+          }
+
+          function Assert-SshAddBinary([string] $Path, [string] $ExpectedSha256) {
+            $item = Get-Item -LiteralPath $Path -Force
+            if ($item.PSIsContainer -or $item.Length -le 0 -or
+                ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                $item.FullName -ine $Path) {
+              throw 'The fixed System32 ssh-add executable is unsafe.'
+            }
+            $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -cne $ExpectedSha256) {
+              throw 'The fixed System32 ssh-add executable changed during acceptance.'
+            }
+          }
+
+          function Invoke-ExactSshAdd {
+            param(
+              [string] $Path,
+              [string] $ExpectedSha256,
+              [string[]] $Arguments,
+              [AllowNull()] [string] $StandardInput = $null
+            )
+            Assert-SshAddBinary $Path $ExpectedSha256
+            $start = [System.Diagnostics.ProcessStartInfo]::new()
+            $start.FileName = $Path
+            $start.UseShellExecute = $false
+            $start.CreateNoWindow = $true
+            $start.RedirectStandardInput = $true
+            $start.RedirectStandardOutput = $true
+            $start.RedirectStandardError = $true
+            $start.StandardInputEncoding = [System.Text.UTF8Encoding]::new($false)
+            $start.WorkingDirectory = $env:RUNNER_TEMP
+            $start.Environment.Clear()
+            $start.Environment['SystemRoot'] = $windowsDirectory
+            $start.Environment['WINDIR'] = $windowsDirectory
+            $start.Environment['TEMP'] = $env:RUNNER_TEMP
+            $start.Environment['TMP'] = $env:RUNNER_TEMP
+            foreach ($argument in $Arguments) {
+              [void] $start.ArgumentList.Add($argument)
+            }
+            $process = [System.Diagnostics.Process]::new()
+            $process.StartInfo = $start
+            try {
+              if (-not $process.Start()) { throw 'The fixed ssh-add process did not start.' }
+              $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+              $stderrTask = $process.StandardError.ReadToEndAsync()
+              if ($null -ne $StandardInput) {
+                $process.StandardInput.Write($StandardInput)
+                if (-not $StandardInput.EndsWith("`n", [StringComparison]::Ordinal)) {
+                  $process.StandardInput.Write("`n")
+                }
+              }
+              $process.StandardInput.Close()
+              if (-not $process.WaitForExit(15000)) {
+                try { $process.Kill($true) } catch { }
+                if (-not $process.WaitForExit(5000)) {
+                  throw 'The fixed ssh-add process could not be terminated within its deadline.'
+                }
+                throw 'The fixed ssh-add process exceeded its deadline.'
+              }
+              $stdout = $stdoutTask.GetAwaiter().GetResult()
+              $stderr = $stderrTask.GetAwaiter().GetResult()
+              [pscustomobject]@{
+                ExitCode = $process.ExitCode
+                StandardOutput = $stdout
+                StandardError = $stderr
+              }
+            } finally {
+              $process.Dispose()
+              Assert-SshAddBinary $Path $ExpectedSha256
+            }
+          }
+
+          function Assert-SshAgentEmpty([string] $Path, [string] $ExpectedSha256) {
+            $probe = Invoke-ExactSshAdd $Path $ExpectedSha256 @('-l')
+            $message = ($probe.StandardOutput + "`n" + $probe.StandardError).Trim()
+            if ($probe.ExitCode -ne 1 -or $message -notmatch '(?i)agent has no identities') {
+              throw 'The Windows ssh-agent is not proven empty.'
+            }
+          }
+
+          $cleanupStatePath = Join-Path $env:RUNNER_TEMP 'rustferry-goal3-ssh-cleanup-state.json'
+          function Save-CleanupState {
+            if ($null -eq $cleanupState) { return }
+            $temporaryStatePath = "$cleanupStatePath.new"
+            [System.IO.File]::Delete($temporaryStatePath)
+            $json = $cleanupState | ConvertTo-Json -Depth 3 -Compress
+            [System.IO.File]::WriteAllText(
+              $temporaryStatePath,
+              $json,
+              [System.Text.UTF8Encoding]::new($false)
+            )
+            [System.IO.File]::Move($temporaryStatePath, $cleanupStatePath, $true)
+          }
+
+          $windowsDirectory = [Environment]::GetFolderPath(
+            [Environment+SpecialFolder]::Windows
+          )
+          $systemDirectory = [Environment]::GetFolderPath(
+            [Environment+SpecialFolder]::System
+          )
+          if ([string]::IsNullOrWhiteSpace($windowsDirectory) -or
+              [string]::IsNullOrWhiteSpace($systemDirectory)) {
+            throw 'Authoritative Windows system directories are unavailable.'
+          }
+          $sshAddPath = [System.IO.Path]::GetFullPath(
+            (Join-Path $systemDirectory 'OpenSSH\ssh-add.exe')
+          )
+          $cleanupState = $null
+          $sshAddGuard = $null
+          $privateKey = $null
+          $safeToClear = $false
+          $finalEmpty = $false
+          $cleanupFailure = $false
+          $serviceRestored = $false
+          $restoredAgent = $null
+          $callerGitRestorationArmed = $false
+          $callerGitOriginal = $null
+          $callerGitConfigPath = $null
+          $callerGitBackupPath = $null
+          $callerGitOriginalConfigSha256 = $null
+          $callerGitRestorePath = $null
+          $mainFailure = $null
+
+          try {
+            $privateKey = $env:RUSTFERRY_ACCEPTANCE_SSH_PRIVATE_KEY
+            if ([string]::IsNullOrWhiteSpace($privateKey) -or
+                [System.Text.Encoding]::UTF8.GetByteCount($privateKey) -gt 65536 -or
+                $privateKey.IndexOf([char] 0) -ge 0 -or
+                -not $privateKey.StartsWith('-----BEGIN OPENSSH PRIVATE KEY-----', [StringComparison]::Ordinal)) {
+              throw 'The controlled acceptance SSH credential is unavailable or malformed.'
+            }
+            $sshAddItem = Get-Item -LiteralPath $sshAddPath -Force
+            if ($sshAddItem.PSIsContainer -or $sshAddItem.Length -le 0 -or
+                ($sshAddItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                $sshAddItem.FullName -ine $sshAddPath) {
+              throw 'The fixed System32 ssh-add executable is unsafe.'
+            }
+            $sshAddSha256 = (Get-FileHash -LiteralPath $sshAddPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            $sshAddGuard = [System.IO.File]::Open(
+              $sshAddPath,
+              [System.IO.FileMode]::Open,
+              [System.IO.FileAccess]::Read,
+              [System.IO.FileShare]::Read
+            )
+            Assert-SshAddBinary $sshAddPath $sshAddSha256
+
+            if (Test-Path -LiteralPath $cleanupStatePath) {
+              throw 'SSH cleanup state already exists on the fresh runner.'
+            }
+            $initialAgent = Get-SshAgentState
+            $cleanupState = [ordered]@{
+              schema_version = 1
+              ssh_add_path = $sshAddPath
+              ssh_add_sha256 = $sshAddSha256
+              initial_running = $initialAgent.Running
+              initial_start_mode = $initialAgent.StartMode
+              initial_empty = $false
+              safe_to_clear = $false
+              load_attempted = $false
+              final_empty = $false
+              cleanup_confirmed = $false
+            }
+            Save-CleanupState
+            Ensure-SshAgentRunning
+            Assert-SshAgentEmpty $sshAddPath $sshAddSha256
+            $safeToClear = $true
+            $cleanupState.initial_empty = $true
+            $cleanupState.safe_to_clear = $true
+            Save-CleanupState
+
+            $cleanupState.load_attempted = $true
+            Save-CleanupState
+            Remove-Item Env:RUSTFERRY_ACCEPTANCE_SSH_PRIVATE_KEY -ErrorAction SilentlyContinue
+            $add = Invoke-ExactSshAdd $sshAddPath $sshAddSha256 @('-') $privateKey
+            $privateKey = $null
+            if ($add.ExitCode -ne 0) {
+              throw 'Could not load the controlled SSH credential through fixed stdin.'
+            }
+            $loaded = Invoke-ExactSshAdd $sshAddPath $sshAddSha256 @('-l')
+            $loadedIdentities = @(
+              $loaded.StandardOutput -split '\r?\n' |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+            )
+            if ($loaded.ExitCode -ne 0 -or $loadedIdentities.Count -ne 1) {
+              throw 'The controlled SSH credential is not the sole loaded identity.'
+            }
+            @(
+              "path=$sshAddPath"
+              "sha256=$sshAddSha256"
+              'regular_file=true'
+              'reparse_point=false'
+              'initial_agent_empty=true'
+              'loaded_identity_count=1'
+              'private_key_transport=stdin_only'
+            ) | Set-Content -LiteralPath (Join-Path $evidence 'ssh-add-binding.txt') -Encoding utf8
+
+            $callerGitDirectory = (git rev-parse --path-format=absolute --git-dir).Trim()
+            if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the caller Git directory.' }
+            $callerGitDirectory = [System.IO.Path]::GetFullPath($callerGitDirectory)
+            $callerGitDirectoryItem = Get-Item -LiteralPath $callerGitDirectory -Force
+            if (-not $callerGitDirectoryItem.PSIsContainer -or
+                ($callerGitDirectoryItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw 'The caller Git directory is not a fixed ordinary directory.'
+            }
+            $callerGitConfigPath = [System.IO.Path]::GetFullPath(
+              (Join-Path $callerGitDirectory 'config')
+            )
+            $callerGitConfigItem = Get-Item -LiteralPath $callerGitConfigPath -Force
+            if ($callerGitConfigItem.PSIsContainer -or
+                ($callerGitConfigItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw 'The caller Git config is not a fixed regular file.'
+            }
+            $callerGitOriginalConfigBytes = [System.IO.File]::ReadAllBytes($callerGitConfigPath)
+            $callerGitOriginalConfigSha256 = [Convert]::ToHexString(
+              [System.Security.Cryptography.SHA256]::HashData($callerGitOriginalConfigBytes)
+            ).ToLowerInvariant()
+            $callerGitConfigText = [System.Text.UTF8Encoding]::new($false, $true).GetString(
+              $callerGitOriginalConfigBytes
+            )
+            $callerGitConfigNames = @(git config --local --name-only --list)
+            if ($LASTEXITCODE -ne 0 -or
+                $callerGitConfigNames.Where({
+                  $_ -match '(?i)(credential|extraheader|authorization|password|token|oauth|askpass)'
+                }).Count -ne 0) {
+              throw 'The caller Git config contains an authentication-bearing setting.'
+            }
+            if ($callerGitConfigText -match '(?i)https?://[^/\s@\]]+@' -or
+                $callerGitConfigText -match '(?im)^\s*(extraheader|password|token)\s*=') {
+              throw 'The caller Git config is not secret-free enough for a temporary backup.'
+            }
+            $callerGitOriginal = Get-RegularFileTreeSnapshot $callerGitDirectory
+            if ((Get-FileHash -LiteralPath $callerGitConfigPath -Algorithm SHA256).Hash.ToLowerInvariant() -cne
+                $callerGitOriginalConfigSha256) {
+              throw 'The caller Git config changed while capturing the original snapshot.'
+            }
+            $callerGitOriginal.Sha256 | Set-Content -LiteralPath `
+              (Join-Path $evidence 'caller-git-original.sha256') -Encoding ascii
+            $callerGitOriginal.Records | Set-Content -LiteralPath `
+              (Join-Path $evidence 'caller-git-original.records.txt') -Encoding utf8
+            $callerGitOriginalConfigSha256 | Set-Content -LiteralPath `
+              (Join-Path $evidence 'caller-git-config-original.sha256') -Encoding ascii
+            $callerGitBackupPath = Join-Path $env:RUNNER_TEMP `
+              "rustferry-goal3-caller-config-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT.bak"
+            $backupStream = [System.IO.FileStream]::new(
+              $callerGitBackupPath,
+              [System.IO.FileMode]::CreateNew,
+              [System.IO.FileAccess]::Write,
+              [System.IO.FileShare]::None
+            )
+            try {
+              $backupStream.Write(
+                $callerGitOriginalConfigBytes,
+                0,
+                $callerGitOriginalConfigBytes.Length
+              )
+              $backupStream.Flush($true)
+            } finally {
+              $backupStream.Dispose()
+              $callerGitOriginalConfigBytes = $null
+              $callerGitConfigText = $null
+            }
+            $backupSha256 = (Get-FileHash -LiteralPath $callerGitBackupPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($backupSha256 -cne $callerGitOriginalConfigSha256) {
+              throw 'The caller Git config backup is not byte-exact.'
+            }
+            $callerGitRestorationArmed = $true
+
+            git remote set-url --push origin 'git@github.com:ShiroKSH/rustferry.git'
+            if ($LASTEXITCODE -ne 0) { throw 'Could not select the controlled push endpoint.' }
+            $pushUrl = (git config --local --get remote.origin.pushurl).Trim()
+            if ($LASTEXITCODE -ne 0 -or
+                $pushUrl -cne 'git@github.com:ShiroKSH/rustferry.git') {
+              throw 'The deliberate origin push URL mutation was not exact.'
+            }
+            $callerGitBefore = Get-RegularFileTreeSnapshot $callerGitDirectory
+            $callerGitBefore.Sha256 | Set-Content -LiteralPath `
+              (Join-Path $evidence 'caller-git-before.sha256') -Encoding ascii
+            $callerGitBefore.Records | Set-Content -LiteralPath `
+              (Join-Path $evidence 'caller-git-before.records.txt') -Encoding utf8
+            @(
+              'intentional_prebaseline_mutation=origin.pushurl'
+              "git_directory=$callerGitDirectory"
+              'provider_period_scope=relative path, length, and SHA-256 of every regular non-reparse file default stream under git_directory'
+              'reparse_points=absent'
+              'not_covered=directory metadata, timestamps, ACLs, and alternate data streams'
+            ) | Set-Content -LiteralPath (Join-Path $evidence 'caller-git-scope.txt') -Encoding utf8
+
+            $setupOutput = target\debug\cargo-ferry.exe --json remote setup github `
+              --project-dir examples/counter `
+              --execution-repository ShiroKSH/rustferry `
+              --source-remote-name origin `
+              --execution-remote-name origin `
+              --trusted-ref $env:RUSTFERRY_ACCEPTANCE_EXPECTED_REF `
+              --worker-repository https://github.com/ShiroKSH/rustferry `
+              --worker-revision $env:RUSTFERRY_WORKER_REVISION `
+              --worker-version 0.1.0
+            $setupExitCode = $LASTEXITCODE
+            $setupOutput | Tee-Object -FilePath (Join-Path $evidence 'setup.json')
+            if ($setupExitCode -ne 0) { throw 'GitHub remote setup failed.' }
+            $setup = Get-Content -Raw -LiteralPath (Join-Path $evidence 'setup.json') | ConvertFrom-Json
+            if ($setup.command -cne 'remote-setup' -or $setup.status -cne 'ok' -or
+                $setup.data.source_repository -cne 'https://github.com/shiroksh/rustferry' -or
+                $setup.data.execution_repository -cne 'shiroksh/rustferry' -or
+                $setup.data.authenticated_as -cne 'repository-scoped token' -or
+                $setup.data.trusted_source_ref -cne $env:RUSTFERRY_ACCEPTANCE_EXPECTED_REF -or
+                $setup.data.worker_revision -cne $env:RUSTFERRY_WORKER_REVISION -or
+                -not $setup.data.installed -or
+                $setup.data.signing_mode -cne 'unsigned-smoke-only') {
+              throw 'GitHub setup evidence is incomplete or mismatched.'
+            }
+
+            $doctorOutput = target\debug\cargo-ferry.exe --json remote doctor github `
+              --project-dir examples/counter
+            $doctorExitCode = $LASTEXITCODE
+            $doctorOutput | Tee-Object -FilePath (Join-Path $evidence 'doctor.json')
+            if ($doctorExitCode -ne 0) { throw 'GitHub remote doctor failed.' }
+            $doctor = Get-Content -Raw -LiteralPath (Join-Path $evidence 'doctor.json') | ConvertFrom-Json
+            if ($doctor.command -cne 'remote-doctor' -or $doctor.status -cne 'ok' -or
+                -not $doctor.data.ready) {
+              throw 'GitHub remote doctor is not ready.'
+            }
+
+            $buildOutput = target\debug\cargo-ferry.exe --json build iphone `
+              --project-dir examples/counter `
+              --remote github `
+              --unsigned
+            $buildExitCode = $LASTEXITCODE
+            $buildOutput | Tee-Object -FilePath (Join-Path $evidence 'build.json')
+            if ($buildExitCode -ne 0) { throw 'Remote unsigned iPhone build failed.' }
+            $build = Get-Content -Raw -LiteralPath (Join-Path $evidence 'build.json') | ConvertFrom-Json
+            $archive = Join-Path $env:GITHUB_WORKSPACE `
+              'examples\counter\target\ferry\ios\device\debug\Counter-unsigned.xcarchive.zip'
+            $sanitizedLog = Join-Path $env:GITHUB_WORKSPACE `
+              'examples\counter\target\ferry\ios\device\debug\sanitized-build-log.txt'
+            $normalizedArchive = Get-NormalizedWindowsPath $archive
+            $normalizedExpectedArtifact = Get-NormalizedWindowsPath `
+              ([string] $build.data.expected_artifact)
+            $normalizedArtifact = Get-NormalizedWindowsPath ([string] $build.data.artifact)
+            if ($build.command -cne 'build' -or $build.status -cne 'ok' -or
+                $build.data.provider -cne 'github' -or
+                $build.data.profile -cne 'debug' -or
+                $build.data.signing_mode -cne 'unsigned-compile-only' -or
+                $build.data.source_revision -cne $env:RUSTFERRY_ACCEPTANCE_EXPECTED_COMMIT -or
+                $build.data.source_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+                [long] $build.data.source_files -le 0 -or
+                $normalizedExpectedArtifact -ine $normalizedArchive -or
+                $normalizedArtifact -ine $normalizedArchive -or
+                $build.data.local_job_id -cnotmatch '^job-[a-z0-9-]+$' -or
+                [string]::IsNullOrWhiteSpace([string] $build.data.job_id) -or
+                -not $build.data.validated -or -not $build.data.cleanup_confirmed -or
+                $build.data.dry_run -or
+                $build.data.artifact_sha256 -cnotmatch '^[0-9a-f]{64}$') {
+              throw 'Remote build did not return exact validated cleanup-confirmed evidence.'
+            }
+
+            if (-not (Test-Path -LiteralPath $archive -PathType Leaf) -or
+                -not (Test-Path -LiteralPath $sanitizedLog -PathType Leaf)) {
+              throw 'Expected downloaded artifacts are absent.'
+            }
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $zip = [System.IO.Compression.ZipFile]::OpenRead($archive)
+            try {
+              $entries = @($zip.Entries | ForEach-Object FullName)
+            } finally {
+              $zip.Dispose()
+            }
+            $entries | Set-Content -LiteralPath (Join-Path $evidence 'archive-entries.txt') -Encoding utf8
+            if ($entries -cnotcontains 'Info.plist' -or
+                $entries -cnotcontains 'Products/Applications/counter.app/Info.plist') {
+              throw 'Downloaded XCArchive ZIP does not have the expected physical-device shape.'
+            }
+
+            $actualSha256 = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualSha256 -cne $build.data.artifact_sha256) {
+              throw 'Downloaded XCArchive digest differs from the client result.'
+            }
+            "$actualSha256  Counter-unsigned.xcarchive.zip" |
+              Set-Content -LiteralPath (Join-Path $evidence 'SHA256SUMS') -Encoding ascii
+            (Get-Item -LiteralPath $archive).Length |
+              Set-Content -LiteralPath (Join-Path $evidence 'archive-size-bytes.txt') -Encoding ascii
+            Copy-Item -LiteralPath $archive -Destination `
+              (Join-Path $evidence 'Counter-unsigned.xcarchive.zip')
+            Copy-Item -LiteralPath $sanitizedLog -Destination `
+              (Join-Path $evidence 'sanitized-build-log.txt')
+            $callerGitAfter = Get-RegularFileTreeSnapshot $callerGitDirectory
+            $callerGitAfter.Sha256 | Set-Content -LiteralPath `
+              (Join-Path $evidence 'caller-git-after.sha256') -Encoding ascii
+            $callerGitAfter.Records | Set-Content -LiteralPath `
+              (Join-Path $evidence 'caller-git-after.records.txt') -Encoding utf8
+            if ($callerGitAfter.Sha256 -cne $callerGitBefore.Sha256 -or
+                [string]::Join("`n", $callerGitAfter.Records) -cne
+                  [string]::Join("`n", $callerGitBefore.Records)) {
+              throw 'Provider-period operations changed caller Git regular-file path/content evidence.'
+            }
+          } catch {
+            $mainFailure = $_
+          } finally {
+            Remove-Item Env:RUSTFERRY_ACCEPTANCE_SSH_PRIVATE_KEY -ErrorAction SilentlyContinue
+            $privateKey = $null
+            if ($callerGitRestorationArmed) {
+              try {
+                $backupItem = Get-Item -LiteralPath $callerGitBackupPath -Force
+                if ($backupItem.PSIsContainer -or
+                    ($backupItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                    (Get-FileHash -LiteralPath $callerGitBackupPath -Algorithm SHA256).Hash.ToLowerInvariant() -cne
+                      $callerGitOriginalConfigSha256) {
+                  throw 'The caller Git config backup changed before restoration.'
+                }
+                $restoreBytes = [System.IO.File]::ReadAllBytes($callerGitBackupPath)
+                $callerGitRestorePath = Join-Path $callerGitDirectory `
+                  "config.rustferry-restore-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+                $restoreStream = [System.IO.FileStream]::new(
+                  $callerGitRestorePath,
+                  [System.IO.FileMode]::CreateNew,
+                  [System.IO.FileAccess]::Write,
+                  [System.IO.FileShare]::None
+                )
+                try {
+                  $restoreStream.Write($restoreBytes, 0, $restoreBytes.Length)
+                  $restoreStream.Flush($true)
+                } finally {
+                  $restoreStream.Dispose()
+                  $restoreBytes = $null
+                }
+                if ((Get-FileHash -LiteralPath $callerGitRestorePath -Algorithm SHA256).Hash.ToLowerInvariant() -cne
+                    $callerGitOriginalConfigSha256) {
+                  throw 'The staged caller Git config restoration is not byte-exact.'
+                }
+                [System.IO.File]::Move($callerGitRestorePath, $callerGitConfigPath, $true)
+                if ((Get-FileHash -LiteralPath $callerGitConfigPath -Algorithm SHA256).Hash.ToLowerInvariant() -cne
+                    $callerGitOriginalConfigSha256) {
+                  throw 'The caller Git config was not restored byte-exactly.'
+                }
+                $callerGitFinal = Get-RegularFileTreeSnapshot $callerGitDirectory
+                $callerGitFinal.Sha256 | Set-Content -LiteralPath `
+                  (Join-Path $evidence 'caller-git-final.sha256') -Encoding ascii
+                $callerGitFinal.Records | Set-Content -LiteralPath `
+                  (Join-Path $evidence 'caller-git-final.records.txt') -Encoding utf8
+                if ($callerGitFinal.Sha256 -cne $callerGitOriginal.Sha256 -or
+                    [string]::Join("`n", $callerGitFinal.Records) -cne
+                      [string]::Join("`n", $callerGitOriginal.Records)) {
+                  throw 'The final caller Git regular-file snapshot differs from the original.'
+                }
+                @(
+                  "config_original_sha256=$callerGitOriginalConfigSha256"
+                  "config_restored_sha256=$callerGitOriginalConfigSha256"
+                  'workflow_mutation_restored=true'
+                  'final_full_regular_file_snapshot_matches_original=true'
+                  "git_directory=$callerGitDirectory"
+                  'scope=relative path, length, and SHA-256 of every regular non-reparse file default stream under git_directory'
+                  'reparse_points=absent'
+                  'not_covered=directory metadata, timestamps, ACLs, and alternate data streams'
+                ) | Set-Content -LiteralPath `
+                  (Join-Path $evidence 'caller-git-restoration.txt') -Encoding utf8
+                [System.IO.File]::Delete($callerGitBackupPath)
+                if (Test-Path -LiteralPath $callerGitBackupPath) {
+                  throw 'The temporary caller Git config backup was not removed.'
+                }
+              } catch {
+                $cleanupFailure = $true
+              } finally {
+                if ($null -ne $callerGitRestorePath -and
+                    (Test-Path -LiteralPath $callerGitRestorePath -PathType Leaf)) {
+                  try { [System.IO.File]::Delete($callerGitRestorePath) } catch { $cleanupFailure = $true }
+                }
+              }
+            }
+            if ($null -ne $cleanupState) {
+              if ($safeToClear) {
+                try {
+                  Ensure-SshAgentRunning
+                  $removed = Invoke-ExactSshAdd $sshAddPath $sshAddSha256 @('-D')
+                  if ($removed.ExitCode -ne 0) {
+                    throw 'Could not clear the controlled empty-before-use SSH agent.'
+                  }
+                  Assert-SshAgentEmpty $sshAddPath $sshAddSha256
+                  $finalEmpty = $true
+                } catch {
+                  $cleanupFailure = $true
+                }
+              }
+              try {
+                Restore-SshAgentState $cleanupState.initial_running $cleanupState.initial_start_mode
+                $restoredAgent = Get-SshAgentState
+                $serviceRestored = $true
+              } catch {
+                $cleanupFailure = $true
+              }
+              $cleanupState.final_empty = $finalEmpty
+              $cleanupState.cleanup_confirmed = $safeToClear -and $finalEmpty -and
+                $serviceRestored -and -not $cleanupFailure
+              try { Save-CleanupState } catch { $cleanupFailure = $true }
+              try {
+                $finalRunningEvidence = if ($null -eq $restoredAgent) {
+                  'unavailable'
+                } else {
+                  $restoredAgent.Running.ToString().ToLowerInvariant()
+                }
+                $finalStartModeEvidence = if ($null -eq $restoredAgent) {
+                  'unavailable'
+                } else {
+                  $restoredAgent.StartMode
+                }
+                @(
+                  "initial_running=$($cleanupState.initial_running.ToString().ToLowerInvariant())"
+                  "initial_start_mode=$($cleanupState.initial_start_mode)"
+                  "initial_empty=$($cleanupState.initial_empty.ToString().ToLowerInvariant())"
+                  "load_attempted=$($cleanupState.load_attempted.ToString().ToLowerInvariant())"
+                  "final_empty=$($cleanupState.final_empty.ToString().ToLowerInvariant())"
+                  "service_restored=$($serviceRestored.ToString().ToLowerInvariant())"
+                  "final_running=$finalRunningEvidence"
+                  "final_start_mode=$finalStartModeEvidence"
+                  "ssh_add_sha256=$($cleanupState.ssh_add_sha256)"
+                ) | Set-Content -LiteralPath (Join-Path $evidence 'ssh-agent-cleanup.txt') -Encoding utf8
+              } catch {
+                $cleanupFailure = $true
+              }
+            }
+            if ($null -ne $sshAddGuard) { $sshAddGuard.Dispose() }
+          }
+          if ($cleanupFailure) {
+            throw 'SSH agent cleanup or exact service restoration failed.'
+          }
+          if ($null -ne $mainFailure) { throw $mainFailure }
+
+      - name: Reconcile SSH-agent cleanup after interruption
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $statePath = Join-Path $env:RUNNER_TEMP 'rustferry-goal3-ssh-cleanup-state.json'
+          $evidence = Join-Path $env:RUNNER_TEMP 'rustferry-goal3-windows-evidence'
+          New-Item -ItemType Directory -Path $evidence -Force | Out-Null
+          if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
+            'ssh_agent_lifecycle=not_started' | Set-Content -LiteralPath `
+              (Join-Path $evidence 'ssh-agent-always-cleanup.txt') -Encoding utf8
+            exit 0
+          }
+          $state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
+          if ($state.schema_version -isnot [int] -or $state.schema_version -ne 1 -or
+              $state.ssh_add_path -isnot [string] -or
+              $state.ssh_add_sha256 -isnot [string] -or
+              $state.initial_start_mode -isnot [string] -or
+              $state.ssh_add_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+              $state.initial_start_mode -cnotin @('Auto', 'Manual', 'Disabled') -or
+              $state.initial_running -isnot [bool] -or
+              $state.initial_empty -isnot [bool] -or
+              $state.safe_to_clear -isnot [bool] -or
+              $state.load_attempted -isnot [bool] -or
+              $state.final_empty -isnot [bool] -or
+              $state.cleanup_confirmed -isnot [bool] -or
+              ($state.safe_to_clear -and -not $state.initial_empty) -or
+              ($state.load_attempted -and -not $state.safe_to_clear)) {
+            throw 'SSH cleanup state is malformed.'
+          }
+          $sshAddPath = [string] $state.ssh_add_path
+          $expectedSha256 = [string] $state.ssh_add_sha256
+          $windowsDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::Windows)
+          $systemDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::System)
+          $expectedPath = [System.IO.Path]::GetFullPath(
+            (Join-Path $systemDirectory 'OpenSSH\ssh-add.exe')
+          )
+          if ($sshAddPath -ine $expectedPath) { throw 'SSH cleanup executable path changed.' }
+
+          function Assert-SshAddBinary {
+            $item = Get-Item -LiteralPath $sshAddPath -Force
+            $actual = (Get-FileHash -LiteralPath $sshAddPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($item.PSIsContainer -or $item.Length -le 0 -or
+                ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                $item.FullName -ine $sshAddPath -or $actual -cne $expectedSha256) {
+              throw 'The fixed System32 ssh-add executable changed before cleanup.'
+            }
+          }
+
+          function Invoke-ExactSshAdd([string[]] $Arguments) {
+            Assert-SshAddBinary
+            $start = [System.Diagnostics.ProcessStartInfo]::new()
+            $start.FileName = $sshAddPath
+            $start.UseShellExecute = $false
+            $start.CreateNoWindow = $true
+            $start.RedirectStandardInput = $true
+            $start.RedirectStandardOutput = $true
+            $start.RedirectStandardError = $true
+            $start.WorkingDirectory = $env:RUNNER_TEMP
+            $start.Environment.Clear()
+            $start.Environment['SystemRoot'] = $windowsDirectory
+            $start.Environment['WINDIR'] = $windowsDirectory
+            $start.Environment['TEMP'] = $env:RUNNER_TEMP
+            $start.Environment['TMP'] = $env:RUNNER_TEMP
+            foreach ($argument in $Arguments) { [void] $start.ArgumentList.Add($argument) }
+            $process = [System.Diagnostics.Process]::new()
+            $process.StartInfo = $start
+            try {
+              if (-not $process.Start()) { throw 'The fixed cleanup process did not start.' }
+              $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+              $stderrTask = $process.StandardError.ReadToEndAsync()
+              $process.StandardInput.Close()
+              if (-not $process.WaitForExit(15000)) {
+                try { $process.Kill($true) } catch { }
+                if (-not $process.WaitForExit(5000)) {
+                  throw 'The fixed cleanup process could not be terminated within its deadline.'
+                }
+                throw 'The fixed cleanup process exceeded its deadline.'
+              }
+              [pscustomobject]@{
+                ExitCode = $process.ExitCode
+                StandardOutput = $stdoutTask.GetAwaiter().GetResult()
+                StandardError = $stderrTask.GetAwaiter().GetResult()
+              }
+            } finally {
+              $process.Dispose()
+              Assert-SshAddBinary
+            }
+          }
+
+          function Get-SshAgentState {
+            $service = Get-CimInstance -ClassName Win32_Service -Filter "Name='ssh-agent'"
+            if ($null -eq $service -or
+                $service.State -cnotin @('Running', 'Stopped') -or
+                $service.StartMode -cnotin @('Auto', 'Manual', 'Disabled')) {
+              throw 'The Windows ssh-agent service state is unsupported during cleanup.'
+            }
+            [pscustomobject]@{
+              Running = $service.State -ceq 'Running'
+              StartMode = [string] $service.StartMode
+            }
+          }
+
+          function Set-SshAgentStartMode([string] $StartMode) {
+            switch -CaseSensitive ($StartMode) {
+              'Auto' { Set-Service -Name ssh-agent -StartupType Automatic }
+              'Manual' { Set-Service -Name ssh-agent -StartupType Manual }
+              'Disabled' { Set-Service -Name ssh-agent -StartupType Disabled }
+              default { throw 'The recorded ssh-agent start mode is invalid.' }
+            }
+          }
+
+          function Wait-SshAgentState([bool] $Running) {
+            $expected = if ($Running) {
+              [System.ServiceProcess.ServiceControllerStatus]::Running
+            } else {
+              [System.ServiceProcess.ServiceControllerStatus]::Stopped
+            }
+            (Get-Service -Name ssh-agent).WaitForStatus($expected, [TimeSpan]::FromSeconds(15))
+          }
+
+          function Ensure-SshAgentRunning {
+            $current = Get-SshAgentState
+            if (-not $current.Running) {
+              if ($current.StartMode -ceq 'Disabled') { Set-SshAgentStartMode 'Manual' }
+              Start-Service -Name ssh-agent
+              Wait-SshAgentState $true
+            }
+          }
+
+          function Restore-SshAgentState {
+            $current = Get-SshAgentState
+            if ([bool] $state.initial_running -and -not $current.Running) {
+              if ($current.StartMode -ceq 'Disabled') { Set-SshAgentStartMode 'Manual' }
+              Start-Service -Name ssh-agent
+              Wait-SshAgentState $true
+            } elseif (-not [bool] $state.initial_running -and $current.Running) {
+              Stop-Service -Name ssh-agent
+              Wait-SshAgentState $false
+            }
+            $current = Get-SshAgentState
+            if ($current.StartMode -cne [string] $state.initial_start_mode) {
+              Set-SshAgentStartMode ([string] $state.initial_start_mode)
+            }
+            $restored = Get-SshAgentState
+            if ($restored.Running -ne [bool] $state.initial_running -or
+                $restored.StartMode -cne [string] $state.initial_start_mode) {
+              throw 'The Windows ssh-agent service was not restored exactly.'
+            }
+          }
+
+          $guard = [System.IO.File]::Open(
+            $sshAddPath,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read
+          )
+          Assert-SshAddBinary
+          $cleanupFailed = $false
+          $finalEmpty = $false
+          $serviceRestored = $false
+          $restoredAgent = $null
+          try {
+            if ([bool] $state.safe_to_clear) {
+              try {
+                Ensure-SshAgentRunning
+                $removed = Invoke-ExactSshAdd @('-D')
+                if ($removed.ExitCode -ne 0) { throw 'Could not clear the acceptance SSH identity.' }
+                $probe = Invoke-ExactSshAdd @('-l')
+                $message = ($probe.StandardOutput + "`n" + $probe.StandardError).Trim()
+                if ($probe.ExitCode -ne 1 -or $message -notmatch '(?i)agent has no identities') {
+                  throw 'The Windows ssh-agent is not empty after cleanup.'
+                }
+                $finalEmpty = $true
+              } catch {
+                $cleanupFailed = $true
+              }
+            } elseif ([bool] $state.load_attempted) {
+              $cleanupFailed = $true
+            }
+            try {
+              Restore-SshAgentState
+              $restoredAgent = Get-SshAgentState
+              $serviceRestored = $true
+            } catch {
+              $cleanupFailed = $true
+            }
+          } finally {
+            $guard.Dispose()
+          }
+          $finalRunningEvidence = if ($null -eq $restoredAgent) {
+            'unavailable'
+          } else {
+            $restoredAgent.Running.ToString().ToLowerInvariant()
+          }
+          $finalStartModeEvidence = if ($null -eq $restoredAgent) {
+            'unavailable'
+          } else {
+            $restoredAgent.StartMode
+          }
+          @(
+            "initial_running=$(([bool] $state.initial_running).ToString().ToLowerInvariant())"
+            "initial_start_mode=$([string] $state.initial_start_mode)"
+            "safe_to_clear=$(([bool] $state.safe_to_clear).ToString().ToLowerInvariant())"
+            "final_empty=$($finalEmpty.ToString().ToLowerInvariant())"
+            "service_restored=$($serviceRestored.ToString().ToLowerInvariant())"
+            "final_running=$finalRunningEvidence"
+            "final_start_mode=$finalStartModeEvidence"
+            "ssh_add_sha256=$expectedSha256"
+          ) | Set-Content -LiteralPath `
+            (Join-Path $evidence 'ssh-agent-always-cleanup.txt') -Encoding utf8
+          if ($cleanupFailed -or ([bool] $state.safe_to_clear -and -not $finalEmpty)) {
+            throw 'Always-run SSH cleanup did not prove final emptiness and exact restoration.'
+          }
+
+      - name: Upload Windows-client acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: 'rustferry-goal3-windows-client-${{ github.run_id }}-${{ github.run_attempt }}'
+          path: '${{ runner.temp }}\rustferry-goal3-windows-evidence'
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3

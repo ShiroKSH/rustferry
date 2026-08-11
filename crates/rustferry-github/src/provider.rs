@@ -7,43 +7,72 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
-    ffi::{OsStr, OsString},
-    fmt,
-    fs::{self, OpenOptions},
-    io::{self, Read, Write},
+    ffi::OsString,
+    fmt, fs,
+    io::{self, Read, Seek, Write},
     path::{Component, Path, PathBuf},
-    process::{Command, ExitStatus, Stdio},
-    sync::Mutex,
+    process::{Child, Command, ExitStatus, Stdio},
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt as _;
+#[cfg(any(not(windows), test))]
+#[cfg(test)]
+use std::ffi::OsStr;
 
 use rustferry_remote::{
-    ArtifactDownloadRequest, ArtifactDownloadResult, ArtifactListRequest, ArtifactManifest,
-    BuildProvider, CURRENT_PROTOCOL_VERSION, CancellationAck, CancellationRequest,
-    CancellationToken, CleanupConfirmation, CleanupRequest, EventPage, EventRequest,
-    HandshakeRequest, HandshakeResponse, IosArtifactType, IosDeviceBuildRequest,
-    IosDeviceBuildResult, JobHandle, JobState, ProviderCapabilities, ProviderCheck,
-    ProviderCheckStatus, ProviderDoctorReport, ProviderDoctorRequest, ProviderFeature,
-    ProviderFuture, RemoteBuildError, RemoteBuildEvent, RemoteBuildEventKind, RemoteBuildResult,
-    RemoteErrorInfo, SecretReference, SecretReferenceKind, SigningMode, SourceMode,
-    canonical_request_sha256,
+    ArtifactDownloadRequest, ArtifactDownloadResult, ArtifactKind, ArtifactListRequest,
+    ArtifactManifest, BuildProvider, CURRENT_PROTOCOL_VERSION, CancellationAck,
+    CancellationRequest, CancellationToken, CleanupConfirmation, CleanupRequest, CleanupStatus,
+    CompilePhaseEvidence, EventPage, EventRequest, GitSnapshotDescriptor, HandshakeRequest,
+    HandshakeResponse, IosArtifactType, IosDeviceBuildRequest, IosDeviceBuildResult, JobHandle,
+    JobState, ProviderCapabilities, ProviderCheck, ProviderCheckStatus, ProviderDoctorReport,
+    ProviderDoctorRequest, ProviderFeature, ProviderFuture, RemoteBuildError, RemoteBuildEvent,
+    RemoteBuildEventKind, RemoteBuildResult, RemoteErrorInfo, SecretReference, SecretReferenceKind,
+    SigningMode, SigningStatus, SourceArchive, SourceBundleDescriptor, SourceMode,
+    canonical_git_snapshot_descriptor_bytes, canonical_request_sha256,
 };
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    transport::{
-        BranchName, CommitSha, GhExecutionError, GhRunner, GithubTransport, PollPolicy, Repository,
-        RunConclusion, RunEvent, RunHandle, RunSnapshot, RunStatus, TemporaryGitRef,
-        TransportError,
+    artifact::GithubArtifactExpectation,
+    git_endpoint::{GitRemoteName, GithubGitEndpoint, GithubRemoteSnapshot},
+    git_process::GitNetworkPolicy,
+    job_logs::GithubDurableRunAttemptLogIdentity,
+    snapshot::{
+        GitSha1ObjectId, GitSnapshotError, GitSnapshotImportInputs, GitSnapshotKeepaliveRef,
+        GitSnapshotObjectGraphV1, GitSnapshotObjectKind, GitSnapshotPrecomputeInputs,
+        GitSnapshotSourceRef, GitSnapshotStageDirectory, GitSnapshotStageLocatorV1,
+        GitSnapshotStageV1, complete_git_snapshot_object_graph,
+        discover_complete_git_snapshot_stages, require_sha1_object_format,
     },
-    workflow::{GeneratedWorkflow, TrustedSourceRef, WorkflowConfig, generate_workflow},
+    transport::{
+        AuthenticatedPrincipal, BranchName, CommitSha, GhExecutionError, GhRunner, GithubTransport,
+        GithubWorkflowDispatchHttpClient, PollPolicy, Repository, RunConclusion, RunEvent,
+        RunHandle, RunId, RunSnapshot, RunStatus, TemporaryGitRef, TransportError,
+        WorkflowDispatchReceipt, WorkflowDispatchRequest, WorkflowId, WorkflowRegistration,
+    },
+    workflow::{
+        GeneratedWorkflow, MAX_SIGNING_PROFILES, TemporaryBranchNamespace, TrustedSourceRef,
+        WorkflowConfig, WorkflowRunTrigger, generate_workflow,
+    },
 };
+
+#[cfg(feature = "secure-job-log-http")]
+use crate::{
+    job_logs::{GithubJobLogError, GithubJobLogFetcher, GithubJobLogLimits, GithubJobLogPoll},
+    transport::GhProcessRunner,
+};
+
+#[cfg(unix)]
+use crate::git_endpoint::GithubGitTransport;
 
 /// Stable provider identifier exposed through the remote-build protocol.
 pub const GITHUB_PROVIDER_ID: &str = "github-actions";
@@ -51,32 +80,28 @@ pub const GITHUB_PROVIDER_ID: &str = "github-actions";
 pub const DISPATCH_MANIFEST_PATH: &str = ".rustferry/goal3/request.json";
 
 const DISPATCH_MANIFEST_SCHEMA_VERSION: u32 = 2;
+const GITHUB_JOB_RESUME_SCHEMA_VERSION: u32 = 1;
+const GITHUB_WORKFLOW_DISPATCH_RESUME_SCHEMA_VERSION: u32 = 1;
+const GITHUB_GIT_SNAPSHOT_RESUME_SCHEMA_VERSION: u32 = 1;
+/// Current attempt-scoped signed-cleanup evidence schema.
+pub const GITHUB_SIGNED_CLEANUP_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 const MAX_JOB_RECORDS: usize = 1_024;
 const MAX_JOB_EVENTS: usize = 64;
+const MAX_JOB_MANIFESTS: usize = 64;
+/// Maximum encoded bytes accepted for one durable GitHub job resume record.
+pub const GITHUB_JOB_RESUME_MAX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_DISPATCH_FILE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_GIT_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_GIT_STDERR_BYTES: usize = 64 * 1024;
 const MAX_GIT_TIMEOUT: Duration = Duration::from_mins(10);
-const GIT_AMBIENT_ENVIRONMENT_ALLOWLIST: &[&str] = &[
-    "HOME",
-    "USERPROFILE",
-    "XDG_CONFIG_HOME",
-    "GH_CONFIG_DIR",
-    "PATH",
-    "PATHEXT",
-    "SSH_AUTH_SOCK",
-    "SYSTEMROOT",
-    "WINDIR",
-    "TMPDIR",
-    "TMP",
-    "TEMP",
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "NO_PROXY",
-    "http_proxy",
-    "https_proxy",
-    "no_proxy",
-];
+const GIT_PROCESS_CLEANUP_GRACE: Duration = Duration::from_secs(1);
+const MAX_CALLER_GIT_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_CALLER_GIT_CONTROL_BYTES: u64 = 1024 * 1024;
+static INDEX_RESERVATION_COUNTER: AtomicU64 = AtomicU64::new(0);
+// For process-fenced publication only: longer than worst-case post-checkpoint identity probes,
+// the Git timeout, and a conservative GitHub ref/run propagation margin.
+/// Minimum quiescence after the first exact absence observation before safe retirement.
+pub const GITHUB_PUBLICATION_QUIESCENCE_WINDOW_MS: u64 = 75 * 60 * 1_000;
 
 /// A validated lowercase SHA-256 digest of the exact generated workflow bytes.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -109,13 +134,23 @@ impl WorkflowFingerprint {
 
 /// Explicit caller authority for externally mutating GitHub state.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent least-privilege mutation authorities must remain separately configurable"
+)]
 pub struct GithubMutationAuthorization {
     /// Permit one create-only push below the configured temporary namespace.
     pub publish_temporary_ref: bool,
-    /// Permit cancellation of the exact mapped GitHub Actions run.
+    /// Permit cancellation of the immutable mapped GitHub Actions run ID across all attempts.
     pub cancel_run: bool,
     /// Permit deletion of the exact provider-created temporary branch.
     pub delete_temporary_ref: bool,
+    /// Permit one create-only push of an explicitly consented Git snapshot source ref.
+    pub publish_git_snapshot_source: bool,
+    /// Permit exact lease-protected deletion of a provider-owned Git snapshot source ref.
+    pub delete_git_snapshot_source: bool,
+    /// Permit exact creation and lineage-prune release of local Git snapshot keepalive refs.
+    pub manage_git_snapshot_keepalive: bool,
 }
 
 /// One bounded policy shared by run discovery and terminal-run polling.
@@ -187,6 +222,10 @@ pub enum GithubProviderConfigError {
     InvalidWorkerVersion,
     /// Handshake worker version differed from the hash-pinned workflow worker.
     WorkerVersionMismatch,
+    /// Persisted Git endpoints did not match configured repository identities.
+    InvalidGitEndpoints,
+    /// This platform has no pinned credential path for an HTTPS execution endpoint.
+    UnsupportedExecutionTransport,
 }
 
 impl fmt::Display for GithubProviderConfigError {
@@ -208,6 +247,11 @@ impl fmt::Display for GithubProviderConfigError {
             Self::WorkerVersionMismatch => {
                 formatter.write_str("handshake worker version does not match workflow distribution")
             }
+            Self::InvalidGitEndpoints => {
+                formatter.write_str("Git endpoints do not match provider repositories")
+            }
+            Self::UnsupportedExecutionTransport => formatter
+                .write_str("execution Git fetch and push must use SSH on this secure platform"),
         }
     }
 }
@@ -225,6 +269,13 @@ pub struct GithubProviderConfig {
     mutation_authorization: GithubMutationAuthorization,
     worker_version: Version,
     max_jobs: usize,
+    git_endpoints: Option<GithubProviderGitEndpoints>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GithubProviderGitEndpoints {
+    source: GithubRemoteSnapshot,
+    execution: GithubRemoteSnapshot,
 }
 
 impl GithubProviderConfig {
@@ -271,6 +322,7 @@ impl GithubProviderConfig {
             mutation_authorization,
             worker_version: distribution_worker_version,
             max_jobs,
+            git_endpoints: None,
         })
     }
 
@@ -303,6 +355,821 @@ impl GithubProviderConfig {
     pub const fn mutation_authorization(&self) -> GithubMutationAuthorization {
         self.mutation_authorization
     }
+
+    /// Bind immutable canonical Git endpoints captured by setup into the durable provider identity.
+    ///
+    /// # Errors
+    ///
+    /// Rejects snapshots whose repository identities differ from the configured source or execution
+    /// repositories.
+    pub fn bind_git_endpoints(
+        mut self,
+        source: GithubRemoteSnapshot,
+        execution: GithubRemoteSnapshot,
+    ) -> Result<Self, GithubProviderConfigError> {
+        if !github_remote_matches(source.fetch().canonical_url(), &self.source_repository)
+            || !github_remote_matches(source.push().canonical_url(), &self.source_repository)
+            || !github_remote_matches(
+                execution.fetch().canonical_url(),
+                &repository_url(&self.repository),
+            )
+            || !github_remote_matches(
+                execution.push().canonical_url(),
+                &repository_url(&self.repository),
+            )
+        {
+            return Err(GithubProviderConfigError::InvalidGitEndpoints);
+        }
+        #[cfg(unix)]
+        if execution.fetch().transport() != GithubGitTransport::Ssh
+            || execution.push().transport() != GithubGitTransport::Ssh
+        {
+            return Err(GithubProviderConfigError::UnsupportedExecutionTransport);
+        }
+        self.git_endpoints = Some(GithubProviderGitEndpoints { source, execution });
+        Ok(self)
+    }
+}
+
+/// Secret-free authenticated principal identity bound to a durable job record.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GithubPrincipalIdentityV1 {
+    /// Human user identity proven by GitHub's authenticated-user endpoint.
+    User {
+        /// Stable GitHub user database identifier.
+        id: u64,
+        /// Exact login returned by GitHub.
+        login: String,
+    },
+    /// Repository-scoped installation credential.
+    ///
+    /// Its durable principal is the composite of this variant and the enclosing exact execution
+    /// repository ID. It is admitted only for explicit workflow dispatch and is re-proven against
+    /// that repository on every live restore.
+    RepositoryCredential,
+}
+
+impl GithubPrincipalIdentityV1 {
+    fn from_authenticated(
+        principal: &AuthenticatedPrincipal,
+        run_trigger: WorkflowRunTrigger,
+        execution_repository_id: u64,
+    ) -> RemoteBuildResult<Self> {
+        match principal {
+            AuthenticatedPrincipal::User(user) => Ok(Self::User {
+                id: user.id(),
+                login: user.login().to_owned(),
+            }),
+            AuthenticatedPrincipal::RepositoryCredential { .. }
+                if run_trigger != WorkflowRunTrigger::WorkflowDispatch =>
+            {
+                Err(resume_failure(
+                    "resume_repository_credential_requires_workflow_dispatch",
+                ))
+            }
+            AuthenticatedPrincipal::RepositoryCredential { repository_id }
+                if *repository_id != execution_repository_id =>
+            {
+                Err(resume_failure(
+                    "resume_repository_credential_repository_mismatch",
+                ))
+            }
+            AuthenticatedPrincipal::RepositoryCredential { .. } => {
+                Ok(Self::RepositoryCredential)
+            }
+        }
+    }
+}
+
+/// Live, secret-free provider identity needed to create a durable local job before submission.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GithubDurableIdentityV1 {
+    /// Stable provider identifier.
+    pub provider: String,
+    /// Digest of all security-relevant provider configuration.
+    pub provider_config_sha256: String,
+    /// Stable authenticated user identity.
+    pub principal: GithubPrincipalIdentityV1,
+    /// Canonical execution-repository URL.
+    pub execution_repository: String,
+    /// Stable GitHub database ID for the execution repository.
+    pub execution_repository_id: u64,
+}
+
+#[derive(Clone, Debug)]
+enum GithubGitSnapshotStageAuthorityV1 {
+    SameInvocation {
+        locator: GitSnapshotStageLocatorV1,
+        stage: GitSnapshotStageV1,
+    },
+    ExactRetryLineage {
+        locator: GitSnapshotStageLocatorV1,
+        stage: GitSnapshotStageV1,
+    },
+    FreshReconsentAdoption,
+}
+
+/// One-shot, path-free authority to create the first durable Git snapshot provider checkpoint.
+///
+/// This value is intentionally not serializable. The caller must construct it only in the same
+/// invocation that displayed and accepted the exact public-upload plan, or through the explicit
+/// fresh-reconsent constructor used after restart. The provider consumes it synchronously and
+/// compares the approved consent SHA against the canonical stage before any Git or network
+/// mutation.
+#[derive(Clone, Debug)]
+pub struct GithubGitSnapshotSubmissionV1 {
+    durable_identity: GithubDurableIdentityV1,
+    request: IosDeviceBuildRequest,
+    approved_consent_sha256: String,
+    stage_authority: GithubGitSnapshotStageAuthorityV1,
+}
+
+/// Explicit durable-prune authority for releasing one exact local snapshot keepalive.
+///
+/// This value binds the provider checkpoint to a deterministic digest over stable sorted lineage
+/// IDs, edges, and cutoff. The provider verifies and executes the exact local ref mutation; it
+/// does not independently prove lineage completeness or bind mutable job revisions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GithubGitSnapshotKeepaliveReleaseAuthorizationV1 {
+    job_id: String,
+    complete_lineage_authorization_sha256: String,
+}
+
+impl GithubGitSnapshotKeepaliveReleaseAuthorizationV1 {
+    /// Bind one exact restored job to one stable complete-lineage authorization digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed validation failure for an unsafe operation identifier or invalid digest.
+    pub fn new(
+        job_id: impl Into<String>,
+        complete_lineage_authorization_sha256: impl Into<String>,
+    ) -> RemoteBuildResult<Self> {
+        let job_id = job_id.into();
+        let complete_lineage_authorization_sha256 = complete_lineage_authorization_sha256.into();
+        GitSnapshotSourceRef::for_operation(&job_id)
+            .map_err(|_| resume_failure("snapshot_prune_job_invalid"))?;
+        if !is_lower_sha256(&complete_lineage_authorization_sha256) {
+            return Err(resume_failure("snapshot_prune_authorization_invalid"));
+        }
+        Ok(Self {
+            job_id,
+            complete_lineage_authorization_sha256,
+        })
+    }
+
+    /// Exact local durable job identifier.
+    pub fn job_id(&self) -> &str {
+        &self.job_id
+    }
+
+    /// SHA-256 of the stable complete-lineage authorization held under exact prune leases.
+    pub fn complete_lineage_authorization_sha256(&self) -> &str {
+        &self.complete_lineage_authorization_sha256
+    }
+}
+
+/// Durable child-lineage authority for staging an exact Git snapshot retry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GithubGitSnapshotExactRetryAuthorizationV1 {
+    parent_job_id: String,
+    child_operation_id: String,
+    child_source_created_at_ms: u64,
+    retry_lineage_authorization_sha256: String,
+}
+
+impl GithubGitSnapshotExactRetryAuthorizationV1 {
+    /// Bind an already-durable parent/child lineage edge to one exact retry stage operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed failure for equal or unsafe operation IDs, an invalid timestamp, or a
+    /// malformed stable lineage-authorization digest.
+    pub fn new(
+        parent_job_id: impl Into<String>,
+        child_operation_id: impl Into<String>,
+        child_source_created_at_ms: u64,
+        retry_lineage_authorization_sha256: impl Into<String>,
+    ) -> RemoteBuildResult<Self> {
+        let parent_job_id = parent_job_id.into();
+        let child_operation_id = child_operation_id.into();
+        let retry_lineage_authorization_sha256 = retry_lineage_authorization_sha256.into();
+        if parent_job_id == child_operation_id
+            || child_source_created_at_ms == 0
+            || child_source_created_at_ms / 1_000 > i64::MAX as u64
+            || GitSnapshotSourceRef::for_operation(&parent_job_id).is_err()
+            || GitSnapshotSourceRef::for_operation(&child_operation_id).is_err()
+            || !is_lower_sha256(&retry_lineage_authorization_sha256)
+        {
+            return Err(resume_failure("snapshot_exact_retry_authorization_invalid"));
+        }
+        Ok(Self {
+            parent_job_id,
+            child_operation_id,
+            child_source_created_at_ms,
+            retry_lineage_authorization_sha256,
+        })
+    }
+}
+
+/// Deterministic, no-write plan for one exact Git snapshot retry.
+///
+/// The final child request and object graph are available before the controller persists the
+/// immutable parent/child lineage. Filesystem identities are deliberately absent: they are
+/// captured only when the already-authorized stage is materialized.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GithubGitSnapshotExactRetryPlanV1 {
+    /// Final child request whose revision is the regenerated parentless commit.
+    pub request: IosDeviceBuildRequest,
+    /// Deterministic child snapshot commit timestamp.
+    pub source_created_at_ms: u64,
+    /// Canonical request-template SHA-256 embedded in the regenerated descriptor.
+    pub request_template_sha256: String,
+    /// Canonical source-manifest SHA-256 retained from the parent.
+    pub manifest_sha256: String,
+    /// Exact parent archive retained for the child.
+    pub archive: SourceArchive,
+    /// SHA-256 of the regenerated canonical descriptor bytes.
+    pub descriptor_sha256: String,
+    /// Regenerated six-object graph, including the final child commit.
+    pub graph: GitSnapshotObjectGraphV1,
+}
+
+/// Complete create-only child stage produced from a verified parent archive blob.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GithubGitSnapshotExactRetryStageV1 {
+    /// Final child request whose revision is the regenerated parentless commit.
+    pub request: IosDeviceBuildRequest,
+    /// Path-free exact child stage locator.
+    pub stage_locator: GitSnapshotStageLocatorV1,
+    /// Immutable child stage summary and regenerated six-object graph.
+    pub stage: GitSnapshotStageV1,
+}
+
+/// Complete path-free recovery candidate discovered without adoption or mutation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GithubGitSnapshotRecoveryCandidateV1 {
+    /// Exact locator required by a later fresh-reconsent adoption.
+    pub stage_locator: GitSnapshotStageLocatorV1,
+    /// Canonical stage, including original operation, timestamp, graph, consent, and final request.
+    pub stage: GitSnapshotStageV1,
+    /// Canonical public-object descriptor bound to the stage and final request.
+    pub descriptor: GitSnapshotDescriptor,
+    /// Secret-free final request reconstructed exactly from canonical stage metadata.
+    pub final_request: IosDeviceBuildRequest,
+}
+
+impl GithubGitSnapshotSubmissionV1 {
+    /// Bind a complete stage created by the same explicit-consent invocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed failure when the accepted plan hash is not canonical SHA-256 text.
+    pub fn same_invocation(
+        durable_identity: GithubDurableIdentityV1,
+        request: IosDeviceBuildRequest,
+        approved_consent_sha256: String,
+        locator: GitSnapshotStageLocatorV1,
+        stage: GitSnapshotStageV1,
+    ) -> RemoteBuildResult<Self> {
+        if !is_lower_sha256(&approved_consent_sha256) {
+            return Err(provider_failure(
+                "snapshot_consent_invalid",
+                "Git snapshot consent identity is invalid",
+                false,
+            ));
+        }
+        Ok(Self {
+            durable_identity,
+            request,
+            approved_consent_sha256,
+            stage_authority: GithubGitSnapshotStageAuthorityV1::SameInvocation { locator, stage },
+        })
+    }
+
+    /// Bind an exact-retry stage created only after durable parent/child lineage publication.
+    ///
+    /// This authority is distinct from user consent. The stable lineage digest must be the exact
+    /// stage authorization captured by the replayable materialization result.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed failure when the child operation, timestamp, lineage digest, final request,
+    /// locator, or stage binding differs from the durable retry authorization.
+    pub fn exact_retry_lineage(
+        durable_identity: GithubDurableIdentityV1,
+        authorization: &GithubGitSnapshotExactRetryAuthorizationV1,
+        staged: GithubGitSnapshotExactRetryStageV1,
+    ) -> RemoteBuildResult<Self> {
+        if staged.request.operation_id != authorization.child_operation_id
+            || staged.stage.operation_id != authorization.child_operation_id
+            || staged.stage_locator.operation_id != authorization.child_operation_id
+            || staged.stage.source_created_at_ms != authorization.child_source_created_at_ms
+            || staged.stage.consent_sha256 != authorization.retry_lineage_authorization_sha256
+            || staged.stage.final_request != staged.request
+        {
+            return Err(provider_failure(
+                "snapshot_exact_retry_stage_authorization_mismatch",
+                "Git snapshot retry stage differs from durable lineage authority",
+                false,
+            ));
+        }
+        staged
+            .stage
+            .validate_for_request(
+                &GitSnapshotDescriptor::from_request(
+                    &staged.request,
+                    SourceBundleDescriptor::new(
+                        staged.stage.archive.clone(),
+                        staged.request.source.clone(),
+                    ),
+                )
+                .map_err(|_| resume_failure("snapshot_exact_retry_stage_invalid"))?,
+                &staged.request,
+            )
+            .map_err(|_| resume_failure("snapshot_exact_retry_stage_invalid"))?;
+        Ok(Self {
+            durable_identity,
+            request: staged.request,
+            approved_consent_sha256: authorization.retry_lineage_authorization_sha256.clone(),
+            stage_authority: GithubGitSnapshotStageAuthorityV1::ExactRetryLineage {
+                locator: staged.stage_locator,
+                stage: staged.stage,
+            },
+        })
+    }
+
+    /// Require no-mutation stage adoption after a fresh restart preview and explicit reconsent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed failure when the newly accepted plan hash is not canonical SHA-256 text.
+    pub fn after_fresh_reconsent(
+        durable_identity: GithubDurableIdentityV1,
+        request: IosDeviceBuildRequest,
+        approved_consent_sha256: String,
+    ) -> RemoteBuildResult<Self> {
+        if !is_lower_sha256(&approved_consent_sha256) {
+            return Err(provider_failure(
+                "snapshot_consent_invalid",
+                "Git snapshot consent identity is invalid",
+                false,
+            ));
+        }
+        Ok(Self {
+            durable_identity,
+            request,
+            approved_consent_sha256,
+            stage_authority: GithubGitSnapshotStageAuthorityV1::FreshReconsentAdoption,
+        })
+    }
+}
+
+/// Trigger event retained with an exact durable run identity.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GithubRunEventV1 {
+    /// Push to the provider's exact temporary ref.
+    Push,
+    /// Explicit workflow dispatch.
+    WorkflowDispatch,
+}
+
+impl From<RunEvent> for GithubRunEventV1 {
+    fn from(value: RunEvent) -> Self {
+        match value {
+            RunEvent::Push => Self::Push,
+            RunEvent::WorkflowDispatch => Self::WorkflowDispatch,
+        }
+    }
+}
+
+impl From<GithubRunEventV1> for RunEvent {
+    fn from(value: GithubRunEventV1) -> Self {
+        match value {
+            GithubRunEventV1::Push => Self::Push,
+            GithubRunEventV1::WorkflowDispatch => Self::WorkflowDispatch,
+        }
+    }
+}
+
+/// GitHub run status retained in a durable provider checkpoint.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GithubRunStatusV1 {
+    /// Requested but not queued.
+    Requested,
+    /// Queued by GitHub Actions.
+    Queued,
+    /// Pending execution.
+    Pending,
+    /// Waiting on an external gate.
+    Waiting,
+    /// Running on a worker.
+    InProgress,
+    /// Terminal run.
+    Completed,
+}
+
+impl From<RunStatus> for GithubRunStatusV1 {
+    fn from(value: RunStatus) -> Self {
+        match value {
+            RunStatus::Requested => Self::Requested,
+            RunStatus::Queued => Self::Queued,
+            RunStatus::Pending => Self::Pending,
+            RunStatus::Waiting => Self::Waiting,
+            RunStatus::InProgress => Self::InProgress,
+            RunStatus::Completed => Self::Completed,
+        }
+    }
+}
+
+impl From<GithubRunStatusV1> for RunStatus {
+    fn from(value: GithubRunStatusV1) -> Self {
+        match value {
+            GithubRunStatusV1::Requested => Self::Requested,
+            GithubRunStatusV1::Queued => Self::Queued,
+            GithubRunStatusV1::Pending => Self::Pending,
+            GithubRunStatusV1::Waiting => Self::Waiting,
+            GithubRunStatusV1::InProgress => Self::InProgress,
+            GithubRunStatusV1::Completed => Self::Completed,
+        }
+    }
+}
+
+/// Terminal GitHub conclusion retained in a durable provider checkpoint.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GithubRunConclusionV1 {
+    /// Successful run.
+    Success,
+    /// Failed run.
+    Failure,
+    /// Cancelled run.
+    Cancelled,
+    /// Timed-out run.
+    TimedOut,
+    /// Neutral run.
+    Neutral,
+    /// Skipped run.
+    Skipped,
+    /// Stale run.
+    Stale,
+    /// Run requiring external action.
+    ActionRequired,
+    /// Run rejected during startup.
+    StartupFailure,
+}
+
+impl From<RunConclusion> for GithubRunConclusionV1 {
+    fn from(value: RunConclusion) -> Self {
+        match value {
+            RunConclusion::Success => Self::Success,
+            RunConclusion::Failure => Self::Failure,
+            RunConclusion::Cancelled => Self::Cancelled,
+            RunConclusion::TimedOut => Self::TimedOut,
+            RunConclusion::Neutral => Self::Neutral,
+            RunConclusion::Skipped => Self::Skipped,
+            RunConclusion::Stale => Self::Stale,
+            RunConclusion::ActionRequired => Self::ActionRequired,
+            RunConclusion::StartupFailure => Self::StartupFailure,
+        }
+    }
+}
+
+impl From<GithubRunConclusionV1> for RunConclusion {
+    fn from(value: GithubRunConclusionV1) -> Self {
+        match value {
+            GithubRunConclusionV1::Success => Self::Success,
+            GithubRunConclusionV1::Failure => Self::Failure,
+            GithubRunConclusionV1::Cancelled => Self::Cancelled,
+            GithubRunConclusionV1::TimedOut => Self::TimedOut,
+            GithubRunConclusionV1::Neutral => Self::Neutral,
+            GithubRunConclusionV1::Skipped => Self::Skipped,
+            GithubRunConclusionV1::Stale => Self::Stale,
+            GithubRunConclusionV1::ActionRequired => Self::ActionRequired,
+            GithubRunConclusionV1::StartupFailure => Self::StartupFailure,
+        }
+    }
+}
+
+/// Exact GitHub Actions run and attempt identity safe to persist without credentials.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GithubRunIdentityV1 {
+    /// Stable numeric run identifier.
+    pub run_id: u64,
+    /// Stable numeric workflow identifier.
+    pub workflow_id: u64,
+    /// Exact repository-relative workflow path.
+    pub workflow_path: String,
+    /// Exact dispatched commit.
+    pub head_sha: String,
+    /// Exact temporary branch without `refs/heads/`.
+    pub branch: String,
+    /// Exact trigger event.
+    pub event: GithubRunEventV1,
+    /// Repository-local run number.
+    pub run_number: u64,
+    /// Exact run attempt observed by the provider.
+    pub run_attempt: u64,
+    /// Last identity-checked status.
+    pub status: GithubRunStatusV1,
+    /// Terminal conclusion, only when status is completed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conclusion: Option<GithubRunConclusionV1>,
+}
+
+/// Secret-free proof that one exact signed GitHub run attempt completed protected cleanup.
+///
+/// The production verifier creates this envelope only after independently validating the compile
+/// handoff, worker manifest, signing report, validation report, and every protected-cleanup flag.
+/// It is scoped to the immutable provider-bound attempt; a later GitHub rerun is a distinct
+/// attempt and neither replaces nor invalidates this evidence.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GithubSignedCleanupEvidenceV1 {
+    /// Evidence schema version; currently `1`.
+    pub schema_version: u32,
+    /// Stable provider identifier.
+    pub provider: String,
+    /// Caller operation identifier.
+    pub operation_id: String,
+    /// Provider job identifier.
+    pub job_id: String,
+    /// Canonical GitHub execution repository URL.
+    pub execution_repository: String,
+    /// Stable database ID of the exact execution repository.
+    pub execution_repository_id: u64,
+    /// Canonical SHA-256 of the complete submitted request.
+    pub request_sha256: String,
+    /// Exact configured source repository URL.
+    pub source_repository: String,
+    /// Exact requested source revision.
+    pub source_revision: String,
+    /// Exact verified source-manifest SHA-256.
+    pub source_sha256: String,
+    /// Exact dispatched commit.
+    pub dispatch_revision: String,
+    /// Full immutable GitHub run identity and attempt that emitted the evidence.
+    pub run: GithubRunIdentityV1,
+    /// SHA-256 of canonical serialized compile-phase evidence.
+    pub compile_evidence_sha256: String,
+    /// SHA-256 of the exact immutable worker manifest bytes.
+    pub manifest_sha256: String,
+    /// SHA-256 of the exact protected signing-report bytes.
+    pub signing_report_sha256: String,
+    /// SHA-256 of the exact independently generated validation-report bytes.
+    pub validation_report_sha256: String,
+    /// Stable numeric ID of the exact final GitHub Actions artifact.
+    pub github_artifact_id: u64,
+    /// GitHub API SHA-256 of the exact final outer artifact ZIP.
+    pub github_artifact_api_sha256: String,
+}
+
+/// Durable mutation phase for one exact Git snapshot.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GithubGitSnapshotPhaseV1 {
+    /// Locator, consent, stage, and graph are durable; no object or ref mutation followed yet.
+    Prepared,
+    /// Local keepalive creation intent is durable; object import may have completed.
+    KeepaliveIntent,
+    /// The exact local keepalive was confirmed present.
+    KeepaliveExact,
+    /// Exact stage deletion intent is durable.
+    StageDeleteIntent,
+    /// The bounded stage was deleted after keepalive confirmation.
+    StageDeleted,
+    /// Create-only public source-ref mutation intent is durable.
+    SourcePublishIntent,
+    /// The exact custom source ref was confirmed at the staged commit.
+    SourceExact,
+    /// Bounded quiescent reconciliation proved the attempted source ref absent.
+    SourceAbsent,
+    /// Exact custom-source ownership was contradicted; the job is failed closed.
+    SourceConflict,
+    /// Terminal exact source-ref deletion intent is durable.
+    SourceCleanupIntent,
+    /// The exact custom source ref is confirmed absent after terminal cleanup.
+    SourceDeleted,
+    /// Complete-lineage prune durably authorized exact local keepalive release.
+    KeepaliveReleaseIntent,
+    /// The exact local keepalive is confirmed absent; no Git GC was requested.
+    KeepaliveReleased,
+}
+
+/// Versioned, path-free, secret-free resume state for one Git snapshot.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GithubGitSnapshotResumeV1 {
+    /// Snapshot resume schema version; currently `1`.
+    pub schema_version: u32,
+    /// Exact path-free private-stage locator checkpointed before import.
+    pub stage_locator: GitSnapshotStageLocatorV1,
+    /// Immutable canonical stage summary, including consent, archive, refs, and six-object graph.
+    pub stage: GitSnapshotStageV1,
+    /// Current exact mutation phase.
+    pub phase: GithubGitSnapshotPhaseV1,
+    /// Number of source-ref pushes armed after durable intent.
+    pub source_publication_attempts: u8,
+    /// Most recent source push-boundary timestamp; zero before the first armed attempt.
+    pub source_publication_started_at_ms: u64,
+    /// Earliest safe absent-ref retry time; `u64::MAX` while an intent is not armed.
+    pub source_publication_quiescence_deadline_ms: u64,
+    /// Source publication held a process lease and its Git child tree was parent-fenced.
+    pub source_publication_process_fenced: bool,
+    /// Digest of the exact local source-publication lease scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_publication_lease_scope_sha256: Option<String>,
+    /// Capped independent exact source-ref absence observations.
+    pub source_publication_absence_observations: u8,
+    /// Timestamp of the first exact source-ref absence observation; zero before observation.
+    pub source_publication_absence_first_observed_at_ms: u64,
+    /// Timestamp of the latest independent exact source-ref absence observation.
+    pub source_publication_absence_last_observed_at_ms: u64,
+    /// Stable complete-lineage authorization authorizing local keepalive release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keepalive_release_authorization_sha256: Option<String>,
+}
+
+/// Versioned, secret-free durable state for one GitHub provider job.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GithubWorkflowDispatchReceiptV1 {
+    /// Positive workflow-run identifier returned or uniquely reconciled.
+    pub run_id: u64,
+    /// Stable active workflow identifier used by the exact dispatch request.
+    pub workflow_id: u64,
+    /// Exact repository-relative workflow path.
+    pub workflow_path: String,
+    /// Exact temporary branch without `refs/heads/`.
+    pub branch: String,
+    /// Exact temporary-ref commit dispatched as `GITHUB_SHA`.
+    pub dispatch_revision: String,
+    /// Canonical public run title binding all four dispatch inputs.
+    pub run_name: String,
+}
+
+/// Durable no-resend boundary for one exact no-secret workflow dispatch.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GithubWorkflowDispatchResumeV1 {
+    /// Dispatch-resume schema version; currently `1`.
+    pub schema_version: u32,
+    /// Stable active workflow identifier selected before the intent checkpoint.
+    pub workflow_id: u64,
+    /// Exact repository-relative workflow path.
+    pub workflow_path: String,
+    /// Exact temporary branch without `refs/heads/`.
+    pub branch: String,
+    /// Caller operation identifier copied into the dispatch input set.
+    pub operation_id: String,
+    /// Canonical build-request SHA-256 copied into the dispatch input set.
+    pub request_sha256: String,
+    /// Exact trusted source commit copied into the dispatch input set.
+    pub source_revision: String,
+    /// Exact temporary-ref commit copied into the dispatch input set.
+    pub dispatch_revision: String,
+    /// SHA-256 of the complete canonical no-secret dispatch request body.
+    pub body_sha256: String,
+    /// Canonical public run title binding all four dispatch inputs.
+    pub run_name: String,
+    /// The POST may have completed without a durably mapped receipt.
+    pub uncertain: bool,
+    /// Exact run-ID receipt, persisted before ordinary polling begins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<GithubWorkflowDispatchReceiptV1>,
+}
+
+/// Versioned, secret-free durable state for one GitHub provider job.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GithubJobResumeV1 {
+    /// Resume-record schema version; currently `1`.
+    pub schema_version: u32,
+    /// Stable provider identifier.
+    pub provider: String,
+    /// Digest of security-relevant provider configuration.
+    pub provider_config_sha256: String,
+    /// Authenticated principal kind and identity.
+    pub principal: GithubPrincipalIdentityV1,
+    /// Exact execution repository URL.
+    pub execution_repository: String,
+    /// Stable GitHub database ID of the exact execution repository.
+    pub execution_repository_id: u64,
+    /// Exact source repository URL.
+    pub source_repository: String,
+    /// Exact trusted source ref.
+    pub trusted_source_ref: String,
+    /// Exact approved workflow path.
+    pub workflow_path: String,
+    /// Exact approved workflow digest.
+    pub workflow_sha256: String,
+    /// Exact full provider-owned temporary ref.
+    pub temporary_ref: String,
+    /// Caller operation identifier.
+    pub operation_id: String,
+    /// Provider job identifier.
+    pub job_id: String,
+    /// Complete declarative request; contains references, never secret values.
+    pub request: IosDeviceBuildRequest,
+    /// Canonical wire-request SHA-256.
+    pub request_sha256: String,
+    /// Exact requested source commit.
+    pub source_revision: String,
+    /// Exact Git snapshot stage/ref checkpoint, absent for formal legacy Git jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_snapshot: Option<GithubGitSnapshotResumeV1>,
+    /// Deterministic dispatch commit prepared after read-only trust preflight and before mutation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prepared_dispatch_commit: Option<String>,
+    /// Exact published dispatch commit when publication was observed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatch_commit: Option<String>,
+    /// Explicit workflow-dispatch intent and optional exact run receipt.
+    ///
+    /// Absence is canonical for every legacy or Push-triggered record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_dispatch: Option<Box<GithubWorkflowDispatchResumeV1>>,
+    /// Last exact run identity and attempt observed through GET revalidation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run: Option<GithubRunIdentityV1>,
+    /// Provider creation timestamp.
+    pub created_at_ms: u64,
+    /// Durable push-boundary timestamp; zero means publication was prepared but never armed.
+    pub publication_started_at_ms: u64,
+    /// Earliest safe absence-retirement time; `u64::MAX` while the boundary is unarmed.
+    pub publication_quiescence_deadline_ms: u64,
+    /// Current protocol-v1 job state.
+    pub state: JobState,
+    /// A durable checkpoint was written before temporary-ref publication began.
+    pub publication_intent: bool,
+    /// Publication may have completed without a conclusive response.
+    pub publication_uncertain: bool,
+    /// Strong external evidence proved publication absent; ref absence alone is insufficient.
+    pub publication_absent: bool,
+    /// This provider invocation ended before any remote mutation was attempted.
+    ///
+    /// This does not assert that the deterministic ref name is globally absent or provider-owned.
+    pub publication_not_attempted: bool,
+    /// Publication held an exclusive process lease and its child tree was parent-lifetime fenced.
+    pub publication_process_fenced: bool,
+    /// Digest of the canonical local lease directory; absent when leasing is unsupported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publication_lease_scope_sha256: Option<String>,
+    /// Capped independent observations that both the exact ref and exact run history were absent.
+    pub publication_absence_observations: u8,
+    /// Timestamp of the first exact ref-and-run absence observation; zero before any observation.
+    pub publication_absence_first_observed_at_ms: u64,
+    /// Cancellation intent was accepted locally.
+    pub cancellation_requested: bool,
+    /// Run-ID-wide cancellation was accepted by GitHub after exact identity/attempt revalidation.
+    pub cancellation_dispatched: bool,
+    /// Cleanup intent was accepted locally.
+    pub cleanup_requested: bool,
+    /// Remote artifact removal was requested.
+    pub remove_artifacts_requested: bool,
+    /// Exact-run artifact removal completed.
+    pub artifacts_removed: bool,
+    /// Exact lease-protected temporary-ref deletion completed.
+    pub temporary_ref_deleted: bool,
+    /// The verification-pending event has already been emitted.
+    pub verification_pending_event: bool,
+    /// Number of bounded exact-run discovery attempts already made.
+    pub run_discovery_attempts: u16,
+    /// Absolute discovery deadline in Unix milliseconds.
+    pub run_discovery_deadline_ms: u64,
+    /// Independently verified artifact manifests retained by the provider.
+    pub manifests: Vec<ArtifactManifest>,
+    /// Exact credential-free compile evidence retained after independent artifact verification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compile_evidence: Option<CompilePhaseEvidence>,
+    /// Attempt-scoped proof of protected signing-material cleanup, for signed builds only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signed_cleanup_evidence: Option<GithubSignedCleanupEvidenceV1>,
+    /// Bounded validated protocol events retained by the provider.
+    pub events: Vec<RemoteBuildEvent>,
+}
+
+/// Injectable durable checkpoint boundary.
+///
+/// Each callback is a complete atomic replacement for the same job ID. Implementations must reject
+/// stale replacements with [`GithubJobResumeV1::validate_successor`] and complete the durable write
+/// before returning success. The callback is invoked while provider state is locked and therefore
+/// must not call back into the provider. Any error is treated as an ambiguous write acknowledgement:
+/// the provider retains the matching live intent and performs no following remote mutation. Durable
+/// job IDs are not implicitly retired or recycled.
+pub trait GithubJobCheckpointSink: Send {
+    /// Persist one complete secret-free job record.
+    ///
+    /// # Errors
+    ///
+    /// Must return a typed failure when durable persistence cannot be proven.
+    fn checkpoint(&mut self, resume: &GithubJobResumeV1) -> RemoteBuildResult<()>;
 }
 
 /// Strict immutable request committed to the temporary dispatch ref.
@@ -377,17 +1244,7 @@ impl GithubDispatchManifest {
                 false,
             ));
         }
-        self.request.validate()?;
-        if self.request.source_mode != SourceMode::Git
-            || self.request.source_repository.as_deref() != Some(config.source_repository())
-        {
-            return Err(provider_failure(
-                "unsupported_source_request",
-                "GitHub provider requires its exact configured Git source repository",
-                false,
-            ));
-        }
-        Ok(())
+        validate_provider_request(config, &self.request)
     }
 
     fn encode(&self) -> RemoteBuildResult<Vec<u8>> {
@@ -407,6 +1264,96 @@ impl GithubDispatchManifest {
     }
 }
 
+/// Exact immutable inputs for reopening and importing one consented Git snapshot stage.
+pub struct GitSnapshotImportRequest<'a> {
+    /// Durable path-free stage locator checkpointed before any object import.
+    pub locator: &'a GitSnapshotStageLocatorV1,
+    /// Exact immutable stage summary independently bound into the durable resume record.
+    pub expected_stage: &'a GitSnapshotStageV1,
+    /// Complete durable request whose revision must equal the staged parentless commit.
+    pub request: &'a IosDeviceBuildRequest,
+}
+
+/// Exact private-DB inputs for no-write planning of one operation-bound child retry.
+pub struct GitSnapshotExactRetryPrecomputeRequest<'a> {
+    /// Terminal parent request retained in the durable job.
+    pub parent_request: &'a IosDeviceBuildRequest,
+    /// Exact parent stage containing archive blob, manifest, and keepalive identity.
+    pub parent_stage: &'a GitSnapshotStageV1,
+    /// New operation identifier proposed for the immutable child lineage.
+    pub child_operation_id: &'a str,
+    /// Deterministic child snapshot commit timestamp.
+    pub child_source_created_at_ms: u64,
+}
+
+/// Exact private-DB inputs for materializing one operation-bound child retry stage.
+pub struct GitSnapshotExactRetryStageRequest<'a> {
+    /// Terminal parent request retained in the durable job.
+    pub parent_request: &'a IosDeviceBuildRequest,
+    /// Exact parent stage containing archive blob, manifest, and keepalive identity.
+    pub parent_stage: &'a GitSnapshotStageV1,
+    /// Exact no-write plan already persisted into the immutable child lineage.
+    pub expected_plan: &'a GithubGitSnapshotExactRetryPlanV1,
+    /// Stable digest proving controller-held durable retry-lineage authority.
+    pub retry_lineage_authorization_sha256: &'a str,
+}
+
+/// Exact inputs for one local create-only keepalive ref mutation.
+pub struct GitSnapshotKeepaliveRequest<'a> {
+    /// Caller operation identifier.
+    pub operation_id: &'a str,
+    /// Exact local keepalive ref derived from the operation.
+    pub keepalive_ref: &'a GitSnapshotKeepaliveRef,
+    /// Exact staged parentless commit.
+    pub commit: &'a GitSha1ObjectId,
+}
+
+/// Exact inputs for one create-only source-ref publication.
+pub struct GitSnapshotSourcePublishRequest<'a> {
+    /// Configured public source repository.
+    pub source_repository: &'a str,
+    /// Exact custom full ref derived from the operation.
+    pub source_ref: &'a GitSnapshotSourceRef,
+    /// Exact local parentless snapshot commit.
+    pub commit: &'a GitSha1ObjectId,
+    /// Explicit consent-derived authority for this public mutation.
+    pub authorized: bool,
+}
+
+/// Exact inputs for lease-protected deletion of one provider-owned source ref.
+pub struct GitSnapshotSourceDeleteRequest<'a> {
+    /// Configured public source repository.
+    pub source_repository: &'a str,
+    /// Exact provider-owned custom full ref.
+    pub source_ref: &'a GitSnapshotSourceRef,
+    /// Only remote tip permitted to be deleted.
+    pub expected_commit: &'a GitSha1ObjectId,
+    /// Durable terminal cleanup authority.
+    pub authorized: bool,
+}
+
+/// Read-only result for one exact local or remote Git snapshot ref.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GitSnapshotRefReconciliation {
+    /// The exact ref is absent.
+    Absent,
+    /// The exact ref resolves to the expected snapshot commit.
+    Exact,
+    /// The ref exists at another commit and must not be adopted or deleted.
+    Conflict,
+}
+
+/// Result of a create-only source publication whose process response may be ambiguous.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GitSnapshotSourcePublication {
+    /// Read-back proves the custom source ref points at the exact commit.
+    Exact,
+    /// The push may have mutated GitHub but exact read-back was unavailable or absent.
+    Uncertain,
+    /// A different commit occupies the exact custom ref.
+    Conflict,
+}
+
 /// Read-only inputs supplied to one temporary-ref publication.
 pub struct TemporaryRefPublishRequest<'a> {
     /// Exact GitHub repository.
@@ -417,6 +1364,8 @@ pub struct TemporaryRefPublishRequest<'a> {
     pub trusted_source_ref: &'a TrustedSourceRef,
     /// Exact source commit selected by the caller.
     pub source_revision: &'a CommitSha,
+    /// Exact custom source ref for a Git snapshot; absent for ordinary Git requests.
+    pub snapshot_source_ref: Option<&'a GitSnapshotSourceRef>,
     /// Create-only target below the configured temporary namespace.
     pub temporary_ref: &'a TemporaryGitRef,
     /// Repository-relative approved workflow path.
@@ -450,9 +1399,23 @@ pub struct TemporaryRefDoctorRequest<'a> {
     pub source_repository: &'a str,
     /// Trusted source branch or tag.
     pub trusted_source_ref: &'a TrustedSourceRef,
+    /// Exact configured namespace used by real provider publications.
+    pub temporary_branch_namespace: &'a TemporaryBranchNamespace,
     /// Repository-relative approved workflow path.
     pub workflow_path: &'a str,
     /// Approved workflow SHA-256.
+    pub workflow_fingerprint: &'a WorkflowFingerprint,
+}
+
+/// Exact immutable inputs for execution-default workflow verification.
+pub struct ExecutionWorkflowDoctorRequest<'a> {
+    /// Exact execution repository.
+    pub repository: &'a Repository,
+    /// Exact default branch ref reported by GitHub metadata.
+    pub default_branch_ref: &'a TrustedSourceRef,
+    /// Repository-relative approved workflow path.
+    pub workflow_path: &'a str,
+    /// Approved WorkflowDispatch workflow SHA-256.
     pub workflow_fingerprint: &'a WorkflowFingerprint,
 }
 
@@ -468,6 +1431,97 @@ pub struct TemporaryRefDeleteRequest<'a> {
     pub expected_commit: &'a CommitSha,
     /// Explicit caller authorization for this deletion.
     pub authorized: bool,
+}
+
+/// Exact immutable inputs for read-only crash reconciliation of one temporary ref.
+pub struct TemporaryRefReconcileRequest<'a> {
+    /// Exact GitHub execution repository.
+    pub repository: &'a Repository,
+    /// Normalized source repository used for trusted-ref ancestry verification.
+    pub source_repository: &'a str,
+    /// Trusted source branch or tag whose workflow and ancestry must be revalidated.
+    pub trusted_source_ref: &'a TrustedSourceRef,
+    /// Exact requested source revision that must remain reachable from the trusted ref.
+    pub source_revision: &'a CommitSha,
+    /// Exact custom Git snapshot source ref; absent for ordinary trusted Git source.
+    pub snapshot_source_ref: Option<&'a GitSnapshotSourceRef>,
+    /// Provider-created temporary ref to inspect.
+    pub temporary_ref: &'a TemporaryGitRef,
+    /// Repository-relative approved workflow path.
+    pub workflow_path: &'a str,
+    /// Exact approved workflow bytes.
+    pub workflow_bytes: &'a [u8],
+    /// Approved digest of the trusted workflow bytes.
+    pub workflow_fingerprint: &'a WorkflowFingerprint,
+    /// Exact strict request-manifest bytes.
+    pub manifest_bytes: &'a [u8],
+    /// Stable operation identifier used to reconstruct the deterministic commit.
+    pub operation_id: &'a str,
+    /// Original provider creation timestamp used in deterministic Git author metadata.
+    pub created_at_ms: u64,
+    /// Exact dispatch commit prepared and checkpointed before the remote mutation boundary.
+    pub expected_prepared_commit: &'a CommitSha,
+}
+
+/// Deterministic local ownership key held across one publication or crash takeover.
+pub struct TemporaryRefPublicationLeaseRequest<'a> {
+    /// Exact GitHub execution repository bound into the lease key.
+    pub repository: &'a Repository,
+    /// Safe operation identifier used for the lease filename.
+    pub operation_id: &'a str,
+    /// Exact provider-owned temporary ref protected by the lease.
+    pub temporary_ref: &'a TemporaryGitRef,
+}
+
+/// Exact cross-process ownership key for one custom Git snapshot source ref.
+pub struct GitSnapshotSourcePublicationLeaseRequest<'a> {
+    /// Canonical configured public source repository.
+    pub source_repository: &'a str,
+    /// Exact provider-owned custom source ref.
+    pub source_ref: &'a GitSnapshotSourceRef,
+}
+
+/// Result of a nonblocking cross-process publication-ownership attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TemporaryRefPublicationLease {
+    /// This publisher acquired the process-lifetime lease and retains it until explicit release
+    /// or publisher drop.
+    Acquired,
+    /// This publisher instance already retains the lease.
+    AlreadyOwned,
+    /// Another live process owns the lease.
+    HeldByOther,
+    /// This alternate publisher cannot provide a process-lifetime lease.
+    Unsupported,
+}
+
+/// Read-only reconciliation result for one deterministic provider ref.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TemporaryRefReconciliation {
+    /// The exact ref is absent; callers must not silently resubmit the old operation.
+    Missing,
+    /// The advertised tip equals the locally recomputed, durably prepared dispatch commit.
+    Exact(PublishedTemporaryRef),
+    /// The ref exists but its commit shape or bytes differ; ownership is not adopted.
+    Conflict,
+}
+
+/// Provider-level result of reconciling a durable pre-publication intent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GithubJobReconciliation {
+    /// No publication had been intended.
+    NotStarted,
+    /// A dispatch commit was already durably mapped.
+    AlreadyMapped,
+    /// The exact temporary ref is absent; no duplicate submission was attempted.
+    Missing,
+    /// Exact remote bytes were adopted and run discovery may continue.
+    Recovered,
+    /// A conflicting ref was found and the job failed closed.
+    Conflict,
+    /// A conflicting ref and exact-SHA run history remained unresolved through the fenced,
+    /// bounded quiescence window; the durable terminal checkpoint was written.
+    ConflictResolved,
 }
 
 /// Result of one create-only temporary-ref publication.
@@ -524,6 +1578,16 @@ pub enum TemporaryRefPublishError {
     TemporaryRefLeaseRejected,
     /// Lease-protected deletion completed without exact absence confirmation.
     DeletionVerificationFailed,
+    /// The selected publisher does not implement the Git snapshot contract.
+    GitSnapshotUnsupported,
+    /// The selected publisher cannot verify execution-default workflow bytes.
+    ExecutionWorkflowVerificationUnsupported,
+    /// A retained stage, canonical graph, or local snapshot ref failed exact validation.
+    GitSnapshotInvalid,
+    /// Snapshot-store membership changed during one bounded recovery discovery.
+    GitSnapshotDiscoveryChanged,
+    /// The exact local or remote snapshot ref is occupied by another commit.
+    GitSnapshotRefConflict,
 }
 
 impl fmt::Display for TemporaryRefPublishError {
@@ -551,6 +1615,21 @@ impl fmt::Display for TemporaryRefPublishError {
             Self::DeletionVerificationFailed => {
                 formatter.write_str("deleted ref failed exact absence verification")
             }
+            Self::GitSnapshotUnsupported => {
+                formatter.write_str("Git snapshot publication is unsupported")
+            }
+            Self::ExecutionWorkflowVerificationUnsupported => {
+                formatter.write_str("execution workflow verification is unsupported")
+            }
+            Self::GitSnapshotInvalid => {
+                formatter.write_str("Git snapshot stage or object graph is invalid")
+            }
+            Self::GitSnapshotDiscoveryChanged => {
+                formatter.write_str("Git snapshot recovery discovery changed during inspection")
+            }
+            Self::GitSnapshotRefConflict => {
+                formatter.write_str("Git snapshot ref conflicts with another commit")
+            }
         }
     }
 }
@@ -560,6 +1639,16 @@ impl Error for TemporaryRefPublishError {}
 impl From<GitExecutionError> for TemporaryRefPublishError {
     fn from(value: GitExecutionError) -> Self {
         Self::Git(value)
+    }
+}
+
+impl From<GitSnapshotError> for TemporaryRefPublishError {
+    fn from(value: GitSnapshotError) -> Self {
+        if value == GitSnapshotError::DiscoveryChanged {
+            Self::GitSnapshotDiscoveryChanged
+        } else {
+            Self::GitSnapshotInvalid
+        }
     }
 }
 
@@ -599,7 +1688,15 @@ impl From<TemporaryRefPublishError> for TemporaryRefPublishFailure {
 }
 
 /// Injectable publication boundary used by the provider.
+///
+/// Implementations must not call back into the provider. Some operations are invoked while the
+/// provider holds internal job state needed to serialize remote mutations and their checkpoints.
 pub trait TemporaryRefPublisher: Send {
+    /// Whether this publisher implements the complete retained-byte Git snapshot contract.
+    fn supports_git_snapshot(&self) -> bool {
+        false
+    }
+
     /// Verify local Git and exact remote/trusted-ref readiness without mutation.
     ///
     /// # Errors
@@ -611,6 +1708,264 @@ pub trait TemporaryRefPublisher: Send {
         request: &TemporaryRefDoctorRequest<'_>,
     ) -> Result<TemporaryRefPublisherReadiness, TemporaryRefPublishError>;
 
+    /// Verify exact workflow bytes from the execution repository default branch without mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted readiness error when the execution remote, stable default ref, or exact
+    /// approved bytes cannot be proven.
+    fn verify_execution_workflow(
+        &mut self,
+        _request: &ExecutionWorkflowDoctorRequest<'_>,
+    ) -> Result<TemporaryRefPublisherReadiness, TemporaryRefPublishError> {
+        Err(TemporaryRefPublishError::ExecutionWorkflowVerificationUnsupported)
+    }
+
+    /// Hash the two retained staged payloads and canonical four-object suffix without writing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted fixed-Git, stage-binding, object-format, or graph failure.
+    fn precompute_git_snapshot(
+        &mut self,
+        _inputs: &mut GitSnapshotPrecomputeInputs,
+        _operation_id: &str,
+        _created_at_ms: u64,
+    ) -> Result<GitSnapshotObjectGraphV1, TemporaryRefPublishError> {
+        Err(TemporaryRefPublishError::GitSnapshotUnsupported)
+    }
+
+    /// Reopen a complete uncheckpointed stage without mutation for a caller that will perform
+    /// fresh explicit-consent validation before creating the first durable snapshot checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted stage or final-request binding failure.
+    fn adopt_git_snapshot_stage(
+        &mut self,
+        _request: &IosDeviceBuildRequest,
+    ) -> Result<(GitSnapshotStageLocatorV1, GitSnapshotStageV1), TemporaryRefPublishError> {
+        Err(TemporaryRefPublishError::GitSnapshotUnsupported)
+    }
+
+    /// Enumerate complete private stages using reads only.
+    ///
+    /// Implementations must fail the whole bounded enumeration on any partial, malformed, unknown,
+    /// or identity-rebound entry. Discovery never adopts or deletes a stage.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted unsupported, recovery-changed, identity, or stage validation failure.
+    fn discover_git_snapshot_stages(
+        &mut self,
+    ) -> Result<Vec<GithubGitSnapshotRecoveryCandidateV1>, TemporaryRefPublishError> {
+        Err(TemporaryRefPublishError::GitSnapshotUnsupported)
+    }
+
+    /// Reopen the exact durable stage and import all six objects while retaining its guards.
+    ///
+    /// The retained import remains live inside the publisher until keepalive creation or explicit
+    /// release. Implementations must compare every actual `hash-object -w` result and revalidate
+    /// all staged bytes after each write.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted stage, object-format, import, or graph failure.
+    fn import_git_snapshot(
+        &mut self,
+        _request: &GitSnapshotImportRequest<'_>,
+    ) -> Result<GitSnapshotObjectGraphV1, TemporaryRefPublishError> {
+        Err(TemporaryRefPublishError::GitSnapshotUnsupported)
+    }
+
+    /// Re-read a terminal parent's exact archive blob and derive the immutable child request.
+    ///
+    /// This operation may perform bounded reads and offline no-write hashing only. It must not
+    /// create a stage, write a Git object, mutate a ref, or access the network.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted parent blob, SHA-1, descriptor, or graph failure.
+    fn precompute_exact_git_snapshot_retry(
+        &mut self,
+        _request: &GitSnapshotExactRetryPrecomputeRequest<'_>,
+    ) -> Result<GithubGitSnapshotExactRetryPlanV1, TemporaryRefPublishError> {
+        Err(TemporaryRefPublishError::GitSnapshotUnsupported)
+    }
+
+    /// Re-read a terminal parent's exact archive blob and create one operation-bound child stage.
+    ///
+    /// The caller must have durably created the parent/child lineage before this method. The
+    /// implementation must first reproduce the already-durable no-write plan exactly. It may then
+    /// write only the bounded private child stage; it must not recapture a workspace or mutate
+    /// local/remote refs.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted parent blob, stage, SHA-1, descriptor, or graph failure.
+    fn stage_exact_git_snapshot_retry(
+        &mut self,
+        _request: &GitSnapshotExactRetryStageRequest<'_>,
+    ) -> Result<GithubGitSnapshotExactRetryStageV1, TemporaryRefPublishError> {
+        Err(TemporaryRefPublishError::GitSnapshotUnsupported)
+    }
+
+    /// Delete the exact bounded stage after its keepalive is durably confirmed.
+    ///
+    /// Replay succeeds only when the whole stage is already absent or every remaining entry still
+    /// has its durable identity. Partial or rebound stages fail closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted identity, exact-removal, or directory-durability failure.
+    fn delete_git_snapshot_stage(
+        &mut self,
+        _request: &GitSnapshotImportRequest<'_>,
+    ) -> Result<(), TemporaryRefPublishError> {
+        Err(TemporaryRefPublishError::GitSnapshotUnsupported)
+    }
+
+    /// Reconcile one exact local keepalive ref without mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted local Git or ref-parse failure.
+    fn reconcile_git_snapshot_keepalive(
+        &mut self,
+        _request: &GitSnapshotKeepaliveRequest<'_>,
+    ) -> Result<GitSnapshotRefReconciliation, TemporaryRefPublishError> {
+        Err(TemporaryRefPublishError::GitSnapshotUnsupported)
+    }
+
+    /// Create the exact local keepalive after its durable intent checkpoint.
+    ///
+    /// Implementations must keep retained staged-file guards live and revalidate them immediately
+    /// before and after the create-only ref mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted stage, local Git, or conflicting-ref failure.
+    fn create_git_snapshot_keepalive(
+        &mut self,
+        _request: &GitSnapshotKeepaliveRequest<'_>,
+    ) -> Result<(), TemporaryRefPublishError> {
+        Err(TemporaryRefPublishError::GitSnapshotUnsupported)
+    }
+
+    /// Publish one exact create-only custom source ref after durable intent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted authorization, endpoint, Git, or verification failure.
+    fn publish_git_snapshot_source(
+        &mut self,
+        _request: &GitSnapshotSourcePublishRequest<'_>,
+    ) -> Result<GitSnapshotSourcePublication, TemporaryRefPublishError> {
+        Err(TemporaryRefPublishError::GitSnapshotUnsupported)
+    }
+
+    /// Reconcile one exact custom source ref using reads only.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted endpoint, Git, or ref-parse failure.
+    fn reconcile_git_snapshot_source(
+        &mut self,
+        _request: &GitSnapshotSourcePublishRequest<'_>,
+    ) -> Result<GitSnapshotRefReconciliation, TemporaryRefPublishError> {
+        Err(TemporaryRefPublishError::GitSnapshotUnsupported)
+    }
+
+    /// Delete only the exact provider-owned custom source ref.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted authorization, lease-conflict, Git, or absence-verification failure.
+    fn delete_git_snapshot_source(
+        &mut self,
+        _request: &GitSnapshotSourceDeleteRequest<'_>,
+    ) -> Result<(), TemporaryRefPublishError> {
+        Err(TemporaryRefPublishError::GitSnapshotUnsupported)
+    }
+
+    /// Release one exact local keepalive after its durable complete-lineage prune intent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted local Git, conflict, or absence-verification failure.
+    fn release_git_snapshot_keepalive(
+        &mut self,
+        _request: &GitSnapshotKeepaliveRequest<'_>,
+    ) -> Result<(), TemporaryRefPublishError> {
+        Err(TemporaryRefPublishError::GitSnapshotUnsupported)
+    }
+
+    /// Complete read-only trust checks and optionally prepare the exact deterministic dispatch
+    /// commit before the provider checkpoints mutation intent.
+    ///
+    /// The default preserves alternate publishers that cannot expose a prepared commit. Such
+    /// publishers remain fail-closed, but cannot use bounded missing-ref retirement after a crash.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted preflight or local preparation error. This method must not mutate the
+    /// remote repository.
+    fn prepare(
+        &mut self,
+        _request: &TemporaryRefPublishRequest<'_>,
+    ) -> Result<Option<PublishedTemporaryRef>, TemporaryRefPublishError> {
+        Ok(None)
+    }
+
+    /// Whether a publication started after successful `prepare` is unable to outlive this process.
+    ///
+    /// Strong bounded absence retirement is disabled unless this guarantee is durable.
+    fn publication_attempt_is_process_fenced(&self) -> bool {
+        false
+    }
+
+    /// Acquire the source-repository/custom-ref scoped mutation lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted local-isolation failure.
+    fn acquire_git_snapshot_source_lease(
+        &mut self,
+        _request: &GitSnapshotSourcePublicationLeaseRequest<'_>,
+    ) -> Result<TemporaryRefPublicationLease, TemporaryRefPublishError> {
+        Ok(TemporaryRefPublicationLease::Unsupported)
+    }
+
+    /// Release this publisher's exact source-repository/custom-ref lease, if owned.
+    fn release_git_snapshot_source_lease(
+        &mut self,
+        _request: &GitSnapshotSourcePublicationLeaseRequest<'_>,
+    ) {
+    }
+
+    /// Digest of the canonical local lease path and exact directory filesystem identity.
+    fn publication_lease_scope_sha256(&self) -> Option<&str> {
+        None
+    }
+
+    /// Try to own the deterministic publication across checkpoints and process crashes.
+    ///
+    /// An `Acquired` or `AlreadyOwned` result requires the publisher to retain the underlying
+    /// operating-system lease until `release_publication_lease` or publisher drop.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted local-isolation failure when the lease cannot be opened safely.
+    fn acquire_publication_lease(
+        &mut self,
+        _request: &TemporaryRefPublicationLeaseRequest<'_>,
+    ) -> Result<TemporaryRefPublicationLease, TemporaryRefPublishError> {
+        Ok(TemporaryRefPublicationLease::Unsupported)
+    }
+
+    /// Release one lease owned by this publisher instance after durable resolution.
+    fn release_publication_lease(&mut self, _request: &TemporaryRefPublicationLeaseRequest<'_>) {}
+
     /// Create and push one exact temporary dispatch ref.
     ///
     /// # Errors
@@ -621,7 +1976,26 @@ pub trait TemporaryRefPublisher: Send {
         request: &TemporaryRefPublishRequest<'_>,
     ) -> Result<PublishedTemporaryRef, TemporaryRefPublishFailure>;
 
+    /// Publish after a durable intent checkpoint, binding any prepared commit exactly.
+    /// Publishers returning prepared evidence must override this method and validate that evidence
+    /// before their first remote mutation; the default refuses prepared publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted publication failure and exact possible cleanup ownership after mutation.
+    fn publish_prepared(
+        &mut self,
+        request: &TemporaryRefPublishRequest<'_>,
+        prepared: Option<&PublishedTemporaryRef>,
+    ) -> Result<PublishedTemporaryRef, TemporaryRefPublishFailure> {
+        if prepared.is_some() {
+            return Err(TemporaryRefPublishError::PublicationVerificationFailed.into());
+        }
+        self.publish(request)
+    }
+
     /// Delete one provider-owned temporary ref with an exact expected-tip lease.
+    /// Replaying the same exact deletion after a crash must succeed when the ref is already absent.
     ///
     /// # Errors
     ///
@@ -632,12 +2006,68 @@ pub trait TemporaryRefPublisher: Send {
     ) -> Result<(), TemporaryRefPublishError>;
 }
 
+/// Optional read-only crash-reconciliation boundary for temporary-ref publishers.
+///
+/// Implementations must not call back into the provider. Reconciliation may run while the
+/// provider holds the matching job state stable.
+pub trait TemporaryRefReconciler: Send {
+    /// Inspect one deterministic ref and adopt it only after exact prepared-commit verification.
+    ///
+    /// Implementations must also revalidate the trusted workflow and prove that the requested
+    /// source revision remains an ancestor of the trusted ref, locally recompute the deterministic
+    /// commit, and compare it with `expected_prepared_commit` before returning exact evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted transport or local Git failure. A content mismatch is returned as
+    /// [`TemporaryRefReconciliation::Conflict`], never as trusted publication evidence.
+    fn reconcile_temporary_ref(
+        &mut self,
+        request: &TemporaryRefReconcileRequest<'_>,
+    ) -> Result<TemporaryRefReconciliation, TemporaryRefPublishError>;
+}
+
 /// Fixed Git argument vector plus optional bounded stdin.
 pub struct GitInvocation {
     arguments: Vec<OsString>,
     stdin: Vec<u8>,
-    environment: Vec<(OsString, OsString)>,
+    environment: Vec<(GitEnvironmentVariable, OsString)>,
     timeout: Duration,
+    stdout_limit: usize,
+    network: GitNetworkPolicy,
+}
+
+/// Exact non-secret environment roles that Git plumbing may override after the sealed policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GitEnvironmentVariable {
+    /// Provider-private temporary index path.
+    IndexFile,
+    /// Fixed dispatch-commit author name.
+    AuthorName,
+    /// Fixed dispatch-commit author email.
+    AuthorEmail,
+    /// Fixed dispatch-commit committer name.
+    CommitterName,
+    /// Fixed dispatch-commit committer email.
+    CommitterEmail,
+    /// Deterministic dispatch-commit author timestamp.
+    AuthorDate,
+    /// Deterministic dispatch-commit committer timestamp.
+    CommitterDate,
+}
+
+impl GitEnvironmentVariable {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::IndexFile => "GIT_INDEX_FILE",
+            Self::AuthorName => "GIT_AUTHOR_NAME",
+            Self::AuthorEmail => "GIT_AUTHOR_EMAIL",
+            Self::CommitterName => "GIT_COMMITTER_NAME",
+            Self::CommitterEmail => "GIT_COMMITTER_EMAIL",
+            Self::AuthorDate => "GIT_AUTHOR_DATE",
+            Self::CommitterDate => "GIT_COMMITTER_DATE",
+        }
+    }
 }
 
 impl GitInvocation {
@@ -647,6 +2077,8 @@ impl GitInvocation {
             stdin: Vec::new(),
             environment: Vec::new(),
             timeout,
+            stdout_limit: MAX_GIT_OUTPUT_BYTES,
+            network: GitNetworkPolicy::Offline,
         }
     }
 
@@ -655,8 +2087,22 @@ impl GitInvocation {
         self
     }
 
-    fn with_environment(mut self, name: impl Into<OsString>, value: impl Into<OsString>) -> Self {
-        self.environment.push((name.into(), value.into()));
+    fn with_environment(
+        mut self,
+        variable: GitEnvironmentVariable,
+        value: impl Into<OsString>,
+    ) -> Self {
+        self.environment.push((variable, value.into()));
+        self
+    }
+
+    fn with_network(mut self, endpoint: &GithubGitEndpoint) -> Self {
+        self.network = endpoint.transport().into();
+        self
+    }
+
+    fn with_stdout_limit(mut self, limit: usize) -> Self {
+        self.stdout_limit = limit;
         self
     }
 
@@ -671,13 +2117,18 @@ impl GitInvocation {
     }
 
     /// Explicit non-secret environment overrides.
-    pub fn environment(&self) -> &[(OsString, OsString)] {
+    pub fn environment(&self) -> &[(GitEnvironmentVariable, OsString)] {
         &self.environment
     }
 
     /// Process deadline.
     pub const fn timeout(&self) -> Duration {
         self.timeout
+    }
+
+    /// Maximum retained standard-output bytes.
+    pub const fn stdout_limit(&self) -> usize {
+        self.stdout_limit
     }
 }
 
@@ -692,10 +2143,12 @@ impl fmt::Debug for GitInvocation {
                 &self
                     .environment
                     .iter()
-                    .map(|pair| &pair.0)
+                    .map(|pair| pair.0.as_str())
                     .collect::<Vec<_>>(),
             )
+            .field("network", &self.network)
             .field("timeout", &self.timeout)
+            .field("stdout_limit", &self.stdout_limit)
             .finish()
     }
 }
@@ -745,62 +2198,895 @@ pub trait GitRunner: Send {
     ///
     /// Returns a redacted process, I/O, timeout, output-limit, or exit-status failure.
     fn execute(&mut self, invocation: &GitInvocation) -> Result<Vec<u8>, GitExecutionError>;
-}
 
-/// Production Git executor rooted at one canonical repository checkout.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GitProcessRunner {
-    executable: PathBuf,
-    repository_root: PathBuf,
-}
-
-impl GitProcessRunner {
-    /// Validate the Git executable and repository root paths.
+    /// Execute one bounded invocation with stdin streamed from an already-open regular file.
+    ///
+    /// The default refuses the operation. Production and snapshot-aware test runners must prove
+    /// the exact expected byte count without resolving a pathname.
     ///
     /// # Errors
     ///
-    /// Rejects relative, missing, or unsuitable paths.
+    /// Returns a redacted process or exact-input failure.
+    fn execute_file(
+        &mut self,
+        _invocation: &GitInvocation,
+        _input: fs::File,
+        _expected_len: u64,
+    ) -> Result<Vec<u8>, GitExecutionError> {
+        Err(GitExecutionError::ProcessIo)
+    }
+
+    /// Whether process trees spawned after a successful `execute` setup are killed on parent exit.
+    ///
+    /// Production currently proves this only on Windows. Unix therefore keeps bounded strong
+    /// missing-publication retirement disabled.
+    fn process_tree_is_parent_fenced(&self) -> bool {
+        false
+    }
+}
+
+/// Production Git executor rooted at a private bare object database.
+#[derive(Debug)]
+pub struct GitProcessRunner {
+    #[cfg(windows)]
+    toolchain: crate::git_process::WindowsGitToolchain,
+    #[cfg(windows)]
+    repository: crate::git_repository::PrivateBareGitRepository,
+    #[cfg(unix)]
+    toolchain: crate::git_process::UnixGitToolchain,
+    #[cfg(unix)]
+    repository: crate::git_repository::PrivateBareGitRepository,
+}
+
+impl GitProcessRunner {
+    /// Validate the Git executable and initialize or reopen a private bare repository.
+    ///
+    /// # Errors
+    ///
+    /// Rejects relative, missing, linked, non-private, or unsuitable paths and tool layouts.
     pub fn new(
         executable: impl AsRef<Path>,
-        repository_root: impl AsRef<Path>,
+        isolation_root: impl AsRef<Path>,
     ) -> Result<Self, GitPublisherConfigError> {
-        let executable = canonical_file(executable.as_ref())?;
-        if !executable_basename_matches(&executable, "git") {
-            return Err(GitPublisherConfigError::InvalidGitExecutable);
+        #[cfg(windows)]
+        {
+            let toolchain = crate::git_process::WindowsGitToolchain::new(executable)
+                .map_err(|_| GitPublisherConfigError::SecureIsolationFailed)?;
+            let preparation =
+                crate::git_repository::PrivateGitRepositoryPreparation::prepare(isolation_root)
+                    .map_err(|_| GitPublisherConfigError::SecureIsolationFailed)?;
+            if preparation.needs_initialization() {
+                let spec = preparation
+                    .initialization_spec(&toolchain)
+                    .map_err(|_| GitPublisherConfigError::SecureIsolationFailed)?;
+                let mut command = spec
+                    .command()
+                    .map_err(|_| GitPublisherConfigError::SecureIsolationFailed)?;
+                command
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                run_git_process(command, &[], MAX_GIT_TIMEOUT, MAX_GIT_OUTPUT_BYTES)
+                    .map_err(|_| GitPublisherConfigError::SecureIsolationFailed)?;
+            }
+            let repository = preparation
+                .finish()
+                .map_err(|_| GitPublisherConfigError::SecureIsolationFailed)?;
+            Ok(Self {
+                toolchain,
+                repository,
+            })
         }
-        let repository_root = canonical_directory(repository_root.as_ref())?;
+
+        #[cfg(unix)]
+        {
+            let toolchain = crate::git_process::UnixGitToolchain::new(executable)
+                .map_err(|_| GitPublisherConfigError::SecureIsolationFailed)?;
+            let preparation =
+                crate::git_repository::PrivateGitRepositoryPreparation::prepare(isolation_root)
+                    .map_err(|_| GitPublisherConfigError::SecureIsolationFailed)?;
+            if preparation.needs_initialization() {
+                let spec = preparation
+                    .initialization_spec(&toolchain)
+                    .map_err(|_| GitPublisherConfigError::SecureIsolationFailed)?;
+                let mut command = spec
+                    .command()
+                    .map_err(|_| GitPublisherConfigError::SecureIsolationFailed)?;
+                command
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                run_git_process(command, &[], MAX_GIT_TIMEOUT, MAX_GIT_OUTPUT_BYTES)
+                    .map_err(|_| GitPublisherConfigError::SecureIsolationFailed)?;
+            }
+            let repository = preparation
+                .finish()
+                .map_err(|_| GitPublisherConfigError::SecureIsolationFailed)?;
+            Ok(Self {
+                toolchain,
+                repository,
+            })
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (executable.as_ref(), isolation_root.as_ref());
+            Err(GitPublisherConfigError::UnsupportedSecurePlatform)
+        }
+    }
+}
+
+/// One retained, offline-only reader for a caller checkout.
+///
+/// Construction resolves the fixed platform Git without `PATH`, creates private process state,
+/// rejects local include/worktree/external-filter policy by key name, and binds one canonical
+/// repository root. Every exposed operation is fixed read-only plumbing; callers cannot supply a
+/// subcommand, network capability, environment override, or output path.
+#[derive(Debug)]
+pub struct CallerGitRepository {
+    #[cfg(windows)]
+    toolchain: crate::git_process::WindowsGitToolchain,
+    #[cfg(unix)]
+    toolchain: crate::git_process::UnixGitToolchain,
+    root: PathBuf,
+    git_dir: Option<PathBuf>,
+    common_dir: Option<PathBuf>,
+    root_retained: Option<rustferry_core::RetainedDirectoryIdentity>,
+    git_dir_retained: Option<rustferry_core::RetainedDirectoryIdentity>,
+    common_dir_retained: Option<rustferry_core::RetainedDirectoryIdentity>,
+    control_files: Vec<CallerGitControlFile>,
+    home: PathBuf,
+    xdg: PathBuf,
+    temp: PathBuf,
+    private_guards: Vec<std::fs::File>,
+    _private_state: tempfile::TempDir,
+}
+
+/// Bounded result of one fixed caller-checkout Git read.
+#[derive(Debug)]
+pub struct CallerGitOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct CallerGitControlFile {
+    path: PathBuf,
+    retained: rustferry_core::RetainedRegularFileIdentity,
+    sha256: String,
+}
+
+impl CallerGitControlFile {
+    fn capture(path: PathBuf) -> Result<Self, GitPublisherConfigError> {
+        let retained = rustferry_core::RetainedRegularFileIdentity::open(&path)
+            .map_err(|_| GitPublisherConfigError::InvalidDirectory)?;
+        let sha256 = caller_git_control_sha256(&path)?;
+        retained
+            .verify_path(&path)
+            .map_err(|_| GitPublisherConfigError::InvalidDirectory)?;
         Ok(Self {
-            executable,
-            repository_root,
+            path,
+            retained,
+            sha256,
         })
     }
+
+    fn verify(&self) -> Result<(), GitPublisherConfigError> {
+        self.retained
+            .verify_path(&self.path)
+            .map_err(|_| GitPublisherConfigError::InvalidDirectory)?;
+        if caller_git_control_sha256(&self.path)? != self.sha256 {
+            return Err(GitPublisherConfigError::InvalidDirectory);
+        }
+        self.retained
+            .verify_path(&self.path)
+            .map_err(|_| GitPublisherConfigError::InvalidDirectory)
+    }
+}
+
+impl CallerGitOutput {
+    /// Whether Git accepted the fixed read operation.
+    pub fn success(&self) -> bool {
+        self.status.success()
+    }
+
+    /// Platform exit code, when one was available.
+    pub fn exit_code(&self) -> Option<i32> {
+        self.status.code()
+    }
+
+    /// Bounded stdout. Stderr is always discarded.
+    pub fn stdout(&self) -> &[u8] {
+        &self.stdout
+    }
+}
+
+impl CallerGitRepository {
+    /// Bind a caller checkout to the fixed platform Git and a config-neutral private process.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unsupported platforms, unsafe paths, missing repositories, executable local Git
+    /// policy, malformed output, and any failure to establish the retained standard toolchain.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the security binding is intentionally one linear pre-spawn validation sequence"
+    )]
+    pub fn open(start: impl AsRef<Path>) -> Result<Self, GitPublisherConfigError> {
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = start.as_ref();
+            return Err(GitPublisherConfigError::UnsupportedSecurePlatform);
+        }
+        #[cfg(any(unix, windows))]
+        {
+            let start = canonical_directory(start.as_ref())?;
+            let executable = crate::git_process::trusted_git_executable()
+                .map_err(|_| GitPublisherConfigError::SecureIsolationFailed)?;
+            #[cfg(windows)]
+            let toolchain = crate::git_process::WindowsGitToolchain::new(&executable)
+                .map_err(|_| GitPublisherConfigError::SecureIsolationFailed)?;
+            #[cfg(unix)]
+            let toolchain = crate::git_process::UnixGitToolchain::new(&executable)
+                .map_err(|_| GitPublisherConfigError::SecureIsolationFailed)?;
+            let private_state =
+                tempfile::tempdir().map_err(|_| GitPublisherConfigError::SecureIsolationFailed)?;
+            let state_root = private_state.path().join("state");
+            let home = state_root.join("home");
+            let xdg = state_root.join("xdg");
+            let temp = state_root.join("tmp");
+            let private_guards =
+                create_private_git_process_directories([&state_root, &home, &xdg, &temp])?;
+            let mut repository = Self {
+                toolchain,
+                root: start.clone(),
+                git_dir: None,
+                common_dir: None,
+                root_retained: None,
+                git_dir_retained: None,
+                common_dir_retained: None,
+                control_files: Vec::new(),
+                home,
+                xdg,
+                temp,
+                private_guards,
+                _private_state: private_state,
+            };
+            repository.validate_local_config(&start)?;
+            let root = repository
+                .execute_at(
+                    &start,
+                    ["rev-parse", "--show-toplevel"],
+                    &[],
+                    MAX_GIT_OUTPUT_BYTES,
+                )
+                .map_err(|_| GitPublisherConfigError::CallerRepositoryReadFailed)?;
+            if !root.status.success() {
+                return Err(GitPublisherConfigError::CallerRepositoryReadFailed);
+            }
+            let root = parse_caller_git_directory(&root.stdout)?;
+            if !start.starts_with(&root) {
+                return Err(GitPublisherConfigError::InvalidDirectory);
+            }
+            repository.root = root;
+            let git_dir = repository
+                .execute_at(
+                    &repository.root,
+                    ["rev-parse", "--absolute-git-dir"],
+                    &[],
+                    MAX_GIT_OUTPUT_BYTES,
+                )
+                .map_err(|_| GitPublisherConfigError::CallerRepositoryReadFailed)?;
+            if !git_dir.status.success() {
+                return Err(GitPublisherConfigError::CallerRepositoryReadFailed);
+            }
+            let git_dir = parse_caller_git_directory(&git_dir.stdout)?;
+            let root_retained = rustferry_core::RetainedDirectoryIdentity::open(&repository.root)
+                .map_err(|_| GitPublisherConfigError::InvalidDirectory)?;
+            let git_dir_retained = rustferry_core::RetainedDirectoryIdentity::open(&git_dir)
+                .map_err(|_| GitPublisherConfigError::InvalidDirectory)?;
+            repository.git_dir = Some(git_dir);
+            repository.root_retained = Some(root_retained);
+            repository.git_dir_retained = Some(git_dir_retained);
+            repository.verify_repository_paths()?;
+            let common_dir = repository
+                .execute(["rev-parse", "--git-common-dir"], &[], MAX_GIT_OUTPUT_BYTES)
+                .map_err(|_| GitPublisherConfigError::CallerRepositoryReadFailed)?;
+            if !common_dir.status.success() {
+                return Err(GitPublisherConfigError::CallerRepositoryReadFailed);
+            }
+            let common_dir = parse_caller_git_directory_relative(
+                &common_dir.stdout,
+                repository.git_dir.as_deref().unwrap_or(&repository.root),
+            )?;
+            let common_dir_retained = rustferry_core::RetainedDirectoryIdentity::open(&common_dir)
+                .map_err(|_| GitPublisherConfigError::InvalidDirectory)?;
+            repository.common_dir = Some(common_dir.clone());
+            repository.common_dir_retained = Some(common_dir_retained);
+            let mut control_paths = BTreeSet::from([common_dir.join("config")]);
+            let dot_git = repository.root.join(".git");
+            if fs::symlink_metadata(&dot_git).is_ok_and(|metadata| metadata.is_file()) {
+                control_paths.insert(dot_git);
+            }
+            let common_pointer = repository
+                .git_dir
+                .as_ref()
+                .ok_or(GitPublisherConfigError::InvalidDirectory)?
+                .join("commondir");
+            if fs::symlink_metadata(&common_pointer).is_ok_and(|metadata| metadata.is_file()) {
+                control_paths.insert(common_pointer);
+            }
+            repository.control_files = control_paths
+                .into_iter()
+                .map(CallerGitControlFile::capture)
+                .collect::<Result<Vec<_>, _>>()?;
+            repository.verify_repository_paths()?;
+            repository.validate_local_config(&repository.root)?;
+            let rebound = repository
+                .execute(
+                    ["rev-parse", "--absolute-git-dir"],
+                    &[],
+                    MAX_GIT_OUTPUT_BYTES,
+                )
+                .map_err(|_| GitPublisherConfigError::CallerRepositoryReadFailed)?;
+            if !rebound.status.success()
+                || parse_caller_git_directory(&rebound.stdout)?
+                    != *repository
+                        .git_dir
+                        .as_ref()
+                        .ok_or(GitPublisherConfigError::InvalidDirectory)?
+            {
+                return Err(GitPublisherConfigError::InvalidDirectory);
+            }
+            let rebound_common = repository
+                .execute(["rev-parse", "--git-common-dir"], &[], MAX_GIT_OUTPUT_BYTES)
+                .map_err(|_| GitPublisherConfigError::CallerRepositoryReadFailed)?;
+            if !rebound_common.status.success()
+                || parse_caller_git_directory_relative(
+                    &rebound_common.stdout,
+                    repository
+                        .git_dir
+                        .as_deref()
+                        .ok_or(GitPublisherConfigError::InvalidDirectory)?,
+                )? != common_dir
+            {
+                return Err(GitPublisherConfigError::InvalidDirectory);
+            }
+            Ok(repository)
+        }
+    }
+
+    /// Exact canonical repository root retained by this reader.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Read the exact, replacement-disabled `HEAD` object name.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted process-policy, timeout, output-limit, or Git failure.
+    pub fn head_revision(&self) -> Result<CallerGitOutput, GitExecutionError> {
+        self.execute(["rev-parse", "--verify", "HEAD"], &[], MAX_GIT_OUTPUT_BYTES)
+    }
+
+    /// Inspect tracked and untracked changes without refreshing or writing the caller index.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted process-policy, timeout, output-limit, or Git failure.
+    pub fn working_tree_status(&self) -> Result<CallerGitOutput, GitExecutionError> {
+        self.execute(
+            [
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignore-submodules=all",
+            ],
+            &[],
+            MAX_CALLER_GIT_OUTPUT_BYTES,
+        )
+    }
+
+    /// Read exact tree metadata for bounded literal repository-relative paths.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid revisions/paths and returns redacted bounded Git execution failures.
+    pub fn tree_entries(
+        &self,
+        revision: &str,
+        paths: &[String],
+    ) -> Result<CallerGitOutput, GitExecutionError> {
+        if !is_lower_object_id(revision)
+            || paths.is_empty()
+            || paths.len() > 128
+            || paths.iter().any(|path| !is_safe_caller_git_path(path))
+            || paths
+                .iter()
+                .map(|path| path.len().saturating_add(1))
+                .sum::<usize>()
+                > 8 * 1024
+        {
+            return Err(GitExecutionError::ProcessIo);
+        }
+        let mut arguments = vec![
+            OsString::from("--literal-pathspecs"),
+            OsString::from("ls-tree"),
+            OsString::from("-l"),
+            OsString::from("-z"),
+            OsString::from(revision),
+            OsString::from("--"),
+        ];
+        arguments.extend(paths.iter().map(OsString::from));
+        self.execute(arguments, &[], MAX_CALLER_GIT_OUTPUT_BYTES)
+    }
+
+    /// Read a bounded batch of exact object IDs through `cat-file --batch`.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed input/output bounds and returns redacted bounded Git failures.
+    pub fn blob_batch(
+        &self,
+        object_ids: &[u8],
+        output_limit: usize,
+    ) -> Result<CallerGitOutput, GitExecutionError> {
+        if object_ids.is_empty()
+            || object_ids.len() > 128 * 41
+            || output_limit == 0
+            || output_limit > MAX_CALLER_GIT_OUTPUT_BYTES
+            || !object_ids
+                .split(|byte| *byte == b'\n')
+                .filter(|value| !value.is_empty())
+                .all(|value| value.len() == 40 && value.iter().copied().all(is_lower_hex_byte))
+        {
+            return Err(GitExecutionError::ProcessIo);
+        }
+        self.execute(["cat-file", "--batch"], object_ids, output_limit)
+    }
+
+    /// Read the current symbolic branch without invoking aliases or external helpers.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted process-policy, timeout, output-limit, or Git failure.
+    pub fn current_branch(&self) -> Result<CallerGitOutput, GitExecutionError> {
+        self.execute(
+            ["symbolic-ref", "--quiet", "--short", "HEAD"],
+            &[],
+            MAX_GIT_OUTPUT_BYTES,
+        )
+    }
+
+    /// Check one exact repository-relative path against repository ignore rules.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unsafe paths and returns redacted bounded Git execution failures.
+    pub fn check_ignore(&self, path: &str) -> Result<CallerGitOutput, GitExecutionError> {
+        if !is_safe_caller_git_path(path) {
+            return Err(GitExecutionError::ProcessIo);
+        }
+        self.execute(
+            ["check-ignore", "--quiet", "--", path],
+            &[],
+            MAX_GIT_OUTPUT_BYTES,
+        )
+    }
+
+    /// Capture one local remote URL/push URL without includes or rewrite evaluation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid names, malformed/duplicate endpoints, and redacted Git failures.
+    pub fn discover_remote(
+        &self,
+        remote_name: &str,
+    ) -> Result<GithubRemoteSnapshot, GitPublisherConfigError> {
+        let remote = GitRemoteName::new(remote_name)
+            .map_err(|_| GitPublisherConfigError::InvalidRemoteName)?;
+        let output = self
+            .execute(remote.discovery_arguments(), &[], MAX_GIT_OUTPUT_BYTES)
+            .map_err(|_| GitPublisherConfigError::RemoteDiscoveryFailed)?;
+        if !output.status.success() {
+            return Err(GitPublisherConfigError::RemoteDiscoveryFailed);
+        }
+        GithubRemoteSnapshot::from_local_config_output(&remote, &output.stdout)
+            .map_err(|_| GitPublisherConfigError::RemoteDiscoveryFailed)
+    }
+
+    fn validate_local_config(&self, directory: &Path) -> Result<(), GitPublisherConfigError> {
+        let output = self
+            .execute_at(
+                directory,
+                [
+                    "config",
+                    "--local",
+                    "--no-includes",
+                    "--null",
+                    "--name-only",
+                    "--list",
+                ],
+                &[],
+                MAX_GIT_OUTPUT_BYTES,
+            )
+            .map_err(|_| GitPublisherConfigError::CallerRepositoryReadFailed)?;
+        if !output.status.success() {
+            return Err(GitPublisherConfigError::CallerRepositoryReadFailed);
+        }
+        validate_caller_git_config_names(&output.stdout)
+    }
+
+    fn execute(
+        &self,
+        arguments: impl IntoIterator<Item = impl Into<OsString>>,
+        stdin: &[u8],
+        output_limit: usize,
+    ) -> Result<CallerGitOutput, GitExecutionError> {
+        self.execute_at(&self.root, arguments, stdin, output_limit)
+    }
+
+    fn execute_at(
+        &self,
+        directory: &Path,
+        arguments: impl IntoIterator<Item = impl Into<OsString>>,
+        stdin: &[u8],
+        output_limit: usize,
+    ) -> Result<CallerGitOutput, GitExecutionError> {
+        self.execute_at_with_pre_spawn_hook(directory, arguments, stdin, output_limit, || {})
+    }
+
+    fn execute_at_with_pre_spawn_hook(
+        &self,
+        directory: &Path,
+        arguments: impl IntoIterator<Item = impl Into<OsString>>,
+        stdin: &[u8],
+        output_limit: usize,
+        pre_spawn_hook: impl FnOnce(),
+    ) -> Result<CallerGitOutput, GitExecutionError> {
+        if stdin.len() > 128 * 41 || output_limit == 0 || output_limit > MAX_CALLER_GIT_OUTPUT_BYTES
+        {
+            return Err(GitExecutionError::ProcessIo);
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (directory, arguments, stdin, output_limit);
+            Err(GitExecutionError::ProcessIo)
+        }
+        #[cfg(any(unix, windows))]
+        {
+            verify_private_git_process_directories(&self.private_guards)
+                .map_err(|_| GitExecutionError::ProcessIo)?;
+            self.verify_repository_paths()
+                .map_err(|_| GitExecutionError::ProcessIo)?;
+            let context = crate::git_process::GitProcessContext::new(
+                directory, None, &self.home, &self.xdg, &self.temp,
+            )
+            .map_err(|_| GitExecutionError::ProcessIo)?;
+            let mut arguments = arguments.into_iter().map(Into::into).collect::<Vec<_>>();
+            if let Some(git_dir) = &self.git_dir {
+                let mut bound = vec![
+                    OsString::from("--git-dir"),
+                    caller_git_argument_path(git_dir),
+                    OsString::from("--work-tree"),
+                    caller_git_argument_path(&self.root),
+                ];
+                bound.append(&mut arguments);
+                arguments = bound;
+            }
+            let spec = self
+                .toolchain
+                .process_spec(&context, GitNetworkPolicy::Offline, arguments)
+                .map_err(|_| GitExecutionError::ProcessIo)?;
+            let mut command = spec.command().map_err(|_| GitExecutionError::ProcessIo)?;
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            pre_spawn_hook();
+            verify_private_git_process_directories(&self.private_guards)
+                .map_err(|_| GitExecutionError::ProcessIo)?;
+            self.verify_repository_paths()
+                .map_err(|_| GitExecutionError::ProcessIo)?;
+            let output =
+                run_git_process_allow_status(command, stdin, MAX_GIT_TIMEOUT, output_limit)?;
+            verify_private_git_process_directories(&self.private_guards)
+                .map_err(|_| GitExecutionError::ProcessIo)?;
+            self.verify_repository_paths()
+                .map_err(|_| GitExecutionError::ProcessIo)?;
+            Ok(CallerGitOutput {
+                status: output.status,
+                stdout: output.stdout,
+            })
+        }
+    }
+
+    fn verify_repository_paths(&self) -> Result<(), GitPublisherConfigError> {
+        match (
+            self.git_dir.as_ref(),
+            self.root_retained.as_ref(),
+            self.git_dir_retained.as_ref(),
+        ) {
+            (None, None, None) => Ok(()),
+            (Some(git_dir), Some(root), Some(retained_git_dir)) => {
+                root.verify_path(&self.root)
+                    .map_err(|_| GitPublisherConfigError::InvalidDirectory)?;
+                retained_git_dir
+                    .verify_path(git_dir)
+                    .map_err(|_| GitPublisherConfigError::InvalidDirectory)?;
+                match (&self.common_dir, &self.common_dir_retained) {
+                    (Some(common_dir), Some(retained)) => retained
+                        .verify_path(common_dir)
+                        .map_err(|_| GitPublisherConfigError::InvalidDirectory)?,
+                    (None, None) => {}
+                    _ => return Err(GitPublisherConfigError::InvalidDirectory),
+                }
+                for control in &self.control_files {
+                    control.verify()?;
+                }
+                Ok(())
+            }
+            _ => Err(GitPublisherConfigError::InvalidDirectory),
+        }
+    }
+}
+
+fn create_private_git_process_directories<'a>(
+    paths: impl IntoIterator<Item = &'a PathBuf>,
+) -> Result<Vec<std::fs::File>, GitPublisherConfigError> {
+    #[cfg(windows)]
+    let mut guards = Vec::new();
+    #[cfg(not(windows))]
+    let guards = Vec::new();
+    #[cfg(windows)]
+    for path in paths {
+        guards.push(
+            rustferry_core::windows_private_directory::create_private_directory(path)
+                .map_err(|_| GitPublisherConfigError::SecureIsolationFailed)?,
+        );
+    }
+    #[cfg(unix)]
+    for path in paths {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+            .create(path)
+            .map_err(|_| GitPublisherConfigError::SecureIsolationFailed)?;
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = paths;
+        return Err(GitPublisherConfigError::UnsupportedSecurePlatform);
+    }
+    Ok(guards)
+}
+
+fn verify_private_git_process_directories(
+    guards: &[std::fs::File],
+) -> Result<(), GitPublisherConfigError> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsHandle as _;
+
+        for guard in guards {
+            rustferry_core::windows_private_directory::verify_private_directory_handle(
+                guard.as_handle(),
+            )
+            .map_err(|_| GitPublisherConfigError::SecureIsolationFailed)?;
+        }
+    }
+    #[cfg(not(windows))]
+    if !guards.is_empty() {
+        return Err(GitPublisherConfigError::SecureIsolationFailed);
+    }
+    Ok(())
+}
+
+fn parse_caller_git_directory(output: &[u8]) -> Result<PathBuf, GitPublisherConfigError> {
+    let value = std::str::from_utf8(output)
+        .map_err(|_| GitPublisherConfigError::CallerRepositoryReadFailed)?
+        .trim();
+    if value.is_empty() || value.contains(['\r', '\n']) {
+        return Err(GitPublisherConfigError::CallerRepositoryReadFailed);
+    }
+    canonical_directory(Path::new(value))
+}
+
+fn caller_git_argument_path(path: &Path) -> OsString {
+    #[cfg(windows)]
+    {
+        crate::git_process::external_path(path)
+            .as_os_str()
+            .to_owned()
+    }
+    #[cfg(not(windows))]
+    path.as_os_str().to_owned()
+}
+
+fn parse_caller_git_directory_relative(
+    output: &[u8],
+    relative_to: &Path,
+) -> Result<PathBuf, GitPublisherConfigError> {
+    let value = std::str::from_utf8(output)
+        .map_err(|_| GitPublisherConfigError::CallerRepositoryReadFailed)?
+        .trim();
+    if value.is_empty() || value.contains(['\r', '\n']) {
+        return Err(GitPublisherConfigError::CallerRepositoryReadFailed);
+    }
+    let path = Path::new(value);
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        relative_to.join(path)
+    };
+    canonical_directory(&resolved)
+}
+
+fn caller_git_control_sha256(path: &Path) -> Result<String, GitPublisherConfigError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|_| GitPublisherConfigError::InvalidDirectory)?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > MAX_CALLER_GIT_CONTROL_BYTES
+    {
+        return Err(GitPublisherConfigError::InvalidDirectory);
+    }
+    let bytes = fs::read(path).map_err(|_| GitPublisherConfigError::InvalidDirectory)?;
+    if u64::try_from(bytes.len()).ok() != Some(metadata.len()) {
+        return Err(GitPublisherConfigError::InvalidDirectory);
+    }
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+#[allow(
+    clippy::case_sensitive_file_extension_comparisons,
+    reason = "the suffix is a Git config-key component, not a file extension"
+)]
+fn validate_caller_git_config_names(output: &[u8]) -> Result<(), GitPublisherConfigError> {
+    if output.len() > MAX_GIT_OUTPUT_BYTES {
+        return Err(GitPublisherConfigError::UnsafeCallerRepositoryConfig);
+    }
+    if output.is_empty() {
+        return Ok(());
+    }
+    let Some(output) = output.strip_suffix(&[0]) else {
+        return Err(GitPublisherConfigError::UnsafeCallerRepositoryConfig);
+    };
+    for raw in output.split(|byte| *byte == 0) {
+        let key = std::str::from_utf8(raw)
+            .map_err(|_| GitPublisherConfigError::UnsafeCallerRepositoryConfig)?;
+        if key.is_empty() || key.len() > 512 || key.chars().any(char::is_control) {
+            return Err(GitPublisherConfigError::UnsafeCallerRepositoryConfig);
+        }
+        let key = key.to_ascii_lowercase();
+        let external_diff = key == "diff.external"
+            || key.starts_with("diff.")
+                && (key.ends_with(".command") || key.ends_with(".textconv"));
+        let partial_clone_remote = key.starts_with("remote.")
+            && (key.ends_with(".promisor") || key.ends_with(".partialclonefilter"));
+        if key == "include.path"
+            || key.starts_with("includeif.") && key.ends_with(".path")
+            || key == "extensions.worktreeconfig"
+            || key == "extensions.partialclone"
+            || key == "core.worktree"
+            || key.starts_with("filter.")
+            || key.starts_with("protocol.")
+            || partial_clone_remote
+            || external_diff
+        {
+            return Err(GitPublisherConfigError::UnsafeCallerRepositoryConfig);
+        }
+    }
+    Ok(())
+}
+
+fn is_lower_object_id(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(is_lower_hex_byte)
+}
+
+const fn is_lower_hex_byte(byte: u8) -> bool {
+    byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
+}
+
+fn is_safe_caller_git_path(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 4_096
+        && !value.starts_with(['/', '\\', '-'])
+        && !value.contains(['\0', '\r', '\n', '\\'])
+        && value
+            .split('/')
+            .all(|component| !component.is_empty() && !matches!(component, "." | ".."))
 }
 
 impl GitRunner for GitProcessRunner {
     fn execute(&mut self, invocation: &GitInvocation) -> Result<Vec<u8>, GitExecutionError> {
-        let mut command = Command::new(&self.executable);
-        apply_allowlisted_git_environment(&mut command);
-        command
-            .arg("-c")
-            .arg("core.hooksPath=/dev/null")
-            .arg("-c")
-            .arg("protocol.file.allow=never")
-            .arg("-c")
-            .arg("credential.interactive=never")
-            .args(&invocation.arguments)
-            .current_dir(&self.repository_root)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GCM_INTERACTIVE", "Never")
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .env("LC_ALL", "C")
-            .env("LANG", "C")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        for (name, value) in &invocation.environment {
-            command.env(name, value);
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = invocation;
+            return Err(GitExecutionError::ProcessIo);
         }
-        run_git_process(command, &invocation.stdin, invocation.timeout)
+        #[cfg(any(unix, windows))]
+        {
+            let context = self
+                .repository
+                .process_context()
+                .map_err(|_| GitExecutionError::ProcessIo)?;
+            let spec = self
+                .toolchain
+                .process_spec(
+                    &context,
+                    invocation.network,
+                    invocation.arguments.iter().cloned(),
+                )
+                .map_err(|_| GitExecutionError::ProcessIo)?;
+            let mut command = spec.command().map_err(|_| GitExecutionError::ProcessIo)?;
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            for (variable, value) in &invocation.environment {
+                command.env(variable.as_str(), value);
+            }
+            run_git_process(
+                command,
+                &invocation.stdin,
+                invocation.timeout,
+                invocation.stdout_limit,
+            )
+        }
+    }
+
+    fn execute_file(
+        &mut self,
+        invocation: &GitInvocation,
+        input: fs::File,
+        expected_len: u64,
+    ) -> Result<Vec<u8>, GitExecutionError> {
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (invocation, input, expected_len);
+            return Err(GitExecutionError::ProcessIo);
+        }
+        #[cfg(any(unix, windows))]
+        {
+            if !invocation.stdin.is_empty() {
+                return Err(GitExecutionError::ProcessIo);
+            }
+            let context = self
+                .repository
+                .process_context()
+                .map_err(|_| GitExecutionError::ProcessIo)?;
+            let spec = self
+                .toolchain
+                .process_spec(
+                    &context,
+                    invocation.network,
+                    invocation.arguments.iter().cloned(),
+                )
+                .map_err(|_| GitExecutionError::ProcessIo)?;
+            let mut command = spec.command().map_err(|_| GitExecutionError::ProcessIo)?;
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            for (variable, value) in &invocation.environment {
+                command.env(variable.as_str(), value);
+            }
+            run_git_process_file(
+                command,
+                input,
+                expected_len,
+                invocation.timeout,
+                invocation.stdout_limit,
+            )
+        }
+    }
+
+    fn process_tree_is_parent_fenced(&self) -> bool {
+        cfg!(windows)
     }
 }
 
@@ -815,6 +3101,16 @@ pub enum GitPublisherConfigError {
     InvalidRemoteName,
     /// Timeout was zero or exceeded ten minutes.
     InvalidTimeout,
+    /// Fixed tool policy or private bare repository initialization failed.
+    SecureIsolationFailed,
+    /// One-shot local remote discovery failed closed.
+    RemoteDiscoveryFailed,
+    /// Caller repository metadata could not be read through the sealed policy.
+    CallerRepositoryReadFailed,
+    /// Local Git policy could execute code or redirect the selected worktree.
+    UnsafeCallerRepositoryConfig,
+    /// The platform has no implemented secure private Git runner.
+    UnsupportedSecurePlatform,
 }
 
 impl fmt::Display for GitPublisherConfigError {
@@ -824,6 +3120,21 @@ impl fmt::Display for GitPublisherConfigError {
             Self::InvalidDirectory => formatter.write_str("Git publisher directory is invalid"),
             Self::InvalidRemoteName => formatter.write_str("Git remote name is invalid"),
             Self::InvalidTimeout => formatter.write_str("Git operation timeout is invalid"),
+            Self::SecureIsolationFailed => {
+                formatter.write_str("secure Git publisher isolation could not be established")
+            }
+            Self::RemoteDiscoveryFailed => {
+                formatter.write_str("Git remote could not be captured safely")
+            }
+            Self::CallerRepositoryReadFailed => {
+                formatter.write_str("caller Git repository could not be read safely")
+            }
+            Self::UnsafeCallerRepositoryConfig => {
+                formatter.write_str("caller Git repository config is unsafe")
+            }
+            Self::UnsupportedSecurePlatform => {
+                formatter.write_str("secure Git publication is unsupported on this platform")
+            }
         }
     }
 }
@@ -831,19 +3142,32 @@ impl fmt::Display for GitPublisherConfigError {
 impl Error for GitPublisherConfigError {}
 
 /// Git-plumbing implementation that publishes without checkout or branch mutation.
+///
+/// On Windows the isolation directory must satisfy `RustFerry`'s strict private-directory policy;
+/// the publisher retains its no-delete-sharing handle for its complete lifetime so a same-path
+/// replacement cannot redirect publication-lease acquisition.
 #[derive(Debug)]
 pub struct GitTemporaryRefPublisher<R> {
     runner: R,
+    snapshot_imports: BTreeMap<String, GitSnapshotImportInputs>,
     isolation_directory: PathBuf,
+    #[cfg(windows)]
+    _isolation_directory_guard: std::fs::File,
+    isolation_directory_identity: rustferry_core::DirectoryFilesystemIdentity,
+    publication_lease_scope_sha256: String,
+    publication_leases: BTreeMap<String, rustferry_core::process_control::ProcessFileLease>,
+    #[cfg(test)]
     source_remote_name: String,
+    #[cfg(test)]
     execution_remote_name: String,
+    frozen_remotes: Option<VerifiedPublisherRemotes>,
     timeout: Duration,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct VerifiedGitRemote {
-    fetch_url: String,
-    push_url: String,
+    fetch: GithubGitEndpoint,
+    push: GithubGitEndpoint,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -852,12 +3176,98 @@ struct VerifiedPublisherRemotes {
     execution: VerifiedGitRemote,
 }
 
+fn execution_readiness_ref(
+    remote: &VerifiedGitRemote,
+    trusted_tip: &CommitSha,
+    namespace: &TemporaryBranchNamespace,
+) -> String {
+    let counter = INDEX_RESERVATION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut digest = Sha256::new();
+    digest.update(b"rustferry-github-execution-readiness-ref-v1\0");
+    digest.update(remote.fetch.canonical_url().as_bytes());
+    digest.update(b"\0");
+    digest.update(remote.push.canonical_url().as_bytes());
+    digest.update(b"\0");
+    digest.update(trusted_tip.as_str().as_bytes());
+    digest.update(b"\0");
+    digest.update(namespace.as_str().as_bytes());
+    digest.update(b"\0");
+    digest.update(std::process::id().to_le_bytes());
+    digest.update(counter.to_le_bytes());
+    digest.update(now.to_le_bytes());
+    let encoded = hex::encode(digest.finalize());
+    format!(
+        "refs/heads/{}/readiness-{}",
+        namespace.as_str(),
+        &encoded[..16]
+    )
+}
+
+fn temporary_namespace_for_publication(
+    temporary_ref: &TemporaryGitRef,
+    operation_id: &str,
+) -> Result<TemporaryBranchNamespace, TemporaryRefPublishError> {
+    let suffix = format!("/{operation_id}");
+    let namespace = temporary_ref
+        .branch()
+        .as_str()
+        .strip_suffix(&suffix)
+        .filter(|value| !value.is_empty())
+        .ok_or(TemporaryRefPublishError::MalformedGitOutput)?;
+    TemporaryBranchNamespace::new(namespace.to_owned())
+        .map_err(|_| TemporaryRefPublishError::MalformedGitOutput)
+}
+
 impl<R> GitTemporaryRefPublisher<R> {
+    fn initialize(
+        runner: R,
+        isolation_directory: impl AsRef<Path>,
+        timeout: Duration,
+    ) -> Result<Self, GitPublisherConfigError> {
+        let isolation_directory = canonical_directory(isolation_directory.as_ref())?;
+        if timeout.is_zero() || timeout > MAX_GIT_TIMEOUT {
+            return Err(GitPublisherConfigError::InvalidTimeout);
+        }
+        #[cfg(windows)]
+        let isolation_directory_guard =
+            rustferry_core::windows_private_directory::open_private_directory_read_guard(
+                &isolation_directory,
+            )
+            .map_err(|_| GitPublisherConfigError::InvalidDirectory)?;
+        let isolation_directory_identity =
+            rustferry_core::DirectoryFilesystemIdentity::capture(&isolation_directory)
+                .map_err(|_| GitPublisherConfigError::InvalidDirectory)?;
+        Ok(Self {
+            runner,
+            snapshot_imports: BTreeMap::new(),
+            publication_lease_scope_sha256: publication_lease_scope_sha256(
+                &isolation_directory,
+                &isolation_directory_identity,
+            ),
+            isolation_directory,
+            #[cfg(windows)]
+            _isolation_directory_guard: isolation_directory_guard,
+            isolation_directory_identity,
+            publication_leases: BTreeMap::new(),
+            #[cfg(test)]
+            source_remote_name: String::new(),
+            #[cfg(test)]
+            execution_remote_name: String::new(),
+            frozen_remotes: None,
+            timeout,
+        })
+    }
+
     /// Bind a runner to a canonical isolation directory and conservative source/execution remotes.
     ///
     /// # Errors
     ///
     /// Rejects symlink-final/non-canonical directories, unsafe remote names, and invalid timeouts.
+    #[cfg(test)]
     pub fn new(
         runner: R,
         isolation_directory: impl AsRef<Path>,
@@ -865,23 +3275,45 @@ impl<R> GitTemporaryRefPublisher<R> {
         execution_remote_name: impl Into<String>,
         timeout: Duration,
     ) -> Result<Self, GitPublisherConfigError> {
-        let isolation_directory = canonical_directory(isolation_directory.as_ref())?;
         let source_remote_name = source_remote_name.into();
         let execution_remote_name = execution_remote_name.into();
         if !is_safe_remote_name(&source_remote_name) || !is_safe_remote_name(&execution_remote_name)
         {
             return Err(GitPublisherConfigError::InvalidRemoteName);
         }
-        if timeout.is_zero() || timeout > MAX_GIT_TIMEOUT {
-            return Err(GitPublisherConfigError::InvalidTimeout);
-        }
-        Ok(Self {
-            runner,
-            isolation_directory,
-            source_remote_name,
-            execution_remote_name,
-            timeout,
-        })
+        let mut publisher = Self::initialize(runner, isolation_directory, timeout)?;
+        publisher.source_remote_name = source_remote_name;
+        publisher.execution_remote_name = execution_remote_name;
+        Ok(publisher)
+    }
+
+    /// Bind a runner to immutable canonical endpoints and a canonical isolation directory.
+    ///
+    /// This constructor never accepts or consults Git remote names. The endpoint snapshots must
+    /// have been captured once during setup and persisted in the private provider configuration.
+    ///
+    /// # Errors
+    ///
+    /// Rejects symlink-final/non-canonical directories and invalid timeouts.
+    pub fn new_with_endpoints(
+        runner: R,
+        isolation_directory: impl AsRef<Path>,
+        source: &GithubRemoteSnapshot,
+        execution: &GithubRemoteSnapshot,
+        timeout: Duration,
+    ) -> Result<Self, GitPublisherConfigError> {
+        let mut publisher = Self::initialize(runner, isolation_directory, timeout)?;
+        publisher.frozen_remotes = Some(VerifiedPublisherRemotes {
+            source: VerifiedGitRemote {
+                fetch: source.fetch().clone(),
+                push: source.push().clone(),
+            },
+            execution: VerifiedGitRemote {
+                fetch: execution.fetch().clone(),
+                push: execution.push().clone(),
+            },
+        });
+        Ok(publisher)
     }
 
     /// Recover the runner, including captured invocations in tests.
@@ -891,6 +3323,7 @@ impl<R> GitTemporaryRefPublisher<R> {
 }
 
 impl<R: GitRunner> GitTemporaryRefPublisher<R> {
+    #[cfg(test)]
     fn execute(
         &mut self,
         arguments: impl IntoIterator<Item = impl Into<OsString>>,
@@ -907,33 +3340,117 @@ impl<R: GitRunner> GitTemporaryRefPublisher<R> {
         self.runner.execute(invocation).map_err(Into::into)
     }
 
+    fn execute_without_replacements(
+        &mut self,
+        arguments: impl IntoIterator<Item = impl Into<OsString>>,
+    ) -> Result<Vec<u8>, TemporaryRefPublishError> {
+        self.execute_invocation(&GitInvocation::new(arguments, self.timeout))
+    }
+
+    #[cfg(test)]
     fn verify_remote(
         &mut self,
         remote_name: &str,
         expected_repository: &str,
     ) -> Result<VerifiedGitRemote, TemporaryRefPublishError> {
         let fetch_output = self.execute(["remote", "get-url", remote_name])?;
-        let fetch_url = parse_single_line(&fetch_output)?.to_owned();
+        let fetch = GithubGitEndpoint::parse(parse_single_line(&fetch_output)?)
+            .map_err(|_| TemporaryRefPublishError::RemoteMismatch)?;
         let push_output = self.execute(["remote", "get-url", "--push", remote_name])?;
-        let push_url = parse_single_line(&push_output)?.to_owned();
-        if !github_remote_matches(&fetch_url, expected_repository)
-            || !github_remote_matches(&push_url, expected_repository)
+        let push = GithubGitEndpoint::parse(parse_single_line(&push_output)?)
+            .map_err(|_| TemporaryRefPublishError::RemoteMismatch)?;
+        if !github_remote_matches(fetch.canonical_url(), expected_repository)
+            || !github_remote_matches(push.canonical_url(), expected_repository)
+            || fetch.repository() != push.repository()
         {
             return Err(TemporaryRefPublishError::RemoteMismatch);
         }
-        Ok(VerifiedGitRemote {
-            fetch_url,
-            push_url,
-        })
+        Ok(VerifiedGitRemote { fetch, push })
     }
 
     fn remote_ref(
         &mut self,
-        remote_url: &str,
+        endpoint: &GithubGitEndpoint,
         full_ref: &str,
     ) -> Result<Option<CommitSha>, TemporaryRefPublishError> {
-        let output = self.execute(["ls-remote", "--refs", remote_url, full_ref])?;
+        let invocation = GitInvocation::new(
+            ["ls-remote", "--refs", endpoint.canonical_url(), full_ref],
+            self.timeout,
+        )
+        .with_network(endpoint);
+        let output = self.execute_invocation(&invocation)?;
         parse_ls_remote(&output, full_ref)
+    }
+
+    fn execution_remote(
+        &mut self,
+        repository: &Repository,
+    ) -> Result<VerifiedGitRemote, TemporaryRefPublishError> {
+        let expected = repository_url(repository);
+        if let Some(remotes) = &self.frozen_remotes {
+            if !github_remote_matches(remotes.execution.fetch.canonical_url(), &expected)
+                || !github_remote_matches(remotes.execution.push.canonical_url(), &expected)
+            {
+                return Err(TemporaryRefPublishError::RemoteMismatch);
+            }
+            return Ok(remotes.execution.clone());
+        }
+        #[cfg(test)]
+        {
+            let execution_remote_name = self.execution_remote_name.clone();
+            self.verify_remote(&execution_remote_name, &expected)
+        }
+        #[cfg(not(test))]
+        {
+            Err(TemporaryRefPublishError::RemoteMismatch)
+        }
+    }
+
+    fn verify_execution_workflow_bytes(
+        &mut self,
+        request: &ExecutionWorkflowDoctorRequest<'_>,
+    ) -> Result<TemporaryRefPublisherReadiness, TemporaryRefPublishError> {
+        validate_repository_path(request.workflow_path)
+            .map_err(|()| TemporaryRefPublishError::MalformedGitOutput)?;
+        let remote = self.execution_remote(request.repository)?;
+        let tip = self
+            .remote_ref(&remote.fetch, request.default_branch_ref.as_str())?
+            .ok_or(TemporaryRefPublishError::TrustedRefUnavailable)?;
+        let fetch = GitInvocation::new(
+            [
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--no-write-fetch-head",
+                remote.fetch.canonical_url(),
+                request.default_branch_ref.as_str(),
+            ],
+            self.timeout,
+        )
+        .with_network(&remote.fetch);
+        self.execute_invocation(&fetch)?;
+        if self
+            .remote_ref(&remote.fetch, request.default_branch_ref.as_str())?
+            .as_ref()
+            != Some(&tip)
+        {
+            return Err(TemporaryRefPublishError::TrustedRefUnavailable);
+        }
+        let workflow = self
+            .execute_without_replacements([
+                "show",
+                &format!("{}:{}", tip.as_str(), request.workflow_path),
+            ])
+            .map_err(|_| TemporaryRefPublishError::WorkflowFingerprintMismatch)?;
+        if workflow.len() > MAX_DISPATCH_FILE_BYTES
+            || WorkflowFingerprint::for_workflow_bytes(&workflow)
+                != *request.workflow_fingerprint
+        {
+            return Err(TemporaryRefPublishError::WorkflowFingerprintMismatch);
+        }
+        Ok(TemporaryRefPublisherReadiness {
+            trusted_ref_tip: tip,
+        })
     }
 
     fn doctor_with_remote(
@@ -943,30 +3460,62 @@ impl<R: GitRunner> GitTemporaryRefPublisher<R> {
     {
         validate_repository_path(request.workflow_path)
             .map_err(|()| TemporaryRefPublishError::MalformedGitOutput)?;
-        let source_remote_name = self.source_remote_name.clone();
-        let execution_remote_name = self.execution_remote_name.clone();
-        let source = self.verify_remote(&source_remote_name, request.source_repository)?;
         let execution_repository = repository_url(request.repository);
-        let execution = if source_remote_name == execution_remote_name
-            && github_remote_matches(request.source_repository, &execution_repository)
-        {
-            source.clone()
+        let remotes = if let Some(remotes) = &self.frozen_remotes {
+            if !github_remote_matches(
+                remotes.source.fetch.canonical_url(),
+                request.source_repository,
+            ) || !github_remote_matches(
+                remotes.source.push.canonical_url(),
+                request.source_repository,
+            ) || !github_remote_matches(
+                remotes.execution.fetch.canonical_url(),
+                &execution_repository,
+            ) || !github_remote_matches(
+                remotes.execution.push.canonical_url(),
+                &execution_repository,
+            ) {
+                return Err(TemporaryRefPublishError::RemoteMismatch);
+            }
+            remotes.clone()
         } else {
-            self.verify_remote(&execution_remote_name, &execution_repository)?
+            #[cfg(test)]
+            {
+                let source_remote_name = self.source_remote_name.clone();
+                let execution_remote_name = self.execution_remote_name.clone();
+                let source = self.verify_remote(&source_remote_name, request.source_repository)?;
+                let execution = if source_remote_name == execution_remote_name
+                    && github_remote_matches(request.source_repository, &execution_repository)
+                {
+                    source.clone()
+                } else {
+                    self.verify_remote(&execution_remote_name, &execution_repository)?
+                };
+                VerifiedPublisherRemotes { source, execution }
+            }
+            #[cfg(not(test))]
+            {
+                return Err(TemporaryRefPublishError::RemoteMismatch);
+            }
         };
         let tip = self
-            .remote_ref(&source.fetch_url, request.trusted_source_ref.as_str())?
+            .remote_ref(&remotes.source.fetch, request.trusted_source_ref.as_str())?
             .ok_or(TemporaryRefPublishError::TrustedRefUnavailable)?;
-        self.execute([
-            "fetch",
-            "--quiet",
-            "--no-tags",
-            "--no-write-fetch-head",
-            &source.fetch_url,
-            request.trusted_source_ref.as_str(),
-        ])?;
+        let fetch = GitInvocation::new(
+            [
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--no-write-fetch-head",
+                remotes.source.fetch.canonical_url(),
+                request.trusted_source_ref.as_str(),
+            ],
+            self.timeout,
+        )
+        .with_network(&remotes.source.fetch);
+        self.execute_invocation(&fetch)?;
         let trusted_workflow = self
-            .execute([
+            .execute_without_replacements([
                 "show",
                 &format!("{}:{}", tip.as_str(), request.workflow_path),
             ])
@@ -976,12 +3525,53 @@ impl<R: GitRunner> GitTemporaryRefPublisher<R> {
         {
             return Err(TemporaryRefPublishError::WorkflowFingerprintMismatch);
         }
+        if self.frozen_remotes.is_some() {
+            self.prove_execution_readiness(
+                &remotes.execution,
+                &tip,
+                request.temporary_branch_namespace,
+            )?;
+        }
         Ok((
             TemporaryRefPublisherReadiness {
                 trusted_ref_tip: tip,
             },
-            VerifiedPublisherRemotes { source, execution },
+            remotes,
         ))
+    }
+
+    fn prove_execution_readiness(
+        &mut self,
+        execution: &VerifiedGitRemote,
+        trusted_tip: &CommitSha,
+        namespace: &TemporaryBranchNamespace,
+    ) -> Result<(), TemporaryRefPublishError> {
+        let readiness_ref = execution_readiness_ref(execution, trusted_tip, namespace);
+        if self.remote_ref(&execution.fetch, &readiness_ref)?.is_some()
+            || self.remote_ref(&execution.push, &readiness_ref)?.is_some()
+        {
+            return Err(TemporaryRefPublishError::PublicationVerificationFailed);
+        }
+        let lease = format!("--force-with-lease={readiness_ref}:");
+        let refspec = format!("{}:{readiness_ref}", trusted_tip.as_str());
+        let dry_run = GitInvocation::new(
+            [
+                "push",
+                "--dry-run",
+                "--porcelain",
+                "--no-verify",
+                &lease,
+                execution.push.canonical_url(),
+                &refspec,
+            ],
+            self.timeout,
+        )
+        .with_network(&execution.push);
+        self.execute_invocation(&dry_run)?;
+        if self.remote_ref(&execution.push, &readiness_ref)?.is_some() {
+            return Err(TemporaryRefPublishError::PublicationVerificationFailed);
+        }
+        Ok(())
     }
 
     fn index_invocation(
@@ -990,7 +3580,7 @@ impl<R: GitRunner> GitTemporaryRefPublisher<R> {
         index_path: &Path,
     ) -> GitInvocation {
         GitInvocation::new(arguments, self.timeout)
-            .with_environment("GIT_INDEX_FILE", index_path.as_os_str())
+            .with_environment(GitEnvironmentVariable::IndexFile, index_path.as_os_str())
     }
 
     fn hash_blob(&mut self, bytes: &[u8]) -> Result<String, TemporaryRefPublishError> {
@@ -998,67 +3588,455 @@ impl<R: GitRunner> GitTemporaryRefPublisher<R> {
             GitInvocation::new(["hash-object", "-w", "--stdin"], self.timeout).with_stdin(bytes);
         parse_object_id(&self.execute_invocation(&invocation)?)
     }
-}
 
-impl<R: GitRunner> TemporaryRefPublisher for GitTemporaryRefPublisher<R> {
-    fn doctor(
+    fn require_snapshot_sha1(&mut self) -> Result<(), TemporaryRefPublishError> {
+        let output = self.execute_without_replacements(["rev-parse", "--show-object-format"])?;
+        require_sha1_object_format(&output).map_err(Into::into)
+    }
+
+    fn hash_snapshot_bytes(
         &mut self,
-        request: &TemporaryRefDoctorRequest<'_>,
-    ) -> Result<TemporaryRefPublisherReadiness, TemporaryRefPublishError> {
-        self.doctor_with_remote(request)
-            .map(|(readiness, _)| readiness)
+        kind: GitSnapshotObjectKind,
+        bytes: &[u8],
+        write: bool,
+    ) -> Result<GitSha1ObjectId, TemporaryRefPublishError> {
+        let mut arguments = vec![OsString::from("hash-object")];
+        if write {
+            arguments.push(OsString::from("-w"));
+        }
+        if kind != GitSnapshotObjectKind::Blob {
+            arguments.push(OsString::from("-t"));
+            arguments.push(OsString::from(kind.git_type()));
+        }
+        arguments.push(OsString::from("--stdin"));
+        let invocation = GitInvocation::new(arguments, self.timeout).with_stdin(bytes);
+        let object = parse_object_id(&self.execute_invocation(&invocation)?)?;
+        GitSha1ObjectId::new(object).map_err(Into::into)
+    }
+
+    fn hash_snapshot_file(
+        &mut self,
+        mut file: fs::File,
+        expected_len: u64,
+        write: bool,
+    ) -> Result<GitSha1ObjectId, TemporaryRefPublishError> {
+        file.seek(io::SeekFrom::Start(0))
+            .map_err(|_| TemporaryRefPublishError::GitSnapshotInvalid)?;
+        let arguments = if write {
+            ["hash-object", "-w", "--stdin"].as_slice()
+        } else {
+            ["hash-object", "--stdin"].as_slice()
+        };
+        let invocation = GitInvocation::new(arguments, self.timeout);
+        let output = self
+            .runner
+            .execute_file(&invocation, file, expected_len)
+            .map_err(TemporaryRefPublishError::from)?;
+        GitSha1ObjectId::new(parse_object_id(&output)?).map_err(Into::into)
+    }
+
+    fn precompute_snapshot_graph(
+        &mut self,
+        inputs: &mut GitSnapshotPrecomputeInputs,
+        operation_id: &str,
+        created_at_ms: u64,
+    ) -> Result<GitSnapshotObjectGraphV1, TemporaryRefPublishError> {
+        self.require_snapshot_sha1()?;
+        let archive_size = inputs.expected_archive().size;
+        let archive_file = inputs
+            .archive_reader()?
+            .try_clone()
+            .map_err(|_| TemporaryRefPublishError::GitSnapshotInvalid)?;
+        let archive_blob = self.hash_snapshot_file(archive_file, archive_size, false)?;
+        inputs.verify_contents()?;
+        let descriptor_bytes = inputs.descriptor_bytes().to_vec();
+        let descriptor_blob =
+            self.hash_snapshot_bytes(GitSnapshotObjectKind::Blob, &descriptor_bytes, false)?;
+        inputs.verify_contents()?;
+        let graph = complete_git_snapshot_object_graph(
+            archive_blob,
+            descriptor_blob,
+            operation_id,
+            created_at_ms,
+            |kind, bytes| {
+                let object = self.hash_snapshot_bytes(kind, bytes, false)?;
+                inputs.verify_contents()?;
+                Ok::<_, TemporaryRefPublishError>(object)
+            },
+        )?;
+        inputs.verify_contents()?;
+        Ok(graph)
+    }
+
+    fn import_snapshot_graph(
+        &mut self,
+        request: &GitSnapshotImportRequest<'_>,
+    ) -> Result<GitSnapshotObjectGraphV1, TemporaryRefPublishError> {
+        if let Some(inputs) = self.snapshot_imports.get_mut(&request.request.operation_id) {
+            if inputs.locator() != request.locator || inputs.stage() != request.expected_stage {
+                return Err(TemporaryRefPublishError::GitSnapshotInvalid);
+            }
+            inputs.verify_bindings()?;
+            return Ok(inputs.stage().graph.clone());
+        }
+        self.require_snapshot_sha1()?;
+        let mut inputs = GitSnapshotImportInputs::load(
+            &self.isolation_directory,
+            request.locator,
+            request.request,
+        )?;
+        if inputs.stage() != request.expected_stage {
+            return Err(TemporaryRefPublishError::GitSnapshotInvalid);
+        }
+        let graph = inputs.stage().graph.clone();
+        let created_at_ms = inputs.stage().source_created_at_ms;
+        let archive_size = inputs.stage().archive.size;
+        let archive_file = inputs
+            .archive_reader()?
+            .try_clone()
+            .map_err(|_| TemporaryRefPublishError::GitSnapshotInvalid)?;
+        let archive_blob = self.hash_snapshot_file(archive_file, archive_size, true)?;
+        inputs.verify_imported_archive_blob(&archive_blob)?;
+        let descriptor_bytes = inputs.descriptor_bytes().to_vec();
+        let descriptor_blob =
+            self.hash_snapshot_bytes(GitSnapshotObjectKind::Blob, &descriptor_bytes, true)?;
+        inputs.verify_imported_descriptor_blob(&descriptor_blob)?;
+        graph.verify_rehashed(
+            archive_blob,
+            descriptor_blob,
+            &request.request.operation_id,
+            created_at_ms,
+            |kind, bytes| {
+                let object = self.hash_snapshot_bytes(kind, bytes, true)?;
+                inputs.verify_bindings()?;
+                Ok::<_, TemporaryRefPublishError>(object)
+            },
+        )?;
+        inputs.verify_bindings()?;
+        self.snapshot_imports
+            .insert(request.request.operation_id.clone(), inputs);
+        Ok(graph)
+    }
+
+    fn precompute_exact_snapshot_retry(
+        &mut self,
+        request: &GitSnapshotExactRetryPrecomputeRequest<'_>,
+    ) -> Result<(GithubGitSnapshotExactRetryPlanV1, Vec<u8>), TemporaryRefPublishError> {
+        if request.parent_request.operation_id == request.child_operation_id
+            || request.child_source_created_at_ms == 0
+            || request.child_source_created_at_ms / 1_000 > i64::MAX as u64
+            || GitSnapshotSourceRef::for_operation(request.child_operation_id).is_err()
+        {
+            return Err(TemporaryRefPublishError::GitSnapshotInvalid);
+        }
+        let parent_descriptor = GitSnapshotDescriptor::from_request(
+            request.parent_request,
+            SourceBundleDescriptor::new(
+                request.parent_stage.archive.clone(),
+                request.parent_request.source.clone(),
+            ),
+        )
+        .map_err(|_| TemporaryRefPublishError::GitSnapshotInvalid)?;
+        request
+            .parent_stage
+            .validate_for_request(&parent_descriptor, request.parent_request)?;
+        self.require_snapshot_sha1()?;
+        let stdout_limit = usize::try_from(
+            request
+                .parent_stage
+                .archive
+                .size
+                .checked_add(1)
+                .ok_or(TemporaryRefPublishError::GitSnapshotInvalid)?,
+        )
+        .map_err(|_| TemporaryRefPublishError::GitSnapshotInvalid)?;
+        let archive_bytes = self.execute_invocation(
+            &GitInvocation::new(
+                [
+                    "cat-file",
+                    "blob",
+                    request.parent_stage.graph.archive_blob.as_str(),
+                ],
+                self.timeout,
+            )
+            .with_stdout_limit(stdout_limit),
+        )?;
+        if archive_bytes.len() as u64 != request.parent_stage.archive.size
+            || hex_sha256(&archive_bytes) != request.parent_stage.archive.sha256
+        {
+            return Err(TemporaryRefPublishError::GitSnapshotInvalid);
+        }
+        let archive_blob =
+            self.hash_snapshot_bytes(GitSnapshotObjectKind::Blob, &archive_bytes, false)?;
+        if archive_blob != request.parent_stage.graph.archive_blob {
+            return Err(TemporaryRefPublishError::GitSnapshotInvalid);
+        }
+        let mut child_request = request.parent_request.clone();
+        request
+            .child_operation_id
+            .clone_into(&mut child_request.operation_id);
+        child_request.source_revision = None;
+        let descriptor = GitSnapshotDescriptor::from_request(
+            &child_request,
+            SourceBundleDescriptor::new(
+                request.parent_stage.archive.clone(),
+                child_request.source.clone(),
+            ),
+        )
+        .map_err(|_| TemporaryRefPublishError::GitSnapshotInvalid)?;
+        let descriptor_bytes = canonical_git_snapshot_descriptor_bytes(&descriptor)
+            .map_err(|_| TemporaryRefPublishError::GitSnapshotInvalid)?;
+        let descriptor_blob =
+            self.hash_snapshot_bytes(GitSnapshotObjectKind::Blob, &descriptor_bytes, false)?;
+        let graph = complete_git_snapshot_object_graph(
+            archive_blob,
+            descriptor_blob,
+            request.child_operation_id,
+            request.child_source_created_at_ms,
+            |kind, bytes| self.hash_snapshot_bytes(kind, bytes, false),
+        )?;
+        child_request.source_revision = Some(graph.commit.as_str().to_owned());
+        child_request
+            .validate()
+            .map_err(|_| TemporaryRefPublishError::GitSnapshotInvalid)?;
+        let plan = GithubGitSnapshotExactRetryPlanV1 {
+            request: child_request,
+            source_created_at_ms: request.child_source_created_at_ms,
+            request_template_sha256: descriptor.request_template_sha256,
+            manifest_sha256: request.parent_stage.manifest_sha256.clone(),
+            archive: request.parent_stage.archive.clone(),
+            descriptor_sha256: hex_sha256(&descriptor_bytes),
+            graph,
+        };
+        Ok((plan, archive_bytes))
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exact retry reproduces the durable plan before its bounded replayable stage publication"
+    )]
+    fn stage_exact_snapshot_retry(
+        &mut self,
+        request: &GitSnapshotExactRetryStageRequest<'_>,
+    ) -> Result<GithubGitSnapshotExactRetryStageV1, TemporaryRefPublishError> {
+        if !is_lower_sha256(request.retry_lineage_authorization_sha256) {
+            return Err(TemporaryRefPublishError::GitSnapshotInvalid);
+        }
+        let precompute_request = GitSnapshotExactRetryPrecomputeRequest {
+            parent_request: request.parent_request,
+            parent_stage: request.parent_stage,
+            child_operation_id: &request.expected_plan.request.operation_id,
+            child_source_created_at_ms: request.expected_plan.source_created_at_ms,
+        };
+        let (actual_plan, archive_bytes) =
+            self.precompute_exact_snapshot_retry(&precompute_request)?;
+        if &actual_plan != request.expected_plan {
+            return Err(TemporaryRefPublishError::GitSnapshotInvalid);
+        }
+        let descriptor = GitSnapshotDescriptor::from_request(
+            &actual_plan.request,
+            SourceBundleDescriptor::new(
+                actual_plan.archive.clone(),
+                actual_plan.request.source.clone(),
+            ),
+        )
+        .map_err(|_| TemporaryRefPublishError::GitSnapshotInvalid)?;
+        let descriptor_bytes = canonical_git_snapshot_descriptor_bytes(&descriptor)
+            .map_err(|_| TemporaryRefPublishError::GitSnapshotInvalid)?;
+        if actual_plan.request_template_sha256 != descriptor.request_template_sha256
+            || actual_plan.manifest_sha256 != descriptor.bundle.manifest.sha256
+            || actual_plan.descriptor_sha256 != hex_sha256(&descriptor_bytes)
+        {
+            return Err(TemporaryRefPublishError::GitSnapshotInvalid);
+        }
+        let operation_id = &actual_plan.request.operation_id;
+        let stage_directory = GitSnapshotStageDirectory::open_or_create_exact_retry(
+            &self.isolation_directory,
+            operation_id,
+        )?;
+        let archive_identity = stage_directory
+            .write_or_verify_archive_bytes_exact_retry(&archive_bytes, &actual_plan.archive)?;
+        let descriptor_identity =
+            stage_directory.write_or_verify_descriptor_exact_retry(&descriptor)?;
+        let stage = GitSnapshotStageV1 {
+            schema_version: crate::snapshot::GIT_SNAPSHOT_STAGE_SCHEMA_VERSION,
+            operation_id: operation_id.clone(),
+            isolation_root_identity: stage_directory.isolation_root_identity().to_owned(),
+            snapshots_store_identity: stage_directory.snapshots_store_identity().to_owned(),
+            stage_directory_identity: stage_directory.stage_directory_identity().to_owned(),
+            source_repository: request.parent_stage.source_repository.clone(),
+            source_ref: GitSnapshotSourceRef::for_operation(operation_id)?,
+            keepalive_ref: GitSnapshotKeepaliveRef::for_operation(operation_id)?,
+            source_created_at_ms: actual_plan.source_created_at_ms,
+            consent_sha256: request.retry_lineage_authorization_sha256.to_owned(),
+            request_template_sha256: actual_plan.request_template_sha256.clone(),
+            manifest_sha256: actual_plan.manifest_sha256.clone(),
+            archive: actual_plan.archive.clone(),
+            descriptor_sha256: actual_plan.descriptor_sha256.clone(),
+            final_request: actual_plan.request.clone(),
+            archive_file_identity: archive_identity.to_string(),
+            descriptor_file_identity: descriptor_identity.to_string(),
+            graph: actual_plan.graph.clone(),
+        };
+        let stage_locator = stage_directory.publish_or_verify_metadata_exact_retry(
+            &stage,
+            &descriptor,
+            &actual_plan.request,
+        )?;
+        Ok(GithubGitSnapshotExactRetryStageV1 {
+            request: actual_plan.request,
+            stage_locator,
+            stage,
+        })
+    }
+
+    fn local_snapshot_ref(
+        &mut self,
+        full_ref: &str,
+    ) -> Result<Option<GitSha1ObjectId>, TemporaryRefPublishError> {
+        let format = "--format=%(refname)%00%(objectname)";
+        let output = self.execute_without_replacements(["for-each-ref", format, full_ref])?;
+        if output.is_empty() {
+            return Ok(None);
+        }
+        let mut lines = output
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty());
+        let line = lines
+            .next()
+            .ok_or(TemporaryRefPublishError::MalformedGitOutput)?;
+        if lines.next().is_some() {
+            return Err(TemporaryRefPublishError::MalformedGitOutput);
+        }
+        let Some(separator) = line.iter().position(|byte| *byte == 0) else {
+            return Err(TemporaryRefPublishError::MalformedGitOutput);
+        };
+        if &line[..separator] != full_ref.as_bytes() {
+            return Err(TemporaryRefPublishError::MalformedGitOutput);
+        }
+        let object = std::str::from_utf8(&line[separator + 1..])
+            .map_err(|_| TemporaryRefPublishError::MalformedGitOutput)?;
+        GitSha1ObjectId::new(object.to_owned())
+            .map(Some)
+            .map_err(Into::into)
+    }
+
+    fn source_snapshot_remote(
+        &mut self,
+        expected_repository: &str,
+    ) -> Result<VerifiedGitRemote, TemporaryRefPublishError> {
+        if let Some(remotes) = &self.frozen_remotes {
+            if !github_remote_matches(remotes.source.fetch.canonical_url(), expected_repository)
+                || !github_remote_matches(remotes.source.push.canonical_url(), expected_repository)
+            {
+                return Err(TemporaryRefPublishError::RemoteMismatch);
+            }
+            return Ok(remotes.source.clone());
+        }
+        #[cfg(test)]
+        {
+            let source_remote_name = self.source_remote_name.clone();
+            self.verify_remote(&source_remote_name, expected_repository)
+        }
+        #[cfg(not(test))]
+        {
+            Err(TemporaryRefPublishError::RemoteMismatch)
+        }
     }
 
     #[allow(clippy::too_many_lines)]
-    fn publish(
+    fn prepare_publication_with_ref_policy(
         &mut self,
         request: &TemporaryRefPublishRequest<'_>,
-    ) -> Result<PublishedTemporaryRef, TemporaryRefPublishFailure> {
+        require_temporary_ref_absent: bool,
+    ) -> Result<(PublishedTemporaryRef, VerifiedGitRemote), TemporaryRefPublishError> {
         if !request.authorized {
-            return Err(TemporaryRefPublishError::Unauthorized.into());
+            return Err(TemporaryRefPublishError::Unauthorized);
         }
         if request.workflow_bytes.len() > MAX_DISPATCH_FILE_BYTES
             || request.manifest_bytes.len() > MAX_DISPATCH_FILE_BYTES
             || WorkflowFingerprint::for_workflow_bytes(request.workflow_bytes)
                 != *request.workflow_fingerprint
         {
-            return Err(TemporaryRefPublishError::WorkflowFingerprintMismatch.into());
+            return Err(TemporaryRefPublishError::WorkflowFingerprintMismatch);
         }
         validate_repository_path(request.workflow_path)
             .map_err(|()| TemporaryRefPublishError::MalformedGitOutput)?;
+        let temporary_branch_namespace =
+            temporary_namespace_for_publication(request.temporary_ref, request.operation_id)?;
         let (readiness, remotes) = self.doctor_with_remote(&TemporaryRefDoctorRequest {
             repository: request.repository,
             source_repository: request.source_repository,
             trusted_source_ref: request.trusted_source_ref,
+            temporary_branch_namespace: &temporary_branch_namespace,
             workflow_path: request.workflow_path,
             workflow_fingerprint: request.workflow_fingerprint,
         })?;
-        self.execute([
-            "cat-file",
-            "-e",
-            &format!("{}^{{commit}}", request.source_revision.as_str()),
-        ])
-        .map_err(|_| TemporaryRefPublishError::SourceRevisionNotTrusted)?;
-        self.execute([
+        if let Some(snapshot_ref) = request.snapshot_source_ref {
+            if self
+                .remote_ref(&remotes.source.fetch, snapshot_ref.as_str())?
+                .as_ref()
+                != Some(request.source_revision)
+            {
+                return Err(TemporaryRefPublishError::GitSnapshotRefConflict);
+            }
+            let fetch = GitInvocation::new(
+                [
+                    "fetch",
+                    "--quiet",
+                    "--no-tags",
+                    "--no-write-fetch-head",
+                    remotes.source.fetch.canonical_url(),
+                    snapshot_ref.as_str(),
+                ],
+                self.timeout,
+            )
+            .with_network(&remotes.source.fetch);
+            self.execute_invocation(&fetch)?;
+            self.execute_without_replacements([
+                "cat-file",
+                "-e",
+                &format!("{}^{{commit}}", request.source_revision.as_str()),
+            ])
+            .map_err(|_| TemporaryRefPublishError::GitSnapshotInvalid)?;
+            if self
+                .remote_ref(&remotes.source.fetch, snapshot_ref.as_str())?
+                .as_ref()
+                != Some(request.source_revision)
+            {
+                return Err(TemporaryRefPublishError::GitSnapshotRefConflict);
+            }
+        } else {
+            self.execute_without_replacements([
+                "cat-file",
+                "-e",
+                &format!("{}^{{commit}}", request.source_revision.as_str()),
+            ])
+            .map_err(|_| TemporaryRefPublishError::SourceRevisionNotTrusted)?;
+        }
+        self.execute_without_replacements([
             "cat-file",
             "-e",
             &format!("{}^{{commit}}", readiness.trusted_ref_tip.as_str()),
         ])
         .map_err(|_| TemporaryRefPublishError::TrustedRefUnavailable)?;
-        self.execute([
-            "merge-base",
-            "--is-ancestor",
-            request.source_revision.as_str(),
-            readiness.trusted_ref_tip.as_str(),
-        ])
-        .map_err(|_| TemporaryRefPublishError::SourceRevisionNotTrusted)?;
+        if request.snapshot_source_ref.is_none() {
+            self.execute_without_replacements([
+                "merge-base",
+                "--is-ancestor",
+                request.source_revision.as_str(),
+                readiness.trusted_ref_tip.as_str(),
+            ])
+            .map_err(|_| TemporaryRefPublishError::SourceRevisionNotTrusted)?;
+        }
 
         let full_temporary_ref = format!("refs/heads/{}", request.temporary_ref.branch().as_str());
-        if self
-            .remote_ref(&remotes.execution.fetch_url, &full_temporary_ref)?
-            .is_some()
+        if require_temporary_ref_absent
+            && self
+                .remote_ref(&remotes.execution.fetch, &full_temporary_ref)?
+                .is_some()
         {
-            return Err(TemporaryRefPublishError::TemporaryRefExists.into());
+            return Err(TemporaryRefPublishError::TemporaryRefExists);
         }
 
         let mut reservation =
@@ -1098,42 +4076,476 @@ impl<R: GitRunner> TemporaryRefPublisher for GitTemporaryRefPublisher<R> {
         let git_date = format!("@{} +0000", request.created_at_ms / 1_000);
         let commit_invocation = GitInvocation::new(["commit-tree", &tree], self.timeout)
             .with_stdin(commit_message.as_bytes())
-            .with_environment("GIT_AUTHOR_NAME", "ShiroKSH")
-            .with_environment("GIT_AUTHOR_EMAIL", "kushidashiro@gmail.com")
-            .with_environment("GIT_COMMITTER_NAME", "ShiroKSH")
-            .with_environment("GIT_COMMITTER_EMAIL", "kushidashiro@gmail.com")
-            .with_environment("GIT_AUTHOR_DATE", &git_date)
-            .with_environment("GIT_COMMITTER_DATE", &git_date);
+            .with_environment(GitEnvironmentVariable::AuthorName, "ShiroKSH")
+            .with_environment(
+                GitEnvironmentVariable::AuthorEmail,
+                "kushidashiro@gmail.com",
+            )
+            .with_environment(GitEnvironmentVariable::CommitterName, "ShiroKSH")
+            .with_environment(
+                GitEnvironmentVariable::CommitterEmail,
+                "kushidashiro@gmail.com",
+            )
+            .with_environment(GitEnvironmentVariable::AuthorDate, &git_date)
+            .with_environment(GitEnvironmentVariable::CommitterDate, &git_date);
         let commit = CommitSha::new(parse_object_id(
             &self.execute_invocation(&commit_invocation)?,
         )?)
         .map_err(|_| TemporaryRefPublishError::MalformedGitOutput)?;
         reservation.finish()?;
+        Ok((
+            PublishedTemporaryRef::new(request.temporary_ref.clone(), commit),
+            remotes.execution,
+        ))
+    }
 
+    fn prepare_publication(
+        &mut self,
+        request: &TemporaryRefPublishRequest<'_>,
+    ) -> Result<(PublishedTemporaryRef, VerifiedGitRemote), TemporaryRefPublishError> {
+        self.prepare_publication_with_ref_policy(request, true)
+    }
+
+    fn push_publication(
+        &mut self,
+        request: &TemporaryRefPublishRequest<'_>,
+        publication: PublishedTemporaryRef,
+        remote: &VerifiedGitRemote,
+    ) -> Result<PublishedTemporaryRef, TemporaryRefPublishFailure> {
+        let full_temporary_ref = format!("refs/heads/{}", request.temporary_ref.branch().as_str());
         let lease = format!("--force-with-lease={full_temporary_ref}:");
-        let refspec = format!("{}:{full_temporary_ref}", commit.as_str());
-        let publication = PublishedTemporaryRef::new(request.temporary_ref.clone(), commit.clone());
-        if let Err(error) = self.execute([
-            "push",
-            "--porcelain",
-            "--no-verify",
-            "--atomic",
-            &lease,
-            &remotes.execution.push_url,
-            &refspec,
-        ]) {
+        let refspec = format!("{}:{full_temporary_ref}", publication.commit().as_str());
+        let push = GitInvocation::new(
+            [
+                "push",
+                "--porcelain",
+                "--no-verify",
+                "--atomic",
+                &lease,
+                remote.push.canonical_url(),
+                &refspec,
+            ],
+            self.timeout,
+        )
+        .with_network(&remote.push);
+        if let Err(error) = self.execute_invocation(&push) {
             return Err(TemporaryRefPublishFailure::uncertain(error, publication));
         }
         let confirmed = self
-            .remote_ref(&remotes.execution.fetch_url, &full_temporary_ref)
+            .remote_ref(&remote.fetch, &full_temporary_ref)
             .map_err(|error| TemporaryRefPublishFailure::uncertain(error, publication.clone()))?;
-        if confirmed.as_ref() != Some(&commit) {
+        if confirmed.as_ref() != Some(publication.commit()) {
             return Err(TemporaryRefPublishFailure::uncertain(
                 TemporaryRefPublishError::PublicationVerificationFailed,
                 publication,
             ));
         }
         Ok(publication)
+    }
+}
+
+impl<R: GitRunner> TemporaryRefPublisher for GitTemporaryRefPublisher<R> {
+    fn supports_git_snapshot(&self) -> bool {
+        cfg!(any(unix, windows))
+    }
+
+    fn precompute_git_snapshot(
+        &mut self,
+        inputs: &mut GitSnapshotPrecomputeInputs,
+        operation_id: &str,
+        created_at_ms: u64,
+    ) -> Result<GitSnapshotObjectGraphV1, TemporaryRefPublishError> {
+        self.precompute_snapshot_graph(inputs, operation_id, created_at_ms)
+    }
+
+    fn adopt_git_snapshot_stage(
+        &mut self,
+        request: &IosDeviceBuildRequest,
+    ) -> Result<(GitSnapshotStageLocatorV1, GitSnapshotStageV1), TemporaryRefPublishError> {
+        let (locator, inputs) =
+            GitSnapshotImportInputs::adopt_without_locator(&self.isolation_directory, request)?;
+        let stage = inputs.stage().clone();
+        drop(inputs);
+        Ok((locator, stage))
+    }
+
+    fn discover_git_snapshot_stages(
+        &mut self,
+    ) -> Result<Vec<GithubGitSnapshotRecoveryCandidateV1>, TemporaryRefPublishError> {
+        discover_complete_git_snapshot_stages(&self.isolation_directory)?
+            .into_iter()
+            .map(|candidate| {
+                let final_request = candidate.stage.final_request.clone();
+                Ok(GithubGitSnapshotRecoveryCandidateV1 {
+                    stage_locator: candidate.locator,
+                    stage: candidate.stage,
+                    descriptor: candidate.descriptor,
+                    final_request,
+                })
+            })
+            .collect()
+    }
+
+    fn import_git_snapshot(
+        &mut self,
+        request: &GitSnapshotImportRequest<'_>,
+    ) -> Result<GitSnapshotObjectGraphV1, TemporaryRefPublishError> {
+        self.import_snapshot_graph(request)
+    }
+
+    fn precompute_exact_git_snapshot_retry(
+        &mut self,
+        request: &GitSnapshotExactRetryPrecomputeRequest<'_>,
+    ) -> Result<GithubGitSnapshotExactRetryPlanV1, TemporaryRefPublishError> {
+        self.precompute_exact_snapshot_retry(request)
+            .map(|(plan, _archive_bytes)| plan)
+    }
+
+    fn stage_exact_git_snapshot_retry(
+        &mut self,
+        request: &GitSnapshotExactRetryStageRequest<'_>,
+    ) -> Result<GithubGitSnapshotExactRetryStageV1, TemporaryRefPublishError> {
+        self.stage_exact_snapshot_retry(request)
+    }
+
+    fn delete_git_snapshot_stage(
+        &mut self,
+        request: &GitSnapshotImportRequest<'_>,
+    ) -> Result<(), TemporaryRefPublishError> {
+        GitSnapshotImportInputs::delete_stage_exact(
+            &self.isolation_directory,
+            request.locator,
+            request.expected_stage,
+            request.request,
+        )
+        .map_err(Into::into)
+    }
+
+    fn reconcile_git_snapshot_keepalive(
+        &mut self,
+        request: &GitSnapshotKeepaliveRequest<'_>,
+    ) -> Result<GitSnapshotRefReconciliation, TemporaryRefPublishError> {
+        if GitSnapshotKeepaliveRef::for_operation(request.operation_id)? != *request.keepalive_ref {
+            return Err(TemporaryRefPublishError::GitSnapshotInvalid);
+        }
+        Ok(
+            match self.local_snapshot_ref(request.keepalive_ref.as_str())? {
+                None => GitSnapshotRefReconciliation::Absent,
+                Some(commit) if commit == *request.commit => GitSnapshotRefReconciliation::Exact,
+                Some(_) => GitSnapshotRefReconciliation::Conflict,
+            },
+        )
+    }
+
+    fn create_git_snapshot_keepalive(
+        &mut self,
+        request: &GitSnapshotKeepaliveRequest<'_>,
+    ) -> Result<(), TemporaryRefPublishError> {
+        if GitSnapshotKeepaliveRef::for_operation(request.operation_id)? != *request.keepalive_ref {
+            return Err(TemporaryRefPublishError::GitSnapshotInvalid);
+        }
+        let mut inputs = self
+            .snapshot_imports
+            .remove(request.operation_id)
+            .ok_or(TemporaryRefPublishError::GitSnapshotInvalid)?;
+        if inputs.stage().graph.commit != *request.commit {
+            self.snapshot_imports
+                .insert(request.operation_id.to_owned(), inputs);
+            return Err(TemporaryRefPublishError::GitSnapshotInvalid);
+        }
+        inputs.verify_bindings()?;
+        let invocation = GitInvocation::new(
+            [
+                "update-ref",
+                request.keepalive_ref.as_str(),
+                request.commit.as_str(),
+                "0000000000000000000000000000000000000000",
+            ],
+            self.timeout,
+        );
+        let mutation = self.execute_invocation(&invocation);
+        inputs.verify_bindings()?;
+        let reconciliation = self.reconcile_git_snapshot_keepalive(request)?;
+        match (mutation, reconciliation) {
+            (_, GitSnapshotRefReconciliation::Exact) => Ok(()),
+            (_, GitSnapshotRefReconciliation::Conflict) => {
+                Err(TemporaryRefPublishError::GitSnapshotRefConflict)
+            }
+            (Err(error), GitSnapshotRefReconciliation::Absent) => {
+                self.snapshot_imports
+                    .insert(request.operation_id.to_owned(), inputs);
+                Err(error)
+            }
+            (Ok(_), GitSnapshotRefReconciliation::Absent) => {
+                self.snapshot_imports
+                    .insert(request.operation_id.to_owned(), inputs);
+                Err(TemporaryRefPublishError::PublicationVerificationFailed)
+            }
+        }
+    }
+
+    fn publish_git_snapshot_source(
+        &mut self,
+        request: &GitSnapshotSourcePublishRequest<'_>,
+    ) -> Result<GitSnapshotSourcePublication, TemporaryRefPublishError> {
+        if !request.authorized {
+            return Err(TemporaryRefPublishError::Unauthorized);
+        }
+        let remote = self.source_snapshot_remote(request.source_repository)?;
+        let full_ref = request.source_ref.as_str();
+        let lease = format!("--force-with-lease={full_ref}:");
+        let refspec = format!("{}:{full_ref}", request.commit.as_str());
+        let invocation = GitInvocation::new(
+            [
+                "push",
+                "--porcelain",
+                "--no-verify",
+                "--atomic",
+                &lease,
+                remote.push.canonical_url(),
+                &refspec,
+            ],
+            self.timeout,
+        )
+        .with_network(&remote.push);
+        let mutation = self.execute_invocation(&invocation);
+        let reconciliation = self.reconcile_git_snapshot_source(request)?;
+        Ok(match reconciliation {
+            GitSnapshotRefReconciliation::Exact => GitSnapshotSourcePublication::Exact,
+            GitSnapshotRefReconciliation::Conflict => GitSnapshotSourcePublication::Conflict,
+            GitSnapshotRefReconciliation::Absent if mutation.is_err() => {
+                GitSnapshotSourcePublication::Uncertain
+            }
+            GitSnapshotRefReconciliation::Absent => GitSnapshotSourcePublication::Uncertain,
+        })
+    }
+
+    fn reconcile_git_snapshot_source(
+        &mut self,
+        request: &GitSnapshotSourcePublishRequest<'_>,
+    ) -> Result<GitSnapshotRefReconciliation, TemporaryRefPublishError> {
+        let remote = self.source_snapshot_remote(request.source_repository)?;
+        let expected = CommitSha::new(request.commit.as_str().to_owned())
+            .map_err(|_| TemporaryRefPublishError::GitSnapshotInvalid)?;
+        Ok(
+            match self.remote_ref(&remote.fetch, request.source_ref.as_str())? {
+                None => GitSnapshotRefReconciliation::Absent,
+                Some(commit) if commit == expected => GitSnapshotRefReconciliation::Exact,
+                Some(_) => GitSnapshotRefReconciliation::Conflict,
+            },
+        )
+    }
+
+    fn delete_git_snapshot_source(
+        &mut self,
+        request: &GitSnapshotSourceDeleteRequest<'_>,
+    ) -> Result<(), TemporaryRefPublishError> {
+        if !request.authorized {
+            return Err(TemporaryRefPublishError::Unauthorized);
+        }
+        let remote = self.source_snapshot_remote(request.source_repository)?;
+        let full_ref = request.source_ref.as_str();
+        let lease = format!(
+            "--force-with-lease={full_ref}:{}",
+            request.expected_commit.as_str()
+        );
+        let refspec = format!(":{full_ref}");
+        let invocation = GitInvocation::new(
+            [
+                "push",
+                "--porcelain",
+                "--no-verify",
+                "--atomic",
+                &lease,
+                remote.push.canonical_url(),
+                &refspec,
+            ],
+            self.timeout,
+        )
+        .with_network(&remote.push);
+        let mutation = self.execute_invocation(&invocation);
+        let reconciliation =
+            self.reconcile_git_snapshot_source(&GitSnapshotSourcePublishRequest {
+                source_repository: request.source_repository,
+                source_ref: request.source_ref,
+                commit: request.expected_commit,
+                authorized: true,
+            })?;
+        match (mutation, reconciliation) {
+            (_, GitSnapshotRefReconciliation::Absent) => Ok(()),
+            (_, GitSnapshotRefReconciliation::Conflict) => {
+                Err(TemporaryRefPublishError::GitSnapshotRefConflict)
+            }
+            (Err(error), GitSnapshotRefReconciliation::Exact) => Err(error),
+            (Ok(_), GitSnapshotRefReconciliation::Exact) => {
+                Err(TemporaryRefPublishError::DeletionVerificationFailed)
+            }
+        }
+    }
+
+    fn release_git_snapshot_keepalive(
+        &mut self,
+        request: &GitSnapshotKeepaliveRequest<'_>,
+    ) -> Result<(), TemporaryRefPublishError> {
+        match self.reconcile_git_snapshot_keepalive(request)? {
+            GitSnapshotRefReconciliation::Absent => return Ok(()),
+            GitSnapshotRefReconciliation::Conflict => {
+                return Err(TemporaryRefPublishError::GitSnapshotRefConflict);
+            }
+            GitSnapshotRefReconciliation::Exact => {}
+        }
+        let invocation = GitInvocation::new(
+            [
+                "update-ref",
+                "-d",
+                request.keepalive_ref.as_str(),
+                request.commit.as_str(),
+            ],
+            self.timeout,
+        );
+        let mutation = self.execute_invocation(&invocation);
+        match (mutation, self.reconcile_git_snapshot_keepalive(request)?) {
+            (_, GitSnapshotRefReconciliation::Absent) => Ok(()),
+            (_, GitSnapshotRefReconciliation::Conflict) => {
+                Err(TemporaryRefPublishError::GitSnapshotRefConflict)
+            }
+            (Err(error), GitSnapshotRefReconciliation::Exact) => Err(error),
+            (Ok(_), GitSnapshotRefReconciliation::Exact) => {
+                Err(TemporaryRefPublishError::DeletionVerificationFailed)
+            }
+        }
+    }
+
+    fn doctor(
+        &mut self,
+        request: &TemporaryRefDoctorRequest<'_>,
+    ) -> Result<TemporaryRefPublisherReadiness, TemporaryRefPublishError> {
+        self.doctor_with_remote(request)
+            .map(|(readiness, _)| readiness)
+    }
+
+    fn verify_execution_workflow(
+        &mut self,
+        request: &ExecutionWorkflowDoctorRequest<'_>,
+    ) -> Result<TemporaryRefPublisherReadiness, TemporaryRefPublishError> {
+        self.verify_execution_workflow_bytes(request)
+    }
+
+    fn prepare(
+        &mut self,
+        request: &TemporaryRefPublishRequest<'_>,
+    ) -> Result<Option<PublishedTemporaryRef>, TemporaryRefPublishError> {
+        let (publication, _) = self.prepare_publication(request)?;
+        Ok(Some(publication))
+    }
+
+    fn publication_attempt_is_process_fenced(&self) -> bool {
+        self.runner.process_tree_is_parent_fenced()
+    }
+
+    fn publication_lease_scope_sha256(&self) -> Option<&str> {
+        Some(&self.publication_lease_scope_sha256)
+    }
+
+    fn acquire_publication_lease(
+        &mut self,
+        request: &TemporaryRefPublicationLeaseRequest<'_>,
+    ) -> Result<TemporaryRefPublicationLease, TemporaryRefPublishError> {
+        if !cfg!(any(unix, windows)) {
+            return Ok(TemporaryRefPublicationLease::Unsupported);
+        }
+        let key = publication_lease_key(request);
+        if self.publication_leases.contains_key(&key) {
+            return Ok(TemporaryRefPublicationLease::AlreadyOwned);
+        }
+        if self.publication_leases.len() >= MAX_JOB_RECORDS {
+            return Err(TemporaryRefPublishError::LocalIsolationFailed);
+        }
+        rustferry_core::verify_directory_identity(
+            &self.isolation_directory,
+            &self.isolation_directory_identity,
+        )
+        .map_err(|_| TemporaryRefPublishError::LocalIsolationFailed)?;
+        let path = self
+            .isolation_directory
+            .join(format!(".rustferry-publication-{key}.lock"));
+        let lease = rustferry_core::process_control::try_acquire_process_file_lease(&path)
+            .map_err(|_| TemporaryRefPublishError::LocalIsolationFailed)?;
+        let Some(lease) = lease else {
+            return Ok(TemporaryRefPublicationLease::HeldByOther);
+        };
+        self.publication_leases.insert(key, lease);
+        Ok(TemporaryRefPublicationLease::Acquired)
+    }
+
+    fn acquire_git_snapshot_source_lease(
+        &mut self,
+        request: &GitSnapshotSourcePublicationLeaseRequest<'_>,
+    ) -> Result<TemporaryRefPublicationLease, TemporaryRefPublishError> {
+        if !cfg!(any(unix, windows)) {
+            return Ok(TemporaryRefPublicationLease::Unsupported);
+        }
+        if repository_from_url(request.source_repository).is_none() {
+            return Err(TemporaryRefPublishError::RemoteMismatch);
+        }
+        let key = git_snapshot_source_lease_key(request);
+        if self.publication_leases.contains_key(&key) {
+            return Ok(TemporaryRefPublicationLease::AlreadyOwned);
+        }
+        if self.publication_leases.len() >= MAX_JOB_RECORDS {
+            return Err(TemporaryRefPublishError::LocalIsolationFailed);
+        }
+        rustferry_core::verify_directory_identity(
+            &self.isolation_directory,
+            &self.isolation_directory_identity,
+        )
+        .map_err(|_| TemporaryRefPublishError::LocalIsolationFailed)?;
+        let path = self
+            .isolation_directory
+            .join(format!(".rustferry-snapshot-source-{key}.lock"));
+        let lease = rustferry_core::process_control::try_acquire_process_file_lease(&path)
+            .map_err(|_| TemporaryRefPublishError::LocalIsolationFailed)?;
+        let Some(lease) = lease else {
+            return Ok(TemporaryRefPublicationLease::HeldByOther);
+        };
+        self.publication_leases.insert(key, lease);
+        Ok(TemporaryRefPublicationLease::Acquired)
+    }
+
+    fn release_publication_lease(&mut self, request: &TemporaryRefPublicationLeaseRequest<'_>) {
+        self.publication_leases
+            .remove(&publication_lease_key(request));
+    }
+
+    fn release_git_snapshot_source_lease(
+        &mut self,
+        request: &GitSnapshotSourcePublicationLeaseRequest<'_>,
+    ) {
+        self.publication_leases
+            .remove(&git_snapshot_source_lease_key(request));
+    }
+
+    fn publish(
+        &mut self,
+        request: &TemporaryRefPublishRequest<'_>,
+    ) -> Result<PublishedTemporaryRef, TemporaryRefPublishFailure> {
+        let (publication, remote) = self.prepare_publication(request)?;
+        self.push_publication(request, publication, &remote)
+    }
+
+    fn publish_prepared(
+        &mut self,
+        request: &TemporaryRefPublishRequest<'_>,
+        prepared: Option<&PublishedTemporaryRef>,
+    ) -> Result<PublishedTemporaryRef, TemporaryRefPublishFailure> {
+        let Some(expected) = prepared else {
+            return self.publish(request);
+        };
+        let (publication, remote) = self.prepare_publication(request)?;
+        if expected != &publication || expected.temporary_ref() != request.temporary_ref {
+            return Err(TemporaryRefPublishError::PublicationVerificationFailed.into());
+        }
+        self.push_publication(request, publication, &remote)
     }
 
     fn delete_temporary_ref(
@@ -1143,30 +4555,33 @@ impl<R: GitRunner> TemporaryRefPublisher for GitTemporaryRefPublisher<R> {
         if !request.authorized {
             return Err(TemporaryRefPublishError::Unauthorized);
         }
-        let execution_remote_name = self.execution_remote_name.clone();
-        let remote =
-            self.verify_remote(&execution_remote_name, &repository_url(request.repository))?;
+        let remote = self.execution_remote(request.repository)?;
         let full_ref = format!("refs/heads/{}", request.temporary_ref.branch().as_str());
         let lease = format!(
             "--force-with-lease={full_ref}:{}",
             request.expected_commit.as_str()
         );
         let delete_refspec = format!(":{full_ref}");
-        let deletion = self.execute([
-            "push",
-            "--porcelain",
-            "--no-verify",
-            "--atomic",
-            &lease,
-            &remote.push_url,
-            &delete_refspec,
-        ]);
+        let deletion_invocation = GitInvocation::new(
+            [
+                "push",
+                "--porcelain",
+                "--no-verify",
+                "--atomic",
+                &lease,
+                remote.push.canonical_url(),
+                &delete_refspec,
+            ],
+            self.timeout,
+        )
+        .with_network(&remote.push);
+        let deletion = self.execute_invocation(&deletion_invocation);
         match deletion {
-            Ok(_) => match self.remote_ref(&remote.fetch_url, &full_ref)? {
+            Ok(_) => match self.remote_ref(&remote.fetch, &full_ref)? {
                 None => Ok(()),
                 Some(_) => Err(TemporaryRefPublishError::DeletionVerificationFailed),
             },
-            Err(push_error) => match self.remote_ref(&remote.fetch_url, &full_ref) {
+            Err(push_error) => match self.remote_ref(&remote.fetch, &full_ref) {
                 Ok(None) => Ok(()),
                 Ok(Some(current)) if current != *request.expected_commit => {
                     Err(TemporaryRefPublishError::TemporaryRefLeaseRejected)
@@ -1177,6 +4592,46 @@ impl<R: GitRunner> TemporaryRefPublisher for GitTemporaryRefPublisher<R> {
     }
 }
 
+impl<R: GitRunner> TemporaryRefReconciler for GitTemporaryRefPublisher<R> {
+    fn reconcile_temporary_ref(
+        &mut self,
+        request: &TemporaryRefReconcileRequest<'_>,
+    ) -> Result<TemporaryRefReconciliation, TemporaryRefPublishError> {
+        let reconstruction = TemporaryRefPublishRequest {
+            repository: request.repository,
+            source_repository: request.source_repository,
+            trusted_source_ref: request.trusted_source_ref,
+            source_revision: request.source_revision,
+            snapshot_source_ref: request.snapshot_source_ref,
+            temporary_ref: request.temporary_ref,
+            workflow_path: request.workflow_path,
+            workflow_bytes: request.workflow_bytes,
+            workflow_fingerprint: request.workflow_fingerprint,
+            manifest_bytes: request.manifest_bytes,
+            operation_id: request.operation_id,
+            created_at_ms: request.created_at_ms,
+            authorized: true,
+        };
+        let (recomputed, remote) =
+            self.prepare_publication_with_ref_policy(&reconstruction, false)?;
+        if recomputed.temporary_ref() != request.temporary_ref
+            || recomputed.commit() != request.expected_prepared_commit
+        {
+            return Ok(TemporaryRefReconciliation::Conflict);
+        }
+        let full_ref = format!("refs/heads/{}", request.temporary_ref.branch().as_str());
+        let Some(tip) = self.remote_ref(&remote.fetch, &full_ref)? else {
+            return Ok(TemporaryRefReconciliation::Missing);
+        };
+        if tip != *request.expected_prepared_commit {
+            return Ok(TemporaryRefReconciliation::Conflict);
+        }
+        Ok(TemporaryRefReconciliation::Exact(
+            PublishedTemporaryRef::new(request.temporary_ref.clone(), tip),
+        ))
+    }
+}
+
 impl WorkflowFingerprint {
     fn for_workflow_bytes(bytes: &[u8]) -> Self {
         Self(hex_sha256(bytes))
@@ -1184,8 +4639,9 @@ impl WorkflowFingerprint {
 }
 
 struct IndexReservation {
-    lock_path: PathBuf,
     index_path: PathBuf,
+    #[cfg(windows)]
+    directory_guard: Option<std::fs::File>,
     finished: bool,
 }
 
@@ -1193,22 +4649,13 @@ impl IndexReservation {
     fn create(directory: &Path, operation_id: &str) -> Result<Self, TemporaryRefPublishError> {
         validate_ref_segment(operation_id)
             .map_err(|()| TemporaryRefPublishError::LocalIsolationFailed)?;
-        let lock_path = directory.join(format!("{operation_id}.lock"));
-        let index_path = directory.join(format!("{operation_id}.index"));
-        if index_path.exists() {
-            return Err(TemporaryRefPublishError::LocalIsolationFailed);
-        }
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        options
-            .open(&lock_path)
-            .and_then(|file| file.sync_all())
-            .map_err(|_| TemporaryRefPublishError::LocalIsolationFailed)?;
+        let created = create_unique_index_directory(directory, operation_id)?;
+        let directory = created.path;
+        let index_path = directory.join("index");
         Ok(Self {
-            lock_path,
             index_path,
+            #[cfg(windows)]
+            directory_guard: Some(created.guard),
             finished: false,
         })
     }
@@ -1223,9 +4670,26 @@ impl IndexReservation {
         Ok(())
     }
 
-    fn cleanup(&self) -> Result<(), TemporaryRefPublishError> {
+    fn cleanup(&mut self) -> Result<(), TemporaryRefPublishError> {
         remove_exact_file_if_present(&self.index_path)?;
-        remove_exact_file_if_present(&self.lock_path)
+        remove_exact_file_if_present(&self.index_path.with_extension("lock"))?;
+        #[cfg(windows)]
+        {
+            let guard = self
+                .directory_guard
+                .take()
+                .ok_or(TemporaryRefPublishError::LocalIsolationFailed)?;
+            rustferry_core::windows_private_directory::remove_private_directory_handle(guard)
+                .map_err(|_| TemporaryRefPublishError::LocalIsolationFailed)
+        }
+        #[cfg(not(windows))]
+        {
+            let directory = self
+                .index_path
+                .parent()
+                .ok_or(TemporaryRefPublishError::LocalIsolationFailed)?;
+            fs::remove_dir(directory).map_err(|_| TemporaryRefPublishError::LocalIsolationFailed)
+        }
     }
 }
 
@@ -1237,6 +4701,54 @@ impl Drop for IndexReservation {
     }
 }
 
+struct UniqueIndexDirectory {
+    path: PathBuf,
+    #[cfg(windows)]
+    guard: std::fs::File,
+}
+
+fn create_unique_index_directory(
+    parent: &Path,
+    operation_id: &str,
+) -> Result<UniqueIndexDirectory, TemporaryRefPublishError> {
+    for _ in 0..16 {
+        let counter = INDEX_RESERVATION_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut digest = Sha256::new();
+        digest.update(b"rustferry-index-reservation-v1\0");
+        digest.update(operation_id.as_bytes());
+        digest.update(std::process::id().to_be_bytes());
+        digest.update(counter.to_be_bytes());
+        digest.update(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+                .to_be_bytes(),
+        );
+        let name = format!(".rustferry-index-{}", hex::encode(digest.finalize()));
+        let path = parent.join(name);
+        #[cfg(windows)]
+        match rustferry_core::windows_private_directory::create_private_directory(&path) {
+            Ok(guard) => return Ok(UniqueIndexDirectory { path, guard }),
+            Err(_) if path.exists() => {}
+            Err(_) => return Err(TemporaryRefPublishError::LocalIsolationFailed),
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(&path) {
+                Ok(()) => return Ok(UniqueIndexDirectory { path }),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(_) => return Err(TemporaryRefPublishError::LocalIsolationFailed),
+            }
+        }
+    }
+    Err(TemporaryRefPublishError::LocalIsolationFailed)
+}
+
 /// Exact provider/run identity exposed to an independent artifact verifier.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GithubArtifactContext {
@@ -1246,6 +4758,9 @@ pub struct GithubArtifactContext {
     pub operation_id: String,
     /// Exact GitHub Actions execution repository used for run and artifact APIs.
     pub repository: Repository,
+    /// Stable GitHub database ID of the exact execution repository when durable evidence is
+    /// requested. Stores that cannot produce durable evidence may receive `None`.
+    pub execution_repository_id: Option<u64>,
     /// Exact mapped run.
     pub run: RunSnapshot,
     /// Exact configured source repository URL bound to the request provenance.
@@ -1260,7 +4775,43 @@ pub struct GithubArtifactContext {
     pub request_sha256: String,
 }
 
+/// Independently verified evidence retained for one exact GitHub run attempt.
+///
+/// Fields are intentionally private. Only the built-in verifier can construct this value after
+/// validating the raw artifact bytes; alternate stores remain unable to assert signed cleanup
+/// from a manifest alone.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GithubVerifiedRunEvidence {
+    compile_evidence: CompilePhaseEvidence,
+    signed_cleanup_evidence: Option<GithubSignedCleanupEvidenceV1>,
+}
+
+impl GithubVerifiedRunEvidence {
+    pub(crate) fn new(
+        compile_evidence: CompilePhaseEvidence,
+        signed_cleanup_evidence: Option<GithubSignedCleanupEvidenceV1>,
+    ) -> Self {
+        Self {
+            compile_evidence,
+            signed_cleanup_evidence,
+        }
+    }
+
+    /// Exact independently verified compile-phase evidence.
+    pub fn compile_evidence(&self) -> &CompilePhaseEvidence {
+        &self.compile_evidence
+    }
+
+    /// Attempt-scoped protected-cleanup evidence, present only for a verified signed artifact.
+    pub fn signed_cleanup_evidence(&self) -> Option<&GithubSignedCleanupEvidenceV1> {
+        self.signed_cleanup_evidence.as_ref()
+    }
+}
+
 /// Injectable independent artifact ingestion and verification seam.
+///
+/// Implementations must not call back into the provider. Artifact operations may run while the
+/// provider holds the exact job identity stable.
 pub trait VerifiedArtifactStore: Send {
     /// Whether verified manifest enumeration is implemented.
     fn supports_listing(&self) -> bool;
@@ -1268,6 +4819,10 @@ pub trait VerifiedArtifactStore: Send {
     fn supports_download(&self) -> bool;
     /// Whether exact retained-artifact deletion is implemented.
     fn supports_removal(&self) -> bool;
+    /// Whether this verifier can produce attempt-scoped signed-cleanup evidence from raw reports.
+    fn supports_signed_cleanup_evidence(&self) -> bool {
+        false
+    }
 
     /// Return only independently verified manifests, or an empty vector while pending.
     ///
@@ -1278,6 +4833,21 @@ pub trait VerifiedArtifactStore: Send {
         &mut self,
         context: &GithubArtifactContext,
     ) -> RemoteBuildResult<Vec<ArtifactManifest>>;
+
+    /// Return evidence produced by the same independent verification as [`Self::list_verified`].
+    ///
+    /// The default cannot claim evidence. Implementations must never synthesize this value from a
+    /// caller-provided manifest or durable checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed verification failure or `None` while exact artifacts are unavailable.
+    fn verified_run_evidence(
+        &mut self,
+        _context: &GithubArtifactContext,
+    ) -> RemoteBuildResult<Option<GithubVerifiedRunEvidence>> {
+        Ok(None)
+    }
 
     /// Download and independently verify one exact manifest artifact.
     ///
@@ -1291,6 +4861,10 @@ pub trait VerifiedArtifactStore: Send {
     ) -> RemoteBuildResult<ArtifactDownloadResult>;
 
     /// Delete only artifacts owned by the exact mapped run.
+    ///
+    /// The same exact request may be replayed after a crash. Implementations must therefore be
+    /// idempotent, succeed when those artifacts are already absent, and never broaden deletion
+    /// beyond the validated run identity.
     ///
     /// # Errors
     ///
@@ -1363,32 +4937,1531 @@ impl ProviderClock for SystemProviderClock {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug)]
 struct JobRecord {
+    principal: Option<GithubPrincipalIdentityV1>,
+    execution_repository_id: Option<u64>,
     operation_id: String,
     job_id: String,
     source_revision: CommitSha,
+    git_snapshot: Option<GithubGitSnapshotResumeV1>,
     request: IosDeviceBuildRequest,
     request_sha256: String,
     temporary_ref: TemporaryGitRef,
+    prepared_dispatch_commit: Option<CommitSha>,
     dispatch_commit: Option<CommitSha>,
+    workflow_dispatch: Option<GithubWorkflowDispatchResumeV1>,
     created_at_ms: u64,
+    publication_started_at_ms: u64,
+    publication_quiescence_deadline_ms: u64,
     state: JobState,
     run: Option<RunHandle>,
     run_snapshot: Option<RunSnapshot>,
+    publication_intent: bool,
+    publication_absent: bool,
+    publication_not_attempted: bool,
+    publication_process_fenced: bool,
+    publication_lease_scope_sha256: Option<String>,
+    publication_takeover_lease_owned: bool,
+    snapshot_source_lease_owned: bool,
+    publication_absence_observations: u8,
+    publication_absence_first_observed_at_ms: u64,
     cancellation_requested: bool,
     cancellation_dispatched: bool,
+    cleanup_requested: bool,
+    remove_artifacts_requested: bool,
+    artifacts_removed: bool,
     temporary_ref_deleted: bool,
     verification_pending_event: bool,
     publication_uncertain: bool,
     run_discovery_attempts: u16,
     run_discovery_deadline_ms: u64,
     manifests: Vec<ArtifactManifest>,
+    compile_evidence: Option<CompilePhaseEvidence>,
+    signed_cleanup_evidence: Option<GithubSignedCleanupEvidenceV1>,
     events: Vec<RemoteBuildEvent>,
+}
+
+#[derive(Debug)]
+struct WorkflowDispatchPostAuthority {
+    job_id: String,
+    request: WorkflowDispatchRequest,
+}
+
+impl GithubWorkflowDispatchResumeV1 {
+    fn from_request(request: &WorkflowDispatchRequest) -> Self {
+        Self {
+            schema_version: GITHUB_WORKFLOW_DISPATCH_RESUME_SCHEMA_VERSION,
+            workflow_id: request.workflow().id().get(),
+            workflow_path: request.workflow().path().to_owned(),
+            branch: request.temporary_ref().branch().as_str().to_owned(),
+            operation_id: request.operation_id().to_owned(),
+            request_sha256: request.request_sha256().to_owned(),
+            source_revision: request.source_revision().as_str().to_owned(),
+            dispatch_revision: request.dispatch_revision().as_str().to_owned(),
+            body_sha256: request.body_sha256().to_owned(),
+            run_name: request.run_name().to_owned(),
+            uncertain: true,
+            receipt: None,
+        }
+    }
+
+    fn request_for_record(
+        &self,
+        config: &GithubProviderConfig,
+        record: &JobRecord,
+    ) -> RemoteBuildResult<WorkflowDispatchRequest> {
+        let dispatch_revision = record
+            .dispatch_commit
+            .clone()
+            .ok_or_else(|| resume_failure("resume_workflow_dispatch_commit_missing"))?;
+        if self.schema_version != GITHUB_WORKFLOW_DISPATCH_RESUME_SCHEMA_VERSION
+            || config.workflow.run_trigger() != WorkflowRunTrigger::WorkflowDispatch
+            || self.workflow_path != config.workflow.filename().repository_path()
+            || self.branch != record.temporary_ref.branch().as_str()
+            || self.operation_id != record.operation_id
+            || self.request_sha256 != record.request_sha256
+            || self.source_revision != record.source_revision.as_str()
+            || self.dispatch_revision != dispatch_revision.as_str()
+            || !is_lower_sha256(&self.body_sha256)
+            || self.run_name.is_empty()
+            || self.uncertain != self.receipt.is_none()
+        {
+            return Err(resume_failure("resume_workflow_dispatch_identity_mismatch"));
+        }
+        let workflow_id = WorkflowId::new(self.workflow_id)
+            .map_err(|_| resume_failure("resume_workflow_dispatch_identity_invalid"))?;
+        let registration = WorkflowRegistration::restore(
+            config.repository.clone(),
+            workflow_id,
+            self.workflow_path.clone(),
+        )
+        .map_err(|_| resume_failure("resume_workflow_dispatch_identity_invalid"))?;
+        let request = WorkflowDispatchRequest::new(
+            config.repository.clone(),
+            registration,
+            record.temporary_ref.clone(),
+            record.operation_id.clone(),
+            record.request_sha256.clone(),
+            record.source_revision.clone(),
+            dispatch_revision,
+        )
+        .map_err(|_| resume_failure("resume_workflow_dispatch_identity_invalid"))?;
+        if request.body_sha256() != self.body_sha256 || request.run_name() != self.run_name {
+            return Err(resume_failure("resume_workflow_dispatch_body_mismatch"));
+        }
+        Ok(request)
+    }
+
+    fn bind_receipt(&mut self, receipt: &WorkflowDispatchReceipt) -> RemoteBuildResult<()> {
+        let candidate = GithubWorkflowDispatchReceiptV1 {
+            run_id: receipt.run_id().get(),
+            workflow_id: receipt.workflow_id().get(),
+            workflow_path: receipt.workflow_path().to_owned(),
+            branch: receipt.branch().as_str().to_owned(),
+            dispatch_revision: receipt.dispatch_revision().as_str().to_owned(),
+            run_name: receipt.run_name().to_owned(),
+        };
+        if candidate.workflow_id != self.workflow_id
+            || candidate.workflow_path != self.workflow_path
+            || candidate.branch != self.branch
+            || candidate.dispatch_revision != self.dispatch_revision
+            || candidate.run_name != self.run_name
+            || self
+                .receipt
+                .as_ref()
+                .is_some_and(|existing| existing != &candidate)
+        {
+            return Err(resume_failure("resume_workflow_dispatch_receipt_mismatch"));
+        }
+        self.receipt = Some(candidate);
+        self.uncertain = false;
+        Ok(())
+    }
+
+    fn restored_receipt(
+        &self,
+        config: &GithubProviderConfig,
+        record: &JobRecord,
+    ) -> RemoteBuildResult<Option<WorkflowDispatchReceipt>> {
+        self.request_for_record(config, record)?;
+        let Some(receipt) = self.receipt.as_ref() else {
+            return Ok(None);
+        };
+        if receipt.workflow_id != self.workflow_id
+            || receipt.workflow_path != self.workflow_path
+            || receipt.branch != self.branch
+            || receipt.dispatch_revision != self.dispatch_revision
+            || receipt.run_name != self.run_name
+        {
+            return Err(resume_failure("resume_workflow_dispatch_receipt_mismatch"));
+        }
+        let restored = WorkflowDispatchReceipt::restore(
+            config.repository.clone(),
+            RunId::new(receipt.run_id)
+                .map_err(|_| resume_failure("resume_workflow_dispatch_receipt_invalid"))?,
+            WorkflowId::new(receipt.workflow_id)
+                .map_err(|_| resume_failure("resume_workflow_dispatch_receipt_invalid"))?,
+            receipt.workflow_path.clone(),
+            CommitSha::new(receipt.dispatch_revision.clone())
+                .map_err(|_| resume_failure("resume_workflow_dispatch_receipt_invalid"))?,
+            BranchName::new(receipt.branch.clone())
+                .map_err(|_| resume_failure("resume_workflow_dispatch_receipt_invalid"))?,
+            receipt.run_name.clone(),
+        )
+        .map_err(|_| resume_failure("resume_workflow_dispatch_receipt_invalid"))?;
+        Ok(Some(restored))
+    }
+}
+
+const fn workflow_run_event(trigger: WorkflowRunTrigger) -> RunEvent {
+    match trigger {
+        WorkflowRunTrigger::Push => RunEvent::Push,
+        WorkflowRunTrigger::WorkflowDispatch => RunEvent::WorkflowDispatch,
+    }
+}
+
+fn validate_workflow_dispatch_record(
+    config: &GithubProviderConfig,
+    record: &JobRecord,
+) -> RemoteBuildResult<()> {
+    let expected_event = workflow_run_event(config.workflow.run_trigger());
+    if record
+        .run
+        .as_ref()
+        .is_some_and(|run| run.event() != expected_event)
+    {
+        return Err(resume_failure("resume_run_trigger_mismatch"));
+    }
+    match config.workflow.run_trigger() {
+        WorkflowRunTrigger::Push => {
+            if record.workflow_dispatch.is_some()
+                || matches!(
+                    record.principal,
+                    Some(GithubPrincipalIdentityV1::RepositoryCredential)
+                )
+            {
+                return Err(resume_failure("resume_workflow_dispatch_unexpected"));
+            }
+        }
+        WorkflowRunTrigger::WorkflowDispatch => {
+            let Some(dispatch) = record.workflow_dispatch.as_ref() else {
+                if record.run.is_some() {
+                    return Err(resume_failure("resume_workflow_dispatch_intent_missing"));
+                }
+                return Ok(());
+            };
+            dispatch.request_for_record(config, record)?;
+            let receipt = dispatch.restored_receipt(config, record)?;
+            if record.publication_uncertain
+                || record.dispatch_commit.is_none()
+                || record.run.as_ref().is_some_and(|run| {
+                    receipt
+                        .as_ref()
+                        .is_none_or(|receipt| receipt.run_id() != run.id())
+                })
+            {
+                return Err(resume_failure(
+                    "resume_workflow_dispatch_state_inconsistent",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+impl GithubRunIdentityV1 {
+    fn from_snapshot(snapshot: &RunSnapshot) -> Self {
+        let handle = snapshot.handle();
+        Self {
+            run_id: handle.id().get(),
+            workflow_id: handle.workflow_id().get(),
+            workflow_path: handle.workflow_path().to_owned(),
+            head_sha: handle.head_sha().as_str().to_owned(),
+            branch: handle.branch().as_str().to_owned(),
+            event: handle.event().into(),
+            run_number: snapshot.run_number(),
+            run_attempt: snapshot.run_attempt(),
+            status: snapshot.status().into(),
+            conclusion: snapshot.conclusion().map(Into::into),
+        }
+    }
+}
+
+/// Validate credential-free compile evidence against one exact GitHub request and job.
+///
+/// This helper is suitable for durable stores that retain compile evidence before a complete
+/// provider resume record is available.
+///
+/// # Errors
+///
+/// Returns a secret-free provider failure when any request, source, sealed-archive, toolchain, or
+/// provider binding is invalid.
+pub fn validate_github_compile_phase_evidence(
+    evidence: &CompilePhaseEvidence,
+    request: &IosDeviceBuildRequest,
+    job_id: &str,
+) -> RemoteBuildResult<()> {
+    GithubArtifactExpectation::new(
+        job_id.to_owned(),
+        GITHUB_PROVIDER_ID,
+        request.clone(),
+        evidence.clone(),
+    )
+    .map(|_| ())
+    .map_err(|_| {
+        provider_failure(
+            "compile_evidence_invalid",
+            "compile evidence does not match the exact GitHub request",
+            false,
+        )
+    })
+}
+
+fn compile_evidence_sha256(evidence: &CompilePhaseEvidence) -> RemoteBuildResult<String> {
+    let bytes = serde_json::to_vec(evidence).map_err(|error| RemoteBuildError::Serialization {
+        message: bounded_message(&error.to_string()),
+    })?;
+    Ok(hex_sha256(&bytes))
+}
+
+impl GithubSignedCleanupEvidenceV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_verified_artifact(
+        context: &GithubArtifactContext,
+        compile_evidence: &CompilePhaseEvidence,
+        manifest: &ArtifactManifest,
+        manifest_sha256: &str,
+        github_artifact_id: u64,
+        github_artifact_api_sha256: &str,
+    ) -> RemoteBuildResult<Self> {
+        validate_github_compile_phase_evidence(
+            compile_evidence,
+            &context.request,
+            &context.job_id,
+        )?;
+        validate_manifests_for_context(context, std::slice::from_ref(manifest))?;
+        let execution_repository_id = context
+            .execution_repository_id
+            .filter(|identity| *identity != 0)
+            .ok_or_else(|| resume_failure("signed_cleanup_repository_identity_missing"))?;
+        if context.operation_id != context.job_id
+            || context.operation_id != context.request.operation_id
+            || context.request.signing.mode != SigningMode::ManualDevelopment
+            || context.request_sha256 != canonical_request_sha256(&context.request)?
+            || !run_snapshot_is_successful(&context.run)
+            || manifest.cleanup_status != CleanupStatus::Confirmed
+            || manifest.signing.mode != SigningMode::ManualDevelopment
+            || manifest.signing.status != SigningStatus::ArtifactValidated
+            || github_artifact_id == 0
+            || !is_lower_sha256(manifest_sha256)
+            || !is_lower_sha256(github_artifact_api_sha256)
+        {
+            return Err(resume_failure("signed_cleanup_evidence_context_invalid"));
+        }
+        let signing_report = manifest
+            .one_artifact(ArtifactKind::SigningReport)
+            .map_err(|_| resume_failure("signed_cleanup_evidence_reports_invalid"))?;
+        let validation_report = manifest
+            .one_artifact(ArtifactKind::ValidationReport)
+            .map_err(|_| resume_failure("signed_cleanup_evidence_reports_invalid"))?;
+        if !is_lower_sha256(&signing_report.sha256) || !is_lower_sha256(&validation_report.sha256) {
+            return Err(resume_failure("signed_cleanup_evidence_reports_invalid"));
+        }
+        Ok(Self {
+            schema_version: GITHUB_SIGNED_CLEANUP_EVIDENCE_SCHEMA_VERSION,
+            provider: GITHUB_PROVIDER_ID.to_owned(),
+            operation_id: context.operation_id.clone(),
+            job_id: context.job_id.clone(),
+            execution_repository: repository_url(&context.repository),
+            execution_repository_id,
+            request_sha256: context.request_sha256.clone(),
+            source_repository: context.source_repository.clone(),
+            source_revision: context.source_revision.as_str().to_owned(),
+            source_sha256: context.request.source.sha256.clone(),
+            dispatch_revision: context.dispatch_revision.as_str().to_owned(),
+            run: GithubRunIdentityV1::from_snapshot(&context.run),
+            compile_evidence_sha256: compile_evidence_sha256(compile_evidence)?,
+            manifest_sha256: manifest_sha256.to_owned(),
+            signing_report_sha256: signing_report.sha256.clone(),
+            validation_report_sha256: validation_report.sha256.clone(),
+            github_artifact_id,
+            github_artifact_api_sha256: github_artifact_api_sha256.to_owned(),
+        })
+    }
+
+    /// Validate this proof against every durable identity and artifact digest in a resume record.
+    ///
+    /// # Errors
+    ///
+    /// Rejects replay across repositories, requests, sources, dispatches, jobs, runs, attempts, or
+    /// verified artifact sets.
+    pub fn validate_for_resume(&self, resume: &GithubJobResumeV1) -> RemoteBuildResult<()> {
+        let compile_evidence = resume
+            .compile_evidence
+            .as_ref()
+            .ok_or_else(|| resume_failure("signed_cleanup_compile_evidence_missing"))?;
+        validate_github_compile_phase_evidence(compile_evidence, &resume.request, &resume.job_id)?;
+        let run = resume
+            .run
+            .as_ref()
+            .ok_or_else(|| resume_failure("signed_cleanup_run_identity_missing"))?;
+        let [manifest] = resume.manifests.as_slice() else {
+            return Err(resume_failure("signed_cleanup_manifest_set_invalid"));
+        };
+        let manifest_record = manifest
+            .one_artifact(ArtifactKind::Manifest)
+            .map_err(|_| resume_failure("signed_cleanup_manifest_digest_missing"))?;
+        let signing_report = manifest
+            .one_artifact(ArtifactKind::SigningReport)
+            .map_err(|_| resume_failure("signed_cleanup_report_digest_missing"))?;
+        let validation_report = manifest
+            .one_artifact(ArtifactKind::ValidationReport)
+            .map_err(|_| resume_failure("signed_cleanup_report_digest_missing"))?;
+        if self.schema_version != GITHUB_SIGNED_CLEANUP_EVIDENCE_SCHEMA_VERSION
+            || self.provider != GITHUB_PROVIDER_ID
+            || self.operation_id != resume.operation_id
+            || self.job_id != resume.job_id
+            || self.execution_repository != resume.execution_repository
+            || self.execution_repository_id == 0
+            || self.execution_repository_id != resume.execution_repository_id
+            || self.request_sha256 != resume.request_sha256
+            || self.source_repository != resume.source_repository
+            || self.source_revision != resume.source_revision
+            || self.source_sha256 != resume.request.source.sha256
+            || resume.dispatch_commit.as_deref() != Some(self.dispatch_revision.as_str())
+            || &self.run != run
+            || self.run.status != GithubRunStatusV1::Completed
+            || self.run.conclusion != Some(GithubRunConclusionV1::Success)
+            || self.compile_evidence_sha256 != compile_evidence_sha256(compile_evidence)?
+            || self.manifest_sha256 != manifest_record.sha256
+            || self.signing_report_sha256 != signing_report.sha256
+            || self.validation_report_sha256 != validation_report.sha256
+            || self.github_artifact_id == 0
+            || !is_lower_sha256(&self.compile_evidence_sha256)
+            || !is_lower_sha256(&self.manifest_sha256)
+            || !is_lower_sha256(&self.signing_report_sha256)
+            || !is_lower_sha256(&self.validation_report_sha256)
+            || !is_lower_sha256(&self.github_artifact_api_sha256)
+            || resume.request.signing.mode != SigningMode::ManualDevelopment
+            || manifest.operation_id != resume.operation_id
+            || manifest.job_id != resume.job_id
+            || manifest.provider != GITHUB_PROVIDER_ID
+            || manifest.source_repository.as_deref() != Some(resume.source_repository.as_str())
+            || manifest.source_revision.as_deref() != Some(resume.source_revision.as_str())
+            || manifest.source_sha256 != compile_evidence.source_sha256
+            || manifest.cargo_lock_sha256 != compile_evidence.cargo_lock_sha256
+            || manifest.config_sha256 != compile_evidence.config_sha256
+            || manifest.cleanup_status != CleanupStatus::Confirmed
+            || manifest.signing.mode != SigningMode::ManualDevelopment
+            || manifest.signing.status != SigningStatus::ArtifactValidated
+        {
+            return Err(resume_failure("signed_cleanup_evidence_mismatch"));
+        }
+        Ok(())
+    }
+}
+
+impl GithubGitSnapshotResumeV1 {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one validator keeps every snapshot phase field invariant adjacent"
+    )]
+    fn validate_for_request(&self, request: &IosDeviceBuildRequest) -> RemoteBuildResult<()> {
+        if self.schema_version != GITHUB_GIT_SNAPSHOT_RESUME_SCHEMA_VERSION
+            || request.source_mode != SourceMode::GitSnapshot
+            || request.signing.mode != SigningMode::UnsignedCompileOnly
+        {
+            return Err(resume_failure("resume_git_snapshot_mode_invalid"));
+        }
+        self.stage_locator
+            .validate_for_operation(&request.operation_id)
+            .map_err(|_| resume_failure("resume_git_snapshot_locator_invalid"))?;
+        let descriptor = GitSnapshotDescriptor::from_request(
+            request,
+            SourceBundleDescriptor::new(self.stage.archive.clone(), request.source.clone()),
+        )
+        .map_err(|_| resume_failure("resume_git_snapshot_descriptor_invalid"))?;
+        self.stage
+            .validate_for_request(&descriptor, request)
+            .map_err(|_| resume_failure("resume_git_snapshot_stage_invalid"))?;
+        if self.stage_locator.operation_id != self.stage.operation_id
+            || self.stage_locator.isolation_root_identity != self.stage.isolation_root_identity
+            || self.stage_locator.snapshots_store_identity != self.stage.snapshots_store_identity
+            || self.stage_locator.stage_directory_identity != self.stage.stage_directory_identity
+            || self.source_publication_attempts > 3
+            || self.source_publication_absence_observations > 2
+            || (self.source_publication_absence_observations == 0)
+                != (self.source_publication_absence_first_observed_at_ms == 0)
+            || (self.source_publication_absence_observations == 0)
+                != (self.source_publication_absence_last_observed_at_ms == 0)
+            || self.source_publication_absence_last_observed_at_ms
+                < self.source_publication_absence_first_observed_at_ms
+            || self.source_publication_process_fenced
+                != self.source_publication_lease_scope_sha256.is_some()
+            || self
+                .source_publication_lease_scope_sha256
+                .as_ref()
+                .is_some_and(|scope| !is_lower_sha256(scope))
+            || self
+                .keepalive_release_authorization_sha256
+                .as_ref()
+                .is_some_and(|digest| !is_lower_sha256(digest))
+        {
+            return Err(resume_failure("resume_git_snapshot_binding_invalid"));
+        }
+        let before_source = matches!(
+            self.phase,
+            GithubGitSnapshotPhaseV1::Prepared
+                | GithubGitSnapshotPhaseV1::KeepaliveIntent
+                | GithubGitSnapshotPhaseV1::KeepaliveExact
+                | GithubGitSnapshotPhaseV1::StageDeleteIntent
+                | GithubGitSnapshotPhaseV1::StageDeleted
+        );
+        if before_source
+            && (self.source_publication_attempts != 0
+                || self.source_publication_started_at_ms != 0
+                || self.source_publication_quiescence_deadline_ms != 0
+                || self.source_publication_process_fenced
+                || self.source_publication_absence_observations != 0)
+        {
+            return Err(resume_failure("resume_git_snapshot_source_started_early"));
+        }
+        let source_phase = !before_source;
+        if source_phase && self.source_publication_attempts == 0 {
+            return Err(resume_failure("resume_git_snapshot_source_intent_missing"));
+        }
+        if source_phase && !self.source_publication_process_fenced {
+            return Err(resume_failure("resume_git_snapshot_source_fence_missing"));
+        }
+        if self.source_publication_started_at_ms == 0
+            && source_phase
+            && self.source_publication_quiescence_deadline_ms != u64::MAX
+        {
+            return Err(resume_failure(
+                "resume_git_snapshot_source_boundary_invalid",
+            ));
+        }
+        if self.source_publication_started_at_ms != 0
+            && self.source_publication_quiescence_deadline_ms
+                < self.source_publication_started_at_ms
+        {
+            return Err(resume_failure(
+                "resume_git_snapshot_source_boundary_invalid",
+            ));
+        }
+        if matches!(
+            self.phase,
+            GithubGitSnapshotPhaseV1::SourceExact
+                | GithubGitSnapshotPhaseV1::SourceConflict
+                | GithubGitSnapshotPhaseV1::SourceCleanupIntent
+                | GithubGitSnapshotPhaseV1::SourceDeleted
+                | GithubGitSnapshotPhaseV1::KeepaliveReleaseIntent
+                | GithubGitSnapshotPhaseV1::KeepaliveReleased
+        ) && self.source_publication_started_at_ms == 0
+        {
+            return Err(resume_failure(
+                "resume_git_snapshot_source_ownership_unarmed",
+            ));
+        }
+        if self.phase == GithubGitSnapshotPhaseV1::SourceAbsent
+            && (!self.source_publication_process_fenced
+                || self.source_publication_absence_observations < 2
+                || self.source_publication_started_at_ms == 0
+                || self.source_publication_absence_last_observed_at_ms
+                    < self.source_publication_quiescence_deadline_ms)
+        {
+            return Err(resume_failure("resume_git_snapshot_absence_unproven"));
+        }
+        let keepalive_release_phase = matches!(
+            self.phase,
+            GithubGitSnapshotPhaseV1::KeepaliveReleaseIntent
+                | GithubGitSnapshotPhaseV1::KeepaliveReleased
+        );
+        if keepalive_release_phase != self.keepalive_release_authorization_sha256.is_some() {
+            return Err(resume_failure(
+                "resume_git_snapshot_keepalive_release_authority_invalid",
+            ));
+        }
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the snapshot reducer keeps every durable phase and retry edge in one audit boundary"
+    )]
+    fn validate_successor(&self, next: &Self) -> RemoteBuildResult<()> {
+        if self.schema_version != next.schema_version
+            || self.stage_locator != next.stage_locator
+            || self.stage != next.stage
+            || self.source_publication_process_fenced && !next.source_publication_process_fenced
+            || !option_can_bind_once(
+                self.source_publication_lease_scope_sha256.as_deref(),
+                next.source_publication_lease_scope_sha256.as_deref(),
+            )
+            || !option_can_bind_once(
+                self.keepalive_release_authorization_sha256.as_deref(),
+                next.keepalive_release_authorization_sha256.as_deref(),
+            )
+        {
+            return Err(resume_failure("resume_git_snapshot_identity_changed"));
+        }
+        let allowed_phase = self.phase == next.phase
+            || matches!(
+                (self.phase, next.phase),
+                (
+                    GithubGitSnapshotPhaseV1::Prepared,
+                    GithubGitSnapshotPhaseV1::KeepaliveIntent
+                ) | (
+                    GithubGitSnapshotPhaseV1::KeepaliveIntent,
+                    GithubGitSnapshotPhaseV1::KeepaliveExact
+                ) | (
+                    GithubGitSnapshotPhaseV1::KeepaliveExact,
+                    GithubGitSnapshotPhaseV1::StageDeleteIntent
+                ) | (
+                    GithubGitSnapshotPhaseV1::StageDeleteIntent,
+                    GithubGitSnapshotPhaseV1::StageDeleted
+                ) | (
+                    GithubGitSnapshotPhaseV1::StageDeleted | GithubGitSnapshotPhaseV1::SourceAbsent,
+                    GithubGitSnapshotPhaseV1::SourcePublishIntent
+                ) | (
+                    GithubGitSnapshotPhaseV1::SourcePublishIntent,
+                    GithubGitSnapshotPhaseV1::SourceExact
+                        | GithubGitSnapshotPhaseV1::SourceAbsent
+                        | GithubGitSnapshotPhaseV1::SourceConflict
+                ) | (
+                    GithubGitSnapshotPhaseV1::SourceExact,
+                    GithubGitSnapshotPhaseV1::SourceCleanupIntent
+                        | GithubGitSnapshotPhaseV1::SourceConflict
+                ) | (
+                    GithubGitSnapshotPhaseV1::SourceCleanupIntent,
+                    GithubGitSnapshotPhaseV1::SourceDeleted
+                ) | (
+                    GithubGitSnapshotPhaseV1::SourceDeleted
+                        | GithubGitSnapshotPhaseV1::SourceAbsent
+                        | GithubGitSnapshotPhaseV1::SourceConflict,
+                    GithubGitSnapshotPhaseV1::KeepaliveReleaseIntent
+                ) | (
+                    GithubGitSnapshotPhaseV1::KeepaliveReleaseIntent,
+                    GithubGitSnapshotPhaseV1::KeepaliveReleased
+                )
+            );
+        if !allowed_phase {
+            return Err(resume_failure("resume_git_snapshot_phase_regressed"));
+        }
+        let retrying_absent = self.phase == GithubGitSnapshotPhaseV1::SourceAbsent
+            && next.phase == GithubGitSnapshotPhaseV1::SourcePublishIntent;
+        let first_source_intent = self.phase == GithubGitSnapshotPhaseV1::StageDeleted
+            && next.phase == GithubGitSnapshotPhaseV1::SourcePublishIntent;
+        let expected_attempts = if retrying_absent || first_source_intent {
+            self.source_publication_attempts
+                .checked_add(1)
+                .ok_or_else(|| resume_failure("resume_git_snapshot_attempt_overflow"))?
+        } else {
+            self.source_publication_attempts
+        };
+        if next.source_publication_attempts != expected_attempts {
+            return Err(resume_failure("resume_git_snapshot_attempt_invalid"));
+        }
+        if retrying_absent {
+            if next.source_publication_started_at_ms != 0
+                || next.source_publication_quiescence_deadline_ms != u64::MAX
+                || next.source_publication_absence_observations != 0
+                || next.source_publication_absence_first_observed_at_ms != 0
+                || next.source_publication_absence_last_observed_at_ms != 0
+            {
+                return Err(resume_failure("resume_git_snapshot_retry_not_rearmed"));
+            }
+        } else {
+            if self.source_publication_started_at_ms != 0
+                && self.source_publication_started_at_ms != next.source_publication_started_at_ms
+            {
+                return Err(resume_failure("resume_git_snapshot_start_changed"));
+            }
+            if self.source_publication_quiescence_deadline_ms != 0
+                && self.source_publication_started_at_ms != 0
+                && self.source_publication_quiescence_deadline_ms
+                    != next.source_publication_quiescence_deadline_ms
+            {
+                return Err(resume_failure("resume_git_snapshot_deadline_changed"));
+            }
+            if self.source_publication_absence_observations
+                > next.source_publication_absence_observations
+                || self.source_publication_absence_first_observed_at_ms != 0
+                    && self.source_publication_absence_first_observed_at_ms
+                        != next.source_publication_absence_first_observed_at_ms
+                || self.source_publication_absence_last_observed_at_ms
+                    > next.source_publication_absence_last_observed_at_ms
+            {
+                return Err(resume_failure("resume_git_snapshot_absence_regressed"));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl GithubJobResumeV1 {
+    /// Validate the trigger-specific durable projection without live configuration or credentials.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a forged or incomplete WorkflowDispatch intent, receipt, correlation title, run
+    /// identity, or a legacy Push record carrying repository-scoped identity.
+    pub fn validate_trigger_binding(&self) -> RemoteBuildResult<()> {
+        let Some(dispatch) = self.workflow_dispatch.as_deref() else {
+            if self.run.as_ref().is_some_and(|run| {
+                matches!(self.principal, GithubPrincipalIdentityV1::RepositoryCredential)
+                    || run.event != GithubRunEventV1::Push
+            }) {
+                return Err(resume_failure("resume_run_trigger_mismatch"));
+            }
+            return Ok(());
+        };
+        if !self.publication_intent
+            || self.publication_uncertain
+            || self.dispatch_commit.as_deref() != Some(dispatch.dispatch_revision.as_str())
+            || dispatch.schema_version != GITHUB_WORKFLOW_DISPATCH_RESUME_SCHEMA_VERSION
+            || dispatch.workflow_path != self.workflow_path
+            || dispatch.operation_id != self.operation_id
+            || dispatch.operation_id != self.request.operation_id
+            || dispatch.request_sha256 != self.request_sha256
+            || dispatch.source_revision != self.source_revision
+            || dispatch.uncertain != dispatch.receipt.is_none()
+        {
+            return Err(resume_failure("resume_workflow_dispatch_identity_mismatch"));
+        }
+        self.request.validate()?;
+        if canonical_request_sha256(&self.request)? != self.request_sha256 {
+            return Err(resume_failure("resume_workflow_dispatch_request_mismatch"));
+        }
+        let repository = repository_from_url(&self.execution_repository)
+            .ok_or_else(|| resume_failure("resume_execution_repository_invalid"))?;
+        let branch = self
+            .temporary_ref
+            .strip_prefix("refs/heads/")
+            .ok_or_else(|| resume_failure("resume_temporary_ref_invalid"))?;
+        let suffix = format!("/{}", self.operation_id);
+        let namespace = branch
+            .strip_suffix(&suffix)
+            .ok_or_else(|| resume_failure("resume_workflow_dispatch_branch_mismatch"))?;
+        let namespace = TemporaryBranchNamespace::new(namespace)
+            .map_err(|_| resume_failure("resume_temporary_ref_invalid"))?;
+        let temporary_ref = TemporaryGitRef::new(
+            &namespace,
+            BranchName::new(branch).map_err(|_| resume_failure("resume_temporary_ref_invalid"))?,
+        )
+        .map_err(|_| resume_failure("resume_temporary_ref_invalid"))?;
+        if dispatch.branch != temporary_ref.branch().as_str() {
+            return Err(resume_failure("resume_workflow_dispatch_branch_mismatch"));
+        }
+        let registration = WorkflowRegistration::restore(
+            repository.clone(),
+            WorkflowId::new(dispatch.workflow_id)
+                .map_err(|_| resume_failure("resume_workflow_dispatch_identity_invalid"))?,
+            dispatch.workflow_path.clone(),
+        )
+        .map_err(|_| resume_failure("resume_workflow_dispatch_identity_invalid"))?;
+        let request = WorkflowDispatchRequest::new(
+            repository,
+            registration,
+            temporary_ref,
+            self.operation_id.clone(),
+            self.request_sha256.clone(),
+            CommitSha::new(self.source_revision.clone())
+                .map_err(|_| resume_failure("resume_source_revision_invalid"))?,
+            CommitSha::new(dispatch.dispatch_revision.clone())
+                .map_err(|_| resume_failure("resume_dispatch_commit_invalid"))?,
+        )
+        .map_err(|_| resume_failure("resume_workflow_dispatch_identity_invalid"))?;
+        if request.body_sha256() != dispatch.body_sha256
+            || request.run_name() != dispatch.run_name
+        {
+            return Err(resume_failure("resume_workflow_dispatch_body_mismatch"));
+        }
+        if dispatch.receipt.as_ref().is_some_and(|receipt| {
+            receipt.run_id == 0
+                || receipt.workflow_id != dispatch.workflow_id
+                || receipt.workflow_path != dispatch.workflow_path
+                || receipt.branch != dispatch.branch
+                || receipt.dispatch_revision != dispatch.dispatch_revision
+                || receipt.run_name != dispatch.run_name
+        }) {
+            return Err(resume_failure("resume_workflow_dispatch_receipt_mismatch"));
+        }
+        match (&dispatch.receipt, &self.run) {
+            (None, None) => Ok(()),
+            (None, Some(_)) => Err(resume_failure("resume_workflow_dispatch_receipt_missing")),
+            (Some(_), None) => Ok(()),
+            (Some(receipt), Some(run))
+                if receipt.run_id == run.run_id
+                    && receipt.workflow_id == dispatch.workflow_id
+                    && receipt.workflow_path == dispatch.workflow_path
+                    && receipt.branch == dispatch.branch
+                    && receipt.dispatch_revision == dispatch.dispatch_revision
+                    && receipt.run_name == dispatch.run_name
+                    && run.workflow_id == receipt.workflow_id
+                    && run.workflow_path == receipt.workflow_path
+                    && run.head_sha == receipt.dispatch_revision
+                    && run.branch == receipt.branch
+                    && run.event == GithubRunEventV1::WorkflowDispatch
+                    && run.run_attempt == 1 =>
+            {
+                Ok(())
+            }
+            (Some(_), Some(_)) => Err(resume_failure("resume_workflow_dispatch_run_mismatch")),
+        }
+    }
+
+    /// Encode one complete compact JSON checkpoint followed by a newline.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed serialization or size-bound failure.
+    pub fn encode(&self) -> RemoteBuildResult<Vec<u8>> {
+        let mut bytes =
+            serde_json::to_vec(self).map_err(|error| RemoteBuildError::Serialization {
+                message: bounded_message(&error.to_string()),
+            })?;
+        bytes.push(b'\n');
+        if bytes.len() > GITHUB_JOB_RESUME_MAX_BYTES {
+            return Err(resume_failure("resume_record_too_large"));
+        }
+        Ok(bytes)
+    }
+
+    /// Decode one bounded JSON checkpoint, rejecting duplicate and unknown fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns a secret-free typed failure for empty, oversized, duplicate-key, trailing, or
+    /// structurally invalid JSON. Provider identity is revalidated by `restore_job_resumes`.
+    pub fn decode(bytes: &[u8]) -> RemoteBuildResult<Self> {
+        let raw: serde_json::Value = crate::strict_json::decode(bytes, GITHUB_JOB_RESUME_MAX_BYTES)
+            .map_err(|_| resume_failure("resume_record_json_invalid"))?;
+        let resume: Self = serde_json::from_value(raw.clone())
+            .map_err(|_| resume_failure("resume_record_json_invalid"))?;
+        let normalized = serde_json::to_value(&resume)
+            .map_err(|_| resume_failure("resume_record_json_invalid"))?;
+        if normalized != raw {
+            return Err(resume_failure("resume_record_json_invalid"));
+        }
+        Ok(resume)
+    }
+
+    /// Validate that `next` is a non-stale complete replacement for this checkpoint.
+    ///
+    /// This validates revision ordering only. A decoded record still requires provider-specific
+    /// configuration and live identity validation through [`GithubBuildProvider::restore_job_resumes`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a secret-free typed failure when immutable identity changes or durable state,
+    /// events, manifests, attempts, or mutation results regress.
+    #[allow(clippy::too_many_lines)]
+    pub fn validate_successor(&self, next: &Self) -> RemoteBuildResult<()> {
+        if self.schema_version != next.schema_version
+            || self.provider != next.provider
+            || self.provider_config_sha256 != next.provider_config_sha256
+            || self.principal != next.principal
+            || self.execution_repository != next.execution_repository
+            || self.execution_repository_id != next.execution_repository_id
+            || self.source_repository != next.source_repository
+            || self.trusted_source_ref != next.trusted_source_ref
+            || self.workflow_path != next.workflow_path
+            || self.workflow_sha256 != next.workflow_sha256
+            || self.temporary_ref != next.temporary_ref
+            || self.operation_id != next.operation_id
+            || self.job_id != next.job_id
+            || self.request != next.request
+            || self.request_sha256 != next.request_sha256
+            || self.source_revision != next.source_revision
+            || self.created_at_ms != next.created_at_ms
+            || self.publication_process_fenced && !next.publication_process_fenced
+            || !option_can_bind_once(
+                self.publication_lease_scope_sha256.as_deref(),
+                next.publication_lease_scope_sha256.as_deref(),
+            )
+            || next
+                .publication_lease_scope_sha256
+                .as_ref()
+                .is_some_and(|scope| !is_lower_sha256(scope))
+            || self.run_discovery_deadline_ms != next.run_discovery_deadline_ms
+        {
+            return Err(resume_failure("resume_successor_identity_changed"));
+        }
+        match (&self.git_snapshot, &next.git_snapshot) {
+            (None, None) => {}
+            (Some(previous), Some(successor)) => {
+                previous.validate_for_request(&self.request)?;
+                successor.validate_for_request(&next.request)?;
+                previous.validate_successor(successor)?;
+            }
+            _ => return Err(resume_failure("resume_successor_git_snapshot_replaced")),
+        }
+        if next.publication_intent
+            && next.git_snapshot.as_ref().is_some_and(|snapshot| {
+                !matches!(
+                    snapshot.phase,
+                    GithubGitSnapshotPhaseV1::SourceExact
+                        | GithubGitSnapshotPhaseV1::SourceCleanupIntent
+                        | GithubGitSnapshotPhaseV1::SourceDeleted
+                        | GithubGitSnapshotPhaseV1::KeepaliveReleaseIntent
+                        | GithubGitSnapshotPhaseV1::KeepaliveReleased
+                )
+            })
+        {
+            return Err(resume_failure(
+                "resume_successor_dispatch_before_snapshot_source",
+            ));
+        }
+        if !publication_boundary_can_advance(self, next) {
+            return Err(resume_failure(
+                "resume_successor_publication_boundary_changed",
+            ));
+        }
+        if !job_state_can_reach(self.state, next.state) {
+            return Err(resume_failure("resume_successor_state_regressed"));
+        }
+        if !option_can_bind_once(
+            self.compile_evidence.as_ref(),
+            next.compile_evidence.as_ref(),
+        ) {
+            return Err(resume_failure("resume_successor_compile_evidence_changed"));
+        }
+        if !option_can_bind_once(
+            self.signed_cleanup_evidence.as_ref(),
+            next.signed_cleanup_evidence.as_ref(),
+        ) {
+            return Err(resume_failure(
+                "resume_successor_signed_cleanup_evidence_changed",
+            ));
+        }
+        if let Some(compile_evidence) = next.compile_evidence.as_ref() {
+            validate_github_compile_phase_evidence(compile_evidence, &next.request, &next.job_id)?;
+        }
+        if let Some(evidence) = next.signed_cleanup_evidence.as_ref() {
+            evidence.validate_for_resume(next)?;
+        }
+        if next.state == JobState::Cleaned {
+            let cleanup_proven = match next.request.signing.mode {
+                SigningMode::UnsignedCompileOnly => next
+                    .run
+                    .as_ref()
+                    .is_some_and(|run| run.status == GithubRunStatusV1::Completed),
+                SigningMode::ManualDevelopment => next.signed_cleanup_evidence.is_some(),
+                _ => false,
+            };
+            if !cleanup_proven {
+                return Err(resume_failure(
+                    "resume_successor_signing_cleanup_evidence_missing",
+                ));
+            }
+        }
+        if matches!(
+            next.state,
+            JobState::Cleaning | JobState::Cleaned | JobState::CleanupFailed
+        ) && next.git_snapshot.as_ref().is_some_and(|snapshot| {
+            !matches!(
+                snapshot.phase,
+                GithubGitSnapshotPhaseV1::SourceDeleted
+                    | GithubGitSnapshotPhaseV1::SourceAbsent
+                    | GithubGitSnapshotPhaseV1::SourceConflict
+                    | GithubGitSnapshotPhaseV1::KeepaliveReleaseIntent
+                    | GithubGitSnapshotPhaseV1::KeepaliveReleased
+            )
+        }) {
+            return Err(resume_failure(
+                "resume_successor_snapshot_source_cleanup_missing",
+            ));
+        }
+        if !option_can_bind_once(
+            self.prepared_dispatch_commit.as_deref(),
+            next.prepared_dispatch_commit.as_deref(),
+        ) {
+            return Err(resume_failure("resume_successor_prepared_dispatch_changed"));
+        }
+        if !option_can_bind_once(
+            self.dispatch_commit.as_deref(),
+            next.dispatch_commit.as_deref(),
+        ) {
+            return Err(resume_failure("resume_successor_dispatch_changed"));
+        }
+        if matches!(
+            (
+                next.prepared_dispatch_commit.as_deref(),
+                next.dispatch_commit.as_deref(),
+            ),
+            (Some(prepared), Some(dispatch)) if prepared != dispatch
+        ) {
+            return Err(resume_failure("resume_successor_dispatch_binding_mismatch"));
+        }
+        match (&self.workflow_dispatch, &next.workflow_dispatch) {
+            (None, _) => {}
+            (Some(_), None) => {
+                return Err(resume_failure(
+                    "resume_successor_workflow_dispatch_intent_removed",
+                ));
+            }
+            (Some(previous), Some(candidate)) => {
+                if previous.schema_version != candidate.schema_version
+                    || previous.workflow_id != candidate.workflow_id
+                    || previous.workflow_path != candidate.workflow_path
+                    || previous.branch != candidate.branch
+                    || previous.operation_id != candidate.operation_id
+                    || previous.request_sha256 != candidate.request_sha256
+                    || previous.source_revision != candidate.source_revision
+                    || previous.dispatch_revision != candidate.dispatch_revision
+                    || previous.body_sha256 != candidate.body_sha256
+                    || previous.run_name != candidate.run_name
+                    || previous.receipt.is_some() && previous.receipt != candidate.receipt
+                    || previous.receipt.is_none()
+                        && candidate.receipt.is_none()
+                        && previous.uncertain != candidate.uncertain
+                    || candidate.uncertain != candidate.receipt.is_none()
+                {
+                    return Err(resume_failure("resume_successor_workflow_dispatch_changed"));
+                }
+            }
+        }
+        match (&self.run, &next.run) {
+            (None, _) => {}
+            (Some(_), None) => return Err(resume_failure("resume_successor_run_removed")),
+            (Some(previous), Some(candidate)) => {
+                if previous.run_id != candidate.run_id
+                    || previous.workflow_id != candidate.workflow_id
+                    || previous.workflow_path != candidate.workflow_path
+                    || previous.head_sha != candidate.head_sha
+                    || previous.branch != candidate.branch
+                    || previous.event != candidate.event
+                    || previous.run_number != candidate.run_number
+                    || previous.run_attempt != candidate.run_attempt
+                {
+                    return Err(resume_failure("resume_successor_run_identity_changed"));
+                }
+                if run_status_phase(candidate.status) < run_status_phase(previous.status)
+                    || previous.conclusion.is_some() && previous.conclusion != candidate.conclusion
+                {
+                    return Err(resume_failure("resume_successor_run_regressed"));
+                }
+            }
+        }
+        if !bool_is_monotonic(self.publication_intent, next.publication_intent)
+            || !bool_is_monotonic(self.publication_absent, next.publication_absent)
+            || !bool_is_monotonic(
+                self.publication_not_attempted,
+                next.publication_not_attempted,
+            )
+            || !bool_is_monotonic(self.cancellation_requested, next.cancellation_requested)
+            || !bool_is_monotonic(self.cancellation_dispatched, next.cancellation_dispatched)
+            || !bool_is_monotonic(self.cleanup_requested, next.cleanup_requested)
+            || !bool_is_monotonic(
+                self.remove_artifacts_requested,
+                next.remove_artifacts_requested,
+            )
+            || !bool_is_monotonic(self.artifacts_removed, next.artifacts_removed)
+            || !bool_is_monotonic(self.temporary_ref_deleted, next.temporary_ref_deleted)
+            || !bool_is_monotonic(
+                self.verification_pending_event,
+                next.verification_pending_event,
+            )
+        {
+            return Err(resume_failure("resume_successor_flag_regressed"));
+        }
+        if self.publication_uncertain
+            && !next.publication_uncertain
+            && next.dispatch_commit.is_none()
+            && !next.publication_absent
+        {
+            return Err(resume_failure(
+                "resume_successor_publication_evidence_removed",
+            ));
+        }
+        if next.run_discovery_attempts < self.run_discovery_attempts {
+            return Err(resume_failure("resume_successor_discovery_regressed"));
+        }
+        if next.publication_absence_observations < self.publication_absence_observations {
+            return Err(resume_failure(
+                "resume_successor_publication_observations_regressed",
+            ));
+        }
+        if self.publication_absence_first_observed_at_ms != 0
+            && self.publication_absence_first_observed_at_ms
+                != next.publication_absence_first_observed_at_ms
+        {
+            return Err(resume_failure(
+                "resume_successor_publication_first_observation_changed",
+            ));
+        }
+        if self.events.len() > next.events.len()
+            || self.events.as_slice() != &next.events[..self.events.len()]
+        {
+            return Err(resume_failure("resume_successor_events_regressed"));
+        }
+        if !self.manifests.is_empty() && self.manifests != next.manifests {
+            return Err(resume_failure("resume_successor_manifests_changed"));
+        }
+        Ok(())
+    }
+
+    fn from_record(
+        config: &GithubProviderConfig,
+        principal: GithubPrincipalIdentityV1,
+        execution_repository_id: u64,
+        record: &JobRecord,
+    ) -> RemoteBuildResult<Self> {
+        if execution_repository_id == 0 {
+            return Err(resume_failure("resume_repository_identity_invalid"));
+        }
+        validate_workflow_dispatch_record(config, record)?;
+        let run = match (&record.run, &record.run_snapshot) {
+            (None, None) => None,
+            (Some(handle), Some(snapshot)) if snapshot.handle() == handle => {
+                Some(GithubRunIdentityV1::from_snapshot(snapshot))
+            }
+            _ => return Err(resume_failure("resume_run_identity_incomplete")),
+        };
+        Ok(Self {
+            schema_version: GITHUB_JOB_RESUME_SCHEMA_VERSION,
+            provider: GITHUB_PROVIDER_ID.to_owned(),
+            provider_config_sha256: provider_config_sha256(config)?,
+            principal,
+            execution_repository: repository_url(&config.repository),
+            execution_repository_id,
+            source_repository: config.source_repository.clone(),
+            trusted_source_ref: config.workflow.trusted_source_ref().as_str().to_owned(),
+            workflow_path: config.workflow.filename().repository_path(),
+            workflow_sha256: config.workflow_fingerprint.as_str().to_owned(),
+            temporary_ref: format!("refs/heads/{}", record.temporary_ref.branch().as_str()),
+            operation_id: record.operation_id.clone(),
+            job_id: record.job_id.clone(),
+            request: record.request.clone(),
+            request_sha256: record.request_sha256.clone(),
+            source_revision: record.source_revision.as_str().to_owned(),
+            git_snapshot: record.git_snapshot.clone(),
+            prepared_dispatch_commit: record
+                .prepared_dispatch_commit
+                .as_ref()
+                .map(|commit| commit.as_str().to_owned()),
+            dispatch_commit: record
+                .dispatch_commit
+                .as_ref()
+                .map(|commit| commit.as_str().to_owned()),
+            workflow_dispatch: record.workflow_dispatch.clone().map(Box::new),
+            run,
+            created_at_ms: record.created_at_ms,
+            publication_started_at_ms: record.publication_started_at_ms,
+            publication_quiescence_deadline_ms: record.publication_quiescence_deadline_ms,
+            state: record.state,
+            publication_intent: record.publication_intent,
+            publication_uncertain: record.publication_uncertain,
+            publication_absent: record.publication_absent,
+            publication_not_attempted: record.publication_not_attempted,
+            publication_process_fenced: record.publication_process_fenced,
+            publication_lease_scope_sha256: record.publication_lease_scope_sha256.clone(),
+            publication_absence_observations: record.publication_absence_observations,
+            publication_absence_first_observed_at_ms: record
+                .publication_absence_first_observed_at_ms,
+            cancellation_requested: record.cancellation_requested,
+            cancellation_dispatched: record.cancellation_dispatched,
+            cleanup_requested: record.cleanup_requested,
+            remove_artifacts_requested: record.remove_artifacts_requested,
+            artifacts_removed: record.artifacts_removed,
+            temporary_ref_deleted: record.temporary_ref_deleted,
+            verification_pending_event: record.verification_pending_event,
+            run_discovery_attempts: record.run_discovery_attempts,
+            run_discovery_deadline_ms: record.run_discovery_deadline_ms,
+            manifests: record.manifests.clone(),
+            compile_evidence: record.compile_evidence.clone(),
+            signed_cleanup_evidence: record.signed_cleanup_evidence.clone(),
+            events: record.events.clone(),
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn into_record(
+        self,
+        config: &GithubProviderConfig,
+        principal: &GithubPrincipalIdentityV1,
+        execution_repository_id: u64,
+    ) -> RemoteBuildResult<JobRecord> {
+        if self.schema_version != GITHUB_JOB_RESUME_SCHEMA_VERSION
+            || self.provider != GITHUB_PROVIDER_ID
+            || self.provider_config_sha256 != provider_config_sha256(config)?
+            || self.principal != *principal
+            || !github_remote_matches(
+                &self.execution_repository,
+                &repository_url(&config.repository),
+            )
+            || self.execution_repository_id == 0
+            || self.execution_repository_id != execution_repository_id
+            || self.source_repository != config.source_repository
+            || self.trusted_source_ref != config.workflow.trusted_source_ref().as_str()
+            || self.workflow_path != config.workflow.filename().repository_path()
+            || self.workflow_sha256 != config.workflow_fingerprint.as_str()
+        {
+            return Err(resume_failure("resume_provider_identity_mismatch"));
+        }
+        validate_provider_request(config, &self.request)?;
+        if self.operation_id != self.job_id
+            || self.operation_id != self.request.operation_id
+            || self.request_sha256 != canonical_request_sha256(&self.request)?
+            || self.request.source_revision.as_deref() != Some(self.source_revision.as_str())
+        {
+            return Err(resume_failure("resume_request_identity_mismatch"));
+        }
+        if let Some(compile_evidence) = self.compile_evidence.as_ref() {
+            validate_github_compile_phase_evidence(compile_evidence, &self.request, &self.job_id)?;
+        }
+        if let Some(evidence) = self.signed_cleanup_evidence.as_ref() {
+            evidence.validate_for_resume(&self)?;
+        }
+        let branch = BranchName::new(format!(
+            "{}/{}",
+            config.workflow.temporary_branch_namespace().as_str(),
+            self.operation_id
+        ))
+        .map_err(|_| resume_failure("resume_temporary_ref_invalid"))?;
+        let temporary_ref =
+            TemporaryGitRef::new(config.workflow.temporary_branch_namespace(), branch)
+                .map_err(|_| resume_failure("resume_temporary_ref_invalid"))?;
+        if self.temporary_ref != format!("refs/heads/{}", temporary_ref.branch().as_str()) {
+            return Err(resume_failure("resume_temporary_ref_mismatch"));
+        }
+        let dispatch_manifest =
+            GithubDispatchManifest::new(config, &temporary_ref, self.request.clone());
+        dispatch_manifest
+            .validate_for(config)
+            .and_then(|()| dispatch_manifest.encode().map(|_| ()))
+            .map_err(|_| resume_failure("resume_dispatch_manifest_invalid"))?;
+        let source_revision = CommitSha::new(self.source_revision.clone())
+            .map_err(|_| resume_failure("resume_source_revision_invalid"))?;
+        match (&self.request.source_mode, &self.git_snapshot) {
+            (SourceMode::Git, None) => {}
+            (SourceMode::GitSnapshot, Some(snapshot)) => {
+                snapshot.validate_for_request(&self.request)?;
+            }
+            _ => return Err(resume_failure("resume_git_snapshot_binding_missing")),
+        }
+        let dispatch_commit = self
+            .dispatch_commit
+            .as_deref()
+            .map(CommitSha::new)
+            .transpose()
+            .map_err(|_| resume_failure("resume_dispatch_revision_invalid"))?;
+        let prepared_dispatch_commit = self
+            .prepared_dispatch_commit
+            .as_deref()
+            .map(CommitSha::new)
+            .transpose()
+            .map_err(|_| resume_failure("resume_prepared_dispatch_revision_invalid"))?;
+        if matches!(
+            (&prepared_dispatch_commit, &dispatch_commit),
+            (Some(prepared), Some(dispatch)) if prepared != dispatch
+        ) {
+            return Err(resume_failure("resume_prepared_dispatch_revision_mismatch"));
+        }
+        let (run, run_snapshot) = match self.run.as_ref() {
+            None => (None, None),
+            Some(identity) => {
+                let dispatch = dispatch_commit
+                    .as_ref()
+                    .ok_or_else(|| resume_failure("resume_run_without_dispatch"))?;
+                if identity.workflow_path != self.workflow_path
+                    || identity.head_sha != dispatch.as_str()
+                    || identity.branch != temporary_ref.branch().as_str()
+                    || RunEvent::from(identity.event)
+                        != workflow_run_event(config.workflow.run_trigger())
+                {
+                    return Err(resume_failure("resume_run_identity_mismatch"));
+                }
+                let handle = RunHandle::restore(
+                    identity.run_id,
+                    identity.workflow_id,
+                    identity.workflow_path.clone(),
+                    identity.head_sha.clone(),
+                    identity.branch.clone(),
+                    identity.event.into(),
+                )
+                .map_err(|_| resume_failure("resume_run_identity_invalid"))?;
+                let snapshot = RunSnapshot::restore(
+                    handle.clone(),
+                    identity.run_number,
+                    identity.run_attempt,
+                    identity.status.into(),
+                    identity.conclusion.map(Into::into),
+                )
+                .map_err(|_| resume_failure("resume_run_snapshot_invalid"))?;
+                (Some(handle), Some(snapshot))
+            }
+        };
+        if self.events.len() > MAX_JOB_EVENTS || self.manifests.len() > MAX_JOB_MANIFESTS {
+            return Err(resume_failure("resume_record_capacity_exceeded"));
+        }
+        for (index, event) in self.events.iter().enumerate() {
+            event.validate()?;
+            if event.operation_id != self.operation_id
+                || event.job_id != self.job_id
+                || event.provider != GITHUB_PROVIDER_ID
+                || event.sequence != u64::try_from(index).unwrap_or(u64::MAX) + 1
+                || matches!(&event.kind, RemoteBuildEventKind::Unknown)
+            {
+                return Err(resume_failure("resume_event_identity_mismatch"));
+            }
+        }
+        let snapshot_pre_dispatch = self.git_snapshot.as_ref().is_some_and(|snapshot| {
+            matches!(
+                snapshot.phase,
+                GithubGitSnapshotPhaseV1::Prepared
+                    | GithubGitSnapshotPhaseV1::KeepaliveIntent
+                    | GithubGitSnapshotPhaseV1::KeepaliveExact
+                    | GithubGitSnapshotPhaseV1::StageDeleteIntent
+                    | GithubGitSnapshotPhaseV1::StageDeleted
+                    | GithubGitSnapshotPhaseV1::SourcePublishIntent
+                    | GithubGitSnapshotPhaseV1::SourceExact
+                    | GithubGitSnapshotPhaseV1::SourceAbsent
+                    | GithubGitSnapshotPhaseV1::SourceConflict
+                    | GithubGitSnapshotPhaseV1::SourceCleanupIntent
+                    | GithubGitSnapshotPhaseV1::SourceDeleted
+            )
+        }) && !self.publication_intent
+            && prepared_dispatch_commit.is_none()
+            && dispatch_commit.is_none()
+            && run.is_none()
+            && self.publication_started_at_ms == 0
+            && self.publication_quiescence_deadline_ms == u64::MAX
+            && !self.publication_uncertain
+            && !self.publication_absent
+            && !self.publication_not_attempted
+            && !self.publication_process_fenced
+            && self.publication_lease_scope_sha256.is_none()
+            && self.publication_absence_observations == 0
+            && self.publication_absence_first_observed_at_ms == 0;
+        let snapshot_terminal_pre_dispatch = self.git_snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.phase == GithubGitSnapshotPhaseV1::SourceConflict
+                || snapshot.phase == GithubGitSnapshotPhaseV1::SourceAbsent
+                    && snapshot.source_publication_attempts >= 3
+        });
+        let snapshot_cancel_cleanup_proven =
+            self.git_snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.phase == GithubGitSnapshotPhaseV1::StageDeleted
+                    && snapshot.source_publication_attempts == 0
+                    || snapshot.phase == GithubGitSnapshotPhaseV1::SourcePublishIntent
+                        && snapshot.source_publication_started_at_ms == 0
+                    || matches!(
+                        snapshot.phase,
+                        GithubGitSnapshotPhaseV1::SourceAbsent
+                            | GithubGitSnapshotPhaseV1::SourceConflict
+                            | GithubGitSnapshotPhaseV1::SourceDeleted
+                    )
+            });
+        let snapshot_source_cleanup_proven = self.git_snapshot.as_ref().is_none_or(|snapshot| {
+            matches!(
+                snapshot.phase,
+                GithubGitSnapshotPhaseV1::SourceDeleted
+                    | GithubGitSnapshotPhaseV1::SourceAbsent
+                    | GithubGitSnapshotPhaseV1::SourceConflict
+                    | GithubGitSnapshotPhaseV1::KeepaliveReleaseIntent
+                    | GithubGitSnapshotPhaseV1::KeepaliveReleased
+            )
+        });
+        let no_dispatch_state_valid = match self.state {
+            JobState::Created => !self.publication_absent,
+            JobState::Cancelling => {
+                self.cancellation_requested
+                    && !self.publication_absent
+                    && (self.publication_intent || snapshot_pre_dispatch)
+            }
+            JobState::Cancelled => {
+                self.cancellation_requested
+                    && (self.publication_absent
+                        || snapshot_pre_dispatch && snapshot_cancel_cleanup_proven)
+            }
+            JobState::Failed => {
+                self.publication_uncertain
+                    || self.publication_absent
+                    || self.publication_not_attempted
+                    || snapshot_pre_dispatch && snapshot_terminal_pre_dispatch
+            }
+            JobState::Cleaning | JobState::CleanupFailed => {
+                (self.publication_absent || self.publication_not_attempted)
+                    && self.cleanup_requested
+                    || snapshot_pre_dispatch
+                        && snapshot_terminal_pre_dispatch
+                        && self.cleanup_requested
+            }
+            JobState::Queued | JobState::Running | JobState::Succeeded | JobState::Cleaned => false,
+        };
+        let expected_discovery_deadline = self
+            .created_at_ms
+            .saturating_add(config.poll_policy.discovery_window_ms());
+        let publication_boundary_armed = publication_boundary_is_armed(&self);
+        let publication_boundary_unarmed = publication_boundary_is_unarmed(&self);
+        let successful_run = run_snapshot
+            .as_ref()
+            .is_some_and(run_snapshot_is_successful);
+        let cleanup_success_run = match self.request.signing.mode {
+            SigningMode::UnsignedCompileOnly => run_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.status() == RunStatus::Completed),
+            SigningMode::ManualDevelopment => self.signed_cleanup_evidence.is_some(),
+            _ => false,
+        };
+        let completed_run = run_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.status() == RunStatus::Completed);
+        let cancelled_run = run_snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.status() == RunStatus::Completed
+                && snapshot.conclusion() == Some(RunConclusion::Cancelled)
+        });
+        let manifest_state_valid = matches!(
+            self.state,
+            JobState::Succeeded | JobState::Cleaning | JobState::Cleaned | JobState::CleanupFailed
+        );
+        if self.run_discovery_attempts > config.poll_policy.discovery_attempts().max(2)
+            || self.publication_absence_observations > 2
+            || self
+                .publication_lease_scope_sha256
+                .as_ref()
+                .is_some_and(|scope| !is_lower_sha256(scope))
+            || self.publication_process_fenced && self.publication_lease_scope_sha256.is_none()
+            || (self.publication_absence_observations == 0)
+                != (self.publication_absence_first_observed_at_ms == 0)
+            || self.run_discovery_deadline_ms != expected_discovery_deadline
+            || !(publication_boundary_armed || publication_boundary_unarmed)
+            || !publication_boundary_armed
+                && (dispatch_commit.is_some()
+                    || self.publication_absent
+                    || self.publication_absence_observations != 0)
+            || !self.publication_intent && !snapshot_pre_dispatch
+            || self.publication_absent
+                && (!self.publication_intent
+                    || prepared_dispatch_commit.is_none()
+                    || !self.publication_process_fenced
+                    || self.publication_absence_observations < 2
+                    || dispatch_commit.is_some()
+                    || !self.temporary_ref_deleted
+                    || self.publication_uncertain)
+            || self.publication_not_attempted
+                && (!self.publication_intent
+                    || self.publication_absent
+                    || self.publication_uncertain
+                    || self.publication_absence_observations != 0
+                    || dispatch_commit.is_some()
+                    || run.is_some()
+                    || !matches!(
+                        self.state,
+                        JobState::Failed | JobState::Cleaning | JobState::CleanupFailed
+                    ))
+            || dispatch_commit.is_none()
+                && (run.is_some()
+                    || self.cancellation_dispatched
+                    || self.artifacts_removed
+                    || !no_dispatch_state_valid)
+            || self.cancellation_dispatched && run.is_none()
+            || self.cancellation_dispatched && !self.cancellation_requested
+            || self.state == JobState::Cancelling && !self.cancellation_requested
+            || self.cancellation_requested
+                && !matches!(
+                    self.state,
+                    JobState::Cancelling
+                        | JobState::Cancelled
+                        | JobState::Failed
+                        | JobState::Cleaning
+                        | JobState::Cleaned
+                        | JobState::CleanupFailed
+                )
+            || self.remove_artifacts_requested && !self.cleanup_requested
+            || self.artifacts_removed && !self.remove_artifacts_requested
+            || self.temporary_ref_deleted && !self.cleanup_requested && !self.publication_absent
+            || matches!(
+                self.state,
+                JobState::Cleaning | JobState::Cleaned | JobState::CleanupFailed
+            ) && (!self.cleanup_requested || !snapshot_source_cleanup_proven)
+            || self.state == JobState::Succeeded && (self.manifests.is_empty() || !successful_run)
+            || self.manifests.is_empty() != self.compile_evidence.is_none()
+            || !self.manifests.is_empty() && (!successful_run || !manifest_state_valid)
+            || self.signed_cleanup_evidence.is_some()
+                && (self.request.signing.mode != SigningMode::ManualDevelopment
+                    || !successful_run
+                    || !manifest_state_valid)
+            || self.request.signing.mode == SigningMode::ManualDevelopment
+                && !self.manifests.is_empty()
+                && self.signed_cleanup_evidence.is_none()
+            || matches!(
+                self.state,
+                JobState::Succeeded
+                    | JobState::Failed
+                    | JobState::Cancelled
+                    | JobState::Cleaning
+                    | JobState::Cleaned
+                    | JobState::CleanupFailed
+            ) && run_snapshot.is_some()
+                && !completed_run
+            || self.state == JobState::Cancelled
+                && !(self.publication_absent && run_snapshot.is_none() || cancelled_run)
+            || self.state == JobState::Cleaned && !cleanup_success_run
+            || matches!(self.state, JobState::Cleaned | JobState::CleanupFailed)
+                && (!(self.temporary_ref_deleted
+                    || self.publication_not_attempted
+                    || snapshot_terminal_pre_dispatch)
+                    || self.remove_artifacts_requested && !self.artifacts_removed)
+        {
+            return Err(resume_failure("resume_state_inconsistent"));
+        }
+        let record = JobRecord {
+            principal: Some(principal.clone()),
+            execution_repository_id: Some(execution_repository_id),
+            operation_id: self.operation_id,
+            job_id: self.job_id,
+            source_revision,
+            git_snapshot: self.git_snapshot,
+            request: self.request,
+            request_sha256: self.request_sha256,
+            temporary_ref,
+            prepared_dispatch_commit,
+            dispatch_commit,
+            workflow_dispatch: self.workflow_dispatch.map(|dispatch| *dispatch),
+            created_at_ms: self.created_at_ms,
+            publication_started_at_ms: self.publication_started_at_ms,
+            publication_quiescence_deadline_ms: self.publication_quiescence_deadline_ms,
+            state: self.state,
+            run,
+            run_snapshot,
+            publication_intent: self.publication_intent,
+            publication_absent: self.publication_absent,
+            publication_not_attempted: self.publication_not_attempted,
+            publication_process_fenced: self.publication_process_fenced,
+            publication_lease_scope_sha256: self.publication_lease_scope_sha256,
+            publication_takeover_lease_owned: false,
+            snapshot_source_lease_owned: false,
+            publication_absence_observations: self.publication_absence_observations,
+            publication_absence_first_observed_at_ms: self.publication_absence_first_observed_at_ms,
+            cancellation_requested: self.cancellation_requested,
+            cancellation_dispatched: self.cancellation_dispatched,
+            cleanup_requested: self.cleanup_requested,
+            remove_artifacts_requested: self.remove_artifacts_requested,
+            artifacts_removed: self.artifacts_removed,
+            temporary_ref_deleted: self.temporary_ref_deleted,
+            verification_pending_event: self.verification_pending_event,
+            publication_uncertain: self.publication_uncertain,
+            run_discovery_attempts: self.run_discovery_attempts,
+            run_discovery_deadline_ms: self.run_discovery_deadline_ms,
+            manifests: self.manifests,
+            compile_evidence: self.compile_evidence,
+            signed_cleanup_evidence: self.signed_cleanup_evidence,
+            events: self.events,
+        };
+        validate_workflow_dispatch_record(config, &record)?;
+        if !record.manifests.is_empty() {
+            validate_manifests(&record, config, &record.manifests)?;
+        }
+        Ok(record)
+    }
 }
 
 #[derive(Debug, Default)]
 struct ProviderState {
     jobs: BTreeMap<String, JobRecord>,
     reservations: BTreeSet<String>,
+    cancellation_reservations: BTreeSet<String>,
 }
 
 struct JobReservation<'a> {
@@ -1402,13 +6475,14 @@ impl<'a> JobReservation<'a> {
         state: &'a Mutex<ProviderState>,
         job_id: String,
         maximum: usize,
+        allow_recycling: bool,
     ) -> RemoteBuildResult<Self> {
         let mut locked = lock_provider_state(state)?;
         if locked.reservations.contains(&job_id)
             || locked
                 .jobs
                 .get(&job_id)
-                .is_some_and(|record| !record.state.is_terminal())
+                .is_some_and(|record| !allow_recycling || !record_is_recyclable(record))
         {
             return Err(provider_failure(
                 "duplicate_job_id",
@@ -1416,18 +6490,21 @@ impl<'a> JobReservation<'a> {
                 false,
             ));
         }
-        if locked
-            .jobs
-            .get(&job_id)
-            .is_some_and(|record| record.state.is_terminal())
-        {
+        if allow_recycling && locked.jobs.get(&job_id).is_some_and(record_is_recyclable) {
             locked.jobs.remove(&job_id);
         }
         if locked.jobs.len() + locked.reservations.len() >= maximum {
+            if !allow_recycling {
+                return Err(provider_failure(
+                    "job_capacity_reached",
+                    "GitHub provider reached its bounded durable job capacity",
+                    true,
+                ));
+            }
             let recyclable = locked
                 .jobs
                 .iter()
-                .filter(|(_, record)| record.state.is_terminal())
+                .filter(|(_, record)| record_is_recyclable(record))
                 .min_by(|(left_id, left), (right_id, right)| {
                     left.created_at_ms
                         .cmp(&right.created_at_ms)
@@ -1484,7 +6561,7 @@ struct PendingJobRecord<'a> {
 }
 
 impl PendingJobRecord<'_> {
-    fn retain(mut self) {
+    fn retain(&mut self) {
         self.retain = true;
     }
 }
@@ -1508,9 +6585,13 @@ pub struct GithubBuildProvider<R, P, A = NoVerifiedArtifactStore, C = SystemProv
     artifacts: Mutex<A>,
     clock: C,
     state: Mutex<ProviderState>,
+    checkpoint_sink: Option<Mutex<Box<dyn GithubJobCheckpointSink>>>,
 }
 
-impl<R, P> GithubBuildProvider<R, P, NoVerifiedArtifactStore, SystemProviderClock> {
+impl<R, P> GithubBuildProvider<R, P, NoVerifiedArtifactStore, SystemProviderClock>
+where
+    P: TemporaryRefPublisher,
+{
     /// Construct the provider without artifact ingestion.
     ///
     /// Artifact listing/download capabilities remain false and GitHub success is reported as
@@ -1528,6 +6609,7 @@ impl<R, P> GithubBuildProvider<R, P, NoVerifiedArtifactStore, SystemProviderCloc
 
 impl<R, P, A, C> GithubBuildProvider<R, P, A, C>
 where
+    P: TemporaryRefPublisher,
     A: VerifiedArtifactStore,
     C: ProviderClock,
 {
@@ -1539,7 +6621,8 @@ where
         artifacts: A,
         clock: C,
     ) -> Self {
-        let capabilities = provider_capabilities(&config, &artifacts);
+        let capabilities =
+            provider_capabilities(&config, &artifacts, publisher.supports_git_snapshot());
         Self {
             config,
             capabilities,
@@ -1548,7 +6631,20 @@ where
             artifacts: Mutex::new(artifacts),
             clock,
             state: Mutex::new(ProviderState::default()),
+            checkpoint_sink: None,
         }
+    }
+
+    /// Attach an atomic durable checkpoint sink without changing the protocol-v1 provider type.
+    #[must_use]
+    pub fn with_checkpoint_sink(mut self, sink: impl GithubJobCheckpointSink + 'static) -> Self {
+        self.checkpoint_sink = Some(Mutex::new(Box::new(sink)));
+        self
+    }
+
+    /// Configured workflow trigger governing publication-to-run mapping.
+    pub const fn workflow_run_trigger(&self) -> WorkflowRunTrigger {
+        self.config.workflow.run_trigger()
     }
 
     /// Explicitly poll one mapped run to terminal using the configured bounded policy.
@@ -1622,6 +6718,3565 @@ where
         })
     }
 
+    fn current_resume_identity(&self) -> RemoteBuildResult<(GithubPrincipalIdentityV1, u64)>
+    where
+        R: GhRunner,
+    {
+        let mut transport = self.lock_transport()?;
+        let principal = transport
+            .authenticate(&self.config.repository)
+            .map_err(transport_failure)?;
+        let repository = transport
+            .repository(&self.config.repository)
+            .map_err(transport_failure)?;
+        let principal = GithubPrincipalIdentityV1::from_authenticated(
+            &principal,
+            self.config.workflow.run_trigger(),
+            repository.id(),
+        )?;
+        Ok((principal, repository.id()))
+    }
+
+    /// Resolve the exact secret-free identity for a local durable record before submission.
+    ///
+    /// This performs only bounded GitHub metadata reads. It never publishes a ref, starts a run,
+    /// cancels a run, or deletes remote state. Repository-scoped credentials are rejected until a
+    /// stable installation principal ID can be proven.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed transport or stable-identity failure.
+    pub fn durable_identity(&self) -> RemoteBuildResult<GithubDurableIdentityV1>
+    where
+        R: GhRunner,
+    {
+        let (principal, execution_repository_id) = self.current_resume_identity()?;
+        Ok(GithubDurableIdentityV1 {
+            provider: GITHUB_PROVIDER_ID.to_owned(),
+            provider_config_sha256: provider_config_sha256(&self.config)?,
+            principal,
+            execution_repository: repository_url(&self.config.repository),
+            execution_repository_id,
+        })
+    }
+
+    fn validate_durable_identity_binding(
+        &self,
+        identity: &GithubDurableIdentityV1,
+    ) -> RemoteBuildResult<()> {
+        if identity.provider != GITHUB_PROVIDER_ID
+            || identity.provider_config_sha256 != provider_config_sha256(&self.config)?
+            || !github_remote_matches(
+                &identity.execution_repository,
+                &repository_url(&self.config.repository),
+            )
+            || identity.execution_repository_id == 0
+            || matches!(
+                identity.principal,
+                GithubPrincipalIdentityV1::RepositoryCredential
+            ) && self.config.workflow.run_trigger() != WorkflowRunTrigger::WorkflowDispatch
+        {
+            return Err(resume_failure("resume_provider_identity_mismatch"));
+        }
+        Ok(())
+    }
+
+    /// Precompute one initial snapshot's exact six-object graph without mutation.
+    ///
+    /// This specialized boundary validates provider snapshot support and the operation-derived
+    /// source ref, then delegates only to the retained-byte no-write publisher primitive. It does
+    /// not create a stage, write a Git object, mutate a ref, access the network, or submit a job.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed cancellation, unsupported-capability, unsafe-operation, retained-stage,
+    /// object-format, fixed-Git, or canonical graph failure.
+    pub fn precompute_git_snapshot_graph(
+        &self,
+        inputs: &mut GitSnapshotPrecomputeInputs,
+        operation_id: &str,
+        source_created_at_ms: u64,
+        cancellation: &CancellationToken,
+    ) -> RemoteBuildResult<GitSnapshotObjectGraphV1> {
+        cancellation.check()?;
+        if !self
+            .capabilities
+            .source_modes
+            .contains(&SourceMode::GitSnapshot)
+        {
+            return Err(unsupported(ProviderFeature::SourceMode(
+                SourceMode::GitSnapshot,
+            )));
+        }
+        GitSnapshotSourceRef::for_operation(operation_id)
+            .map_err(TemporaryRefPublishError::from)
+            .map_err(publisher_failure)?;
+        let graph = {
+            let mut publisher = self.lock_publisher()?;
+            publisher
+                .precompute_git_snapshot(inputs, operation_id, source_created_at_ms)
+                .map_err(publisher_failure)?
+        };
+        cancellation.check()?;
+        Ok(graph)
+    }
+
+    /// Discover complete provider-unowned snapshot stages using bounded private reads only.
+    ///
+    /// This method neither adopts nor deletes any candidate. Provider jobs and in-process
+    /// reservations are excluded, but the controller must separately prove that no on-disk
+    /// `JobStore` record owns the operation before atomically creating that owner and invoking
+    /// fresh-reconsent submission.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed failure when snapshot support is unavailable or any private store entry is
+    /// partial, unknown, over the fixed bound, non-canonical, rebound, or configuration-mismatched.
+    pub fn discover_uncheckpointed_git_snapshot_stages(
+        &self,
+    ) -> RemoteBuildResult<Vec<GithubGitSnapshotRecoveryCandidateV1>> {
+        if !self
+            .capabilities
+            .source_modes
+            .contains(&SourceMode::GitSnapshot)
+        {
+            return Err(unsupported(ProviderFeature::SourceMode(
+                SourceMode::GitSnapshot,
+            )));
+        }
+        let mut candidates = self
+            .lock_publisher()?
+            .discover_git_snapshot_stages()
+            .map_err(publisher_failure)?;
+        let occupied = {
+            let state = self.lock_state()?;
+            state
+                .jobs
+                .keys()
+                .chain(state.reservations.iter())
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        };
+        candidates.retain(|candidate| !occupied.contains(&candidate.final_request.operation_id));
+        candidates.sort_by(|left, right| {
+            left.final_request
+                .operation_id
+                .cmp(&right.final_request.operation_id)
+        });
+        let mut previous = None;
+        for candidate in &candidates {
+            let operation_id = candidate.final_request.operation_id.as_str();
+            if previous == Some(operation_id)
+                || candidate.stage.final_request != candidate.final_request
+                || candidate.stage.operation_id != operation_id
+                || candidate.stage_locator.operation_id != operation_id
+                || candidate.stage.source_repository != self.config.source_repository
+            {
+                return Err(provider_failure(
+                    "snapshot_stage_discovery_invalid",
+                    "Git snapshot recovery discovery found an invalid candidate",
+                    false,
+                ));
+            }
+            candidate
+                .stage
+                .validate_for_request(&candidate.descriptor, &candidate.final_request)
+                .map_err(|_| {
+                    provider_failure(
+                        "snapshot_stage_discovery_invalid",
+                        "Git snapshot recovery discovery found an invalid candidate",
+                        false,
+                    )
+                })?;
+            validate_git_snapshot_submission(&self.config, &candidate.final_request)?;
+            previous = Some(operation_id);
+        }
+        Ok(candidates)
+    }
+
+    /// Submit one explicit-consent unsigned Git snapshot without an ordinary clean-Git fallback.
+    ///
+    /// The first `Prepared` checkpoint is synchronously durable before this method permits a Git
+    /// object write, ref mutation, or network request. Same-invocation stages must carry the exact
+    /// accepted consent SHA. Restart adoption is available only through the distinct fresh-
+    /// reconsent constructor and is no-mutation until that same checkpoint succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed validation, checkpoint, retained-stage, Git, identity, transport, or
+    /// publication failure. A checkpointed job remains resumable after any later failure.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "snapshot reservation, consent, immutable record construction, and first checkpoint form one security boundary"
+    )]
+    pub fn submit_git_snapshot(
+        &self,
+        submission: GithubGitSnapshotSubmissionV1,
+        cancellation: &CancellationToken,
+    ) -> RemoteBuildResult<JobHandle>
+    where
+        R: GhRunner,
+        P: TemporaryRefReconciler,
+    {
+        cancellation.check()?;
+        if self.checkpoint_sink.is_none() {
+            return Err(provider_failure(
+                "snapshot_checkpoint_required",
+                "Git snapshot submission requires durable provider checkpoints",
+                false,
+            ));
+        }
+        validate_git_snapshot_submission(&self.config, &submission.request)?;
+        if !self
+            .capabilities
+            .source_modes
+            .contains(&SourceMode::GitSnapshot)
+        {
+            return Err(unsupported(ProviderFeature::SourceMode(
+                SourceMode::GitSnapshot,
+            )));
+        }
+        self.validate_durable_identity_binding(&submission.durable_identity)?;
+        let mut workflow_dispatch_client =
+            if self.config.workflow.run_trigger() == WorkflowRunTrigger::WorkflowDispatch {
+                self.preflight_workflow_dispatch_registration()?;
+                Some(self.prepare_workflow_dispatch_client()?)
+            } else {
+                None
+            };
+        let job_id = submission.request.operation_id.clone();
+        let reservation =
+            JobReservation::acquire(&self.state, job_id.clone(), self.config.max_jobs, false)?;
+        let (stage_locator, stage) = match submission.stage_authority {
+            GithubGitSnapshotStageAuthorityV1::SameInvocation { locator, stage }
+            | GithubGitSnapshotStageAuthorityV1::ExactRetryLineage { locator, stage } => {
+                (locator, stage)
+            }
+            GithubGitSnapshotStageAuthorityV1::FreshReconsentAdoption => self
+                .lock_publisher()?
+                .adopt_git_snapshot_stage(&submission.request)
+                .map_err(publisher_failure)?,
+        };
+        if stage.consent_sha256 != submission.approved_consent_sha256 {
+            return Err(provider_failure(
+                "snapshot_consent_changed",
+                "Git snapshot stage differs from the explicitly accepted upload plan",
+                false,
+            ));
+        }
+        let snapshot = GithubGitSnapshotResumeV1 {
+            schema_version: GITHUB_GIT_SNAPSHOT_RESUME_SCHEMA_VERSION,
+            stage_locator,
+            stage,
+            phase: GithubGitSnapshotPhaseV1::Prepared,
+            source_publication_attempts: 0,
+            source_publication_started_at_ms: 0,
+            source_publication_quiescence_deadline_ms: 0,
+            source_publication_process_fenced: false,
+            source_publication_lease_scope_sha256: None,
+            source_publication_absence_observations: 0,
+            source_publication_absence_first_observed_at_ms: 0,
+            source_publication_absence_last_observed_at_ms: 0,
+            keepalive_release_authorization_sha256: None,
+        };
+        snapshot.validate_for_request(&submission.request)?;
+        let branch = BranchName::new(format!(
+            "{}/{}",
+            self.config.workflow.temporary_branch_namespace().as_str(),
+            submission.request.operation_id
+        ))
+        .map_err(|_| {
+            provider_failure(
+                "operation_id_not_ref_safe",
+                "operation ID cannot form a safe temporary Git ref",
+                false,
+            )
+        })?;
+        let temporary_ref =
+            TemporaryGitRef::new(self.config.workflow.temporary_branch_namespace(), branch)
+                .map_err(|_| {
+                    provider_failure(
+                        "operation_id_not_ref_safe",
+                        "operation ID cannot form a safe temporary Git ref",
+                        false,
+                    )
+                })?;
+        let source_revision = CommitSha::new(
+            submission
+                .request
+                .source_revision
+                .clone()
+                .ok_or_else(|| resume_failure("resume_source_revision_invalid"))?,
+        )
+        .map_err(|_| resume_failure("resume_source_revision_invalid"))?;
+        let created_at_ms = snapshot.stage.source_created_at_ms;
+        let manifest =
+            GithubDispatchManifest::new(&self.config, &temporary_ref, submission.request.clone());
+        manifest.validate_for(&self.config)?;
+        manifest.encode()?;
+        let request_sha256 = canonical_request_sha256(&submission.request)?;
+        let discovery_deadline_ms =
+            created_at_ms.saturating_add(self.config.poll_policy.discovery_window_ms());
+        let mut record = JobRecord {
+            principal: Some(submission.durable_identity.principal),
+            execution_repository_id: Some(submission.durable_identity.execution_repository_id),
+            operation_id: job_id.clone(),
+            job_id: job_id.clone(),
+            source_revision,
+            git_snapshot: Some(snapshot),
+            request: submission.request,
+            request_sha256,
+            temporary_ref,
+            prepared_dispatch_commit: None,
+            dispatch_commit: None,
+            workflow_dispatch: None,
+            created_at_ms,
+            publication_started_at_ms: 0,
+            publication_quiescence_deadline_ms: u64::MAX,
+            state: JobState::Created,
+            run: None,
+            run_snapshot: None,
+            publication_intent: false,
+            publication_absent: false,
+            publication_not_attempted: false,
+            publication_process_fenced: false,
+            publication_lease_scope_sha256: None,
+            publication_takeover_lease_owned: false,
+            snapshot_source_lease_owned: false,
+            publication_absence_observations: 0,
+            publication_absence_first_observed_at_ms: 0,
+            cancellation_requested: false,
+            cancellation_dispatched: false,
+            cleanup_requested: false,
+            remove_artifacts_requested: false,
+            artifacts_removed: false,
+            temporary_ref_deleted: false,
+            verification_pending_event: false,
+            publication_uncertain: false,
+            run_discovery_attempts: 0,
+            run_discovery_deadline_ms: discovery_deadline_ms,
+            manifests: Vec::new(),
+            compile_evidence: None,
+            signed_cleanup_evidence: None,
+            events: Vec::new(),
+        };
+        append_event(
+            &mut record,
+            created_at_ms,
+            "submit",
+            RemoteBuildEventKind::OperationStarted {
+                command: "build-iphone --snapshot".to_owned(),
+            },
+        )?;
+        append_event(
+            &mut record,
+            created_at_ms,
+            "submit",
+            RemoteBuildEventKind::JobCreated {
+                state: JobState::Created,
+            },
+        )?;
+        let mut pending = reservation.insert_pending(record)?;
+        {
+            let mut provider_state = self.lock_state()?;
+            let record = provider_state
+                .jobs
+                .get_mut(&job_id)
+                .ok_or_else(|| resume_failure("snapshot_pending_job_lost"))?;
+            self.checkpoint_record(record)?;
+        }
+        pending.retain();
+        self.continue_git_snapshot_submission(&job_id, cancellation)?;
+        let start_dispatch = {
+            let provider_state = self.lock_state()?;
+            let record = provider_state
+                .jobs
+                .get(&job_id)
+                .ok_or_else(|| job_not_found(&job_id))?;
+            self.config.workflow.run_trigger() == WorkflowRunTrigger::WorkflowDispatch
+                && record.dispatch_commit.is_some()
+                && !record.publication_uncertain
+                && !record.state.is_terminal()
+                && !record.state.is_build_terminal()
+        };
+        if start_dispatch {
+            let client = workflow_dispatch_client.as_deref_mut().ok_or_else(|| {
+                provider_failure(
+                    "workflow_dispatch_client_unavailable",
+                    "Preflighted workflow dispatch client is unavailable",
+                    true,
+                )
+            })?;
+            self.start_workflow_dispatch_with_client(&job_id, client, cancellation)?;
+        }
+        let provider_state = self.lock_state()?;
+        let record = provider_state
+            .jobs
+            .get(&job_id)
+            .ok_or_else(|| job_not_found(&job_id))?;
+        Ok(JobHandle {
+            job_id,
+            state: record.state,
+            created_at_ms,
+        })
+    }
+
+    /// Derive one immutable exact-retry child request without creating a stage or mutating Git.
+    ///
+    /// The terminal parent's archive blob and keepalive are verified before and after bounded
+    /// offline no-write hashing. The returned request and graph can therefore be persisted in the
+    /// parent/child lineage before any child stage write.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed failure for a nonterminal or releasing parent, missing/conflicting
+    /// keepalive, invalid child identity, parent blob mismatch, or deterministic graph failure.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "parent terminal, keepalive, archive, and no-write child-plan checks are one read-only authority boundary"
+    )]
+    pub fn precompute_exact_git_snapshot_retry(
+        &self,
+        parent_job_id: &str,
+        child_operation_id: &str,
+        child_source_created_at_ms: u64,
+        cancellation: &CancellationToken,
+    ) -> RemoteBuildResult<GithubGitSnapshotExactRetryPlanV1> {
+        cancellation.check()?;
+        if !self
+            .capabilities
+            .source_modes
+            .contains(&SourceMode::GitSnapshot)
+        {
+            return Err(unsupported(ProviderFeature::SourceMode(
+                SourceMode::GitSnapshot,
+            )));
+        }
+        if parent_job_id == child_operation_id
+            || child_source_created_at_ms == 0
+            || child_source_created_at_ms / 1_000 > i64::MAX as u64
+            || GitSnapshotSourceRef::for_operation(child_operation_id).is_err()
+        {
+            return Err(provider_failure(
+                "snapshot_exact_retry_child_invalid",
+                "Git snapshot exact retry child identity is invalid",
+                false,
+            ));
+        }
+        let state = self.lock_state()?;
+        if state.jobs.contains_key(child_operation_id)
+            || state.reservations.contains(child_operation_id)
+        {
+            return Err(provider_failure(
+                "snapshot_exact_retry_child_exists",
+                "Git snapshot retry child operation already exists",
+                false,
+            ));
+        }
+        let parent = state
+            .jobs
+            .get(parent_job_id)
+            .ok_or_else(|| job_not_found(parent_job_id))?;
+        if parent.operation_id != parent_job_id
+            || !parent.cleanup_requested
+            || parent.state != JobState::Cleaned
+        {
+            return Err(provider_failure(
+                "snapshot_exact_retry_parent_not_terminal",
+                "Git snapshot exact retry requires completed parent cleanup",
+                false,
+            ));
+        }
+        let snapshot = parent
+            .git_snapshot
+            .as_ref()
+            .ok_or_else(|| resume_failure("resume_git_snapshot_binding_missing"))?;
+        if !matches!(
+            snapshot.phase,
+            GithubGitSnapshotPhaseV1::SourceDeleted
+                | GithubGitSnapshotPhaseV1::SourceAbsent
+                | GithubGitSnapshotPhaseV1::SourceConflict
+        ) || snapshot.keepalive_release_authorization_sha256.is_some()
+        {
+            return Err(provider_failure(
+                "snapshot_exact_retry_parent_releasing",
+                "Git snapshot parent keepalive is already releasing or unavailable",
+                false,
+            ));
+        }
+        let keepalive_request = GitSnapshotKeepaliveRequest {
+            operation_id: &parent.operation_id,
+            keepalive_ref: &snapshot.stage.keepalive_ref,
+            commit: &snapshot.stage.graph.commit,
+        };
+        let precompute_request = GitSnapshotExactRetryPrecomputeRequest {
+            parent_request: &parent.request,
+            parent_stage: &snapshot.stage,
+            child_operation_id,
+            child_source_created_at_ms,
+        };
+        let mut publisher = self.lock_publisher()?;
+        match publisher
+            .reconcile_git_snapshot_keepalive(&keepalive_request)
+            .map_err(publisher_failure)?
+        {
+            GitSnapshotRefReconciliation::Exact => {}
+            GitSnapshotRefReconciliation::Absent => {
+                return Err(provider_failure(
+                    "snapshot_exact_retry_parent_keepalive_missing",
+                    "Git snapshot parent keepalive is absent",
+                    false,
+                ));
+            }
+            GitSnapshotRefReconciliation::Conflict => {
+                return Err(provider_failure(
+                    "snapshot_exact_retry_parent_keepalive_conflict",
+                    "Git snapshot parent keepalive changed",
+                    false,
+                ));
+            }
+        }
+        let plan = publisher
+            .precompute_exact_git_snapshot_retry(&precompute_request)
+            .map_err(publisher_failure)?;
+        match publisher
+            .reconcile_git_snapshot_keepalive(&keepalive_request)
+            .map_err(publisher_failure)?
+        {
+            GitSnapshotRefReconciliation::Exact => {}
+            GitSnapshotRefReconciliation::Absent => {
+                return Err(provider_failure(
+                    "snapshot_exact_retry_parent_keepalive_lost",
+                    "Git snapshot parent keepalive disappeared during retry planning",
+                    false,
+                ));
+            }
+            GitSnapshotRefReconciliation::Conflict => {
+                return Err(provider_failure(
+                    "snapshot_exact_retry_parent_keepalive_changed",
+                    "Git snapshot parent keepalive changed during retry planning",
+                    false,
+                ));
+            }
+        }
+        drop(publisher);
+        cancellation.check()?;
+        Ok(plan)
+    }
+
+    /// Create one exact child retry stage from a verified terminal parent's private archive blob.
+    ///
+    /// The caller must durably bind the parent/child retry lineage before invoking this method.
+    /// No workspace is recaptured and no Git object or ref is mutated. The parent keepalive is
+    /// required at its exact commit before and after the bounded child stage is published.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed failure for missing lineage authority, a nonterminal or releasing parent,
+    /// a missing/conflicting keepalive, parent blob size/SHA/object mismatch, or child stage and
+    /// descriptor/graph failure.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "lineage authorization, child lease, replayable stage, and parent recheck must stay visibly ordered"
+    )]
+    pub fn stage_exact_git_snapshot_retry(
+        &self,
+        authorization: &GithubGitSnapshotExactRetryAuthorizationV1,
+        expected_plan: &GithubGitSnapshotExactRetryPlanV1,
+        cancellation: &CancellationToken,
+    ) -> RemoteBuildResult<GithubGitSnapshotExactRetryStageV1> {
+        cancellation.check()?;
+        if !self
+            .capabilities
+            .source_modes
+            .contains(&SourceMode::GitSnapshot)
+        {
+            return Err(unsupported(ProviderFeature::SourceMode(
+                SourceMode::GitSnapshot,
+            )));
+        }
+        if expected_plan.request.operation_id != authorization.child_operation_id
+            || expected_plan.source_created_at_ms != authorization.child_source_created_at_ms
+            || expected_plan.request.source_revision.as_deref()
+                != Some(expected_plan.graph.commit.as_str())
+        {
+            return Err(provider_failure(
+                "snapshot_exact_retry_plan_mismatch",
+                "Git snapshot retry plan differs from durable lineage authority",
+                false,
+            ));
+        }
+        let state = self.lock_state()?;
+        if state.jobs.contains_key(&authorization.child_operation_id)
+            || state
+                .reservations
+                .contains(&authorization.child_operation_id)
+        {
+            return Err(provider_failure(
+                "snapshot_exact_retry_child_exists",
+                "Git snapshot retry child operation already exists",
+                false,
+            ));
+        }
+        let parent = state
+            .jobs
+            .get(&authorization.parent_job_id)
+            .ok_or_else(|| job_not_found(&authorization.parent_job_id))?;
+        if parent.operation_id != authorization.parent_job_id
+            || !parent.cleanup_requested
+            || parent.state != JobState::Cleaned
+        {
+            return Err(provider_failure(
+                "snapshot_exact_retry_parent_not_terminal",
+                "Git snapshot exact retry requires completed parent cleanup",
+                false,
+            ));
+        }
+        let snapshot = parent
+            .git_snapshot
+            .as_ref()
+            .ok_or_else(|| resume_failure("resume_git_snapshot_binding_missing"))?;
+        if !matches!(
+            snapshot.phase,
+            GithubGitSnapshotPhaseV1::SourceDeleted
+                | GithubGitSnapshotPhaseV1::SourceAbsent
+                | GithubGitSnapshotPhaseV1::SourceConflict
+        ) || snapshot.keepalive_release_authorization_sha256.is_some()
+        {
+            return Err(provider_failure(
+                "snapshot_exact_retry_parent_releasing",
+                "Git snapshot parent keepalive is already releasing or unavailable",
+                false,
+            ));
+        }
+        let keepalive_request = GitSnapshotKeepaliveRequest {
+            operation_id: &parent.operation_id,
+            keepalive_ref: &snapshot.stage.keepalive_ref,
+            commit: &snapshot.stage.graph.commit,
+        };
+        let stage_request = GitSnapshotExactRetryStageRequest {
+            parent_request: &parent.request,
+            parent_stage: &snapshot.stage,
+            expected_plan,
+            retry_lineage_authorization_sha256: &authorization.retry_lineage_authorization_sha256,
+        };
+        let mut publisher = self.lock_publisher()?;
+        if !publisher.publication_attempt_is_process_fenced() {
+            return Err(provider_failure(
+                "snapshot_exact_retry_process_unfenced",
+                "Git snapshot retry staging requires a cross-process child lease",
+                false,
+            ));
+        }
+        let child_source_ref =
+            GitSnapshotSourceRef::for_operation(&authorization.child_operation_id)
+                .map_err(|_| resume_failure("snapshot_exact_retry_authorization_invalid"))?;
+        let child_lease = GitSnapshotSourcePublicationLeaseRequest {
+            source_repository: &self.config.source_repository,
+            source_ref: &child_source_ref,
+        };
+        if publisher
+            .acquire_git_snapshot_source_lease(&child_lease)
+            .map_err(publisher_failure)?
+            != TemporaryRefPublicationLease::Acquired
+        {
+            return Err(provider_failure(
+                "snapshot_exact_retry_child_active",
+                "Another live provider owns this Git snapshot retry child",
+                true,
+            ));
+        }
+        let result = (|| {
+            match publisher
+                .reconcile_git_snapshot_keepalive(&keepalive_request)
+                .map_err(publisher_failure)?
+            {
+                GitSnapshotRefReconciliation::Exact => {}
+                GitSnapshotRefReconciliation::Absent => {
+                    return Err(provider_failure(
+                        "snapshot_exact_retry_parent_keepalive_missing",
+                        "Git snapshot parent keepalive is absent",
+                        false,
+                    ));
+                }
+                GitSnapshotRefReconciliation::Conflict => {
+                    return Err(provider_failure(
+                        "snapshot_exact_retry_parent_keepalive_conflict",
+                        "Git snapshot parent keepalive changed",
+                        false,
+                    ));
+                }
+            }
+            let child = publisher
+                .stage_exact_git_snapshot_retry(&stage_request)
+                .map_err(publisher_failure)?;
+            match publisher
+                .reconcile_git_snapshot_keepalive(&keepalive_request)
+                .map_err(publisher_failure)?
+            {
+                GitSnapshotRefReconciliation::Exact => {}
+                GitSnapshotRefReconciliation::Absent => {
+                    return Err(provider_failure(
+                        "snapshot_exact_retry_parent_keepalive_lost",
+                        "Git snapshot parent keepalive disappeared during retry staging",
+                        false,
+                    ));
+                }
+                GitSnapshotRefReconciliation::Conflict => {
+                    return Err(provider_failure(
+                        "snapshot_exact_retry_parent_keepalive_changed",
+                        "Git snapshot parent keepalive changed during retry staging",
+                        false,
+                    ));
+                }
+            }
+            cancellation.check()?;
+            Ok(child)
+        })();
+        publisher.release_git_snapshot_source_lease(&child_lease);
+        drop(publisher);
+        result
+    }
+
+    /// Release one exact local snapshot keepalive under complete-lineage prune authority.
+    ///
+    /// The caller remains responsible for proving complete-lineage prune authority and retaining
+    /// every controller/store lease until this method returns. The provider binds the stable
+    /// lineage IDs/edges/cutoff digest into its own checkpoint before any local ref mutation,
+    /// verifies the exact expected commit, and checkpoints confirmed absence before returning.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed failure unless the exact restored job has completed terminal cleanup, its
+    /// remote source ref is already absent or conflict-proven, checkpoints are durable, and the
+    /// local keepalive can be reconciled and removed without conflict.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "prune authorization, durable intent, exact release, and absence checkpoint are one crash-safe primitive"
+    )]
+    pub fn release_git_snapshot_keepalive_for_prune(
+        &self,
+        authorization: &GithubGitSnapshotKeepaliveReleaseAuthorizationV1,
+        cancellation: &CancellationToken,
+    ) -> RemoteBuildResult<()> {
+        cancellation.check()?;
+        if self.checkpoint_sink.is_none() {
+            return Err(provider_failure(
+                "snapshot_checkpoint_required",
+                "Git snapshot keepalive release requires durable provider checkpoints",
+                false,
+            ));
+        }
+        if !self
+            .config
+            .mutation_authorization
+            .manage_git_snapshot_keepalive
+        {
+            return Err(provider_failure(
+                "snapshot_keepalive_unauthorized",
+                "Git snapshot keepalive mutation is not authorized",
+                false,
+            ));
+        }
+        let mut state = self.lock_state()?;
+        let record = state
+            .jobs
+            .get_mut(authorization.job_id())
+            .ok_or_else(|| job_not_found(authorization.job_id()))?;
+        if record.operation_id != authorization.job_id
+            || !record.cleanup_requested
+            || record.state != JobState::Cleaned
+        {
+            return Err(provider_failure(
+                "snapshot_keepalive_prune_not_terminal",
+                "Git snapshot keepalive release requires completed terminal cleanup",
+                false,
+            ));
+        }
+        let snapshot = record
+            .git_snapshot
+            .as_mut()
+            .ok_or_else(|| resume_failure("resume_git_snapshot_binding_missing"))?;
+        let reacknowledge_release_intent =
+            snapshot.phase == GithubGitSnapshotPhaseV1::KeepaliveReleaseIntent;
+        match snapshot.phase {
+            GithubGitSnapshotPhaseV1::SourceDeleted
+            | GithubGitSnapshotPhaseV1::SourceAbsent
+            | GithubGitSnapshotPhaseV1::SourceConflict => {
+                snapshot.keepalive_release_authorization_sha256 =
+                    Some(authorization.complete_lineage_authorization_sha256.clone());
+                snapshot.phase = GithubGitSnapshotPhaseV1::KeepaliveReleaseIntent;
+                self.checkpoint_record(record)?;
+            }
+            GithubGitSnapshotPhaseV1::KeepaliveReleaseIntent
+            | GithubGitSnapshotPhaseV1::KeepaliveReleased => {
+                if snapshot.keepalive_release_authorization_sha256.as_deref()
+                    != Some(authorization.complete_lineage_authorization_sha256())
+                {
+                    return Err(provider_failure(
+                        "snapshot_prune_authorization_changed",
+                        "Git snapshot complete-lineage authorization changed after intent",
+                        false,
+                    ));
+                }
+                if snapshot.phase == GithubGitSnapshotPhaseV1::KeepaliveReleased {
+                    self.checkpoint_record(record)?;
+                    return Ok(());
+                }
+            }
+            _ => {
+                return Err(provider_failure(
+                    "snapshot_keepalive_prune_source_not_clean",
+                    "Git snapshot source cleanup is incomplete",
+                    false,
+                ));
+            }
+        }
+        if reacknowledge_release_intent {
+            self.checkpoint_record(record)?;
+        }
+        cancellation.check()?;
+        let snapshot = record
+            .git_snapshot
+            .as_ref()
+            .ok_or_else(|| resume_failure("resume_git_snapshot_binding_missing"))?;
+        let request = GitSnapshotKeepaliveRequest {
+            operation_id: &record.operation_id,
+            keepalive_ref: &snapshot.stage.keepalive_ref,
+            commit: &snapshot.stage.graph.commit,
+        };
+        let reconciliation = {
+            let mut publisher = self.lock_publisher()?;
+            publisher
+                .reconcile_git_snapshot_keepalive(&request)
+                .map_err(publisher_failure)?
+        };
+        match reconciliation {
+            GitSnapshotRefReconciliation::Absent => {}
+            GitSnapshotRefReconciliation::Exact => {
+                self.lock_publisher()?
+                    .release_git_snapshot_keepalive(&request)
+                    .map_err(publisher_failure)?;
+            }
+            GitSnapshotRefReconciliation::Conflict => {
+                return Err(provider_failure(
+                    "snapshot_keepalive_conflict",
+                    "Git snapshot keepalive changed before lineage prune",
+                    false,
+                ));
+            }
+        }
+        let final_reconciliation = {
+            let mut publisher = self.lock_publisher()?;
+            publisher
+                .reconcile_git_snapshot_keepalive(&request)
+                .map_err(publisher_failure)?
+        };
+        if final_reconciliation != GitSnapshotRefReconciliation::Absent {
+            return Err(provider_failure(
+                "snapshot_keepalive_release_unconfirmed",
+                "Git snapshot keepalive absence was not confirmed",
+                false,
+            ));
+        }
+        record
+            .git_snapshot
+            .as_mut()
+            .ok_or_else(|| resume_failure("resume_git_snapshot_binding_missing"))?
+            .phase = GithubGitSnapshotPhaseV1::KeepaliveReleased;
+        self.checkpoint_record(record)
+    }
+
+    fn current_public_snapshot_source_identity(
+        &self,
+        record: &JobRecord,
+    ) -> RemoteBuildResult<(GithubPrincipalIdentityV1, u64)>
+    where
+        R: GhRunner,
+    {
+        let identity = self.current_resume_identity()?;
+        Self::validate_record_identity(record, &identity)?;
+        let source_repository =
+            repository_from_url(&self.config.source_repository).ok_or_else(|| {
+                provider_failure(
+                    "source_repository_invalid",
+                    "configured source repository identity is invalid",
+                    false,
+                )
+            })?;
+        let source = self
+            .lock_transport()?
+            .repository(&source_repository)
+            .map_err(transport_failure)?;
+        if source.is_private() || source.is_archived() || source.is_disabled() {
+            return Err(provider_failure(
+                "snapshot_source_repository_not_public_writable",
+                "Git snapshots require the exact configured public writable source repository",
+                false,
+            ));
+        }
+        Ok(identity)
+    }
+
+    fn revalidate_public_snapshot_source(&self, record: &JobRecord) -> RemoteBuildResult<()>
+    where
+        R: GhRunner,
+    {
+        self.current_public_snapshot_source_identity(record).map(drop)
+    }
+
+    fn acquire_snapshot_source_lease(
+        &self,
+        record: &mut JobRecord,
+    ) -> RemoteBuildResult<(bool, String)> {
+        let expected_scope = record
+            .git_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.source_publication_lease_scope_sha256.as_deref());
+        let source_ref = record
+            .git_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.stage.source_ref.clone())
+            .ok_or_else(|| resume_failure("resume_git_snapshot_binding_missing"))?;
+        let mut publisher = self.lock_publisher()?;
+        let actual_scope = publisher
+            .publication_lease_scope_sha256()
+            .filter(|scope| is_lower_sha256(scope))
+            .ok_or_else(|| {
+                provider_failure(
+                    "snapshot_publication_lease_unavailable",
+                    "Git snapshot source publication has no exact process lease scope",
+                    true,
+                )
+            })?
+            .to_owned();
+        if expected_scope.is_some_and(|expected| expected != actual_scope) {
+            return Err(provider_failure(
+                "snapshot_publication_lease_scope_changed",
+                "Git snapshot source publication lease scope changed",
+                true,
+            ));
+        }
+        if !publisher.publication_attempt_is_process_fenced() {
+            return Err(provider_failure(
+                "snapshot_publication_process_unfenced",
+                "Git snapshot source publication process cannot be fenced across restart",
+                false,
+            ));
+        }
+        let lease_request = GitSnapshotSourcePublicationLeaseRequest {
+            source_repository: &self.config.source_repository,
+            source_ref: &source_ref,
+        };
+        match publisher
+            .acquire_git_snapshot_source_lease(&lease_request)
+            .map_err(publisher_failure)?
+        {
+            TemporaryRefPublicationLease::Acquired => {
+                record.snapshot_source_lease_owned = true;
+            }
+            TemporaryRefPublicationLease::AlreadyOwned if record.snapshot_source_lease_owned => {}
+            TemporaryRefPublicationLease::AlreadyOwned
+            | TemporaryRefPublicationLease::HeldByOther => {
+                return Err(provider_failure(
+                    "snapshot_publication_owner_active",
+                    "Another live provider owns Git snapshot source publication",
+                    true,
+                ));
+            }
+            TemporaryRefPublicationLease::Unsupported => {
+                return Err(provider_failure(
+                    "snapshot_publication_lease_unavailable",
+                    "Git snapshot source publication requires a cross-process lease",
+                    false,
+                ));
+            }
+        }
+        Ok((true, actual_scope))
+    }
+
+    fn release_snapshot_source_lease(&self, record: &mut JobRecord) -> RemoteBuildResult<()> {
+        if !record.snapshot_source_lease_owned {
+            return Ok(());
+        }
+        let source_ref = record
+            .git_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.stage.source_ref.clone())
+            .ok_or_else(|| resume_failure("resume_git_snapshot_binding_missing"))?;
+        self.lock_publisher()?.release_git_snapshot_source_lease(
+            &GitSnapshotSourcePublicationLeaseRequest {
+                source_repository: &self.config.source_repository,
+                source_ref: &source_ref,
+            },
+        );
+        record.snapshot_source_lease_owned = false;
+        Ok(())
+    }
+
+    fn fail_snapshot_before_dispatch(
+        &self,
+        record: &mut JobRecord,
+        code: &'static str,
+        message: &'static str,
+    ) -> RemoteBuildResult<()> {
+        if record.state == JobState::Created {
+            transition_record(record, JobState::Failed)?;
+            append_failed(record, self.clock.now_ms(), code, message, false)?;
+        }
+        self.checkpoint_record(record)
+    }
+
+    fn cleanup_git_snapshot_source(&self, record: &mut JobRecord) -> RemoteBuildResult<()>
+    where
+        R: GhRunner,
+    {
+        let Some(snapshot) = record.git_snapshot.clone() else {
+            return Ok(());
+        };
+        if matches!(
+            snapshot.phase,
+            GithubGitSnapshotPhaseV1::SourceExact | GithubGitSnapshotPhaseV1::SourceCleanupIntent
+        ) && !self
+            .config
+            .mutation_authorization
+            .delete_git_snapshot_source
+        {
+            return Err(provider_failure(
+                "snapshot_source_cleanup_unauthorized",
+                "Git snapshot source cleanup is not authorized",
+                false,
+            ));
+        }
+        match snapshot.phase {
+            GithubGitSnapshotPhaseV1::SourceExact => {
+                record
+                    .git_snapshot
+                    .as_mut()
+                    .expect("checked snapshot")
+                    .phase = GithubGitSnapshotPhaseV1::SourceCleanupIntent;
+                self.checkpoint_record(record)?;
+            }
+            GithubGitSnapshotPhaseV1::SourceCleanupIntent => {
+                self.checkpoint_record(record)?;
+            }
+            GithubGitSnapshotPhaseV1::SourceDeleted => {
+                if record.snapshot_source_lease_owned {
+                    self.checkpoint_record(record)?;
+                    self.release_snapshot_source_lease(record)?;
+                }
+                return Ok(());
+            }
+            GithubGitSnapshotPhaseV1::SourceAbsent
+            | GithubGitSnapshotPhaseV1::SourceConflict
+            | GithubGitSnapshotPhaseV1::KeepaliveReleaseIntent
+            | GithubGitSnapshotPhaseV1::KeepaliveReleased => return Ok(()),
+            _ => {
+                return Err(provider_failure(
+                    "snapshot_source_cleanup_not_owned",
+                    "Git snapshot source cleanup lacks exact publication ownership",
+                    false,
+                ));
+            }
+        }
+        let snapshot = record.git_snapshot.clone().expect("checked snapshot");
+        self.acquire_snapshot_source_lease(record)?;
+        self.revalidate_record_identity(record)?;
+        self.lock_publisher()?
+            .delete_git_snapshot_source(&GitSnapshotSourceDeleteRequest {
+                source_repository: &self.config.source_repository,
+                source_ref: &snapshot.stage.source_ref,
+                expected_commit: &snapshot.stage.graph.commit,
+                authorized: self
+                    .config
+                    .mutation_authorization
+                    .delete_git_snapshot_source,
+            })
+            .map_err(publisher_failure)?;
+        record
+            .git_snapshot
+            .as_mut()
+            .expect("checked snapshot")
+            .phase = GithubGitSnapshotPhaseV1::SourceDeleted;
+        self.checkpoint_record(record)?;
+        self.release_snapshot_source_lease(record)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "each snapshot crash boundary is kept adjacent to its durable checkpoint"
+    )]
+    fn continue_git_snapshot_submission(
+        &self,
+        job_id: &str,
+        cancellation: &CancellationToken,
+    ) -> RemoteBuildResult<()>
+    where
+        R: GhRunner,
+        P: TemporaryRefReconciler,
+    {
+        let mut acknowledged_phase = None;
+        loop {
+            cancellation.check()?;
+            let workflow_dispatch_snapshot_identity =
+                if self.config.workflow.run_trigger() == WorkflowRunTrigger::WorkflowDispatch {
+                    let working = {
+                        let state = self.lock_state()?;
+                        state
+                            .jobs
+                            .get(job_id)
+                            .cloned()
+                            .ok_or_else(|| job_not_found(job_id))?
+                    };
+                    let phase = working
+                        .git_snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.phase)
+                        .ok_or_else(|| resume_failure("resume_git_snapshot_binding_missing"))?;
+                    if matches!(
+                        phase,
+                        GithubGitSnapshotPhaseV1::Prepared
+                            | GithubGitSnapshotPhaseV1::SourceExact
+                    ) {
+                        self.verify_execution_workflow_default()?;
+                    }
+                    matches!(
+                        phase,
+                        GithubGitSnapshotPhaseV1::Prepared
+                            | GithubGitSnapshotPhaseV1::SourcePublishIntent
+                            | GithubGitSnapshotPhaseV1::SourceExact
+                    )
+                    .then(|| self.current_public_snapshot_source_identity(&working))
+                    .transpose()?
+                } else {
+                    None
+                };
+            let mut state = self.lock_state()?;
+            let record = state
+                .jobs
+                .get_mut(job_id)
+                .ok_or_else(|| job_not_found(job_id))?;
+            let snapshot = record
+                .git_snapshot
+                .clone()
+                .ok_or_else(|| resume_failure("resume_git_snapshot_binding_missing"))?;
+            let phase_was_acknowledged = acknowledged_phase.take() == Some(snapshot.phase);
+            if snapshot.phase != GithubGitSnapshotPhaseV1::Prepared && !phase_was_acknowledged {
+                self.checkpoint_record(record)?;
+            }
+            match snapshot.phase {
+                GithubGitSnapshotPhaseV1::Prepared => {
+                    if let Some(identity) = &workflow_dispatch_snapshot_identity {
+                        Self::validate_record_identity(record, identity)?;
+                    } else {
+                        self.revalidate_public_snapshot_source(record)?;
+                    }
+                    record
+                        .git_snapshot
+                        .as_mut()
+                        .expect("checked snapshot")
+                        .phase = GithubGitSnapshotPhaseV1::KeepaliveIntent;
+                    self.checkpoint_record(record)?;
+                    acknowledged_phase = Some(GithubGitSnapshotPhaseV1::KeepaliveIntent);
+                }
+                GithubGitSnapshotPhaseV1::KeepaliveIntent => {
+                    if !self
+                        .config
+                        .mutation_authorization
+                        .manage_git_snapshot_keepalive
+                    {
+                        return Err(provider_failure(
+                            "snapshot_keepalive_unauthorized",
+                            "Git snapshot keepalive mutation is not authorized",
+                            false,
+                        ));
+                    }
+                    let keepalive_request = GitSnapshotKeepaliveRequest {
+                        operation_id: &record.operation_id,
+                        keepalive_ref: &snapshot.stage.keepalive_ref,
+                        commit: &snapshot.stage.graph.commit,
+                    };
+                    let reconciliation = self
+                        .lock_publisher()?
+                        .reconcile_git_snapshot_keepalive(&keepalive_request)
+                        .map_err(publisher_failure)?;
+                    match reconciliation {
+                        GitSnapshotRefReconciliation::Exact => {}
+                        GitSnapshotRefReconciliation::Conflict => {
+                            return Err(provider_failure(
+                                "snapshot_keepalive_conflict",
+                                "Git snapshot keepalive ref is occupied by another commit",
+                                false,
+                            ));
+                        }
+                        GitSnapshotRefReconciliation::Absent => {
+                            let import_request = GitSnapshotImportRequest {
+                                locator: &snapshot.stage_locator,
+                                expected_stage: &snapshot.stage,
+                                request: &record.request,
+                            };
+                            let mut publisher = self.lock_publisher()?;
+                            let imported = publisher
+                                .import_git_snapshot(&import_request)
+                                .map_err(publisher_failure)?;
+                            if imported != snapshot.stage.graph {
+                                return Err(provider_failure(
+                                    "snapshot_import_graph_mismatch",
+                                    "Git snapshot import differs from the durable object graph",
+                                    false,
+                                ));
+                            }
+                            publisher
+                                .create_git_snapshot_keepalive(&keepalive_request)
+                                .map_err(publisher_failure)?;
+                        }
+                    }
+                    record
+                        .git_snapshot
+                        .as_mut()
+                        .expect("checked snapshot")
+                        .phase = GithubGitSnapshotPhaseV1::KeepaliveExact;
+                    self.checkpoint_record(record)?;
+                    acknowledged_phase = Some(GithubGitSnapshotPhaseV1::KeepaliveExact);
+                }
+                GithubGitSnapshotPhaseV1::KeepaliveExact => {
+                    record
+                        .git_snapshot
+                        .as_mut()
+                        .expect("checked snapshot")
+                        .phase = GithubGitSnapshotPhaseV1::StageDeleteIntent;
+                    self.checkpoint_record(record)?;
+                    acknowledged_phase = Some(GithubGitSnapshotPhaseV1::StageDeleteIntent);
+                }
+                GithubGitSnapshotPhaseV1::StageDeleteIntent => {
+                    let keepalive_request = GitSnapshotKeepaliveRequest {
+                        operation_id: &record.operation_id,
+                        keepalive_ref: &snapshot.stage.keepalive_ref,
+                        commit: &snapshot.stage.graph.commit,
+                    };
+                    match self
+                        .lock_publisher()?
+                        .reconcile_git_snapshot_keepalive(&keepalive_request)
+                        .map_err(publisher_failure)?
+                    {
+                        GitSnapshotRefReconciliation::Exact => {}
+                        GitSnapshotRefReconciliation::Absent => {
+                            return Err(provider_failure(
+                                "snapshot_keepalive_missing",
+                                "Git snapshot keepalive disappeared before stage deletion",
+                                false,
+                            ));
+                        }
+                        GitSnapshotRefReconciliation::Conflict => {
+                            return Err(provider_failure(
+                                "snapshot_keepalive_conflict",
+                                "Git snapshot keepalive changed before stage deletion",
+                                false,
+                            ));
+                        }
+                    }
+                    self.lock_publisher()?
+                        .delete_git_snapshot_stage(&GitSnapshotImportRequest {
+                            locator: &snapshot.stage_locator,
+                            expected_stage: &snapshot.stage,
+                            request: &record.request,
+                        })
+                        .map_err(publisher_failure)?;
+                    record
+                        .git_snapshot
+                        .as_mut()
+                        .expect("checked snapshot")
+                        .phase = GithubGitSnapshotPhaseV1::StageDeleted;
+                    self.checkpoint_record(record)?;
+                    acknowledged_phase = Some(GithubGitSnapshotPhaseV1::StageDeleted);
+                }
+                GithubGitSnapshotPhaseV1::StageDeleted => {
+                    let (process_fenced, scope) = self.acquire_snapshot_source_lease(record)?;
+                    let snapshot = record.git_snapshot.as_mut().expect("checked snapshot");
+                    snapshot.phase = GithubGitSnapshotPhaseV1::SourcePublishIntent;
+                    snapshot.source_publication_attempts = 1;
+                    snapshot.source_publication_started_at_ms = 0;
+                    snapshot.source_publication_quiescence_deadline_ms = u64::MAX;
+                    snapshot.source_publication_process_fenced = process_fenced;
+                    snapshot.source_publication_lease_scope_sha256 = Some(scope);
+                    snapshot.source_publication_absence_observations = 0;
+                    snapshot.source_publication_absence_first_observed_at_ms = 0;
+                    snapshot.source_publication_absence_last_observed_at_ms = 0;
+                    self.checkpoint_record(record)?;
+                    acknowledged_phase = Some(GithubGitSnapshotPhaseV1::SourcePublishIntent);
+                }
+                GithubGitSnapshotPhaseV1::SourcePublishIntent => {
+                    self.acquire_snapshot_source_lease(record)?;
+                    if snapshot.source_publication_started_at_ms == 0 {
+                        if let Some(identity) = &workflow_dispatch_snapshot_identity {
+                            Self::validate_record_identity(record, identity)?;
+                        } else {
+                            self.revalidate_public_snapshot_source(record)?;
+                        }
+                        let started_at_ms = self.clock.now_ms();
+                        {
+                            let snapshot = record.git_snapshot.as_mut().expect("checked snapshot");
+                            snapshot.source_publication_started_at_ms = started_at_ms;
+                            snapshot.source_publication_quiescence_deadline_ms =
+                                publication_quiescence_deadline(started_at_ms, 0);
+                        }
+                        self.checkpoint_record(record)?;
+                        let result = self
+                            .lock_publisher()?
+                            .publish_git_snapshot_source(&GitSnapshotSourcePublishRequest {
+                                source_repository: &self.config.source_repository,
+                                source_ref: &snapshot.stage.source_ref,
+                                commit: &snapshot.stage.graph.commit,
+                                authorized: self
+                                    .config
+                                    .mutation_authorization
+                                    .publish_git_snapshot_source,
+                            })
+                            .map_err(publisher_failure)?;
+                        match result {
+                            GitSnapshotSourcePublication::Exact => {
+                                record
+                                    .git_snapshot
+                                    .as_mut()
+                                    .expect("checked snapshot")
+                                    .phase = GithubGitSnapshotPhaseV1::SourceExact;
+                                self.checkpoint_record(record)?;
+                                acknowledged_phase = Some(GithubGitSnapshotPhaseV1::SourceExact);
+                            }
+                            GitSnapshotSourcePublication::Conflict => {
+                                record
+                                    .git_snapshot
+                                    .as_mut()
+                                    .expect("checked snapshot")
+                                    .phase = GithubGitSnapshotPhaseV1::SourceConflict;
+                                self.fail_snapshot_before_dispatch(
+                                    record,
+                                    "snapshot_source_ref_conflict",
+                                    "Git snapshot source ref is occupied by another commit",
+                                )?;
+                                self.release_snapshot_source_lease(record)?;
+                                return Ok(());
+                            }
+                            GitSnapshotSourcePublication::Uncertain => {
+                                let observed_at_ms = self.clock.now_ms();
+                                let snapshot =
+                                    record.git_snapshot.as_mut().expect("checked snapshot");
+                                snapshot.source_publication_absence_observations = 1;
+                                snapshot.source_publication_absence_first_observed_at_ms =
+                                    observed_at_ms;
+                                snapshot.source_publication_absence_last_observed_at_ms =
+                                    observed_at_ms;
+                                snapshot.source_publication_quiescence_deadline_ms =
+                                    publication_quiescence_deadline(
+                                        snapshot.source_publication_started_at_ms,
+                                        observed_at_ms,
+                                    );
+                                self.checkpoint_record(record)?;
+                                return Err(provider_failure(
+                                    "snapshot_source_publication_uncertain",
+                                    "Git snapshot source publication requires exact reconciliation",
+                                    true,
+                                ));
+                            }
+                        }
+                    } else {
+                        if let Some(identity) = &workflow_dispatch_snapshot_identity {
+                            Self::validate_record_identity(record, identity)?;
+                        } else {
+                            self.revalidate_public_snapshot_source(record)?;
+                        }
+                        let reconciliation = self
+                            .lock_publisher()?
+                            .reconcile_git_snapshot_source(&GitSnapshotSourcePublishRequest {
+                                source_repository: &self.config.source_repository,
+                                source_ref: &snapshot.stage.source_ref,
+                                commit: &snapshot.stage.graph.commit,
+                                authorized: true,
+                            })
+                            .map_err(publisher_failure)?;
+                        match reconciliation {
+                            GitSnapshotRefReconciliation::Exact => {
+                                record
+                                    .git_snapshot
+                                    .as_mut()
+                                    .expect("checked snapshot")
+                                    .phase = GithubGitSnapshotPhaseV1::SourceExact;
+                                self.checkpoint_record(record)?;
+                                acknowledged_phase = Some(GithubGitSnapshotPhaseV1::SourceExact);
+                            }
+                            GitSnapshotRefReconciliation::Conflict => {
+                                record
+                                    .git_snapshot
+                                    .as_mut()
+                                    .expect("checked snapshot")
+                                    .phase = GithubGitSnapshotPhaseV1::SourceConflict;
+                                self.fail_snapshot_before_dispatch(
+                                    record,
+                                    "snapshot_source_ref_conflict",
+                                    "Git snapshot source ref is occupied by another commit",
+                                )?;
+                                self.release_snapshot_source_lease(record)?;
+                                return Ok(());
+                            }
+                            GitSnapshotRefReconciliation::Absent => {
+                                let observed_at_ms = self.clock.now_ms();
+                                let snapshot =
+                                    record.git_snapshot.as_mut().expect("checked snapshot");
+                                if snapshot.source_publication_absence_observations == 0 {
+                                    snapshot.source_publication_absence_first_observed_at_ms =
+                                        observed_at_ms;
+                                    snapshot.source_publication_quiescence_deadline_ms =
+                                        publication_quiescence_deadline(
+                                            snapshot.source_publication_started_at_ms,
+                                            observed_at_ms,
+                                        );
+                                }
+                                snapshot.source_publication_absence_observations = snapshot
+                                    .source_publication_absence_observations
+                                    .saturating_add(1)
+                                    .min(2);
+                                snapshot.source_publication_absence_last_observed_at_ms =
+                                    observed_at_ms;
+                                let absent = snapshot.source_publication_absence_observations >= 2
+                                    && snapshot.source_publication_process_fenced
+                                    && observed_at_ms
+                                        >= snapshot.source_publication_quiescence_deadline_ms;
+                                if absent {
+                                    snapshot.phase = GithubGitSnapshotPhaseV1::SourceAbsent;
+                                }
+                                self.checkpoint_record(record)?;
+                                acknowledged_phase = Some(
+                                    record
+                                        .git_snapshot
+                                        .as_ref()
+                                        .expect("checked snapshot")
+                                        .phase,
+                                );
+                                if !absent {
+                                    return Err(provider_failure(
+                                        "snapshot_source_reconciliation_pending",
+                                        "Git snapshot source absence is not yet strongly proven",
+                                        true,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                GithubGitSnapshotPhaseV1::SourceAbsent => {
+                    if snapshot.source_publication_attempts >= 3 {
+                        self.fail_snapshot_before_dispatch(
+                            record,
+                            "snapshot_source_publication_absent",
+                            "Git snapshot source publication remained absent after bounded retries",
+                        )?;
+                        self.release_snapshot_source_lease(record)?;
+                        return Ok(());
+                    }
+                    self.acquire_snapshot_source_lease(record)?;
+                    let snapshot = record.git_snapshot.as_mut().expect("checked snapshot");
+                    snapshot.phase = GithubGitSnapshotPhaseV1::SourcePublishIntent;
+                    snapshot.source_publication_attempts += 1;
+                    snapshot.source_publication_started_at_ms = 0;
+                    snapshot.source_publication_quiescence_deadline_ms = u64::MAX;
+                    snapshot.source_publication_absence_observations = 0;
+                    snapshot.source_publication_absence_first_observed_at_ms = 0;
+                    snapshot.source_publication_absence_last_observed_at_ms = 0;
+                    self.checkpoint_record(record)?;
+                    acknowledged_phase = Some(GithubGitSnapshotPhaseV1::SourcePublishIntent);
+                }
+                GithubGitSnapshotPhaseV1::SourceConflict => {
+                    self.release_snapshot_source_lease(record)?;
+                    return Ok(());
+                }
+                GithubGitSnapshotPhaseV1::SourceExact => {
+                    self.acquire_snapshot_source_lease(record)?;
+                    if let Some(identity) = &workflow_dispatch_snapshot_identity {
+                        Self::validate_record_identity(record, identity)?;
+                    } else {
+                        self.revalidate_public_snapshot_source(record)?;
+                    }
+                    let reconciliation = self
+                        .lock_publisher()?
+                        .reconcile_git_snapshot_source(&GitSnapshotSourcePublishRequest {
+                            source_repository: &self.config.source_repository,
+                            source_ref: &snapshot.stage.source_ref,
+                            commit: &snapshot.stage.graph.commit,
+                            authorized: true,
+                        })
+                        .map_err(publisher_failure)?;
+                    if reconciliation != GitSnapshotRefReconciliation::Exact {
+                        record
+                            .git_snapshot
+                            .as_mut()
+                            .expect("checked snapshot")
+                            .phase = GithubGitSnapshotPhaseV1::SourceConflict;
+                        self.fail_snapshot_before_dispatch(
+                            record,
+                            "snapshot_source_ownership_lost",
+                            "Git snapshot source ref changed before dispatch publication",
+                        )?;
+                        self.release_snapshot_source_lease(record)?;
+                        return Ok(());
+                    }
+                    if self.config.workflow.run_trigger()
+                        == WorkflowRunTrigger::WorkflowDispatch
+                    {
+                        drop(state);
+                        return self.publish_git_snapshot_dispatch_workflow_dispatch(
+                            job_id,
+                            cancellation,
+                        );
+                    }
+                    let result = self.publish_git_snapshot_dispatch(record, cancellation);
+                    if !record.publication_intent {
+                        self.release_snapshot_source_lease(record)?;
+                    }
+                    return result;
+                }
+                GithubGitSnapshotPhaseV1::SourceCleanupIntent
+                | GithubGitSnapshotPhaseV1::SourceDeleted
+                | GithubGitSnapshotPhaseV1::KeepaliveReleaseIntent
+                | GithubGitSnapshotPhaseV1::KeepaliveReleased => return Ok(()),
+            }
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the snapshot dispatch intent, fresh identity barrier, ref mutation, and lease release are one ordered boundary"
+    )]
+    fn publish_git_snapshot_dispatch_workflow_dispatch(
+        &self,
+        job_id: &str,
+        cancellation: &CancellationToken,
+    ) -> RemoteBuildResult<()>
+    where
+        R: GhRunner,
+    {
+        cancellation.check()?;
+        let mut working = {
+            let state = self.lock_state()?;
+            state
+                .jobs
+                .get(job_id)
+                .cloned()
+                .ok_or_else(|| job_not_found(job_id))?
+        };
+        if working.publication_intent {
+            return Ok(());
+        }
+        let snapshot = working
+            .git_snapshot
+            .clone()
+            .filter(|snapshot| snapshot.phase == GithubGitSnapshotPhaseV1::SourceExact)
+            .ok_or_else(|| resume_failure("resume_git_snapshot_source_not_exact"))?;
+        let initial_identity = self.current_public_snapshot_source_identity(&working)?;
+        let workflow = generate_workflow(&self.config.workflow);
+        let manifest = GithubDispatchManifest::new(
+            &self.config,
+            &working.temporary_ref,
+            working.request.clone(),
+        );
+        manifest.validate_for(&self.config)?;
+        let manifest_bytes = manifest.encode()?;
+        let source_revision = working.source_revision.clone();
+        let snapshot_source_ref = snapshot.stage.source_ref.clone();
+        let temporary_ref = working.temporary_ref.clone();
+        let operation_id = working.operation_id.clone();
+        let created_at_ms = working.created_at_ms;
+        let publish_request = TemporaryRefPublishRequest {
+            repository: &self.config.repository,
+            source_repository: &self.config.source_repository,
+            trusted_source_ref: self.config.workflow.trusted_source_ref(),
+            source_revision: &source_revision,
+            snapshot_source_ref: Some(&snapshot_source_ref),
+            temporary_ref: &temporary_ref,
+            workflow_path: workflow.path(),
+            workflow_bytes: workflow.yaml().as_bytes(),
+            workflow_fingerprint: &self.config.workflow_fingerprint,
+            manifest_bytes: &manifest_bytes,
+            operation_id: &operation_id,
+            created_at_ms,
+            authorized: self.config.mutation_authorization.publish_temporary_ref,
+        };
+        let prepared = self
+            .lock_publisher()?
+            .prepare(&publish_request)
+            .map_err(publisher_failure)?;
+        if prepared
+            .as_ref()
+            .is_some_and(|publication| publication.temporary_ref() != &temporary_ref)
+        {
+            return Err(publisher_failure(
+                TemporaryRefPublishError::PublicationVerificationFailed,
+            ));
+        }
+        let (publication_process_fenced, publication_lease_scope_sha256) =
+            self.acquire_new_snapshot_dispatch_lease(&mut working)?;
+        working.prepared_dispatch_commit = prepared
+            .as_ref()
+            .map(|publication| publication.commit().clone());
+        working.publication_started_at_ms = 0;
+        working.publication_quiescence_deadline_ms = u64::MAX;
+        working.publication_intent = true;
+        working.publication_process_fenced = publication_process_fenced;
+        working.publication_lease_scope_sha256 = Some(publication_lease_scope_sha256.clone());
+        {
+            let mut state = self.lock_state()?;
+            let record = state
+                .jobs
+                .get_mut(job_id)
+                .ok_or_else(|| job_not_found(job_id))?;
+            if record.git_snapshot.as_ref() != Some(&snapshot)
+                || record.publication_intent
+                || record.prepared_dispatch_commit.is_some()
+                || record.dispatch_commit.is_some()
+            {
+                return Err(resume_failure("snapshot_dispatch_identity_changed"));
+            }
+            Self::validate_record_identity(record, &initial_identity)?;
+            record.prepared_dispatch_commit = working.prepared_dispatch_commit.clone();
+            record.publication_started_at_ms = 0;
+            record.publication_quiescence_deadline_ms = u64::MAX;
+            record.publication_intent = true;
+            record.publication_process_fenced = publication_process_fenced;
+            record.publication_lease_scope_sha256 = Some(publication_lease_scope_sha256);
+            record.publication_takeover_lease_owned = true;
+            self.checkpoint_record(record)?;
+        }
+
+        let publication_identity = self.current_public_snapshot_source_identity(&working);
+        let boundary_cancellation = cancellation.check();
+        let boundary_result = (|| {
+            let mut state = self.lock_state()?;
+            let record = state
+                .jobs
+                .get_mut(job_id)
+                .ok_or_else(|| job_not_found(job_id))?;
+            let identity = publication_identity?;
+            boundary_cancellation?;
+            Self::validate_record_identity(record, &identity)?;
+            if record.prepared_dispatch_commit != working.prepared_dispatch_commit
+                || !record.publication_intent
+                || record.publication_uncertain
+                || record.dispatch_commit.is_some()
+                || record.git_snapshot.as_ref() != Some(&snapshot)
+            {
+                return Err(resume_failure("snapshot_dispatch_identity_changed"));
+            }
+            if record.cancellation_requested {
+                return Err(provider_failure(
+                    "publication_cancelled_before_mutation",
+                    "GitHub snapshot dispatch was cancelled before any remote ref mutation",
+                    false,
+                ));
+            }
+            record.publication_started_at_ms = self.clock.now_ms();
+            record.publication_quiescence_deadline_ms =
+                publication_quiescence_deadline(record.publication_started_at_ms, 0);
+            working.publication_started_at_ms = record.publication_started_at_ms;
+            working.publication_quiescence_deadline_ms =
+                record.publication_quiescence_deadline_ms;
+            self.checkpoint_record(record)
+        })();
+        if let Err(error) = boundary_result {
+            let mut state = self.lock_state()?;
+            let record = state
+                .jobs
+                .get_mut(job_id)
+                .ok_or_else(|| job_not_found(job_id))?;
+            mark_publication_not_attempted(
+                record,
+                self.clock.now_ms(),
+                "snapshot_dispatch_identity_revalidation_failed",
+                "GitHub identity or public snapshot source changed before dispatch publication",
+                true,
+            )?;
+            record.publication_takeover_lease_owned = false;
+            record.snapshot_source_lease_owned = false;
+            self.checkpoint_record(record)?;
+            drop(state);
+            let _ = self.release_record_publication_lease(&mut working);
+            let _ = self.release_snapshot_source_lease(&mut working);
+            return Err(error);
+        }
+
+        let publish_result = self
+            .lock_publisher()?
+            .publish_prepared(&publish_request, prepared.as_ref());
+        let (published, publication_uncertain) = match publish_result {
+            Ok(published) => (published, false),
+            Err(failure) => {
+                if let Some(publication) = failure.possible_publication().cloned() {
+                    (publication, true)
+                } else {
+                    let error = publisher_failure(failure.error());
+                    let mut state = self.lock_state()?;
+                    let record = state
+                        .jobs
+                        .get_mut(job_id)
+                        .ok_or_else(|| job_not_found(job_id))?;
+                    mark_publication_not_attempted(
+                        record,
+                        self.clock.now_ms(),
+                        "snapshot_dispatch_publication_not_attempted",
+                        "Snapshot dispatch publication failed before any remote mutation",
+                        false,
+                    )?;
+                    record.publication_takeover_lease_owned = false;
+                    record.snapshot_source_lease_owned = false;
+                    self.checkpoint_record(record)?;
+                    drop(state);
+                    let _ = self.release_record_publication_lease(&mut working);
+                    let _ = self.release_snapshot_source_lease(&mut working);
+                    return Err(error);
+                }
+            }
+        };
+        let publisher_binding_mismatch = published.temporary_ref() != &temporary_ref
+            || prepared
+                .as_ref()
+                .is_some_and(|expected| expected.commit() != published.commit());
+        let release_publication = !publication_uncertain || publisher_binding_mismatch;
+        {
+            let mut state = self.lock_state()?;
+            let record = state
+                .jobs
+                .get_mut(job_id)
+                .ok_or_else(|| job_not_found(job_id))?;
+            if record.prepared_dispatch_commit != working.prepared_dispatch_commit
+                || record.publication_started_at_ms != working.publication_started_at_ms
+                || record.dispatch_commit.is_some()
+                || record.git_snapshot.as_ref() != Some(&snapshot)
+            {
+                return Err(resume_failure("snapshot_dispatch_identity_changed"));
+            }
+            record.dispatch_commit = (!publisher_binding_mismatch && !publication_uncertain)
+                .then(|| published.commit().clone());
+            record.publication_uncertain = publication_uncertain || publisher_binding_mismatch;
+            record.cancellation_requested |= cancellation.is_cancelled();
+            if record.cancellation_requested && record.state != JobState::Cancelling {
+                transition_record(record, JobState::Cancelling)?;
+            }
+            if publisher_binding_mismatch {
+                transition_record(record, JobState::Failed)?;
+                append_event(
+                    record,
+                    self.clock.now_ms(),
+                    "cleanup",
+                    RemoteBuildEventKind::Warning {
+                        code: "github.cleanup_required".to_owned(),
+                        message: "Snapshot dispatch publisher violated its prepared ref/commit binding; automatic adoption was refused".to_owned(),
+                        help: Some("Inspect the alternate publisher and exact remote ref".to_owned()),
+                    },
+                )?;
+                append_failed(
+                    record,
+                    self.clock.now_ms(),
+                    "snapshot_dispatch_binding_mismatch",
+                    "Snapshot dispatch publisher returned a different ref or commit after possible mutation",
+                    false,
+                )?;
+            } else if publication_uncertain {
+                append_event(
+                    record,
+                    self.clock.now_ms(),
+                    "submit",
+                    RemoteBuildEventKind::Warning {
+                        code: "github.snapshot_dispatch_publication_uncertain".to_owned(),
+                        message: "Snapshot dispatch ref push may have succeeded; cleanup ownership was retained".to_owned(),
+                        help: Some("Continue polling or reconcile this exact job".to_owned()),
+                    },
+                )?;
+            }
+            record.snapshot_source_lease_owned = false;
+            if release_publication {
+                record.publication_takeover_lease_owned = false;
+            }
+            self.checkpoint_record(record)?;
+        }
+        self.release_snapshot_source_lease(&mut working)?;
+        if release_publication {
+            self.release_record_publication_lease(&mut working)?;
+        }
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "source-ref revalidation and dispatch publication checkpoints form one ordered mutation boundary"
+    )]
+    fn publish_git_snapshot_dispatch(
+        &self,
+        record: &mut JobRecord,
+        cancellation: &CancellationToken,
+    ) -> RemoteBuildResult<()>
+    where
+        R: GhRunner,
+    {
+        if record.publication_intent {
+            return Ok(());
+        }
+        cancellation.check()?;
+        let snapshot = record
+            .git_snapshot
+            .clone()
+            .filter(|snapshot| snapshot.phase == GithubGitSnapshotPhaseV1::SourceExact)
+            .ok_or_else(|| resume_failure("resume_git_snapshot_source_not_exact"))?;
+        self.revalidate_public_snapshot_source(record)?;
+        let workflow = generate_workflow(&self.config.workflow);
+        let manifest = GithubDispatchManifest::new(
+            &self.config,
+            &record.temporary_ref,
+            record.request.clone(),
+        );
+        manifest.validate_for(&self.config)?;
+        let manifest_bytes = manifest.encode()?;
+        let source_revision = record.source_revision.clone();
+        let snapshot_source_ref = snapshot.stage.source_ref.clone();
+        let temporary_ref = record.temporary_ref.clone();
+        let operation_id = record.operation_id.clone();
+        let created_at_ms = record.created_at_ms;
+        let publish_request = TemporaryRefPublishRequest {
+            repository: &self.config.repository,
+            source_repository: &self.config.source_repository,
+            trusted_source_ref: self.config.workflow.trusted_source_ref(),
+            source_revision: &source_revision,
+            snapshot_source_ref: Some(&snapshot_source_ref),
+            temporary_ref: &temporary_ref,
+            workflow_path: workflow.path(),
+            workflow_bytes: workflow.yaml().as_bytes(),
+            workflow_fingerprint: &self.config.workflow_fingerprint,
+            manifest_bytes: &manifest_bytes,
+            operation_id: &operation_id,
+            created_at_ms,
+            authorized: self.config.mutation_authorization.publish_temporary_ref,
+        };
+        let prepared = self
+            .lock_publisher()?
+            .prepare(&publish_request)
+            .map_err(publisher_failure)?;
+        if prepared
+            .as_ref()
+            .is_some_and(|publication| publication.temporary_ref() != &record.temporary_ref)
+        {
+            return Err(publisher_failure(
+                TemporaryRefPublishError::PublicationVerificationFailed,
+            ));
+        }
+        let (publication_process_fenced, publication_lease_scope_sha256) =
+            self.acquire_new_snapshot_dispatch_lease(record)?;
+        record.prepared_dispatch_commit = prepared
+            .as_ref()
+            .map(|publication| publication.commit().clone());
+        record.publication_started_at_ms = 0;
+        record.publication_quiescence_deadline_ms = u64::MAX;
+        record.publication_intent = true;
+        record.publication_process_fenced = publication_process_fenced;
+        record.publication_lease_scope_sha256 = Some(publication_lease_scope_sha256);
+        self.checkpoint_record(record)?;
+        if let Err(error) = self.revalidate_public_snapshot_source(record) {
+            mark_publication_not_attempted(
+                record,
+                self.clock.now_ms(),
+                "snapshot_dispatch_identity_revalidation_failed",
+                "GitHub identity or public snapshot source changed before dispatch publication",
+                true,
+            )?;
+            self.checkpoint_record(record)?;
+            self.release_record_publication_lease(record)?;
+            self.release_snapshot_source_lease(record)?;
+            return Err(error);
+        }
+        record.publication_started_at_ms = self.clock.now_ms();
+        record.publication_quiescence_deadline_ms =
+            publication_quiescence_deadline(record.publication_started_at_ms, 0);
+        self.checkpoint_record(record)?;
+        cancellation.check()?;
+        let publish_result = self
+            .lock_publisher()?
+            .publish_prepared(&publish_request, prepared.as_ref());
+        let (published, publication_uncertain) = match publish_result {
+            Ok(published) => (published, false),
+            Err(failure) => {
+                if let Some(publication) = failure.possible_publication().cloned() {
+                    (publication, true)
+                } else {
+                    let error = publisher_failure(failure.error());
+                    mark_publication_not_attempted(
+                        record,
+                        self.clock.now_ms(),
+                        "snapshot_dispatch_publication_not_attempted",
+                        "Snapshot dispatch publication failed before any remote mutation",
+                        false,
+                    )?;
+                    self.checkpoint_record(record)?;
+                    self.release_record_publication_lease(record)?;
+                    self.release_snapshot_source_lease(record)?;
+                    return Err(error);
+                }
+            }
+        };
+        let publisher_binding_mismatch = published.temporary_ref() != &record.temporary_ref
+            || prepared
+                .as_ref()
+                .is_some_and(|expected| expected.commit() != published.commit());
+        record.dispatch_commit = (!publisher_binding_mismatch && !publication_uncertain)
+            .then(|| published.commit().clone());
+        record.publication_uncertain = publication_uncertain || publisher_binding_mismatch;
+        self.checkpoint_record(record)?;
+        if publisher_binding_mismatch {
+            transition_record(record, JobState::Failed)?;
+            append_event(
+                record,
+                self.clock.now_ms(),
+                "cleanup",
+                RemoteBuildEventKind::Warning {
+                    code: "github.cleanup_required".to_owned(),
+                    message: "Snapshot dispatch publisher violated its prepared ref/commit binding; automatic adoption was refused".to_owned(),
+                    help: Some("Inspect the alternate publisher and exact remote ref".to_owned()),
+                },
+            )?;
+            append_failed(
+                record,
+                self.clock.now_ms(),
+                "snapshot_dispatch_binding_mismatch",
+                "Snapshot dispatch publisher returned a different ref or commit after possible mutation",
+                false,
+            )?;
+            self.checkpoint_record(record)?;
+            self.release_record_publication_lease(record)?;
+            self.release_snapshot_source_lease(record)?;
+            return Ok(());
+        }
+        if publication_uncertain {
+            append_event(
+                record,
+                self.clock.now_ms(),
+                "submit",
+                RemoteBuildEventKind::Warning {
+                    code: "github.snapshot_dispatch_publication_uncertain".to_owned(),
+                    message: "Snapshot dispatch ref push may have succeeded; cleanup ownership was retained".to_owned(),
+                    help: Some("Continue polling or reconcile this exact job".to_owned()),
+                },
+            )?;
+        } else if self.config.workflow.run_trigger() == WorkflowRunTrigger::Push {
+            if record.state == JobState::Created {
+                transition_record(record, JobState::Queued)?;
+            }
+            append_event(
+                record,
+                self.clock.now_ms(),
+                "queue",
+                RemoteBuildEventKind::JobQueued { position: None },
+            )?;
+        }
+        record.cancellation_requested |= cancellation.is_cancelled();
+        if record.cancellation_requested && record.state != JobState::Cancelling {
+            transition_record(record, JobState::Cancelling)?;
+        }
+        self.checkpoint_record(record)?;
+        self.release_snapshot_source_lease(record)?;
+        if !record.publication_uncertain {
+            self.release_record_publication_lease(record)?;
+        }
+        Ok(())
+    }
+
+    fn revalidate_record_identity(&self, record: &JobRecord) -> RemoteBuildResult<()>
+    where
+        R: GhRunner,
+    {
+        let identity = self.current_resume_identity()?;
+        Self::validate_record_identity(record, &identity)
+    }
+
+    fn validate_record_identity(
+        record: &JobRecord,
+        identity: &(GithubPrincipalIdentityV1, u64),
+    ) -> RemoteBuildResult<()> {
+        let (Some(expected_principal), Some(expected_repository_id)) =
+            (record.principal.as_ref(), record.execution_repository_id)
+        else {
+            return Ok(());
+        };
+        if &identity.0 != expected_principal || identity.1 != expected_repository_id {
+            return Err(resume_failure("resume_live_identity_changed"));
+        }
+        Ok(())
+    }
+
+    fn checkpoint_record(&self, record: &JobRecord) -> RemoteBuildResult<()> {
+        let Some(sink) = &self.checkpoint_sink else {
+            return Ok(());
+        };
+        let principal = record
+            .principal
+            .clone()
+            .ok_or_else(|| resume_failure("checkpoint_principal_unavailable"))?;
+        let repository_id = record
+            .execution_repository_id
+            .ok_or_else(|| resume_failure("checkpoint_repository_identity_unavailable"))?;
+        let resume =
+            GithubJobResumeV1::from_record(&self.config, principal, repository_id, record)?;
+        sink.lock()
+            .map_err(|_| {
+                provider_failure(
+                    "checkpoint_sink_unavailable",
+                    "GitHub job checkpoint sink is unavailable",
+                    true,
+                )
+            })?
+            .checkpoint(&resume)
+    }
+
+    fn verify_execution_workflow_default(&self) -> RemoteBuildResult<()>
+    where
+        P: TemporaryRefPublisher,
+    {
+        let workflow_path = self.config.workflow.filename().repository_path();
+        self.lock_publisher()?
+            .verify_execution_workflow(&ExecutionWorkflowDoctorRequest {
+                repository: &self.config.repository,
+                default_branch_ref: self.config.workflow.trusted_source_ref(),
+                workflow_path: &workflow_path,
+                workflow_fingerprint: &self.config.workflow_fingerprint,
+            })
+            .map_err(publisher_failure)?;
+        Ok(())
+    }
+
+    fn preflight_workflow_dispatch_registration(&self) -> RemoteBuildResult<WorkflowRegistration>
+    where
+        R: GhRunner,
+    {
+        if self.config.workflow.run_trigger() != WorkflowRunTrigger::WorkflowDispatch {
+            return Err(resume_failure("workflow_dispatch_trigger_mismatch"));
+        }
+        let mut transport = self.lock_transport()?;
+        let repository = transport
+            .repository(&self.config.repository)
+            .map_err(transport_failure)?;
+        let expected_trusted_ref = format!("refs/heads/{}", repository.default_branch().as_str());
+        if self.config.workflow.trusted_source_ref().as_str() != expected_trusted_ref {
+            return Err(provider_failure(
+                "workflow_dispatch_default_branch_required",
+                "Workflow dispatch requires its exact workflow on the execution repository default branch",
+                false,
+            ));
+        }
+        let registration = transport
+            .workflow_registration(
+                &self.config.repository,
+                &self.config.workflow.filename().repository_path(),
+            )
+            .map_err(transport_failure)?;
+        drop(transport);
+        self.verify_execution_workflow_default()?;
+        Ok(registration)
+    }
+
+    fn prepare_workflow_dispatch_client(
+        &self,
+    ) -> RemoteBuildResult<Box<dyn GithubWorkflowDispatchHttpClient + Send>>
+    where
+        R: GhRunner,
+    {
+        let factory = {
+            let transport = self.lock_transport()?;
+            transport.runner().workflow_dispatch_client_factory()
+        }
+        .map_err(workflow_dispatch_client_failure)?;
+        factory.create().map_err(workflow_dispatch_client_failure)
+    }
+
+    fn ensure_workflow_dispatch_intent(
+        &self,
+        job_id: &str,
+    ) -> RemoteBuildResult<Option<WorkflowDispatchPostAuthority>>
+    where
+        R: GhRunner,
+    {
+        if self.config.workflow.run_trigger() != WorkflowRunTrigger::WorkflowDispatch {
+            return Err(resume_failure("workflow_dispatch_trigger_mismatch"));
+        }
+        if self.checkpoint_sink.is_none() {
+            return Err(provider_failure(
+                "workflow_dispatch_checkpoint_required",
+                "Workflow dispatch requires a durable provider checkpoint sink",
+                false,
+            ));
+        }
+        {
+            let state = self.lock_state()?;
+            let record = state
+                .jobs
+                .get(job_id)
+                .ok_or_else(|| job_not_found(job_id))?;
+            if let Some(dispatch) = record.workflow_dispatch.as_ref() {
+                dispatch.request_for_record(&self.config, record)?;
+                return Ok(None);
+            }
+            if !record.publication_intent
+                || record.publication_uncertain
+                || record.dispatch_commit.is_none()
+                || record.state.is_build_terminal()
+                || record.state.is_terminal()
+            {
+                return Err(provider_failure(
+                    "workflow_dispatch_not_ready",
+                    "Workflow dispatch lacks an exact active published ref",
+                    true,
+                ));
+            }
+        }
+
+        let identity = self.current_resume_identity()?;
+        let registration = self.preflight_workflow_dispatch_registration()?;
+        let mut state = self.lock_state()?;
+        let record = state
+            .jobs
+            .get_mut(job_id)
+            .ok_or_else(|| job_not_found(job_id))?;
+        if let Some(dispatch) = record.workflow_dispatch.as_ref() {
+            dispatch.request_for_record(&self.config, record)?;
+            return Ok(None);
+        }
+        if !record.publication_intent
+            || record.publication_uncertain
+            || record.dispatch_commit.is_none()
+            || record.state.is_build_terminal()
+            || record.state.is_terminal()
+        {
+            return Err(provider_failure(
+                "workflow_dispatch_not_ready",
+                "Workflow dispatch lacks an exact active published ref",
+                true,
+            ));
+        }
+        Self::validate_record_identity(record, &identity)?;
+        let request = WorkflowDispatchRequest::new(
+            self.config.repository.clone(),
+            registration,
+            record.temporary_ref.clone(),
+            record.operation_id.clone(),
+            record.request_sha256.clone(),
+            record.source_revision.clone(),
+            record
+                .dispatch_commit
+                .clone()
+                .expect("checked dispatch commit"),
+        )
+        .map_err(|_| resume_failure("workflow_dispatch_request_invalid"))?;
+        record.workflow_dispatch = Some(GithubWorkflowDispatchResumeV1::from_request(&request));
+        self.checkpoint_record(record)?;
+        Ok(Some(WorkflowDispatchPostAuthority {
+            job_id: job_id.to_owned(),
+            request,
+        }))
+    }
+
+    fn dispatch_workflow_once(
+        &self,
+        authority: WorkflowDispatchPostAuthority,
+        client: &mut (dyn GithubWorkflowDispatchHttpClient + Send),
+    ) -> RemoteBuildResult<()>
+    where
+        R: GhRunner,
+    {
+        let WorkflowDispatchPostAuthority { job_id, request } = authority;
+        {
+            let state = self.lock_state()?;
+            let record = state
+                .jobs
+                .get(&job_id)
+                .ok_or_else(|| job_not_found(&job_id))?;
+            let dispatch = record
+                .workflow_dispatch
+                .as_ref()
+                .ok_or_else(|| resume_failure("workflow_dispatch_intent_lost"))?;
+            let current = dispatch.request_for_record(&self.config, record)?;
+            if current != request
+                || dispatch.receipt.is_some()
+                || record.run.is_some()
+            {
+                return Err(provider_failure(
+                    "workflow_dispatch_post_forbidden",
+                    "Workflow dispatch no longer permits a first POST",
+                    false,
+                ));
+            }
+        }
+        let attempt = {
+            let transport = self.lock_transport()?;
+            transport.workflow_dispatch_attempt(&request)
+        };
+        let receipt = attempt.send(client).map_err(transport_failure)?;
+        let mut state = self.lock_state()?;
+        let record = state
+            .jobs
+            .get_mut(&job_id)
+            .ok_or_else(|| job_not_found(&job_id))?;
+        let dispatch = record
+            .workflow_dispatch
+            .as_ref()
+            .ok_or_else(|| resume_failure("workflow_dispatch_intent_lost"))?;
+        if dispatch.request_for_record(&self.config, record)? != request {
+            return Err(resume_failure("workflow_dispatch_intent_changed"));
+        }
+        if let Some(existing) = dispatch.restored_receipt(&self.config, record)? {
+            if existing != receipt {
+                return Err(resume_failure("workflow_dispatch_receipt_changed"));
+            }
+        } else {
+            record
+                .workflow_dispatch
+                .as_mut()
+                .expect("checked workflow dispatch")
+                .bind_receipt(&receipt)?;
+        }
+        self.checkpoint_record(record)
+    }
+
+    fn workflow_dispatch_receipt_for_reconciliation(
+        &self,
+        job_id: &str,
+        request: &WorkflowDispatchRequest,
+        existing_receipt: Option<WorkflowDispatchReceipt>,
+    ) -> RemoteBuildResult<WorkflowDispatchReceipt>
+    where
+        R: GhRunner,
+    {
+        if let Some(receipt) = existing_receipt {
+            return Ok(receipt);
+        }
+        let handle = self
+            .lock_transport()?
+            .find_workflow_dispatch_run(request)
+            .map_err(workflow_dispatch_reconciliation_failure)?;
+        if handle.workflow_id() != request.workflow().id() {
+            return Err(resume_failure("workflow_dispatch_workflow_id_mismatch"));
+        }
+        let receipt = WorkflowDispatchReceipt::restore(
+            self.config.repository.clone(),
+            handle.id(),
+            handle.workflow_id(),
+            handle.workflow_path().to_owned(),
+            handle.head_sha().clone(),
+            handle.branch().clone(),
+            request.run_name().to_owned(),
+        )
+        .map_err(|_| resume_failure("workflow_dispatch_receipt_invalid"))?;
+        let mut state = self.lock_state()?;
+        let record = state
+            .jobs
+            .get_mut(job_id)
+            .ok_or_else(|| job_not_found(job_id))?;
+        let receipt_was_missing = record
+            .workflow_dispatch
+            .as_ref()
+            .ok_or_else(|| resume_failure("workflow_dispatch_intent_lost"))?
+            .receipt
+            .is_none();
+        if receipt_was_missing {
+            record
+                .workflow_dispatch
+                .as_mut()
+                .expect("checked workflow dispatch")
+                .bind_receipt(&receipt)?;
+            self.checkpoint_record(record)?;
+        } else if record
+            .workflow_dispatch
+            .as_ref()
+            .expect("checked workflow dispatch")
+            .restored_receipt(&self.config, record)?
+            .as_ref()
+            != Some(&receipt)
+        {
+            return Err(resume_failure("workflow_dispatch_receipt_changed"));
+        }
+        Ok(receipt)
+    }
+
+    fn reconcile_workflow_dispatch_run(
+        &self,
+        job_id: &str,
+        cancellation: &CancellationToken,
+    ) -> RemoteBuildResult<()>
+    where
+        R: GhRunner,
+    {
+        cancellation.check()?;
+        let (request, existing_receipt, existing_run) = {
+            let state = self.lock_state()?;
+            let record = state
+                .jobs
+                .get(job_id)
+                .ok_or_else(|| job_not_found(job_id))?;
+            let dispatch = record
+                .workflow_dispatch
+                .as_ref()
+                .ok_or_else(|| resume_failure("workflow_dispatch_intent_missing"))?;
+            (
+                dispatch.request_for_record(&self.config, record)?,
+                dispatch.restored_receipt(&self.config, record)?,
+                record.run.clone(),
+            )
+        };
+        if existing_run.is_some() {
+            return Ok(());
+        }
+
+        let receipt =
+            self.workflow_dispatch_receipt_for_reconciliation(job_id, &request, existing_receipt)?;
+
+        let snapshot = self
+            .lock_transport()?
+            .run_by_id(&receipt)
+            .map_err(workflow_dispatch_reconciliation_failure)?;
+        if snapshot.run_attempt() != 1 {
+            return Err(provider_failure(
+                "run_initial_attempt_mismatch",
+                "Initial GitHub run mapping observed an external rerun attempt",
+                false,
+            ));
+        }
+        let identity = self.current_resume_identity()?;
+        let mut state = self.lock_state()?;
+        let record = state
+            .jobs
+            .get_mut(job_id)
+            .ok_or_else(|| job_not_found(job_id))?;
+        let durable_receipt = record
+            .workflow_dispatch
+            .as_ref()
+            .ok_or_else(|| resume_failure("workflow_dispatch_intent_lost"))?
+            .restored_receipt(&self.config, record)?
+            .ok_or_else(|| resume_failure("workflow_dispatch_receipt_lost"))?;
+        if durable_receipt != receipt {
+            return Err(resume_failure("workflow_dispatch_receipt_changed"));
+        }
+        Self::validate_record_identity(record, &identity)?;
+        record.run = Some(snapshot.handle().clone());
+        record.run_snapshot = Some(snapshot);
+        if record.state == JobState::Created {
+            transition_record(record, JobState::Queued)?;
+            append_event(
+                record,
+                self.clock.now_ms(),
+                "queue",
+                RemoteBuildEventKind::JobQueued { position: None },
+            )?;
+        }
+        append_event(
+            record,
+            self.clock.now_ms(),
+            "queue",
+            RemoteBuildEventKind::Progress {
+                message: "Exact workflow-dispatch run mapped to this job".to_owned(),
+                current: None,
+                total: None,
+            },
+        )?;
+        self.checkpoint_record(record)
+    }
+
+    fn start_or_reconcile_workflow_dispatch(
+        &self,
+        job_id: &str,
+        cancellation: &CancellationToken,
+    ) -> RemoteBuildResult<()>
+    where
+        R: GhRunner,
+    {
+        let start = self.start_or_reconcile_workflow_dispatch_inner(job_id, cancellation);
+        self.checkpoint_workflow_dispatch_cancellation(job_id, cancellation)?;
+        start
+    }
+
+    fn start_or_reconcile_workflow_dispatch_inner(
+        &self,
+        job_id: &str,
+        cancellation: &CancellationToken,
+    ) -> RemoteBuildResult<()>
+    where
+        R: GhRunner,
+    {
+        let intent_exists = {
+            let state = self.lock_state()?;
+            state
+                .jobs
+                .get(job_id)
+                .ok_or_else(|| job_not_found(job_id))?
+                .workflow_dispatch
+                .is_some()
+        };
+        if intent_exists {
+            return self.reconcile_workflow_dispatch_with_cancellation_checkpoint(
+                job_id,
+                cancellation,
+            );
+        }
+        let mut client = self.prepare_workflow_dispatch_client()?;
+        self.start_workflow_dispatch_with_client(job_id, &mut *client, cancellation)
+    }
+
+    fn reconcile_workflow_dispatch_with_cancellation_checkpoint(
+        &self,
+        job_id: &str,
+        cancellation: &CancellationToken,
+    ) -> RemoteBuildResult<()>
+    where
+        R: GhRunner,
+    {
+        let reconciliation = self.reconcile_workflow_dispatch_run(job_id, cancellation);
+        self.checkpoint_workflow_dispatch_cancellation(job_id, cancellation)?;
+        reconciliation
+    }
+
+    fn checkpoint_workflow_dispatch_cancellation(
+        &self,
+        job_id: &str,
+        cancellation: &CancellationToken,
+    ) -> RemoteBuildResult<bool> {
+        let mut state = self.lock_state()?;
+        let record = state
+            .jobs
+            .get_mut(job_id)
+            .ok_or_else(|| job_not_found(job_id))?;
+        if cancellation.is_cancelled()
+            && !record.cancellation_requested
+            && !record.state.is_terminal()
+            && !record.state.is_build_terminal()
+            && !(record.git_snapshot.is_some() && !record.publication_intent)
+        {
+            record.cancellation_requested = true;
+            if record.state != JobState::Cancelling {
+                transition_record(record, JobState::Cancelling)?;
+            }
+            self.checkpoint_record(record)?;
+        }
+        Ok(record.cancellation_requested)
+    }
+
+    fn start_workflow_dispatch_with_client(
+        &self,
+        job_id: &str,
+        client: &mut (dyn GithubWorkflowDispatchHttpClient + Send),
+        cancellation: &CancellationToken,
+    ) -> RemoteBuildResult<()>
+    where
+        R: GhRunner,
+    {
+        let start = self.start_workflow_dispatch_with_client_inner(job_id, client, cancellation);
+        self.checkpoint_workflow_dispatch_cancellation(job_id, cancellation)?;
+        start
+    }
+
+    fn start_workflow_dispatch_with_client_inner(
+        &self,
+        job_id: &str,
+        client: &mut (dyn GithubWorkflowDispatchHttpClient + Send),
+        cancellation: &CancellationToken,
+    ) -> RemoteBuildResult<()>
+    where
+        R: GhRunner,
+    {
+        if let Some(authority) = self.ensure_workflow_dispatch_intent(job_id)? {
+            let dispatch_result = self.dispatch_workflow_once(authority, client);
+            let cancellation_result =
+                self.checkpoint_workflow_dispatch_cancellation(job_id, cancellation);
+            cancellation_result?;
+            dispatch_result?;
+            let mapping_cancellation = CancellationToken::new();
+            let mapping_result =
+                self.reconcile_workflow_dispatch_run(job_id, &mapping_cancellation);
+            let cancellation_requested =
+                self.checkpoint_workflow_dispatch_cancellation(job_id, cancellation)?;
+            mapping_result?;
+            if cancellation_requested {
+                self.sync_job_with_cancel_policy(job_id, &mapping_cancellation, true)?;
+            }
+            return Ok(());
+        }
+        self.reconcile_workflow_dispatch_with_cancellation_checkpoint(job_id, cancellation)
+    }
+
+    fn acquire_restored_publication_lease(&self, record: &mut JobRecord) -> RemoteBuildResult<()>
+    where
+        P: TemporaryRefPublisher,
+    {
+        if record.publication_takeover_lease_owned {
+            return Ok(());
+        }
+        let expected_scope = record
+            .publication_lease_scope_sha256
+            .as_deref()
+            .ok_or_else(|| {
+                provider_failure(
+                    "publication_lease_unavailable",
+                    "Durable publication has no cross-process ownership lease",
+                    true,
+                )
+            })?;
+        let mut publisher = self.lock_publisher()?;
+        if publisher.publication_lease_scope_sha256() != Some(expected_scope) {
+            return Err(provider_failure(
+                "publication_lease_scope_changed",
+                "Temporary-ref publication lease scope changed",
+                true,
+            ));
+        }
+        let lease = publisher
+            .acquire_publication_lease(&TemporaryRefPublicationLeaseRequest {
+                repository: &self.config.repository,
+                operation_id: &record.operation_id,
+                temporary_ref: &record.temporary_ref,
+            })
+            .map_err(publisher_failure)?;
+        match lease {
+            TemporaryRefPublicationLease::Acquired => {
+                record.publication_takeover_lease_owned = true;
+                Ok(())
+            }
+            TemporaryRefPublicationLease::AlreadyOwned
+            | TemporaryRefPublicationLease::HeldByOther => Err(provider_failure(
+                "publication_owner_active",
+                "Another live provider owns temporary-ref publication",
+                true,
+            )),
+            TemporaryRefPublicationLease::Unsupported => Err(provider_failure(
+                "publication_lease_unavailable",
+                "Temporary-ref publisher cannot provide cross-process ownership",
+                true,
+            )),
+        }
+    }
+
+    fn acquire_new_snapshot_dispatch_lease(
+        &self,
+        record: &mut JobRecord,
+    ) -> RemoteBuildResult<(bool, String)> {
+        let mut publisher = self.lock_publisher()?;
+        let scope = publisher
+            .publication_lease_scope_sha256()
+            .filter(|scope| is_lower_sha256(scope))
+            .ok_or_else(|| {
+                provider_failure(
+                    "publication_lease_unavailable",
+                    "Snapshot dispatch publication has no cross-process ownership scope",
+                    false,
+                )
+            })?
+            .to_owned();
+        if !publisher.publication_attempt_is_process_fenced() {
+            return Err(provider_failure(
+                "publication_process_unfenced",
+                "Snapshot dispatch publication process cannot be fenced across restart",
+                false,
+            ));
+        }
+        let request = TemporaryRefPublicationLeaseRequest {
+            repository: &self.config.repository,
+            operation_id: &record.operation_id,
+            temporary_ref: &record.temporary_ref,
+        };
+        match publisher
+            .acquire_publication_lease(&request)
+            .map_err(publisher_failure)?
+        {
+            TemporaryRefPublicationLease::Acquired => {
+                record.publication_takeover_lease_owned = true;
+                Ok((true, scope))
+            }
+            TemporaryRefPublicationLease::AlreadyOwned
+                if record.publication_takeover_lease_owned =>
+            {
+                Ok((true, scope))
+            }
+            TemporaryRefPublicationLease::AlreadyOwned
+            | TemporaryRefPublicationLease::HeldByOther => Err(provider_failure(
+                "publication_owner_active",
+                "Another live provider owns snapshot dispatch publication",
+                true,
+            )),
+            TemporaryRefPublicationLease::Unsupported => Err(provider_failure(
+                "publication_lease_unavailable",
+                "Snapshot dispatch publication requires a cross-process lease",
+                false,
+            )),
+        }
+    }
+
+    fn release_record_publication_lease(&self, record: &mut JobRecord) -> RemoteBuildResult<()>
+    where
+        P: TemporaryRefPublisher,
+    {
+        if !record.publication_takeover_lease_owned {
+            return Ok(());
+        }
+        self.lock_publisher()?
+            .release_publication_lease(&TemporaryRefPublicationLeaseRequest {
+                repository: &self.config.repository,
+                operation_id: &record.operation_id,
+                temporary_ref: &record.temporary_ref,
+            });
+        record.publication_takeover_lease_owned = false;
+        Ok(())
+    }
+
+    fn revalidate_restored_run(&self, record: &mut JobRecord) -> RemoteBuildResult<()>
+    where
+        R: GhRunner,
+    {
+        self.revalidate_restored_run_with_policy(record, false)
+    }
+
+    fn revalidate_restored_run_with_policy(
+        &self,
+        record: &mut JobRecord,
+        include_terminal: bool,
+    ) -> RemoteBuildResult<()>
+    where
+        R: GhRunner,
+    {
+        if record.state.is_terminal() && !include_terminal {
+            return Ok(());
+        }
+        let Some(expected) = record.run.clone() else {
+            return Ok(());
+        };
+        let snapshot = self
+            .lock_transport()?
+            .run(&self.config.repository, &expected)
+            .map_err(transport_failure)?;
+        if record
+            .run_snapshot
+            .as_ref()
+            .is_some_and(|previous| github_run_is_later_attempt(previous, &snapshot))
+            && record.signed_cleanup_evidence.is_some()
+        {
+            // Durable signed evidence belongs to the immutable provider-bound attempt. GitHub's
+            // later attempt is a distinct execution and must not replace that checkpointed proof.
+            return Ok(());
+        }
+        ensure_same_run_attempt(record.run_snapshot.as_ref(), &snapshot)?;
+        if (record.state == JobState::Succeeded || !record.manifests.is_empty())
+            && !run_snapshot_is_successful(&snapshot)
+        {
+            return Err(resume_failure("resume_live_success_state_mismatch"));
+        }
+        record.run_snapshot = Some(snapshot);
+        Ok(())
+    }
+
+    fn records_from_offline_resumes(
+        &self,
+        resumes: Vec<GithubJobResumeV1>,
+        expected: &GithubDurableIdentityV1,
+    ) -> RemoteBuildResult<BTreeMap<String, JobRecord>> {
+        if resumes.len() > self.config.max_jobs {
+            return Err(resume_failure("resume_job_capacity_exceeded"));
+        }
+        if expected.provider != GITHUB_PROVIDER_ID
+            || expected.provider_config_sha256 != provider_config_sha256(&self.config)?
+            || !github_remote_matches(
+                &expected.execution_repository,
+                &repository_url(&self.config.repository),
+            )
+            || expected.execution_repository_id == 0
+        {
+            return Err(resume_failure("resume_provider_identity_mismatch"));
+        }
+        let mut restored = BTreeMap::new();
+        for resume in resumes {
+            let record = resume.into_record(
+                &self.config,
+                &expected.principal,
+                expected.execution_repository_id,
+            )?;
+            if restored.insert(record.job_id.clone(), record).is_some() {
+                return Err(resume_failure("resume_duplicate_job_id"));
+            }
+        }
+        Ok(restored)
+    }
+
+    fn insert_restored_records(
+        &self,
+        restored: BTreeMap<String, JobRecord>,
+    ) -> RemoteBuildResult<()> {
+        let mut state = self.lock_state()?;
+        if !state.reservations.is_empty()
+            || state.jobs.len().saturating_add(restored.len()) > self.config.max_jobs
+            || restored
+                .keys()
+                .any(|job_id| state.jobs.contains_key(job_id))
+        {
+            return Err(resume_failure("resume_state_conflict"));
+        }
+        state.jobs.extend(restored);
+        Ok(())
+    }
+
+    /// Restore durable jobs using only their stored identity and local provider configuration.
+    ///
+    /// This method performs no transport or publisher operation. Call
+    /// [`Self::revalidate_restored_job_live`] after any controller-owned mutation intent is durable
+    /// and before relying on live GitHub state.
+    ///
+    /// # Errors
+    ///
+    /// Rejects any configuration, principal, repository, request, ref, run, event, or state
+    /// mismatch, duplicate job, capacity violation, or existing provider-state conflict.
+    pub fn restore_job_resumes_offline(
+        &self,
+        resumes: Vec<GithubJobResumeV1>,
+        expected: &GithubDurableIdentityV1,
+    ) -> RemoteBuildResult<()> {
+        let restored = self.records_from_offline_resumes(resumes, expected)?;
+        self.insert_restored_records(restored)
+    }
+
+    /// Revalidate one offline-restored job against the current principal, repository, and run.
+    ///
+    /// This performs bounded read-only GitHub requests and persists any refreshed exact run
+    /// snapshot through the configured checkpoint sink. It never publishes, cancels, or cleans.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed identity, transport, checkpoint, or restored-state failure.
+    pub fn revalidate_restored_job_live(
+        &self,
+        job_id: &str,
+        cancellation: &CancellationToken,
+    ) -> RemoteBuildResult<()>
+    where
+        R: GhRunner,
+    {
+        if self.config.workflow.run_trigger() == WorkflowRunTrigger::WorkflowDispatch {
+            let live_validation = (|| {
+                cancellation.check()?;
+                if self
+                    .observe_workflow_dispatch_run(job_id, true, cancellation)?
+                    .is_none()
+                {
+                    let identity = self.current_resume_identity()?;
+                    cancellation.check()?;
+                    let mut state = self.lock_state()?;
+                    let record = state
+                        .jobs
+                        .get_mut(job_id)
+                        .ok_or_else(|| job_not_found(job_id))?;
+                    Self::validate_record_identity(record, &identity)?;
+                    self.checkpoint_record(record)?;
+                }
+                Ok(())
+            })();
+            self.checkpoint_workflow_dispatch_cancellation(job_id, cancellation)?;
+            live_validation?;
+            return cancellation.check();
+        }
+        cancellation.check()?;
+        let mut state = self.lock_state()?;
+        let record = state
+            .jobs
+            .get_mut(job_id)
+            .ok_or_else(|| job_not_found(job_id))?;
+        self.revalidate_record_identity(record)?;
+        self.revalidate_restored_run_with_policy(record, true)?;
+        self.checkpoint_record(record)?;
+        cancellation.check()
+    }
+
+    /// Recover an offline-only identity for an exact terminal attempt restored from durable state.
+    ///
+    /// This performs no transport or publisher operation. The returned type can validate an
+    /// append-last durable log marker but cannot be passed to the network log fetcher.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed restored-state or terminal-run identity failure.
+    pub fn restored_terminal_job_log_identity(
+        &self,
+        job_id: &str,
+    ) -> RemoteBuildResult<Option<GithubDurableRunAttemptLogIdentity>> {
+        let state = self.lock_state()?;
+        let record = state
+            .jobs
+            .get(job_id)
+            .ok_or_else(|| job_not_found(job_id))?;
+        let Some(snapshot) = record.run_snapshot.as_ref() else {
+            return Ok(None);
+        };
+        if !snapshot.status().is_terminal() || snapshot.conclusion().is_none() {
+            return Ok(None);
+        }
+        GithubDurableRunAttemptLogIdentity::new(
+            self.config.repository.clone(),
+            snapshot.handle().id(),
+            snapshot.run_attempt(),
+            snapshot.handle().head_sha().clone(),
+            snapshot.handle().workflow_id(),
+        )
+        .map(Some)
+        .map_err(|_| job_log_identity_failure())
+    }
+
+    /// Export all current jobs as strictly validated, secret-free durable records.
+    ///
+    /// The current credential and stable execution-repository ID are revalidated before records
+    /// are emitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed identity, transport, state, or serialization failure.
+    pub fn export_job_resumes(&self) -> RemoteBuildResult<Vec<GithubJobResumeV1>>
+    where
+        R: GhRunner,
+    {
+        let records = {
+            let state = self.lock_state()?;
+            state.jobs.values().cloned().collect::<Vec<_>>()
+        };
+        if records
+            .iter()
+            .any(|record| !record.publication_intent && record.git_snapshot.is_none())
+        {
+            return Err(resume_failure("resume_submission_not_checkpointable"));
+        }
+        if records
+            .iter()
+            .any(|record| record.principal.is_none() || record.execution_repository_id.is_none())
+        {
+            return Err(resume_failure("resume_creation_identity_unbound"));
+        }
+        let (principal, repository_id) = self.current_resume_identity()?;
+        records
+            .iter()
+            .map(|record| {
+                if record.principal.as_ref() != Some(&principal)
+                    || record.execution_repository_id != Some(repository_id)
+                {
+                    return Err(resume_failure("resume_live_identity_changed"));
+                }
+                GithubJobResumeV1::from_record(
+                    &self.config,
+                    principal.clone(),
+                    repository_id,
+                    record,
+                )
+            })
+            .collect()
+    }
+
+    /// Restore an atomic batch of durable jobs after strict live identity revalidation.
+    ///
+    /// Existing jobs and reservations are never overwritten.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unknown schema fields during deserialization and rejects any repository,
+    /// principal, configuration, request, ref, run, attempt, event, or state mismatch here.
+    pub fn restore_job_resumes(&self, resumes: Vec<GithubJobResumeV1>) -> RemoteBuildResult<()>
+    where
+        R: GhRunner,
+    {
+        let (principal, repository_id) = self.current_resume_identity()?;
+        let expected = GithubDurableIdentityV1 {
+            provider: GITHUB_PROVIDER_ID.to_owned(),
+            provider_config_sha256: provider_config_sha256(&self.config)?,
+            principal,
+            execution_repository: repository_url(&self.config.repository),
+            execution_repository_id: repository_id,
+        };
+        let mut restored = self.records_from_offline_resumes(resumes, &expected)?;
+        for record in restored.values_mut() {
+            self.revalidate_restored_run(record)?;
+        }
+        self.insert_restored_records(restored)
+    }
+
+    /// Reconcile one restored pre-publication intent without issuing a duplicate push.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed provider or read-only publisher failure. Exact remote bytes must match
+    /// before a dispatch commit is adopted.
+    pub fn reconcile_restored_job(
+        &self,
+        job_id: &str,
+        cancellation: &CancellationToken,
+    ) -> RemoteBuildResult<GithubJobReconciliation>
+    where
+        R: GhRunner,
+        P: TemporaryRefPublisher + TemporaryRefReconciler,
+    {
+        self.reconcile_restored_job_with_cancel_policy(job_id, cancellation, true)
+    }
+
+    /// Reconcile one restored publication using reads only, never cancellation dispatch.
+    ///
+    /// This is the restart-safe path for a durable cancellation whose provider checkpoint already
+    /// records cancellation intent but not dispatch acknowledgement.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed provider or read-only publisher failure. Exact remote bytes must match
+    /// before a dispatch commit is adopted.
+    pub fn reconcile_restored_job_get_only(
+        &self,
+        job_id: &str,
+        cancellation: &CancellationToken,
+    ) -> RemoteBuildResult<GithubJobReconciliation>
+    where
+        R: GhRunner,
+        P: TemporaryRefPublisher + TemporaryRefReconciler,
+    {
+        self.reconcile_restored_job_with_cancel_policy(job_id, cancellation, false)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the dispatch restart boundary keeps external reconciliation and exact state rebinding adjacent"
+    )]
+    fn reconcile_restored_workflow_dispatch_publication(
+        &self,
+        job_id: &str,
+        cancellation: &CancellationToken,
+        allow_cancel_dispatch: bool,
+    ) -> RemoteBuildResult<GithubJobReconciliation>
+    where
+        R: GhRunner,
+        P: TemporaryRefPublisher + TemporaryRefReconciler,
+    {
+        cancellation.check()?;
+        let mut working = {
+            let state = self.lock_state()?;
+            state
+                .jobs
+                .get(job_id)
+                .cloned()
+                .ok_or_else(|| job_not_found(job_id))?
+        };
+        if working.dispatch_commit.is_some() && !working.publication_uncertain {
+            {
+                let mut state = self.lock_state()?;
+                let record = state
+                    .jobs
+                    .get_mut(job_id)
+                    .ok_or_else(|| job_not_found(job_id))?;
+                self.checkpoint_record(record)?;
+            }
+            if working.workflow_dispatch.is_some() {
+                self.reconcile_workflow_dispatch_with_cancellation_checkpoint(
+                    job_id,
+                    cancellation,
+                )?;
+            } else if allow_cancel_dispatch {
+                self.start_or_reconcile_workflow_dispatch(job_id, cancellation)?;
+            }
+            self.sync_job_with_cancel_policy(job_id, cancellation, allow_cancel_dispatch)?;
+            return Ok(GithubJobReconciliation::AlreadyMapped);
+        }
+        if working.publication_absent {
+            let mut state = self.lock_state()?;
+            let record = state
+                .jobs
+                .get_mut(job_id)
+                .ok_or_else(|| job_not_found(job_id))?;
+            self.checkpoint_record(record)?;
+            return Ok(GithubJobReconciliation::Missing);
+        }
+        if working.publication_not_attempted || !working.publication_intent {
+            let mut state = self.lock_state()?;
+            let record = state
+                .jobs
+                .get_mut(job_id)
+                .ok_or_else(|| job_not_found(job_id))?;
+            self.checkpoint_record(record)?;
+            return Ok(GithubJobReconciliation::NotStarted);
+        }
+        self.acquire_restored_publication_lease(&mut working)?;
+        if publication_record_boundary_is_unarmed(&working) {
+            let apply_result = (|| {
+                let mut state = self.lock_state()?;
+                let record = state
+                    .jobs
+                    .get_mut(job_id)
+                    .ok_or_else(|| job_not_found(job_id))?;
+                if record.operation_id != working.operation_id
+                    || record.request_sha256 != working.request_sha256
+                    || record.temporary_ref != working.temporary_ref
+                    || record.prepared_dispatch_commit != working.prepared_dispatch_commit
+                    || !publication_record_boundary_is_unarmed(record)
+                {
+                    return Err(resume_failure(
+                        "workflow_dispatch_publication_identity_changed",
+                    ));
+                }
+                mark_publication_not_attempted(
+                    record,
+                    self.clock.now_ms(),
+                    "publication_not_armed",
+                    "Prepared publication never reached its durable push boundary",
+                    false,
+                )?;
+                self.checkpoint_record(record)
+            })();
+            let release_source = self.release_snapshot_source_lease(&mut working);
+            let release_publication = self.release_record_publication_lease(&mut working);
+            apply_result?;
+            release_source?;
+            release_publication?;
+            return Ok(GithubJobReconciliation::NotStarted);
+        }
+        let external_result = (|| {
+            if let Some(snapshot) = working.git_snapshot.clone() {
+                if snapshot.phase != GithubGitSnapshotPhaseV1::SourceExact {
+                    return Err(resume_failure("resume_git_snapshot_source_not_exact"));
+                }
+                self.acquire_snapshot_source_lease(&mut working)?;
+                self.revalidate_public_snapshot_source(&working)?;
+                let source = self
+                    .lock_publisher()?
+                    .reconcile_git_snapshot_source(&GitSnapshotSourcePublishRequest {
+                        source_repository: &self.config.source_repository,
+                        source_ref: &snapshot.stage.source_ref,
+                        commit: &snapshot.stage.graph.commit,
+                        authorized: true,
+                    })
+                    .map_err(publisher_failure)?;
+                if source != GitSnapshotRefReconciliation::Exact {
+                    return Err(provider_failure(
+                        "snapshot_source_ownership_lost",
+                        "Git snapshot source ref changed before dispatch reconciliation",
+                        false,
+                    ));
+                }
+            } else {
+                self.revalidate_record_identity(&working)?;
+            }
+            let workflow = generate_workflow(&self.config.workflow);
+            let manifest = GithubDispatchManifest::new(
+                &self.config,
+                &working.temporary_ref,
+                working.request.clone(),
+            );
+            manifest.validate_for(&self.config)?;
+            let manifest_bytes = manifest.encode()?;
+            let expected_prepared_commit = working.prepared_dispatch_commit.as_ref().ok_or_else(|| {
+                provider_failure(
+                    "publication_reconciliation_unavailable",
+                    "Durable publication does not contain an exact prepared commit",
+                    true,
+                )
+            })?;
+            self.lock_publisher()?
+                .reconcile_temporary_ref(&TemporaryRefReconcileRequest {
+                    repository: &self.config.repository,
+                    source_repository: &self.config.source_repository,
+                    trusted_source_ref: self.config.workflow.trusted_source_ref(),
+                    source_revision: &working.source_revision,
+                    snapshot_source_ref: working
+                        .git_snapshot
+                        .as_ref()
+                        .map(|snapshot| &snapshot.stage.source_ref),
+                    temporary_ref: &working.temporary_ref,
+                    workflow_path: workflow.path(),
+                    workflow_bytes: workflow.yaml().as_bytes(),
+                    workflow_fingerprint: &self.config.workflow_fingerprint,
+                    manifest_bytes: &manifest_bytes,
+                    operation_id: &working.operation_id,
+                    created_at_ms: working.created_at_ms,
+                    expected_prepared_commit,
+                })
+                .map_err(publisher_failure)
+        })();
+        let reconciliation = match external_result {
+            Ok(reconciliation) => reconciliation,
+            Err(error) => {
+                let _ = self.release_snapshot_source_lease(&mut working);
+                let _ = self.release_record_publication_lease(&mut working);
+                return Err(error);
+            }
+        };
+        let expected_prepared_commit = working
+            .prepared_dispatch_commit
+            .clone()
+            .ok_or_else(|| resume_failure("resume_prepared_dispatch_commit_missing"))?;
+        let recovered = matches!(
+            &reconciliation,
+            TemporaryRefReconciliation::Exact(published)
+                if published.temporary_ref() == &working.temporary_ref
+                    && published.commit() == &expected_prepared_commit
+        );
+        let outcome = if recovered {
+            GithubJobReconciliation::Recovered
+        } else if matches!(reconciliation, TemporaryRefReconciliation::Missing) {
+            GithubJobReconciliation::Missing
+        } else {
+            GithubJobReconciliation::Conflict
+        };
+        let apply_result = (|| {
+            let mut state = self.lock_state()?;
+            let record = state
+                .jobs
+                .get_mut(job_id)
+                .ok_or_else(|| job_not_found(job_id))?;
+            if record.principal != working.principal
+                || record.execution_repository_id != working.execution_repository_id
+                || record.operation_id != working.operation_id
+                || record.source_revision != working.source_revision
+                || record.git_snapshot != working.git_snapshot
+                || record.request_sha256 != working.request_sha256
+                || record.temporary_ref != working.temporary_ref
+                || record.prepared_dispatch_commit != working.prepared_dispatch_commit
+                || record.dispatch_commit != working.dispatch_commit
+                || record.publication_intent != working.publication_intent
+                || record.publication_uncertain != working.publication_uncertain
+                || record.workflow_dispatch != working.workflow_dispatch
+            {
+                return Err(resume_failure("workflow_dispatch_publication_identity_changed"));
+            }
+            if recovered {
+                record.dispatch_commit = Some(expected_prepared_commit);
+                record.publication_uncertain = false;
+                record.publication_absent = false;
+            } else {
+                record.publication_uncertain = true;
+                record.publication_absent = false;
+                record.publication_absence_observations = record
+                    .publication_absence_observations
+                    .saturating_add(1)
+                    .min(2);
+                if record.publication_absence_first_observed_at_ms == 0 {
+                    record.publication_absence_first_observed_at_ms = self.clock.now_ms();
+                    record.publication_quiescence_deadline_ms = publication_quiescence_deadline(
+                        record.publication_started_at_ms,
+                        record.publication_absence_first_observed_at_ms,
+                    );
+                }
+            }
+            self.checkpoint_record(record)
+        })();
+        let release_source = self.release_snapshot_source_lease(&mut working);
+        let release_publication = self.release_record_publication_lease(&mut working);
+        apply_result?;
+        release_source?;
+        release_publication?;
+        if recovered {
+            let has_dispatch_intent = {
+                let state = self.lock_state()?;
+                state
+                    .jobs
+                    .get(job_id)
+                    .ok_or_else(|| job_not_found(job_id))?
+                    .workflow_dispatch
+                    .is_some()
+            };
+            if has_dispatch_intent {
+                self.reconcile_workflow_dispatch_with_cancellation_checkpoint(
+                    job_id,
+                    cancellation,
+                )?;
+            } else if allow_cancel_dispatch {
+                self.start_or_reconcile_workflow_dispatch(job_id, cancellation)?;
+            } else {
+                return Err(provider_failure(
+                    "workflow_dispatch_mutation_required",
+                    "Exact publication was recovered, but starting its workflow requires mutation authorization",
+                    true,
+                ));
+            }
+            self.sync_job_with_cancel_policy(job_id, cancellation, allow_cancel_dispatch)?;
+        }
+        Ok(outcome)
+    }
+
+    fn reconcile_restored_job_with_cancel_policy(
+        &self,
+        job_id: &str,
+        cancellation: &CancellationToken,
+        allow_cancel_dispatch: bool,
+    ) -> RemoteBuildResult<GithubJobReconciliation>
+    where
+        R: GhRunner,
+        P: TemporaryRefPublisher + TemporaryRefReconciler,
+    {
+        if self.config.workflow.run_trigger() == WorkflowRunTrigger::WorkflowDispatch {
+            let reconciliation = self.reconcile_restored_job_with_cancel_policy_inner(
+                job_id,
+                cancellation,
+                allow_cancel_dispatch,
+            );
+            self.checkpoint_workflow_dispatch_cancellation(job_id, cancellation)?;
+            return reconciliation;
+        }
+        self.reconcile_restored_job_with_cancel_policy_inner(
+            job_id,
+            cancellation,
+            allow_cancel_dispatch,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn reconcile_restored_job_with_cancel_policy_inner(
+        &self,
+        job_id: &str,
+        cancellation: &CancellationToken,
+        allow_cancel_dispatch: bool,
+    ) -> RemoteBuildResult<GithubJobReconciliation>
+    where
+        R: GhRunner,
+        P: TemporaryRefPublisher + TemporaryRefReconciler,
+    {
+        cancellation.check()?;
+        let snapshot_pending_dispatch = {
+            let state = self.lock_state()?;
+            let record = state
+                .jobs
+                .get(job_id)
+                .ok_or_else(|| job_not_found(job_id))?;
+            record.git_snapshot.is_some() && !record.publication_intent
+        };
+        if snapshot_pending_dispatch {
+            self.continue_git_snapshot_submission(job_id, cancellation)?;
+            let state = self.lock_state()?;
+            let record = state
+                .jobs
+                .get(job_id)
+                .ok_or_else(|| job_not_found(job_id))?;
+            if !record.publication_intent {
+                return Ok(
+                    match record.git_snapshot.as_ref().map(|snapshot| snapshot.phase) {
+                        Some(GithubGitSnapshotPhaseV1::SourceConflict) => {
+                            GithubJobReconciliation::Conflict
+                        }
+                        Some(GithubGitSnapshotPhaseV1::SourceAbsent) => {
+                            GithubJobReconciliation::Missing
+                        }
+                        _ => GithubJobReconciliation::NotStarted,
+                    },
+                );
+            }
+        }
+        if self.config.workflow.run_trigger() == WorkflowRunTrigger::WorkflowDispatch {
+            return self.reconcile_restored_workflow_dispatch_publication(
+                job_id,
+                cancellation,
+                allow_cancel_dispatch,
+            );
+        }
+        let mut state = self.lock_state()?;
+        let record = state
+            .jobs
+            .get_mut(job_id)
+            .ok_or_else(|| job_not_found(job_id))?;
+        if record.dispatch_commit.is_some() && !record.publication_uncertain {
+            if self.config.workflow.run_trigger() == WorkflowRunTrigger::Push {
+                normalize_published_record(record, self.clock.now_ms())?;
+            }
+            let has_dispatch_intent = record.workflow_dispatch.is_some();
+            self.checkpoint_record(record)?;
+            self.release_record_publication_lease(record)?;
+            self.release_snapshot_source_lease(record)?;
+            if self.config.workflow.run_trigger() == WorkflowRunTrigger::WorkflowDispatch
+                && (has_dispatch_intent || allow_cancel_dispatch)
+            {
+                drop(state);
+                if has_dispatch_intent {
+                    self.reconcile_workflow_dispatch_with_cancellation_checkpoint(
+                        job_id,
+                        cancellation,
+                    )?;
+                } else {
+                    self.start_or_reconcile_workflow_dispatch(job_id, cancellation)?;
+                }
+                self.sync_job_with_cancel_policy(job_id, cancellation, allow_cancel_dispatch)?;
+            }
+            return Ok(GithubJobReconciliation::AlreadyMapped);
+        }
+        if record.publication_absent {
+            self.checkpoint_record(record)?;
+            self.release_record_publication_lease(record)?;
+            self.release_snapshot_source_lease(record)?;
+            return Ok(GithubJobReconciliation::Missing);
+        }
+        if record.publication_not_attempted {
+            self.checkpoint_record(record)?;
+            self.release_record_publication_lease(record)?;
+            self.release_snapshot_source_lease(record)?;
+            return Ok(GithubJobReconciliation::NotStarted);
+        }
+        self.acquire_restored_publication_lease(record)?;
+        if publication_record_boundary_is_unarmed(record) {
+            mark_publication_not_attempted(
+                record,
+                self.clock.now_ms(),
+                "publication_not_armed",
+                "Prepared publication never reached its durable push boundary",
+                false,
+            )?;
+            self.checkpoint_record(record)?;
+            self.release_record_publication_lease(record)?;
+            self.release_snapshot_source_lease(record)?;
+            return Ok(GithubJobReconciliation::NotStarted);
+        }
+        if !record.publication_intent {
+            self.release_snapshot_source_lease(record)?;
+            return Ok(GithubJobReconciliation::NotStarted);
+        }
+        let snapshot = record
+            .git_snapshot
+            .clone()
+            .filter(|snapshot| snapshot.phase == GithubGitSnapshotPhaseV1::SourceExact);
+        if let Some(snapshot) = snapshot {
+            self.acquire_snapshot_source_lease(record)?;
+            self.revalidate_public_snapshot_source(record)?;
+            let source = self
+                .lock_publisher()?
+                .reconcile_git_snapshot_source(&GitSnapshotSourcePublishRequest {
+                    source_repository: &self.config.source_repository,
+                    source_ref: &snapshot.stage.source_ref,
+                    commit: &snapshot.stage.graph.commit,
+                    authorized: true,
+                })
+                .map_err(publisher_failure)?;
+            if source != GitSnapshotRefReconciliation::Exact {
+                self.release_record_publication_lease(record)?;
+                self.release_snapshot_source_lease(record)?;
+                return Err(provider_failure(
+                    "snapshot_source_ownership_lost",
+                    "Git snapshot source ref changed before dispatch reconciliation",
+                    false,
+                ));
+            }
+        } else if record.git_snapshot.is_some() {
+            self.release_record_publication_lease(record)?;
+            return Err(resume_failure("resume_git_snapshot_source_not_exact"));
+        }
+        let workflow = generate_workflow(&self.config.workflow);
+        let manifest = GithubDispatchManifest::new(
+            &self.config,
+            &record.temporary_ref,
+            record.request.clone(),
+        );
+        manifest.validate_for(&self.config)?;
+        let manifest_bytes = manifest.encode()?;
+        let expected_prepared_commit =
+            record.prepared_dispatch_commit.as_ref().ok_or_else(|| {
+                provider_failure(
+                    "publication_reconciliation_unavailable",
+                    "Durable publication does not contain an exact prepared commit",
+                    true,
+                )
+            })?;
+        self.revalidate_record_identity(record)?;
+        let reconciliation = self
+            .lock_publisher()?
+            .reconcile_temporary_ref(&TemporaryRefReconcileRequest {
+                repository: &self.config.repository,
+                source_repository: &self.config.source_repository,
+                trusted_source_ref: self.config.workflow.trusted_source_ref(),
+                source_revision: &record.source_revision,
+                snapshot_source_ref: record
+                    .git_snapshot
+                    .as_ref()
+                    .map(|snapshot| &snapshot.stage.source_ref),
+                temporary_ref: &record.temporary_ref,
+                workflow_path: workflow.path(),
+                workflow_bytes: workflow.yaml().as_bytes(),
+                workflow_fingerprint: &self.config.workflow_fingerprint,
+                manifest_bytes: &manifest_bytes,
+                operation_id: &record.operation_id,
+                created_at_ms: record.created_at_ms,
+                expected_prepared_commit,
+            })
+            .map_err(publisher_failure)?;
+        cancellation.check()?;
+        self.revalidate_record_identity(record)?;
+        match reconciliation {
+            TemporaryRefReconciliation::Exact(published)
+                if published.temporary_ref() == &record.temporary_ref
+                    && record
+                        .prepared_dispatch_commit
+                        .as_ref()
+                        .is_none_or(|prepared| prepared == published.commit()) =>
+            {
+                record.dispatch_commit = Some(published.commit().clone());
+                record.publication_uncertain = false;
+                record.publication_absent = false;
+                if record.state == JobState::Created
+                    && self.config.workflow.run_trigger() == WorkflowRunTrigger::Push
+                {
+                    transition_record(record, JobState::Queued)?;
+                    append_event(
+                        record,
+                        self.clock.now_ms(),
+                        "queue",
+                        RemoteBuildEventKind::JobQueued { position: None },
+                    )?;
+                }
+                self.checkpoint_record(record)?;
+                self.release_record_publication_lease(record)?;
+                self.release_snapshot_source_lease(record)?;
+                drop(state);
+                self.sync_job_with_cancel_policy(job_id, cancellation, allow_cancel_dispatch)?;
+                Ok(GithubJobReconciliation::Recovered)
+            }
+            observation => {
+                let ref_is_missing = matches!(observation, TemporaryRefReconciliation::Missing);
+                let outcome = if ref_is_missing {
+                    GithubJobReconciliation::Missing
+                } else {
+                    GithubJobReconciliation::Conflict
+                };
+                record.publication_uncertain = true;
+                record.publication_absent = false;
+                let prepared_commit = record.prepared_dispatch_commit.clone().ok_or_else(|| {
+                    provider_failure(
+                        "publication_reconciliation_unavailable",
+                        "Durable publication does not contain an exact prepared commit",
+                        true,
+                    )
+                })?;
+                if self.config.workflow.run_trigger() == WorkflowRunTrigger::Push {
+                    let run = self.lock_transport()?.find_run(
+                        &self.config.repository,
+                        &self.config.workflow.filename().repository_path(),
+                        &prepared_commit,
+                        record.temporary_ref.branch(),
+                        RunEvent::Push,
+                    );
+                    self.revalidate_record_identity(record)?;
+                    match run {
+                        Ok(handle) => {
+                            let snapshot = self
+                                .lock_transport()?
+                                .run(&self.config.repository, &handle)
+                                .map_err(transport_failure)?;
+                            self.revalidate_record_identity(record)?;
+                            if snapshot.run_attempt() != 1 {
+                                return Err(resume_failure("resume_recovered_run_attempt_invalid"));
+                            }
+                            record.dispatch_commit = Some(prepared_commit);
+                            record.run = Some(handle);
+                            record.run_snapshot = Some(snapshot);
+                            record.publication_uncertain = false;
+                            if record.state == JobState::Created {
+                                transition_record(record, JobState::Queued)?;
+                                append_event(
+                                    record,
+                                    self.clock.now_ms(),
+                                    "queue",
+                                    RemoteBuildEventKind::JobQueued { position: None },
+                                )?;
+                            }
+                            append_event(
+                                record,
+                                self.clock.now_ms(),
+                                "queue",
+                                RemoteBuildEventKind::Progress {
+                                    message: "Exact GitHub Actions run recovered from publication uncertainty"
+                                        .to_owned(),
+                                    current: None,
+                                    total: None,
+                                },
+                            )?;
+                            self.checkpoint_record(record)?;
+                            self.release_record_publication_lease(record)?;
+                            self.release_snapshot_source_lease(record)?;
+                            drop(state);
+                            self.sync_job_with_cancel_policy(
+                                job_id,
+                                cancellation,
+                                allow_cancel_dispatch,
+                            )?;
+                            return Ok(GithubJobReconciliation::Recovered);
+                        }
+                        Err(TransportError::RunNotFound) => {}
+                        Err(error) => return Err(transport_failure(error)),
+                    }
+                }
+
+                if record.publication_absence_first_observed_at_ms == 0 {
+                    record.publication_absence_first_observed_at_ms = self.clock.now_ms();
+                    record.publication_quiescence_deadline_ms = publication_quiescence_deadline(
+                        record.publication_started_at_ms,
+                        record.publication_absence_first_observed_at_ms,
+                    );
+                }
+                record.publication_absence_observations = record
+                    .publication_absence_observations
+                    .saturating_add(1)
+                    .min(2);
+                let strongly_resolved = record.publication_absence_observations >= 2
+                    && self.clock.now_ms() >= record.publication_quiescence_deadline_ms
+                    && record.publication_process_fenced;
+                if strongly_resolved {
+                    if ref_is_missing && record.dispatch_commit.is_none() {
+                        record.publication_uncertain = false;
+                        record.publication_absent = true;
+                        record.temporary_ref_deleted = true;
+                        if record.cancellation_requested {
+                            transition_record(record, JobState::Cancelled)?;
+                            append_event(
+                                record,
+                                self.clock.now_ms(),
+                                "finished",
+                                RemoteBuildEventKind::OperationCancelled {
+                                    reason: "publication_not_observed".to_owned(),
+                                    duration_ms: self
+                                        .clock
+                                        .now_ms()
+                                        .saturating_sub(record.created_at_ms),
+                                },
+                            )?;
+                        } else {
+                            transition_record(record, JobState::Failed)?;
+                            append_failed(
+                                record,
+                                self.clock.now_ms(),
+                                "publication_not_observed",
+                                "Prepared publication remained absent from both the ref and bounded run history",
+                                false,
+                            )?;
+                        }
+                    } else if !record.state.is_build_terminal() && !record.state.is_terminal() {
+                        transition_record(record, JobState::Failed)?;
+                        append_failed(
+                            record,
+                            self.clock.now_ms(),
+                            if ref_is_missing {
+                                "publication_not_observed_after_uncertain_mapping"
+                            } else {
+                                "temporary_ref_reconciliation_conflict"
+                            },
+                            if ref_is_missing {
+                                "Possible publication remained absent from bounded ref and run history"
+                            } else {
+                                "Temporary Git ref differed and no exact prepared-commit run appeared during bounded reconciliation"
+                            },
+                            false,
+                        )?;
+                    }
+                }
+                self.checkpoint_record(record)?;
+                if strongly_resolved {
+                    self.release_record_publication_lease(record)?;
+                    self.release_snapshot_source_lease(record)?;
+                }
+                Ok(if strongly_resolved && !ref_is_missing {
+                    GithubJobReconciliation::ConflictResolved
+                } else {
+                    outcome
+                })
+            }
+        }
+    }
+
     fn artifact_context(
         record: &JobRecord,
         config: &GithubProviderConfig,
@@ -1630,6 +10285,7 @@ where
             job_id: record.job_id.clone(),
             operation_id: record.operation_id.clone(),
             repository: config.repository.clone(),
+            execution_repository_id: record.execution_repository_id,
             run: record.run_snapshot.clone()?,
             source_repository: config.source_repository.clone(),
             source_revision: record.source_revision.clone(),
@@ -1639,23 +10295,379 @@ where
         })
     }
 
-    #[allow(clippy::too_many_lines)]
+    fn has_valid_signed_cleanup_evidence(&self, record: &JobRecord) -> RemoteBuildResult<bool> {
+        let Some(evidence) = record.signed_cleanup_evidence.as_ref() else {
+            return Ok(false);
+        };
+        let principal = record
+            .principal
+            .clone()
+            .ok_or_else(|| resume_failure("checkpoint_principal_unavailable"))?;
+        let repository_id = record
+            .execution_repository_id
+            .ok_or_else(|| resume_failure("checkpoint_repository_identity_unavailable"))?;
+        let resume =
+            GithubJobResumeV1::from_record(&self.config, principal, repository_id, record)?;
+        evidence.validate_for_resume(&resume)?;
+        Ok(true)
+    }
+
     fn sync_job(&self, job_id: &str, cancellation: &CancellationToken) -> RemoteBuildResult<()>
     where
         R: GhRunner,
     {
+        self.sync_job_with_cancel_policy(job_id, cancellation, true)
+    }
+
+    fn observe_workflow_dispatch_run(
+        &self,
+        job_id: &str,
+        include_terminal: bool,
+        cancellation: &CancellationToken,
+    ) -> RemoteBuildResult<Option<RunSnapshot>>
+    where
+        R: GhRunner,
+    {
+        let (handle, previous) = {
+            let state = self.lock_state()?;
+            let record = state
+                .jobs
+                .get(job_id)
+                .ok_or_else(|| job_not_found(job_id))?;
+            if record.workflow_dispatch.is_none()
+                || record.state.is_terminal() && !include_terminal
+            {
+                return Ok(None);
+            }
+            let Some(handle) = record.run.clone() else {
+                return Ok(None);
+            };
+            (handle, record.run_snapshot.clone())
+        };
+        let snapshot = self
+            .lock_transport()?
+            .run(&self.config.repository, &handle)
+            .map_err(transport_failure)?;
+        ensure_same_run_attempt(previous.as_ref(), &snapshot)?;
+        let identity = self.current_resume_identity()?;
         cancellation.check()?;
+
+        let mut state = self.lock_state()?;
+        let record = state
+            .jobs
+            .get_mut(job_id)
+            .ok_or_else(|| job_not_found(job_id))?;
+        if record.workflow_dispatch.is_none() || record.run.as_ref() != Some(&handle) {
+            return Err(resume_failure("workflow_dispatch_run_identity_changed"));
+        }
+        Self::validate_record_identity(record, &identity)?;
+        if record
+            .run_snapshot
+            .as_ref()
+            .is_some_and(|current| github_run_is_later_attempt(current, &snapshot))
+            && record.signed_cleanup_evidence.is_some()
+        {
+            return Ok(record.run_snapshot.clone());
+        }
+        ensure_same_run_attempt(record.run_snapshot.as_ref(), &snapshot)?;
+        if (record.state == JobState::Succeeded || !record.manifests.is_empty())
+            && !run_snapshot_is_successful(&snapshot)
+        {
+            return Err(resume_failure("resume_live_success_state_mismatch"));
+        }
+        record.run_snapshot = Some(snapshot.clone());
+        self.checkpoint_record(record)?;
+        Ok(Some(snapshot))
+    }
+
+    fn apply_workflow_dispatch_snapshot(
+        &self,
+        record: &mut JobRecord,
+        snapshot: &RunSnapshot,
+    ) -> RemoteBuildResult<()>
+    where
+        R: GhRunner,
+    {
+        match snapshot.status() {
+            RunStatus::Requested
+            | RunStatus::Queued
+            | RunStatus::Pending
+            | RunStatus::Waiting => {}
+            RunStatus::InProgress => {
+                if record.state == JobState::Queued {
+                    transition_record(record, JobState::Running)?;
+                    append_event(
+                        record,
+                        self.clock.now_ms(),
+                        "remote-build",
+                        RemoteBuildEventKind::PhaseStarted {
+                            message: Some("GitHub macOS worker started".to_owned()),
+                        },
+                    )?;
+                }
+            }
+            RunStatus::Completed => self.finish_from_snapshot(record, snapshot)?,
+        }
+        Ok(())
+    }
+
+    fn sync_workflow_dispatch_job_with_cancel_policy(
+        &self,
+        job_id: &str,
+        cancellation: &CancellationToken,
+        allow_cancel_dispatch: bool,
+    ) -> RemoteBuildResult<()>
+    where
+        R: GhRunner,
+    {
+        cancellation.check()?;
+        {
+            let mut state = self.lock_state()?;
+            let record = state
+                .jobs
+                .get_mut(job_id)
+                .ok_or_else(|| job_not_found(job_id))?;
+            if record.state.is_build_terminal() || record.state.is_terminal() {
+                self.checkpoint_record(record)?;
+                return Ok(());
+            }
+            if !record.publication_intent {
+                return Ok(());
+            }
+            if record.publication_uncertain {
+                self.checkpoint_record(record)?;
+                return Err(provider_failure(
+                    "publication_reconciliation_required",
+                    "Possible temporary-ref publication requires exact ref and run-history reconciliation",
+                    true,
+                ));
+            }
+            normalize_published_record(record, self.clock.now_ms())?;
+            self.checkpoint_record(record)?;
+            if record.run.is_none() {
+                return Err(resume_failure("workflow_dispatch_run_mapping_missing"));
+            }
+        }
+
+        let Some(mut snapshot) =
+            self.observe_workflow_dispatch_run(job_id, false, cancellation)?
+        else {
+            return Ok(());
+        };
+        let cancellation_authority = {
+            let mut state = self.lock_state()?;
+            let should_reserve = {
+                let record = state
+                    .jobs
+                    .get_mut(job_id)
+                    .ok_or_else(|| job_not_found(job_id))?;
+                ensure_same_run_attempt(record.run_snapshot.as_ref(), &snapshot)?;
+                record.run_snapshot = Some(snapshot.clone());
+                record.cancellation_requested
+                    && !record.cancellation_dispatched
+                    && !snapshot.status().is_terminal()
+                    && allow_cancel_dispatch
+            };
+            if should_reserve && !self.config.mutation_authorization.cancel_run {
+                return Err(unsupported(ProviderFeature::Cancellation));
+            }
+            should_reserve && state.cancellation_reservations.insert(job_id.to_owned())
+        };
+
+        if cancellation_authority {
+            let cancellation_result = (|| {
+                let (handle, previous) = {
+                    let state = self.lock_state()?;
+                    let record = state
+                        .jobs
+                        .get(job_id)
+                        .ok_or_else(|| job_not_found(job_id))?;
+                    let handle = record.run.clone().ok_or_else(|| {
+                        resume_failure("workflow_dispatch_run_mapping_missing")
+                    })?;
+                    (handle, record.run_snapshot.clone())
+                };
+                let checked = self
+                    .lock_transport()?
+                    .run(&self.config.repository, &handle)
+                    .map_err(transport_failure)?;
+                ensure_same_run_attempt(previous.as_ref(), &checked)?;
+                let identity = self.current_resume_identity()?;
+                let should_cancel = {
+                    let mut state = self.lock_state()?;
+                    let record = state
+                        .jobs
+                        .get_mut(job_id)
+                        .ok_or_else(|| job_not_found(job_id))?;
+                    if record.workflow_dispatch.is_none()
+                        || record.run.as_ref() != Some(&handle)
+                    {
+                        return Err(resume_failure("workflow_dispatch_run_identity_changed"));
+                    }
+                    Self::validate_record_identity(record, &identity)?;
+                    ensure_same_run_attempt(record.run_snapshot.as_ref(), &checked)?;
+                    record.run_snapshot = Some(checked.clone());
+                    snapshot = checked.clone();
+                    self.checkpoint_record(record)?;
+                    record.cancellation_requested
+                        && !record.cancellation_dispatched
+                        && !checked.status().is_terminal()
+                };
+                if should_cancel {
+                    self.lock_transport()?
+                        .cancel_run(&self.config.repository, handle.id())
+                        .map_err(transport_failure)?;
+                }
+                let mut state = self.lock_state()?;
+                let record = state
+                    .jobs
+                    .get_mut(job_id)
+                    .ok_or_else(|| job_not_found(job_id))?;
+                if record.workflow_dispatch.is_none() || record.run.as_ref() != Some(&handle) {
+                    return Err(resume_failure("workflow_dispatch_run_identity_changed"));
+                }
+                ensure_same_run_attempt(record.run_snapshot.as_ref(), &checked)?;
+                record.run_snapshot = Some(checked.clone());
+                if should_cancel {
+                    record.cancellation_dispatched = true;
+                }
+                self.apply_workflow_dispatch_snapshot(record, &checked)?;
+                self.checkpoint_record(record)
+            })();
+            self.lock_state()?
+                .cancellation_reservations
+                .remove(job_id);
+            cancellation_result?;
+        } else {
+            let mut state = self.lock_state()?;
+            let record = state
+                .jobs
+                .get_mut(job_id)
+                .ok_or_else(|| job_not_found(job_id))?;
+            ensure_same_run_attempt(record.run_snapshot.as_ref(), &snapshot)?;
+            record.run_snapshot = Some(snapshot.clone());
+            self.apply_workflow_dispatch_snapshot(record, &snapshot)?;
+            self.checkpoint_record(record)?;
+        }
+        cancellation.check()
+    }
+
+    /// Refresh one restored job through bounded GET requests without cancellation dispatch.
+    ///
+    /// Provider state and its checkpoint may advance from exact run observations, including to a
+    /// terminal state. No remote mutation is issued even when durable cancellation intent exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed identity, transport, checkpoint, or restored-state failure.
+    pub fn refresh_restored_job_get_only(
+        &self,
+        job_id: &str,
+        cancellation: &CancellationToken,
+    ) -> RemoteBuildResult<()>
+    where
+        R: GhRunner,
+    {
+        self.sync_job_with_cancel_policy(job_id, cancellation, false)
+    }
+
+    fn sync_job_with_cancel_policy(
+        &self,
+        job_id: &str,
+        cancellation: &CancellationToken,
+        allow_cancel_dispatch: bool,
+    ) -> RemoteBuildResult<()>
+    where
+        R: GhRunner,
+    {
+        if self.config.workflow.run_trigger() == WorkflowRunTrigger::WorkflowDispatch {
+            let synchronization = self.sync_job_with_cancel_policy_inner(
+                job_id,
+                cancellation,
+                allow_cancel_dispatch,
+            );
+            self.checkpoint_workflow_dispatch_cancellation(job_id, cancellation)?;
+            return synchronization;
+        }
+        self.sync_job_with_cancel_policy_inner(job_id, cancellation, allow_cancel_dispatch)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn sync_job_with_cancel_policy_inner(
+        &self,
+        job_id: &str,
+        cancellation: &CancellationToken,
+        allow_cancel_dispatch: bool,
+    ) -> RemoteBuildResult<()>
+    where
+        R: GhRunner,
+    {
+        cancellation.check()?;
+        if self.config.workflow.run_trigger() == WorkflowRunTrigger::WorkflowDispatch {
+            let dispatch_state = {
+                let state = self.lock_state()?;
+                let record = state
+                    .jobs
+                    .get(job_id)
+                    .ok_or_else(|| job_not_found(job_id))?;
+                (!record.state.is_build_terminal()
+                    && !record.state.is_terminal()
+                    && record.publication_intent
+                    && !record.publication_uncertain
+                    && record.dispatch_commit.is_some()
+                    && record.run.is_none())
+                .then_some(record.workflow_dispatch.is_some())
+            };
+            match dispatch_state {
+                Some(true) => self.reconcile_workflow_dispatch_with_cancellation_checkpoint(
+                    job_id,
+                    cancellation,
+                )?,
+                Some(false) if allow_cancel_dispatch => {
+                    self.start_or_reconcile_workflow_dispatch(job_id, cancellation)?;
+                }
+                Some(false) => return Ok(()),
+                None => {}
+            }
+            return self.sync_workflow_dispatch_job_with_cancel_policy(
+                job_id,
+                cancellation,
+                allow_cancel_dispatch,
+            );
+        }
         let mut state = self.lock_state()?;
         let record = state
             .jobs
             .get_mut(job_id)
             .ok_or_else(|| job_not_found(job_id))?;
         if record.state.is_build_terminal() || record.state.is_terminal() {
+            self.checkpoint_record(record)?;
             return Ok(());
         }
+        if !record.publication_intent {
+            return Ok(());
+        }
+        if record.publication_uncertain {
+            self.checkpoint_record(record)?;
+            return Err(provider_failure(
+                "publication_reconciliation_required",
+                "Possible temporary-ref publication requires exact ref and run-history reconciliation",
+                true,
+            ));
+        }
+        if record.dispatch_commit.is_some() {
+            normalize_published_record(record, self.clock.now_ms())?;
+            self.checkpoint_record(record)?;
+            self.revalidate_record_identity(record)?;
+        }
 
+        let mut mapped_snapshot = None;
         if record.run.is_none() {
+            if self.config.workflow.run_trigger() == WorkflowRunTrigger::WorkflowDispatch {
+                return Err(resume_failure("workflow_dispatch_run_mapping_missing"));
+            }
             let Some(dispatch_commit) = record.dispatch_commit.as_ref() else {
+                self.checkpoint_record(record)?;
                 return Ok(());
             };
             let result = self.lock_transport()?.find_run(
@@ -1667,7 +10679,20 @@ where
             );
             match result {
                 Ok(handle) => {
+                    let snapshot = self
+                        .lock_transport()?
+                        .run(&self.config.repository, &handle)
+                        .map_err(transport_failure)?;
+                    self.revalidate_record_identity(record)?;
+                    if snapshot.run_attempt() != 1 {
+                        return Err(provider_failure(
+                            "run_initial_attempt_mismatch",
+                            "Initial GitHub run mapping observed an external rerun attempt",
+                            false,
+                        ));
+                    }
                     record.run = Some(handle);
+                    record.run_snapshot = Some(snapshot.clone());
                     append_event(
                         record,
                         self.clock.now_ms(),
@@ -1678,6 +10703,8 @@ where
                             total: None,
                         },
                     )?;
+                    self.checkpoint_record(record)?;
+                    mapped_snapshot = Some(snapshot);
                 }
                 Err(TransportError::RunNotFound) => {
                     record.run_discovery_attempts = record.run_discovery_attempts.saturating_add(1);
@@ -1708,6 +10735,7 @@ where
                             true,
                         )?;
                     }
+                    self.checkpoint_record(record)?;
                     return Ok(());
                 }
                 Err(error) => return Err(transport_failure(error)),
@@ -1721,23 +10749,45 @@ where
                 true,
             )
         })?;
-        let snapshot = self
-            .lock_transport()?
-            .run(&self.config.repository, &handle)
-            .map_err(transport_failure)?;
+        let mut snapshot = if let Some(snapshot) = mapped_snapshot {
+            snapshot
+        } else {
+            let snapshot = self
+                .lock_transport()?
+                .run(&self.config.repository, &handle)
+                .map_err(transport_failure)?;
+            ensure_same_run_attempt(record.run_snapshot.as_ref(), &snapshot)?;
+            snapshot
+        };
         record.run_snapshot = Some(snapshot.clone());
 
         if record.cancellation_requested
             && !record.cancellation_dispatched
             && !snapshot.status().is_terminal()
+            && allow_cancel_dispatch
         {
             if !self.config.mutation_authorization.cancel_run {
                 return Err(unsupported(ProviderFeature::Cancellation));
             }
-            self.lock_transport()?
-                .cancel_run(&self.config.repository, handle.id())
+            self.checkpoint_record(record)?;
+            self.revalidate_record_identity(record)?;
+            let checked = self
+                .lock_transport()?
+                .run(&self.config.repository, &handle)
                 .map_err(transport_failure)?;
-            record.cancellation_dispatched = true;
+            ensure_same_run_attempt(record.run_snapshot.as_ref(), &checked)?;
+            record.run_snapshot = Some(checked.clone());
+            snapshot = checked;
+            if !snapshot.status().is_terminal() {
+                self.revalidate_record_identity(record)?;
+                // GitHub exposes no attempt-conditioned cancellation endpoint. The provider owns
+                // and cancels the immutable run ID across every attempt after this exact GET.
+                self.lock_transport()?
+                    .cancel_run(&self.config.repository, handle.id())
+                    .map_err(transport_failure)?;
+                record.cancellation_dispatched = true;
+                self.checkpoint_record(record)?;
+            }
         }
 
         match snapshot.status() {
@@ -1757,6 +10807,7 @@ where
             }
             RunStatus::Completed => self.finish_from_snapshot(record, &snapshot)?,
         }
+        self.checkpoint_record(record)?;
         cancellation.check()
     }
 
@@ -1764,7 +10815,10 @@ where
         &self,
         record: &mut JobRecord,
         snapshot: &RunSnapshot,
-    ) -> RemoteBuildResult<()> {
+    ) -> RemoteBuildResult<()>
+    where
+        R: GhRunner,
+    {
         match snapshot.conclusion() {
             Some(RunConclusion::Cancelled) => {
                 ensure_running_or_cancelling(record)?;
@@ -1810,11 +10864,16 @@ where
         }
     }
 
-    fn finish_success(&self, record: &mut JobRecord) -> RemoteBuildResult<()> {
+    #[allow(clippy::too_many_lines)]
+    fn finish_success(&self, record: &mut JobRecord) -> RemoteBuildResult<()>
+    where
+        R: GhRunner,
+    {
         if record.state == JobState::Queued {
             transition_record(record, JobState::Running)?;
         }
-        let supports_listing = self.lock_artifacts()?.supports_listing();
+        let mut artifacts = self.lock_artifacts()?;
+        let supports_listing = artifacts.supports_listing();
         if !supports_listing {
             if !record.verification_pending_event {
                 append_event(
@@ -1835,6 +10894,16 @@ where
             }
             return Ok(());
         }
+        if artifacts.supports_signed_cleanup_evidence()
+            && (record.principal.is_none() || record.execution_repository_id.is_none())
+        {
+            drop(artifacts);
+            let (principal, repository_id) = self.current_resume_identity()?;
+            record.principal = Some(principal);
+            record.execution_repository_id = Some(repository_id);
+            artifacts = self.lock_artifacts()?;
+        }
+        self.revalidate_record_identity(record)?;
         let context = Self::artifact_context(record, &self.config).ok_or_else(|| {
             provider_failure(
                 "run_identity_unavailable",
@@ -1842,11 +10911,58 @@ where
                 true,
             )
         })?;
-        let manifests = self.lock_artifacts()?.list_verified(&context)?;
+        let manifests = artifacts.list_verified(&context)?;
         if manifests.is_empty() {
             return Ok(());
         }
+        let verified_evidence = artifacts.verified_run_evidence(&context)?.ok_or_else(|| {
+            provider_failure(
+                "verified_run_evidence_missing",
+                "verified artifacts lack independently retained compile evidence",
+                false,
+            )
+        })?;
+        drop(artifacts);
         validate_manifests(record, &self.config, &manifests)?;
+        validate_github_compile_phase_evidence(
+            verified_evidence.compile_evidence(),
+            &record.request,
+            &record.job_id,
+        )?;
+        let signed_cleanup_evidence = verified_evidence.signed_cleanup_evidence().cloned();
+        match record.request.signing.mode {
+            SigningMode::ManualDevelopment if signed_cleanup_evidence.is_none() => {
+                return Err(provider_failure(
+                    "signed_cleanup_evidence_missing",
+                    "signed artifacts lack attempt-scoped protected-cleanup evidence",
+                    false,
+                ));
+            }
+            SigningMode::UnsignedCompileOnly if signed_cleanup_evidence.is_some() => {
+                return Err(provider_failure(
+                    "signed_cleanup_evidence_unexpected",
+                    "unsigned artifacts cannot carry signed-cleanup evidence",
+                    false,
+                ));
+            }
+            _ => {}
+        }
+        let mut candidate = record.clone();
+        candidate.manifests.clone_from(&manifests);
+        candidate.compile_evidence = Some(verified_evidence.compile_evidence().clone());
+        candidate.signed_cleanup_evidence = signed_cleanup_evidence;
+        if let Some(evidence) = candidate.signed_cleanup_evidence.as_ref() {
+            let principal = candidate
+                .principal
+                .clone()
+                .ok_or_else(|| resume_failure("checkpoint_principal_unavailable"))?;
+            let repository_id = candidate
+                .execution_repository_id
+                .ok_or_else(|| resume_failure("checkpoint_repository_identity_unavailable"))?;
+            let resume =
+                GithubJobResumeV1::from_record(&self.config, principal, repository_id, &candidate)?;
+            evidence.validate_for_resume(&resume)?;
+        }
         for manifest in &manifests {
             append_event(
                 record,
@@ -1857,7 +10973,9 @@ where
                 },
             )?;
         }
-        record.manifests.clone_from(&manifests);
+        record.manifests = candidate.manifests;
+        record.compile_evidence = candidate.compile_evidence;
+        record.signed_cleanup_evidence = candidate.signed_cleanup_evidence;
         transition_record(record, JobState::Succeeded)?;
         let result = IosDeviceBuildResult {
             protocol_version: CURRENT_PROTOCOL_VERSION,
@@ -1879,6 +10997,57 @@ where
                 error: None,
             },
         )
+    }
+}
+
+#[cfg(feature = "secure-job-log-http")]
+impl<P, A, C> GithubBuildProvider<GhProcessRunner, P, A, C>
+where
+    P: TemporaryRefPublisher,
+    A: VerifiedArtifactStore,
+    C: ProviderClock,
+{
+    /// Live-revalidate one restored job, then fetch its exact terminal attempt's sanitized logs.
+    ///
+    /// Active or unmapped attempts return `None`. A successful poll contains only bounded,
+    /// sanitized projections; raw bodies, redirect URLs, and credentials never cross this API.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed identity, checkpoint, authentication, transport, redirect, parsing, or
+    /// resource-bound failure.
+    pub fn fetch_restored_job_logs(
+        &self,
+        job_id: &str,
+        cancellation: &CancellationToken,
+    ) -> RemoteBuildResult<Option<GithubJobLogPoll>> {
+        self.revalidate_restored_job_live(job_id, cancellation)?;
+        let identity = {
+            let state = self.lock_state()?;
+            let record = state
+                .jobs
+                .get(job_id)
+                .ok_or_else(|| job_not_found(job_id))?;
+            let Some(snapshot) = record.run_snapshot.as_ref() else {
+                return Ok(None);
+            };
+            if !snapshot.status().is_terminal() || snapshot.conclusion().is_none() {
+                return Ok(None);
+            }
+            crate::job_logs::GithubRunAttemptLogIdentity::from_terminal_run(
+                self.config.repository.clone(),
+                snapshot,
+            )
+            .map_err(|_| job_log_identity_failure())?
+        };
+        let runner = { self.lock_transport()?.runner().clone() };
+        let client = runner
+            .job_log_http_client()
+            .map_err(job_log_client_failure)?;
+        GithubJobLogFetcher::new(client, GithubJobLogLimits::secure_defaults())
+            .fetch_attempt(&identity, cancellation)
+            .map(Some)
+            .map_err(job_log_fetch_failure)
     }
 }
 
@@ -1926,59 +11095,54 @@ where
             validate_provider_identifier("operation_id", &request.operation_id)?;
 
             let mut checks = Vec::new();
-            match self.lock_transport()?.authenticate(&self.config.repository) {
-                Ok(principal) => checks.push(ProviderCheck {
-                    code: "github.authentication".to_owned(),
-                    status: ProviderCheckStatus::Ready,
-                    message: principal.user_login().map_or_else(
-                        || "Repository-scoped GitHub credential is available".to_owned(),
-                        |login| format!("Authenticated GitHub account `{login}` is available"),
-                    ),
-                    help: None,
-                }),
-                Err(error) => checks.push(ProviderCheck {
-                    code: "github.authentication".to_owned(),
-                    status: ProviderCheckStatus::Error,
-                    message: transport_public_message(error),
-                    help: Some("Authenticate the configured GitHub transport and retry".to_owned()),
-                }),
-            }
+            let authenticated = self
+                .lock_transport()?
+                .authenticate(&self.config.repository);
             cancellation.check()?;
 
-            let execution_private = match self.lock_transport()?.repository(&self.config.repository)
-            {
-                Ok(repository) if repository.is_archived() || repository.is_disabled() => {
-                    checks.push(ProviderCheck {
-                        code: "github.repository".to_owned(),
-                        status: ProviderCheckStatus::Error,
-                        message: "Configured GitHub repository cannot run new builds".to_owned(),
-                        help: Some("Use an active, non-archived repository".to_owned()),
-                    });
-                    Some(repository.is_private())
-                }
-                Ok(repository) if request.require_signing && !repository.is_private() => {
-                    checks.push(ProviderCheck {
-                        code: "github.signing_repository_visibility".to_owned(),
-                        status: ProviderCheckStatus::Error,
-                        message: "Signed artifacts require a private GitHub execution repository"
-                            .to_owned(),
-                        help: Some(
-                            "Configure a private signing repository so embedded provisioning metadata is not published to public readers"
-                            .to_owned(),
-                        ),
-                    });
-                    Some(false)
-                }
+            let execution_info = match self.lock_transport()?.repository(&self.config.repository) {
                 Ok(repository) => {
-                    let private = repository.is_private();
-                    checks.push(ProviderCheck {
-                        code: "github.repository".to_owned(),
-                        status: ProviderCheckStatus::Ready,
-                        message: "Exact configured GitHub execution repository is available"
-                            .to_owned(),
-                        help: None,
+                    checks.push(if repository.is_archived() || repository.is_disabled() {
+                        ProviderCheck {
+                            code: "github.repository".to_owned(),
+                            status: ProviderCheckStatus::Error,
+                            message: "Configured GitHub repository cannot run new builds"
+                                .to_owned(),
+                            help: Some("Use an active, non-archived repository".to_owned()),
+                        }
+                    } else {
+                        ProviderCheck {
+                            code: "github.repository".to_owned(),
+                            status: ProviderCheckStatus::Ready,
+                            message: "Exact configured GitHub execution repository is available"
+                                .to_owned(),
+                            help: None,
+                        }
                     });
-                    Some(private)
+                    if request.require_signing {
+                        checks.push(if repository.is_private() {
+                            ProviderCheck {
+                                code: "github.signing_repository_visibility".to_owned(),
+                                status: ProviderCheckStatus::Ready,
+                                message: "Exact GitHub signing execution repository is private"
+                                    .to_owned(),
+                                help: None,
+                            }
+                        } else {
+                            ProviderCheck {
+                                code: "github.signing_repository_visibility".to_owned(),
+                                status: ProviderCheckStatus::Error,
+                                message:
+                                    "Signed artifacts require a private GitHub execution repository"
+                                        .to_owned(),
+                                help: Some(
+                                    "Configure a private signing repository so embedded provisioning metadata is not published to public readers"
+                                        .to_owned(),
+                                ),
+                            }
+                        });
+                    }
+                    Some(repository)
                 }
                 Err(error) => {
                     checks.push(ProviderCheck {
@@ -1989,14 +11153,78 @@ where
                             "Check execution repository identity and token access".to_owned(),
                         ),
                     });
+                    if request.require_signing {
+                        checks.push(ProviderCheck {
+                            code: "github.signing_repository_visibility".to_owned(),
+                            status: ProviderCheckStatus::Error,
+                            message: "Private signing repository visibility could not be proven"
+                                .to_owned(),
+                            help: Some(
+                                "Grant repository metadata access and verify the private execution repository"
+                                    .to_owned(),
+                            ),
+                        });
+                    }
                     None
                 }
             };
+            let authentication_check = match (&authenticated, &execution_info) {
+                (Ok(AuthenticatedPrincipal::User(user)), _) => ProviderCheck {
+                    code: "github.authentication".to_owned(),
+                    status: ProviderCheckStatus::Ready,
+                    message: format!(
+                        "Authenticated GitHub account `{}` is available",
+                        user.login()
+                    ),
+                    help: None,
+                },
+                (
+                    Ok(AuthenticatedPrincipal::RepositoryCredential { .. }),
+                    _,
+                ) if self.config.workflow.run_trigger() != WorkflowRunTrigger::WorkflowDispatch => {
+                    ProviderCheck {
+                        code: "github.authentication".to_owned(),
+                        status: ProviderCheckStatus::Error,
+                        message: "Repository-scoped GitHub credentials require explicit workflow dispatch"
+                            .to_owned(),
+                        help: Some(
+                            "Use an authenticated user for Push or configure WorkflowDispatch"
+                                .to_owned(),
+                        ),
+                    }
+                }
+                (
+                    Ok(AuthenticatedPrincipal::RepositoryCredential { repository_id }),
+                    Some(repository),
+                ) if *repository_id == repository.id() => ProviderCheck {
+                    code: "github.authentication".to_owned(),
+                    status: ProviderCheckStatus::Ready,
+                    message: "Repository-scoped GitHub credential is bound to the exact execution repository"
+                        .to_owned(),
+                    help: None,
+                },
+                (Ok(AuthenticatedPrincipal::RepositoryCredential { .. }), _) => ProviderCheck {
+                    code: "github.authentication".to_owned(),
+                    status: ProviderCheckStatus::Error,
+                    message: "Repository-scoped GitHub credential identity could not be bound to the exact execution repository"
+                        .to_owned(),
+                    help: Some(
+                        "Grant the credential access to the exact execution repository".to_owned(),
+                    ),
+                },
+                (Err(error), _) => ProviderCheck {
+                    code: "github.authentication".to_owned(),
+                    status: ProviderCheckStatus::Error,
+                    message: transport_public_message(error.clone()),
+                    help: Some("Authenticate the configured GitHub transport and retry".to_owned()),
+                },
+            };
+            checks.insert(0, authentication_check);
             let execution_repository_url = repository_url(&self.config.repository);
-            let source_private =
+            let source_info =
                 if github_remote_matches(&self.config.source_repository, &execution_repository_url)
                 {
-                    execution_private
+                    execution_info.clone()
                 } else {
                     let source_repository = repository_from_url(&self.config.source_repository)
                         .ok_or_else(|| {
@@ -2007,7 +11235,7 @@ where
                             )
                         })?;
                     match self.lock_transport()?.repository(&source_repository) {
-                        Ok(repository) => Some(repository.is_private()),
+                        Ok(repository) => Some(repository),
                         Err(error) => {
                             checks.push(ProviderCheck {
                                 code: "github.source_repository".to_owned(),
@@ -2022,14 +11250,14 @@ where
                         }
                     }
                 };
-            match source_private {
-                Some(false) => checks.push(ProviderCheck {
+            match source_info.as_ref() {
+                Some(repository) if !repository.is_private() => checks.push(ProviderCheck {
                     code: "github.source_repository_visibility".to_owned(),
                     status: ProviderCheckStatus::Ready,
                     message: "Exact configured source repository is public".to_owned(),
                     help: None,
                 }),
-                Some(true) => checks.push(ProviderCheck {
+                Some(_) => checks.push(ProviderCheck {
                     code: "github.source_repository_visibility".to_owned(),
                     status: ProviderCheckStatus::Error,
                     message: "Trusted project source must be in a public GitHub repository"
@@ -2039,7 +11267,159 @@ where
                             .to_owned(),
                     ),
                 }),
-                None => {}
+                None => checks.push(ProviderCheck {
+                    code: "github.source_repository_visibility".to_owned(),
+                    status: ProviderCheckStatus::Error,
+                    message: "Public source repository visibility could not be proven".to_owned(),
+                    help: Some(
+                        "Grant repository metadata access and verify the public source repository"
+                            .to_owned(),
+                    ),
+                }),
+            }
+            if request.require_signing {
+                checks.push(match (&source_info, &execution_info) {
+                    (Some(source), Some(execution)) if source.id() != execution.id() => {
+                        ProviderCheck {
+                            code: "github.signing_repository_distinct".to_owned(),
+                            status: ProviderCheckStatus::Ready,
+                            message: "Public source and private signing execution use distinct GitHub repositories"
+                                .to_owned(),
+                            help: None,
+                        }
+                    }
+                    (Some(_), Some(_)) => ProviderCheck {
+                        code: "github.signing_repository_distinct".to_owned(),
+                        status: ProviderCheckStatus::Error,
+                        message: "Signed builds require distinct source and execution repositories"
+                            .to_owned(),
+                        help: Some(
+                            "Keep project source public and configure a separate private signing execution repository"
+                                .to_owned(),
+                        ),
+                    },
+                    _ => ProviderCheck {
+                        code: "github.signing_repository_distinct".to_owned(),
+                        status: ProviderCheckStatus::Error,
+                        message: "Distinct signing repository identity could not be proven"
+                            .to_owned(),
+                        help: Some(
+                            "Grant repository metadata access for both configured repositories"
+                                .to_owned(),
+                        ),
+                        },
+                });
+            }
+
+            if request.require_signing {
+                match self
+                    .lock_transport()?
+                    .actions_permissions(&self.config.repository)
+                {
+                    Ok(permissions) if permissions.enabled() => checks.push(ProviderCheck {
+                        code: "github.actions.enabled".to_owned(),
+                        status: ProviderCheckStatus::Ready,
+                        message: "GitHub Actions is enabled for the execution repository".to_owned(),
+                        help: None,
+                    }),
+                    Ok(_) => checks.push(ProviderCheck {
+                        code: "github.actions.enabled".to_owned(),
+                        status: ProviderCheckStatus::Error,
+                        message: "GitHub Actions is disabled for the execution repository".to_owned(),
+                        help: Some(
+                            "Enable GitHub Actions for the exact execution repository".to_owned(),
+                        ),
+                    }),
+                    Err(error) => checks.push(ProviderCheck {
+                        code: "github.actions.enabled".to_owned(),
+                        status: ProviderCheckStatus::Error,
+                        message: transport_public_message(error),
+                        help: Some(
+                            "Grant repository administration read access and verify GitHub Actions policy"
+                                .to_owned(),
+                        ),
+                    }),
+                }
+            }
+
+            if self.config.workflow.run_trigger() == WorkflowRunTrigger::WorkflowDispatch {
+                let default_branch_check = execution_info.as_ref().map_or_else(
+                    || ProviderCheck {
+                        code: "github.workflow_dispatch_default_branch".to_owned(),
+                        status: ProviderCheckStatus::Error,
+                        message: "Execution repository default branch could not be proven"
+                            .to_owned(),
+                        help: Some(
+                            "Grant repository metadata access and configure workflow dispatch on the exact default branch"
+                                .to_owned(),
+                        ),
+                    },
+                    |repository| {
+                        let expected = format!("refs/heads/{}", repository.default_branch().as_str());
+                        if self.config.workflow.trusted_source_ref().as_str() == expected {
+                            ProviderCheck {
+                                code: "github.workflow_dispatch_default_branch".to_owned(),
+                                status: ProviderCheckStatus::Ready,
+                                message: "Workflow dispatch is bound to the execution repository default branch"
+                                    .to_owned(),
+                                help: None,
+                            }
+                        } else {
+                            ProviderCheck {
+                                code: "github.workflow_dispatch_default_branch".to_owned(),
+                                status: ProviderCheckStatus::Error,
+                                message: "Workflow dispatch trusted ref is not the execution repository default branch"
+                                    .to_owned(),
+                                help: Some(
+                                    "Configure the exact execution repository default branch for workflow dispatch"
+                                        .to_owned(),
+                                ),
+                            }
+                        }
+                    },
+                );
+                checks.push(default_branch_check);
+                let workflow_path = self.config.workflow.filename().repository_path();
+                match self
+                    .lock_transport()?
+                    .workflow_registration(&self.config.repository, &workflow_path)
+                {
+                    Ok(_) => checks.push(ProviderCheck {
+                        code: "github.workflow_registration".to_owned(),
+                        status: ProviderCheckStatus::Ready,
+                        message: "Exact workflow_dispatch workflow is actively registered"
+                            .to_owned(),
+                        help: None,
+                    }),
+                    Err(error) => checks.push(ProviderCheck {
+                        code: "github.workflow_registration".to_owned(),
+                        status: ProviderCheckStatus::Error,
+                        message: transport_public_message(error),
+                        help: Some(
+                            "Register and enable the exact configured workflow on the execution repository's default branch"
+                                .to_owned(),
+                        ),
+                    }),
+                }
+                checks.push(match self.verify_execution_workflow_default() {
+                    Ok(()) => ProviderCheck {
+                        code: "github.workflow_dispatch_default_workflow".to_owned(),
+                        status: ProviderCheckStatus::Ready,
+                        message: "Exact WorkflowDispatch bytes are present on the execution repository default branch"
+                            .to_owned(),
+                        help: None,
+                    },
+                    Err(_) => ProviderCheck {
+                        code: "github.workflow_dispatch_default_workflow".to_owned(),
+                        status: ProviderCheckStatus::Error,
+                        message: "Exact WorkflowDispatch bytes could not be proven on the execution repository default branch"
+                            .to_owned(),
+                        help: Some(
+                            "Install the generated workflow unchanged on the exact execution default branch"
+                                .to_owned(),
+                        ),
+                    },
+                });
             }
             cancellation.check()?;
 
@@ -2047,15 +11427,29 @@ where
                 repository: &self.config.repository,
                 source_repository: &self.config.source_repository,
                 trusted_source_ref: self.config.workflow.trusted_source_ref(),
+                temporary_branch_namespace: self.config.workflow.temporary_branch_namespace(),
                 workflow_path: &self.config.workflow.filename().repository_path(),
                 workflow_fingerprint: &self.config.workflow_fingerprint,
             }) {
-                Ok(_) => checks.push(ProviderCheck {
-                    code: "github.trusted_source".to_owned(),
-                    status: ProviderCheckStatus::Ready,
-                    message: "Trusted ref contains the exact approved workflow bytes".to_owned(),
-                    help: None,
-                }),
+                Ok(_) => {
+                    checks.push(ProviderCheck {
+                        code: "github.trusted_source".to_owned(),
+                        status: ProviderCheckStatus::Ready,
+                        message: "Trusted ref contains the exact approved workflow bytes"
+                            .to_owned(),
+                        help: None,
+                    });
+                    checks.push(ProviderCheck {
+                        code: "github.temporary_ref_policy_unproven".to_owned(),
+                        status: ProviderCheckStatus::Warning,
+                        message: "Credentialed receive-pack is reachable; branch mutation policy is proven only by a durable build publication"
+                            .to_owned(),
+                        help: Some(
+                            "Run an authorized build to prove the configured temporary-ref policy"
+                                .to_owned(),
+                        ),
+                    });
+                }
                 Err(error) => checks.push(ProviderCheck {
                     code: "github.trusted_source".to_owned(),
                     status: ProviderCheckStatus::Error,
@@ -2084,7 +11478,28 @@ where
             if request.require_signing {
                 let mut transport = self.lock_transport()?;
                 append_signing_environment_checks(&mut checks, &mut transport, &self.config);
+                drop(transport);
                 cancellation.check()?;
+                checks.push(if self.lock_artifacts()?.supports_signed_cleanup_evidence() {
+                    ProviderCheck {
+                        code: "github.signing_cleanup_evidence".to_owned(),
+                        status: ProviderCheckStatus::Ready,
+                        message: "Independent verification retains attempt-scoped protected-cleanup evidence"
+                            .to_owned(),
+                        help: None,
+                    }
+                } else {
+                    ProviderCheck {
+                        code: "github.signing_cleanup_evidence".to_owned(),
+                        status: ProviderCheckStatus::Error,
+                        message: "Signed cleanup lacks attempt-scoped worker evidence that signing material was removed"
+                            .to_owned(),
+                        help: Some(
+                            "Configure the verified GitHub artifact store before signed builds"
+                                .to_owned(),
+                        ),
+                    }
+                });
             }
             if !self
                 .artifacts
@@ -2129,6 +11544,15 @@ where
         let result = (|| {
             cancellation.check()?;
             validate_submission(&self.config, &request)?;
+            if self.config.workflow.run_trigger() == WorkflowRunTrigger::WorkflowDispatch
+                && self.checkpoint_sink.is_none()
+            {
+                return Err(provider_failure(
+                    "workflow_dispatch_checkpoint_required",
+                    "Workflow dispatch requires a durable provider checkpoint sink",
+                    false,
+                ));
+            }
             let branch = BranchName::new(format!(
                 "{}/{}",
                 self.config.workflow.temporary_branch_namespace().as_str(),
@@ -2166,8 +11590,24 @@ where
                     )
                 })?;
             let job_id = request.operation_id.clone();
-            let reservation =
-                JobReservation::acquire(&self.state, job_id.clone(), self.config.max_jobs)?;
+            let reservation = JobReservation::acquire(
+                &self.state,
+                job_id.clone(),
+                self.config.max_jobs,
+                self.checkpoint_sink.is_none(),
+            )?;
+            let resume_identity = if self.checkpoint_sink.is_some() {
+                Some(self.current_resume_identity()?)
+            } else {
+                None
+            };
+            let mut workflow_dispatch_client =
+                if self.config.workflow.run_trigger() == WorkflowRunTrigger::WorkflowDispatch {
+                    self.preflight_workflow_dispatch_registration()?;
+                    Some(self.prepare_workflow_dispatch_client()?)
+                } else {
+                    None
+                };
             let created_at_ms = self.clock.now_ms();
             let workflow = generate_workflow(&self.config.workflow);
             let manifest =
@@ -2178,25 +11618,50 @@ where
             let discovery_deadline_ms =
                 created_at_ms.saturating_add(self.config.poll_policy.discovery_window_ms());
             let mut record = JobRecord {
+                principal: resume_identity
+                    .as_ref()
+                    .map(|(principal, _)| principal.clone()),
+                execution_repository_id: resume_identity
+                    .as_ref()
+                    .map(|(_, repository_id)| *repository_id),
                 operation_id: request.operation_id.clone(),
                 job_id: job_id.clone(),
                 source_revision: source_revision.clone(),
+                git_snapshot: None,
                 request: request.clone(),
                 request_sha256,
                 temporary_ref: temporary_ref.clone(),
+                prepared_dispatch_commit: None,
                 dispatch_commit: None,
+                workflow_dispatch: None,
                 created_at_ms,
+                publication_started_at_ms: 0,
+                publication_quiescence_deadline_ms: 0,
                 state: JobState::Created,
                 run: None,
                 run_snapshot: None,
+                publication_intent: false,
+                publication_absent: false,
+                publication_not_attempted: false,
+                publication_process_fenced: false,
+                publication_lease_scope_sha256: None,
+                publication_takeover_lease_owned: false,
+                snapshot_source_lease_owned: false,
+                publication_absence_observations: 0,
+                publication_absence_first_observed_at_ms: 0,
                 cancellation_requested: false,
                 cancellation_dispatched: false,
+                cleanup_requested: false,
+                remove_artifacts_requested: false,
+                artifacts_removed: false,
                 temporary_ref_deleted: false,
                 verification_pending_event: false,
                 publication_uncertain: false,
                 run_discovery_attempts: 0,
                 run_discovery_deadline_ms: discovery_deadline_ms,
                 manifests: Vec::new(),
+                compile_evidence: None,
+                signed_cleanup_evidence: None,
                 events: Vec::new(),
             };
             append_event(
@@ -2215,7 +11680,7 @@ where
                     state: JobState::Created,
                 },
             )?;
-            let pending = reservation.insert_pending(record)?;
+            let mut pending = reservation.insert_pending(record)?;
             if request.signing.mode == SigningMode::ManualDevelopment {
                 let source_repository = repository_from_url(&self.config.source_repository)
                     .ok_or_else(|| {
@@ -2285,11 +11750,12 @@ where
                 }
                 cancellation.check()?;
             }
-            let publish_result = self.lock_publisher()?.publish(&TemporaryRefPublishRequest {
+            let publish_request = TemporaryRefPublishRequest {
                 repository: &self.config.repository,
                 source_repository: &self.config.source_repository,
                 trusted_source_ref: self.config.workflow.trusted_source_ref(),
                 source_revision: &source_revision,
+                snapshot_source_ref: None,
                 temporary_ref: &temporary_ref,
                 workflow_path: workflow.path(),
                 workflow_bytes: workflow.yaml().as_bytes(),
@@ -2298,16 +11764,182 @@ where
                 operation_id: &request.operation_id,
                 created_at_ms,
                 authorized: self.config.mutation_authorization.publish_temporary_ref,
-            });
+            };
+            let prepared = {
+                let mut publisher = self.lock_publisher()?;
+                let prepared = publisher
+                    .prepare(&publish_request)
+                    .map_err(publisher_failure)?;
+                if prepared
+                    .as_ref()
+                    .is_some_and(|publication| publication.temporary_ref() != &temporary_ref)
+                {
+                    return Err(publisher_failure(
+                        TemporaryRefPublishError::PublicationVerificationFailed,
+                    ));
+                }
+                prepared
+            };
+            let (
+                publication_process_fenced,
+                publication_lease_scope_sha256,
+                publication_lease_owned,
+            ) = {
+                let mut publisher = self.lock_publisher()?;
+                let lease_request = TemporaryRefPublicationLeaseRequest {
+                    repository: &self.config.repository,
+                    operation_id: &request.operation_id,
+                    temporary_ref: &temporary_ref,
+                };
+                let lease = publisher
+                    .acquire_publication_lease(&lease_request)
+                    .map_err(publisher_failure)?;
+                match lease {
+                    TemporaryRefPublicationLease::Acquired => {
+                        let scope = publisher
+                            .publication_lease_scope_sha256()
+                            .filter(|scope| is_lower_sha256(scope))
+                            .map(str::to_owned);
+                        let Some(scope) = scope else {
+                            publisher.release_publication_lease(&lease_request);
+                            return Err(publisher_failure(
+                                TemporaryRefPublishError::LocalIsolationFailed,
+                            ));
+                        };
+                        (
+                            publisher.publication_attempt_is_process_fenced(),
+                            Some(scope),
+                            true,
+                        )
+                    }
+                    TemporaryRefPublicationLease::Unsupported => (false, None, false),
+                    TemporaryRefPublicationLease::AlreadyOwned
+                    | TemporaryRefPublicationLease::HeldByOther => {
+                        return Err(provider_failure(
+                            "publication_owner_active",
+                            "Another live provider owns temporary-ref publication",
+                            true,
+                        ));
+                    }
+                }
+            };
+            let mut state = self.lock_state()?;
+            let record = state.jobs.get_mut(&job_id).ok_or_else(|| {
+                provider_failure(
+                    "pending_job_lost",
+                    "pending GitHub job disappeared before publication",
+                    false,
+                )
+            })?;
+            record.prepared_dispatch_commit = prepared
+                .as_ref()
+                .map(|publication| publication.commit().clone());
+            record.publication_started_at_ms = 0;
+            record.publication_quiescence_deadline_ms = u64::MAX;
+            record.publication_intent = true;
+            record.publication_process_fenced = publication_process_fenced;
+            record.publication_lease_scope_sha256 = publication_lease_scope_sha256;
+            record.publication_takeover_lease_owned = publication_lease_owned;
+            if self.checkpoint_sink.is_some() {
+                pending.retain();
+            }
+            self.checkpoint_record(record)?;
+            let prepared_dispatch_commit = record.prepared_dispatch_commit.clone();
+            drop(state);
+            let publication_identity = self.current_resume_identity();
+            let boundary_cancellation = cancellation.check();
+            let mut state = self.lock_state()?;
+            let record = state.jobs.get_mut(&job_id).ok_or_else(|| {
+                provider_failure(
+                    "pending_job_lost",
+                    "pending GitHub job disappeared before publication",
+                    false,
+                )
+            })?;
+            let publication_boundary = publication_identity
+                .and_then(|identity| boundary_cancellation.map(|()| identity))
+                .and_then(|identity| Self::validate_record_identity(record, &identity))
+                .and_then(|()| {
+                    if record.prepared_dispatch_commit != prepared_dispatch_commit
+                        || !record.publication_intent
+                        || record.publication_uncertain
+                        || record.dispatch_commit.is_some()
+                    {
+                        return Err(resume_failure("publication_identity_changed_before_push"));
+                    }
+                    if record.cancellation_requested {
+                        return Err(provider_failure(
+                            "publication_cancelled_before_mutation",
+                            "GitHub publication was cancelled before any remote ref mutation",
+                            false,
+                        ));
+                    }
+                    Ok(())
+                });
+            if let Err(error) = publication_boundary {
+                mark_publication_not_attempted(
+                    record,
+                    self.clock.now_ms(),
+                    "publication_identity_revalidation_failed",
+                    "GitHub identity changed before temporary-ref publication began",
+                    true,
+                )?;
+                self.checkpoint_record(record)?;
+                let release_publication_lease = record.publication_takeover_lease_owned;
+                record.publication_takeover_lease_owned = false;
+                drop(state);
+                if release_publication_lease {
+                    self.lock_publisher()?.release_publication_lease(
+                        &TemporaryRefPublicationLeaseRequest {
+                            repository: &self.config.repository,
+                            operation_id: &request.operation_id,
+                            temporary_ref: &temporary_ref,
+                        },
+                    );
+                }
+                return Err(error);
+            }
+            record.publication_started_at_ms = self.clock.now_ms();
+            record.publication_quiescence_deadline_ms =
+                publication_quiescence_deadline(record.publication_started_at_ms, 0);
+            self.checkpoint_record(record)?;
+            drop(state);
+            let publish_result = self
+                .lock_publisher()?
+                .publish_prepared(&publish_request, prepared.as_ref());
             let (published, publication_uncertain) = match publish_result {
                 Ok(published) => (published, false),
-                Err(failure) => match failure.possible_publication().cloned() {
-                    Some(publication) => (publication, true),
-                    None => return Err(publisher_failure(failure.error())),
-                },
+                Err(failure) => {
+                    if let Some(publication) = failure.possible_publication().cloned() {
+                        (publication, true)
+                    } else {
+                        let error = publisher_failure(failure.error());
+                        let mut state = self.lock_state()?;
+                        let record = state.jobs.get_mut(&job_id).ok_or_else(|| {
+                            provider_failure(
+                                "pending_job_lost",
+                                "pending GitHub job disappeared after publication failure",
+                                false,
+                            )
+                        })?;
+                        mark_publication_not_attempted(
+                            record,
+                            self.clock.now_ms(),
+                            "temporary_ref_publication_not_attempted",
+                            "Temporary-ref publication failed before any remote mutation",
+                            false,
+                        )?;
+                        self.checkpoint_record(record)?;
+                        self.release_record_publication_lease(record)?;
+                        return Err(error);
+                    }
+                }
             };
             pending.retain();
-            let publisher_identity_mismatch = published.temporary_ref() != &temporary_ref;
+            let publisher_binding_mismatch = published.temporary_ref() != &temporary_ref
+                || prepared
+                    .as_ref()
+                    .is_some_and(|expected| expected.commit() != published.commit());
             let mut state = self.lock_state()?;
             let record = state.jobs.get_mut(&job_id).ok_or_else(|| {
                 provider_failure(
@@ -2316,9 +11948,11 @@ where
                     false,
                 )
             })?;
-            record.dispatch_commit = Some(published.commit().clone());
-            record.publication_uncertain = publication_uncertain || publisher_identity_mismatch;
-            if publisher_identity_mismatch {
+            record.dispatch_commit = (!publisher_binding_mismatch && !publication_uncertain)
+                .then(|| published.commit().clone());
+            record.publication_uncertain = publication_uncertain || publisher_binding_mismatch;
+            self.checkpoint_record(record)?;
+            if publisher_binding_mismatch {
                 transition_record(record, JobState::Failed)?;
                 append_event(
                     record,
@@ -2326,18 +11960,20 @@ where
                     "cleanup",
                     RemoteBuildEventKind::Warning {
                         code: "github.cleanup_required".to_owned(),
-                        message: "Temporary-ref publisher returned a different ref; exact cleanup ownership was retained"
+                        message: "Temporary-ref publisher violated its prepared ref/commit binding; automatic adoption was refused"
                             .to_owned(),
-                        help: Some("Run provider cleanup for this exact failed job".to_owned()),
+                        help: Some("Inspect the alternate publisher and remote ref manually".to_owned()),
                     },
                 )?;
                 append_failed(
                     record,
                     self.clock.now_ms(),
-                    "publisher_identity_mismatch",
-                    "Temporary-ref publisher returned a different ref after possible mutation",
+                    "publisher_binding_mismatch",
+                    "Temporary-ref publisher returned a different ref or commit after possible mutation",
                     false,
                 )?;
+                self.checkpoint_record(record)?;
+                self.release_record_publication_lease(record)?;
                 return Ok(JobHandle {
                     job_id,
                     state: JobState::Failed,
@@ -2360,20 +11996,46 @@ where
                     },
                 )?;
             }
-            if record.state == JobState::Created {
-                transition_record(record, JobState::Queued)?;
+            if !record.publication_uncertain
+                && self.config.workflow.run_trigger() == WorkflowRunTrigger::Push
+            {
+                if record.state == JobState::Created {
+                    transition_record(record, JobState::Queued)?;
+                }
+                append_event(
+                    record,
+                    created_at_ms,
+                    "queue",
+                    RemoteBuildEventKind::JobQueued { position: None },
+                )?;
             }
-            append_event(
-                record,
-                created_at_ms,
-                "queue",
-                RemoteBuildEventKind::JobQueued { position: None },
-            )?;
             record.cancellation_requested |= cancellation.is_cancelled();
             if record.cancellation_requested && record.state != JobState::Cancelling {
                 transition_record(record, JobState::Cancelling)?;
             }
-            let returned_state = record.state;
+            self.checkpoint_record(record)?;
+            if !record.publication_uncertain {
+                self.release_record_publication_lease(record)?;
+            }
+            let start_dispatch = !record.publication_uncertain
+                && self.config.workflow.run_trigger() == WorkflowRunTrigger::WorkflowDispatch;
+            drop(state);
+            if start_dispatch {
+                let client = workflow_dispatch_client.as_deref_mut().ok_or_else(|| {
+                    provider_failure(
+                        "workflow_dispatch_client_unavailable",
+                        "Preflighted workflow dispatch client is unavailable",
+                        true,
+                    )
+                })?;
+                self.start_workflow_dispatch_with_client(&job_id, client, &cancellation)?;
+            }
+            let returned_state = self
+                .lock_state()?
+                .jobs
+                .get(&job_id)
+                .ok_or_else(|| job_not_found(&job_id))?
+                .state;
             Ok(JobHandle {
                 job_id,
                 state: returned_state,
@@ -2432,12 +12094,66 @@ where
             if !self.config.mutation_authorization.cancel_run {
                 return Err(unsupported(ProviderFeature::Cancellation));
             }
+            if self.config.workflow.run_trigger() == WorkflowRunTrigger::WorkflowDispatch {
+                let accepted = {
+                    let mut state = self.lock_state()?;
+                    let record = state
+                        .jobs
+                        .get_mut(&request.job_id)
+                        .ok_or_else(|| job_not_found(&request.job_id))?;
+                    if !record.publication_intent {
+                        return Err(provider_failure(
+                            "job_submission_pending",
+                            "GitHub job has not reached its durable publication boundary",
+                            true,
+                        ));
+                    }
+                    if record.state.is_build_terminal() || record.state.is_terminal() {
+                        self.checkpoint_record(record)?;
+                        return Ok(CancellationAck {
+                            job_id: record.job_id.clone(),
+                            accepted: false,
+                            state: record.state,
+                        });
+                    }
+                    let accepted = !record.cancellation_requested;
+                    record.cancellation_requested = true;
+                    if record.state != JobState::Cancelling {
+                        transition_record(record, JobState::Cancelling)?;
+                    }
+                    self.checkpoint_record(record)?;
+                    accepted
+                };
+                self.sync_job_with_cancel_policy(
+                    &request.job_id,
+                    &CancellationToken::new(),
+                    true,
+                )?;
+                let state = self.lock_state()?;
+                let record = state
+                    .jobs
+                    .get(&request.job_id)
+                    .ok_or_else(|| job_not_found(&request.job_id))?;
+                return Ok(CancellationAck {
+                    job_id: record.job_id.clone(),
+                    accepted,
+                    state: record.state,
+                });
+            }
             let mut state = self.lock_state()?;
             let record = state
                 .jobs
                 .get_mut(&request.job_id)
                 .ok_or_else(|| job_not_found(&request.job_id))?;
+            if !record.publication_intent {
+                return Err(provider_failure(
+                    "job_submission_pending",
+                    "GitHub job has not reached its durable publication boundary",
+                    true,
+                ));
+            }
             if record.state.is_build_terminal() || record.state.is_terminal() {
+                self.checkpoint_record(record)?;
                 return Ok(CancellationAck {
                     job_id: record.job_id.clone(),
                     accepted: false,
@@ -2449,14 +12165,42 @@ where
             if record.state != JobState::Cancelling {
                 transition_record(record, JobState::Cancelling)?;
             }
-            if let Some(handle) = &record.run
+            self.checkpoint_record(record)?;
+            if let Some(handle) = record.run.clone()
                 && !record.cancellation_dispatched
             {
-                self.lock_transport()?
-                    .cancel_run(&self.config.repository, handle.id())
+                self.revalidate_record_identity(record)?;
+                let snapshot = self
+                    .lock_transport()?
+                    .run(&self.config.repository, &handle)
                     .map_err(transport_failure)?;
-                record.cancellation_dispatched = true;
+                ensure_same_run_attempt(record.run_snapshot.as_ref(), &snapshot)?;
+                record.run_snapshot = Some(snapshot.clone());
+                if snapshot.status().is_terminal() {
+                    self.finish_from_snapshot(record, &snapshot)?;
+                } else {
+                    self.checkpoint_record(record)?;
+                    let checked = self
+                        .lock_transport()?
+                        .run(&self.config.repository, &handle)
+                        .map_err(transport_failure)?;
+                    ensure_same_run_attempt(record.run_snapshot.as_ref(), &checked)?;
+                    record.run_snapshot = Some(checked.clone());
+                    if checked.status().is_terminal() {
+                        self.finish_from_snapshot(record, &checked)?;
+                    } else {
+                        self.revalidate_record_identity(record)?;
+                        // GitHub cancellation is run-ID-wide; the exact GET above rejects drift
+                        // before POST but cannot turn the endpoint into an attempt lease.
+                        self.lock_transport()?
+                            .cancel_run(&self.config.repository, handle.id())
+                            .map_err(transport_failure)?;
+                        record.cancellation_dispatched = true;
+                        self.checkpoint_record(record)?;
+                    }
+                }
             }
+            self.checkpoint_record(record)?;
             Ok(CancellationAck {
                 job_id: record.job_id.clone(),
                 accepted,
@@ -2565,7 +12309,7 @@ where
                 .run_snapshot
                 .as_ref()
                 .is_some_and(|snapshot| snapshot.status().is_terminal());
-            if !record.state.is_build_terminal() && terminal_run {
+            if !record.state.is_build_terminal() && !record.state.is_terminal() && terminal_run {
                 ensure_running_or_cancelling(record)?;
                 transition_record(record, JobState::Failed)?;
                 append_failed(
@@ -2585,16 +12329,26 @@ where
                     true,
                 ));
             }
-            if matches!(record.state, JobState::Cleaned | JobState::CleanupFailed) {
+            let signed_cleanup_proven = self.has_valid_signed_cleanup_evidence(record)?;
+            if record.state == JobState::Cleaned {
+                self.checkpoint_record(record)?;
                 return Err(provider_failure(
                     "cleanup_already_attempted",
                     "GitHub job cleanup was already attempted",
                     false,
                 ));
             }
-            let context = Self::artifact_context(record, &self.config);
-            if request.remove_artifacts {
-                let context = context.as_ref().ok_or_else(|| {
+            if record.cleanup_requested
+                && record.remove_artifacts_requested != request.remove_artifacts
+            {
+                return Err(provider_failure(
+                    "cleanup_resume_request_mismatch",
+                    "cleanup retry differs from its durable artifact-removal intent",
+                    false,
+                ));
+            }
+            if request.remove_artifacts && !record.artifacts_removed {
+                Self::artifact_context(record, &self.config).ok_or_else(|| {
                     provider_failure(
                         "artifact_identity_unavailable",
                         "exact run identity is unavailable for artifact removal",
@@ -2608,9 +12362,78 @@ where
                         false,
                     ));
                 }
-                self.lock_artifacts()?.remove_artifacts(context)?;
             }
-            if !record.temporary_ref_deleted {
+            if let Some(handle) = record.run.clone() {
+                self.revalidate_record_identity(record)?;
+                let snapshot = self
+                    .lock_transport()?
+                    .run(&self.config.repository, &handle)
+                    .map_err(transport_failure)?;
+                match ensure_same_run_attempt(record.run_snapshot.as_ref(), &snapshot) {
+                    Ok(()) => {
+                        self.revalidate_record_identity(record)?;
+                        if !snapshot.status().is_terminal() {
+                            return Err(resume_failure("cleanup_live_run_not_terminal"));
+                        }
+                        record.run_snapshot = Some(snapshot);
+                    }
+                    Err(_)
+                        if signed_cleanup_proven
+                            && record.run_snapshot.as_ref().is_some_and(|previous| {
+                                github_run_is_later_attempt(previous, &snapshot)
+                            }) =>
+                    {
+                        self.revalidate_record_identity(record)?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            let context = Self::artifact_context(record, &self.config);
+            record.cleanup_requested = true;
+            record.remove_artifacts_requested = request.remove_artifacts;
+            self.checkpoint_record(record)?;
+            if let Some(handle) = record.run.clone() {
+                let snapshot = self
+                    .lock_transport()?
+                    .run(&self.config.repository, &handle)
+                    .map_err(transport_failure)?;
+                match ensure_same_run_attempt(record.run_snapshot.as_ref(), &snapshot) {
+                    Ok(()) => {
+                        self.revalidate_record_identity(record)?;
+                        if !snapshot.status().is_terminal() {
+                            return Err(resume_failure("cleanup_live_run_not_terminal"));
+                        }
+                        record.run_snapshot = Some(snapshot);
+                    }
+                    Err(_)
+                        if signed_cleanup_proven
+                            && record.run_snapshot.as_ref().is_some_and(|previous| {
+                                github_run_is_later_attempt(previous, &snapshot)
+                            }) =>
+                    {
+                        self.revalidate_record_identity(record)?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if record.remove_artifacts_requested && !record.artifacts_removed {
+                let context = context.as_ref().ok_or_else(|| {
+                    provider_failure(
+                        "artifact_identity_unavailable",
+                        "exact run identity is unavailable for artifact removal",
+                        false,
+                    )
+                })?;
+                self.revalidate_record_identity(record)?;
+                self.lock_artifacts()?.remove_artifacts(context)?;
+                record.artifacts_removed = true;
+                self.checkpoint_record(record)?;
+            }
+            self.cleanup_git_snapshot_source(record)?;
+            if record.publication_intent
+                && !record.temporary_ref_deleted
+                && !record.publication_not_attempted
+            {
                 let expected_commit = record.dispatch_commit.as_ref().ok_or_else(|| {
                     provider_failure(
                         "dispatch_commit_unavailable",
@@ -2618,6 +12441,7 @@ where
                         false,
                     )
                 })?;
+                self.revalidate_record_identity(record)?;
                 self.lock_publisher()?
                     .delete_temporary_ref(&TemporaryRefDeleteRequest {
                         repository: &self.config.repository,
@@ -2628,6 +12452,41 @@ where
                     })
                     .map_err(publisher_failure)?;
                 record.temporary_ref_deleted = true;
+                self.checkpoint_record(record)?;
+            }
+            if let Some(handle) = record.run.clone() {
+                let snapshot = self
+                    .lock_transport()?
+                    .run(&self.config.repository, &handle)
+                    .map_err(transport_failure)?;
+                match ensure_same_run_attempt(record.run_snapshot.as_ref(), &snapshot) {
+                    Ok(()) => {
+                        self.revalidate_record_identity(record)?;
+                        if !snapshot.status().is_terminal() {
+                            return Err(provider_failure(
+                                "cleanup_run_reactivated_after_mutation",
+                                "GitHub run became active during cleanup",
+                                true,
+                            ));
+                        }
+                        record.run_snapshot = Some(snapshot);
+                    }
+                    Err(_)
+                        if signed_cleanup_proven
+                            && record.run_snapshot.as_ref().is_some_and(|previous| {
+                                github_run_is_later_attempt(previous, &snapshot)
+                            }) =>
+                    {
+                        self.revalidate_record_identity(record)?;
+                    }
+                    Err(_) => {
+                        return Err(provider_failure(
+                            "cleanup_run_changed_after_mutation",
+                            "GitHub run attempt changed during cleanup",
+                            true,
+                        ));
+                    }
+                }
             }
             transition_record(record, JobState::Cleaning)?;
             append_event(
@@ -2641,11 +12500,9 @@ where
                 .run_snapshot
                 .as_ref()
                 .is_some_and(|snapshot| snapshot.status().is_terminal());
-            let signing_material_removed = record
-                .run_snapshot
-                .as_ref()
-                .and_then(RunSnapshot::conclusion)
-                == Some(RunConclusion::Success);
+            let signing_material_removed = record.request.signing.mode
+                == SigningMode::UnsignedCompileOnly
+                || signed_cleanup_proven;
             let confirmation = CleanupConfirmation {
                 job_id: record.job_id.clone(),
                 completed_at_ms: self.clock.now_ms(),
@@ -2667,6 +12524,7 @@ where
                     confirmation: confirmation.clone(),
                 },
             )?;
+            self.checkpoint_record(record)?;
             Ok(confirmation)
         })();
         Box::pin(async move { result })
@@ -2676,9 +12534,21 @@ where
 fn provider_capabilities(
     config: &GithubProviderConfig,
     artifacts: &impl VerifiedArtifactStore,
+    snapshot_publisher_supported: bool,
 ) -> ProviderCapabilities {
+    let mut source_modes = BTreeSet::from([SourceMode::Git]);
+    let authorization = config.mutation_authorization;
+    if snapshot_publisher_supported
+        && authorization.publish_temporary_ref
+        && authorization.delete_temporary_ref
+        && authorization.publish_git_snapshot_source
+        && authorization.delete_git_snapshot_source
+        && authorization.manage_git_snapshot_keepalive
+    {
+        source_modes.insert(SourceMode::GitSnapshot);
+    }
     ProviderCapabilities {
-        source_modes: BTreeSet::from([SourceMode::Git]),
+        source_modes,
         ios_device_build: true,
         ios_simulator_build: false,
         signing_modes: BTreeSet::from([
@@ -2691,6 +12561,8 @@ fn provider_capabilities(
         cancellation: config.mutation_authorization.cancel_run,
         artifact_types: BTreeSet::from([
             IosArtifactType::Ipa,
+            IosArtifactType::AppBundle,
+            IosArtifactType::Dsym,
             IosArtifactType::SigningReport,
             IosArtifactType::Xcarchive,
         ]),
@@ -2829,11 +12701,7 @@ fn append_signing_secret_check<R: GhRunner>(
 ) {
     let workflow = config.workflow();
     let secret_names = workflow.secret_names();
-    let expected_secrets = BTreeSet::from([
-        secret_names.certificate_p12().clone(),
-        secret_names.certificate_password().clone(),
-        secret_names.provisioning_profile().clone(),
-    ]);
+    let expected_secrets = secret_names.all_names().cloned().collect::<BTreeSet<_>>();
     match transport.list_environment_secrets(config.repository(), workflow.protected_environment())
     {
         Ok(secrets)
@@ -2878,18 +12746,65 @@ fn validate_submission(
     config: &GithubProviderConfig,
     request: &IosDeviceBuildRequest,
 ) -> RemoteBuildResult<()> {
+    validate_provider_request(config, request)?;
+    if request.source_mode != SourceMode::Git {
+        return Err(provider_failure(
+            "snapshot_submission_requires_consent",
+            "Git snapshots require the explicit consent-bound submission path",
+            false,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_git_snapshot_submission(
+    config: &GithubProviderConfig,
+    request: &IosDeviceBuildRequest,
+) -> RemoteBuildResult<()> {
+    validate_provider_request(config, request)?;
+    if request.source_mode != SourceMode::GitSnapshot
+        || request.signing.mode != SigningMode::UnsignedCompileOnly
+    {
+        return Err(provider_failure(
+            "unsupported_snapshot_request",
+            "GitHub snapshots require an unsigned physical-iPhone XCArchive request",
+            false,
+        ));
+    }
+    let authorization = config.mutation_authorization;
+    if !authorization.publish_temporary_ref
+        || !authorization.delete_temporary_ref
+        || !authorization.publish_git_snapshot_source
+        || !authorization.delete_git_snapshot_source
+        || !authorization.manage_git_snapshot_keepalive
+    {
+        return Err(provider_failure(
+            "snapshot_mutation_unauthorized",
+            "Git snapshot publication and cleanup authority are not configured",
+            false,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_provider_request(
+    config: &GithubProviderConfig,
+    request: &IosDeviceBuildRequest,
+) -> RemoteBuildResult<()> {
     if request.signing.mode == SigningMode::ManualDevelopment
-        && request.signing.provisioning.len() != 1
+        && !(1..=MAX_SIGNING_PROFILES).contains(&request.signing.provisioning.len())
     {
         return Err(provider_failure(
             "profile_mapping_unsupported",
-            "GitHub provider requires exactly one application provisioning profile",
+            "GitHub provider accepts one application profile and at most two extension profiles",
             false,
         ));
     }
     request.validate()?;
-    if request.source_mode != SourceMode::Git
-        || request.source_repository.as_deref() != Some(config.source_repository())
+    if !matches!(
+        request.source_mode,
+        SourceMode::Git | SourceMode::GitSnapshot
+    ) || request.source_repository.as_deref() != Some(config.source_repository())
         || request.source_revision.is_none()
     {
         return Err(provider_failure(
@@ -2898,8 +12813,21 @@ fn validate_submission(
             false,
         ));
     }
-    match request.signing.mode {
-        SigningMode::ManualDevelopment => {
+    match (request.source_mode, request.signing.mode) {
+        (SourceMode::Git | SourceMode::GitSnapshot, SigningMode::UnsignedCompileOnly) => {
+            validate_exact_artifact_request(
+                request,
+                &BTreeSet::from([IosArtifactType::Xcarchive]),
+            )?;
+        }
+        (SourceMode::GitSnapshot, _) => {
+            return Err(provider_failure(
+                "snapshot_signing_unsupported",
+                "GitHub snapshots support unsigned compilation only",
+                false,
+            ));
+        }
+        (SourceMode::Git, SigningMode::ManualDevelopment) => {
             if github_remote_matches(
                 config.source_repository(),
                 &repository_url(config.repository()),
@@ -2911,18 +12839,9 @@ fn validate_submission(
                 ));
             }
             validate_signing_secret_references(config, request)?;
-            validate_exact_artifact_request(
-                request,
-                &BTreeSet::from([IosArtifactType::Ipa, IosArtifactType::SigningReport]),
-            )?;
+            validate_signed_artifact_request(request)?;
         }
-        SigningMode::UnsignedCompileOnly => {
-            validate_exact_artifact_request(
-                request,
-                &BTreeSet::from([IosArtifactType::Xcarchive]),
-            )?;
-        }
-        mode => return Err(unsupported(ProviderFeature::SigningMode(mode))),
+        (_, mode) => return Err(unsupported(ProviderFeature::SigningMode(mode))),
     }
     validate_ref_segment(&request.operation_id).map_err(|()| {
         provider_failure(
@@ -2938,17 +12857,31 @@ fn validate_signing_secret_references(
     request: &IosDeviceBuildRequest,
 ) -> RemoteBuildResult<()> {
     let names = config.workflow.secret_names();
-    let references_match = request.signing.signing.as_ref().is_some_and(|signing| {
+    let identity_references_match = request.signing.signing.as_ref().is_some_and(|signing| {
         exact_github_secret(
             &signing.identity.private_key.reference,
             names.certificate_p12().as_str(),
         ) && signing.password.as_ref().is_some_and(|password| {
             exact_github_secret(password, names.certificate_password().as_str())
         })
-    }) && request.signing.provisioning.first().is_some_and(|profile| {
-        exact_github_secret(&profile.profile, names.provisioning_profile().as_str())
     });
-    if !references_match {
+    let profiles_match = if names.uses_legacy_profile_binding() {
+        request.signing.provisioning.len() == 1
+            && request.signing.provisioning.first().is_some_and(|profile| {
+                exact_github_secret(&profile.profile, names.provisioning_profile().as_str())
+            })
+    } else {
+        names.matches_target_graph(&request.signing.targets)
+            && request.signing.provisioning.len() == names.profile_names().count()
+            && request.signing.provisioning.iter().all(|profile| {
+                names
+                    .profile_for_target(&profile.target)
+                    .is_some_and(|expected| {
+                        exact_github_secret(&profile.profile, expected.as_str())
+                    })
+            })
+    };
+    if !identity_references_match || !profiles_match {
         return Err(provider_failure(
             "signing_secret_reference_mismatch",
             "signed GitHub builds require the exact configured GitHub Actions secret roles",
@@ -2979,6 +12912,28 @@ fn validate_exact_artifact_request(
     ))
 }
 
+fn validate_signed_artifact_request(request: &IosDeviceBuildRequest) -> RemoteBuildResult<()> {
+    let required = BTreeSet::from([IosArtifactType::Ipa, IosArtifactType::SigningReport]);
+    let supported = BTreeSet::from([
+        IosArtifactType::Ipa,
+        IosArtifactType::AppBundle,
+        IosArtifactType::Xcarchive,
+        IosArtifactType::Dsym,
+        IosArtifactType::SigningReport,
+    ]);
+    if let Some(extra) = request.requested_artifacts.difference(&supported).next() {
+        return Err(unsupported(ProviderFeature::ArtifactType(*extra)));
+    }
+    if required.is_subset(&request.requested_artifacts) {
+        return Ok(());
+    }
+    Err(provider_failure(
+        "artifact_request_mismatch",
+        "signed builds require the IPA and signing report artifact set",
+        false,
+    ))
+}
+
 fn validate_manifests(
     record: &JobRecord,
     config: &GithubProviderConfig,
@@ -3002,6 +12957,7 @@ fn validate_manifests(
         job_id: record.job_id.clone(),
         operation_id: record.operation_id.clone(),
         repository: config.repository.clone(),
+        execution_repository_id: record.execution_repository_id,
         run: snapshot,
         source_repository: config.source_repository.clone(),
         source_revision: record.source_revision.clone(),
@@ -3051,7 +13007,58 @@ fn transition_record(record: &mut JobRecord, next: JobState) -> RemoteBuildResul
     if record.state == next {
         return Ok(());
     }
+    // Provider cleanup retries preserve the immutable build outcome while reopening only the
+    // cleanup phase after a durable negative confirmation.
+    if record.state == JobState::CleanupFailed && next == JobState::Cleaning {
+        record.state = JobState::Cleaning;
+        return Ok(());
+    }
     record.state = record.state.transition_to(next)?;
+    Ok(())
+}
+
+fn normalize_published_record(record: &mut JobRecord, timestamp_ms: u64) -> RemoteBuildResult<()> {
+    if record.state != JobState::Created || record.dispatch_commit.is_none() {
+        return Ok(());
+    }
+    transition_record(record, JobState::Queued)?;
+    if !record
+        .events
+        .iter()
+        .any(|event| matches!(&event.kind, RemoteBuildEventKind::JobQueued { .. }))
+    {
+        append_event(
+            record,
+            timestamp_ms,
+            "queue",
+            RemoteBuildEventKind::JobQueued { position: None },
+        )?;
+    }
+    Ok(())
+}
+
+fn mark_publication_not_attempted(
+    record: &mut JobRecord,
+    timestamp_ms: u64,
+    code: &'static str,
+    message: &'static str,
+    retryable: bool,
+) -> RemoteBuildResult<()> {
+    record.publication_uncertain = false;
+    record.publication_absent = false;
+    record.publication_not_attempted = true;
+    record.publication_absence_observations = 0;
+    record.publication_absence_first_observed_at_ms = 0;
+    record.publication_quiescence_deadline_ms = if record.publication_started_at_ms == 0 {
+        u64::MAX
+    } else {
+        publication_quiescence_deadline(record.publication_started_at_ms, 0)
+    };
+    record.temporary_ref_deleted = false;
+    if !record.state.is_build_terminal() && !record.state.is_terminal() {
+        transition_record(record, JobState::Failed)?;
+        append_failed(record, timestamp_ms, code, message, retryable)?;
+    }
     Ok(())
 }
 
@@ -3167,6 +13174,15 @@ fn publisher_failure(error: TemporaryRefPublishError) -> RemoteBuildError {
         TemporaryRefPublishError::DeletionVerificationFailed => {
             ("temporary_ref_deletion_unverified", true)
         }
+        TemporaryRefPublishError::GitSnapshotUnsupported => ("git_snapshot_unsupported", false),
+        TemporaryRefPublishError::ExecutionWorkflowVerificationUnsupported => {
+            ("execution_workflow_verification_unsupported", false)
+        }
+        TemporaryRefPublishError::GitSnapshotInvalid => ("git_snapshot_invalid", false),
+        TemporaryRefPublishError::GitSnapshotDiscoveryChanged => {
+            ("git_snapshot_discovery_changed", true)
+        }
+        TemporaryRefPublishError::GitSnapshotRefConflict => ("git_snapshot_ref_conflict", false),
     };
     provider_failure(code, "temporary Git ref mutation failed", retryable)
 }
@@ -3183,6 +13199,91 @@ fn transport_failure(error: TransportError) -> RemoteBuildError {
         "GitHub API operation failed",
         retryable,
     )
+}
+
+fn workflow_dispatch_client_failure(error: GhExecutionError) -> RemoteBuildError {
+    let retryable = matches!(
+        error,
+        GhExecutionError::TimedOut | GhExecutionError::ProcessIo
+    );
+    provider_failure(
+        "github_workflow_dispatch_client_unavailable",
+        "GitHub workflow-dispatch authentication is unavailable",
+        retryable,
+    )
+}
+
+fn workflow_dispatch_reconciliation_failure(error: TransportError) -> RemoteBuildError {
+    match error {
+        TransportError::RunNotFound => provider_failure(
+            "github_workflow_dispatch_run_not_found",
+            "Workflow dispatch remains uncertain because no exact run was found",
+            true,
+        ),
+        TransportError::AmbiguousRun => provider_failure(
+            "github_workflow_dispatch_run_ambiguous",
+            "Workflow dispatch remains uncertain because multiple exact runs were found",
+            false,
+        ),
+        error => transport_failure(error),
+    }
+}
+
+fn job_log_identity_failure() -> RemoteBuildError {
+    provider_failure(
+        "github_job_log_identity_invalid",
+        "the restored GitHub run could not bind an exact job-log identity",
+        false,
+    )
+}
+
+#[cfg(feature = "secure-job-log-http")]
+fn job_log_client_failure(error: GhExecutionError) -> RemoteBuildError {
+    let (code, retryable) = match error {
+        GhExecutionError::AuthenticationUnavailable => {
+            ("github_job_log_authentication_unavailable", false)
+        }
+        GhExecutionError::TimedOut | GhExecutionError::ProcessIo => {
+            ("github_job_log_client_unavailable", true)
+        }
+        GhExecutionError::SecretTooLarge
+        | GhExecutionError::SpawnFailed
+        | GhExecutionError::OutputLimitExceeded
+        | GhExecutionError::CommandFailed { .. } => ("github_job_log_client_unavailable", false),
+    };
+    provider_failure(code, "GitHub job-log authentication failed", retryable)
+}
+
+#[cfg(feature = "secure-job-log-http")]
+fn job_log_fetch_failure(error: GithubJobLogError) -> RemoteBuildError {
+    if error == GithubJobLogError::Cancelled {
+        return RemoteBuildError::Cancelled;
+    }
+    let (code, retryable) = match error {
+        GithubJobLogError::Cancelled => unreachable!("handled above"),
+        GithubJobLogError::TimedOut
+        | GithubJobLogError::Transport(_)
+        | GithubJobLogError::UnexpectedStatus
+        | GithubJobLogError::IncompleteJobPagination
+        | GithubJobLogError::JobSetNotTerminal => ("github_job_logs_unavailable", true),
+        GithubJobLogError::TransportContractViolation
+        | GithubJobLogError::MalformedJobMetadata
+        | GithubJobLogError::JobIdentityMismatch
+        | GithubJobLogError::ConflictingJobIdentity
+        | GithubJobLogError::JobPaginationLimitReached
+        | GithubJobLogError::JobLimitReached
+        | GithubJobLogError::InvalidRedirect
+        | GithubJobLogError::RedirectHostNotAllowed
+        | GithubJobLogError::RedirectLimitReached
+        | GithubJobLogError::UnexpectedContentType
+        | GithubJobLogError::JobLogTooLarge
+        | GithubJobLogError::PollTooLarge
+        | GithubJobLogError::EventLimitReached
+        | GithubJobLogError::ProjectedByteLimitReached
+        | GithubJobLogError::SourceSequenceOverflow
+        | GithubJobLogError::InvalidCompletionMarker => ("github_job_logs_rejected", false),
+    };
+    provider_failure(code, "GitHub job logs could not be accepted", retryable)
 }
 
 fn transport_public_message(error: TransportError) -> String {
@@ -3241,6 +13342,112 @@ fn job_not_mapped(_job_id: &str) -> RemoteBuildError {
     )
 }
 
+fn record_is_recyclable(record: &JobRecord) -> bool {
+    record.state.is_terminal()
+        || record.publication_not_attempted
+        || (record.publication_absent && record.temporary_ref_deleted)
+}
+
+fn option_can_bind_once<T: PartialEq + ?Sized>(previous: Option<&T>, next: Option<&T>) -> bool {
+    match (previous, next) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(previous), Some(next)) => previous == next,
+    }
+}
+
+fn publication_boundary_is_armed(resume: &GithubJobResumeV1) -> bool {
+    resume.publication_started_at_ms >= resume.created_at_ms
+        && resume.publication_started_at_ms != 0
+        && (resume.publication_absence_first_observed_at_ms == 0
+            || resume.publication_absence_first_observed_at_ms >= resume.publication_started_at_ms)
+        && resume.publication_quiescence_deadline_ms
+            == publication_quiescence_deadline(
+                resume.publication_started_at_ms,
+                resume.publication_absence_first_observed_at_ms,
+            )
+}
+
+fn publication_boundary_is_unarmed(resume: &GithubJobResumeV1) -> bool {
+    resume.publication_started_at_ms == 0
+        && resume.publication_quiescence_deadline_ms == u64::MAX
+        && resume.publication_absence_first_observed_at_ms == 0
+}
+
+fn publication_record_boundary_is_unarmed(record: &JobRecord) -> bool {
+    record.publication_started_at_ms == 0
+        && record.publication_quiescence_deadline_ms == u64::MAX
+        && record.publication_absence_first_observed_at_ms == 0
+}
+
+fn publication_boundary_can_advance(
+    previous: &GithubJobResumeV1,
+    next: &GithubJobResumeV1,
+) -> bool {
+    let previous_valid =
+        publication_boundary_is_unarmed(previous) || publication_boundary_is_armed(previous);
+    let next_valid = publication_boundary_is_unarmed(next) || publication_boundary_is_armed(next);
+    previous_valid
+        && next_valid
+        && ((previous.publication_started_at_ms == next.publication_started_at_ms
+            && (previous.publication_quiescence_deadline_ms
+                == next.publication_quiescence_deadline_ms
+                || previous.publication_absence_first_observed_at_ms == 0
+                    && next.publication_absence_first_observed_at_ms != 0))
+            || publication_boundary_is_unarmed(previous) && publication_boundary_is_armed(next))
+}
+
+fn publication_quiescence_deadline(
+    publication_started_at_ms: u64,
+    publication_absence_first_observed_at_ms: u64,
+) -> u64 {
+    publication_started_at_ms
+        .max(publication_absence_first_observed_at_ms)
+        .saturating_add(GITHUB_PUBLICATION_QUIESCENCE_WINDOW_MS)
+}
+
+const fn bool_is_monotonic(previous: bool, next: bool) -> bool {
+    !previous || next
+}
+
+const fn run_status_phase(status: GithubRunStatusV1) -> u8 {
+    match status {
+        GithubRunStatusV1::Requested => 0,
+        GithubRunStatusV1::Queued | GithubRunStatusV1::Pending | GithubRunStatusV1::Waiting => 1,
+        GithubRunStatusV1::InProgress => 2,
+        GithubRunStatusV1::Completed => 3,
+    }
+}
+
+fn job_state_can_reach(previous: JobState, next: JobState) -> bool {
+    previous == next
+        || match previous {
+            JobState::Created => true,
+            JobState::Queued => !matches!(next, JobState::Created),
+            JobState::Running => !matches!(next, JobState::Created | JobState::Queued),
+            JobState::Cancelling => matches!(
+                next,
+                JobState::Failed
+                    | JobState::Cancelled
+                    | JobState::Cleaning
+                    | JobState::Cleaned
+                    | JobState::CleanupFailed
+            ),
+            JobState::Succeeded | JobState::Failed | JobState::Cancelled => matches!(
+                next,
+                JobState::Cleaning | JobState::Cleaned | JobState::CleanupFailed
+            ),
+            JobState::Cleaning => matches!(next, JobState::Cleaned | JobState::CleanupFailed),
+            JobState::Cleaned => false,
+            JobState::CleanupFailed => {
+                matches!(
+                    next,
+                    JobState::Cleaning | JobState::Cleaned | JobState::CleanupFailed
+                )
+            }
+        }
+}
+
 fn repository_url(repository: &Repository) -> String {
     format!(
         "https://github.com/{}/{}",
@@ -3258,6 +13465,7 @@ fn repository_from_url(value: &str) -> Option<Repository> {
     Repository::new(owner, name).ok()
 }
 
+#[cfg(test)]
 fn is_safe_remote_name(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
@@ -3381,18 +13589,7 @@ fn remove_exact_file_if_present(path: &Path) -> Result<(), TemporaryRefPublishEr
     }
 }
 
-fn canonical_file(path: &Path) -> Result<PathBuf, GitPublisherConfigError> {
-    if !is_absolute_normal(path) {
-        return Err(GitPublisherConfigError::InvalidGitExecutable);
-    }
-    let canonical =
-        fs::canonicalize(path).map_err(|_| GitPublisherConfigError::InvalidGitExecutable)?;
-    if !canonical.is_file() {
-        return Err(GitPublisherConfigError::InvalidGitExecutable);
-    }
-    Ok(canonical)
-}
-
+#[cfg(test)]
 fn executable_basename_matches(path: &Path, stem: &str) -> bool {
     let Some(name) = path.file_name().and_then(OsStr::to_str) else {
         return false;
@@ -3404,15 +13601,6 @@ fn executable_basename_matches(path: &Path, stem: &str) -> bool {
     #[cfg(not(windows))]
     {
         name == stem
-    }
-}
-
-fn apply_allowlisted_git_environment(command: &mut Command) {
-    command.env_clear();
-    for &name in GIT_AMBIENT_ENVIRONMENT_ALLOWLIST {
-        if let Some(value) = std::env::var_os(name).filter(|value| !value.is_empty()) {
-            command.env(name, value);
-        }
     }
 }
 
@@ -3435,38 +13623,125 @@ fn is_absolute_normal(path: &Path) -> bool {
             .all(|component| !matches!(component, Component::CurDir | Component::ParentDir))
 }
 
+fn ensure_git_process_parent_fence() -> Result<(), GitExecutionError> {
+    let fenced = rustferry_core::process_control::ensure_descendants_terminate_on_process_exit()
+        .map_err(|_| GitExecutionError::ProcessIo)?;
+    if cfg!(windows) && !fenced {
+        return Err(GitExecutionError::ProcessIo);
+    }
+    Ok(())
+}
+
 fn run_git_process(
-    mut command: Command,
+    command: Command,
     stdin_bytes: &[u8],
     timeout: Duration,
+    stdout_limit: usize,
 ) -> Result<Vec<u8>, GitExecutionError> {
-    let mut child = command
-        .spawn()
-        .map_err(|_| GitExecutionError::SpawnFailed)?;
-    let stdin = child.stdin.take().ok_or_else(|| {
-        terminate_child(&mut child);
-        GitExecutionError::ProcessIo
-    })?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        terminate_child(&mut child);
-        GitExecutionError::ProcessIo
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| {
-        terminate_child(&mut child);
-        GitExecutionError::ProcessIo
-    })?;
-    let input = stdin_bytes.to_vec();
-    let stdin_writer = thread::spawn(move || -> io::Result<()> {
-        let mut stdin = stdin;
-        stdin.write_all(&input)?;
-        stdin.flush()
+    let output = run_git_process_allow_status(command, stdin_bytes, timeout, stdout_limit)?;
+    if !output.status.success() {
+        return Err(git_command_failed(output.status));
+    }
+    Ok(output.stdout)
+}
+
+fn run_git_process_file(
+    command: Command,
+    input: fs::File,
+    expected_len: u64,
+    timeout: Duration,
+    stdout_limit: usize,
+) -> Result<Vec<u8>, GitExecutionError> {
+    let output = run_git_process_allow_status_with_input(
+        command,
+        GitProcessInput::File {
+            input,
+            expected_len,
+        },
+        timeout,
+        stdout_limit,
+    )?;
+    if !output.status.success() {
+        return Err(git_command_failed(output.status));
+    }
+    Ok(output.stdout)
+}
+
+struct GitProcessOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+}
+
+fn run_git_process_allow_status(
+    command: Command,
+    stdin_bytes: &[u8],
+    timeout: Duration,
+    stdout_limit: usize,
+) -> Result<GitProcessOutput, GitExecutionError> {
+    run_git_process_allow_status_with_input(
+        command,
+        GitProcessInput::Bytes(stdin_bytes.to_vec()),
+        timeout,
+        stdout_limit,
+    )
+}
+
+enum GitProcessInput {
+    Bytes(Vec<u8>),
+    File { input: fs::File, expected_len: u64 },
+}
+
+fn run_git_process_allow_status_with_input(
+    mut command: Command,
+    input: GitProcessInput,
+    timeout: Duration,
+    stdout_limit: usize,
+) -> Result<GitProcessOutput, GitExecutionError> {
+    ensure_git_process_parent_fence()?;
+    let (mut child, platform_guard) =
+        rustferry_core::process_control::spawn_tracked_child(&mut command)
+            .map_err(|_| GitExecutionError::ProcessIo)?;
+    let mut process_tree = GitProcessTreeGuard::from_spawn(&child, platform_guard);
+    let Some(stdin) = child.stdin.take() else {
+        let deadline = git_process_cleanup_deadline();
+        terminate_git_process_tree(&mut child, &mut process_tree, deadline);
+        return Err(GitExecutionError::ProcessIo);
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let deadline = git_process_cleanup_deadline();
+        terminate_git_process_tree(&mut child, &mut process_tree, deadline);
+        return Err(GitExecutionError::ProcessIo);
+    };
+    let Some(stderr) = child.stderr.take() else {
+        let deadline = git_process_cleanup_deadline();
+        terminate_git_process_tree(&mut child, &mut process_tree, deadline);
+        return Err(GitExecutionError::ProcessIo);
+    };
+    let stdin_writer = spawn_git_process_worker(move || match input {
+        GitProcessInput::Bytes(input) => {
+            let mut stdin = stdin;
+            stdin
+                .write_all(&input)
+                .and_then(|()| stdin.flush())
+                .map_err(|_| GitExecutionError::ProcessIo)
+        }
+        GitProcessInput::File {
+            mut input,
+            expected_len,
+        } => copy_exact_git_input(&mut input, stdin, expected_len),
     });
-    let stdout_reader = thread::spawn(move || read_capped(stdout, MAX_GIT_OUTPUT_BYTES, true));
-    let stderr_reader = thread::spawn(move || read_capped(stderr, MAX_GIT_STDERR_BYTES, false));
+    let stdout_reader = spawn_git_process_worker(move || read_capped(stdout, stdout_limit, true));
+    let stderr_reader =
+        spawn_git_process_worker(move || read_capped(stderr, MAX_GIT_STDERR_BYTES, false));
     let Some(deadline) = Instant::now().checked_add(timeout) else {
-        terminate_child(&mut child);
-        let (_stdin_result, _stdout, _stderr) =
-            join_git_threads(stdin_writer, stdout_reader, stderr_reader)?;
+        let cleanup_deadline = git_process_cleanup_deadline();
+        terminate_git_process_tree(&mut child, &mut process_tree, cleanup_deadline);
+        let _ = collect_git_process_workers(
+            &stdin_writer,
+            &stdout_reader,
+            &stderr_reader,
+            cleanup_deadline,
+        );
         return Err(GitExecutionError::TimedOut);
     };
     let status = loop {
@@ -3474,54 +13749,187 @@ fn run_git_process(
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
             Ok(None) => {
-                terminate_child(&mut child);
-                let (_stdin_result, _stdout, _stderr) =
-                    join_git_threads(stdin_writer, stdout_reader, stderr_reader)?;
+                let cleanup_deadline = git_process_cleanup_deadline();
+                terminate_git_process_tree(&mut child, &mut process_tree, cleanup_deadline);
+                let _ = collect_git_process_workers(
+                    &stdin_writer,
+                    &stdout_reader,
+                    &stderr_reader,
+                    cleanup_deadline,
+                );
                 return Err(GitExecutionError::TimedOut);
             }
             Err(_) => {
-                terminate_child(&mut child);
-                let (_stdin_result, _stdout, _stderr) =
-                    join_git_threads(stdin_writer, stdout_reader, stderr_reader)?;
+                let cleanup_deadline = git_process_cleanup_deadline();
+                terminate_git_process_tree(&mut child, &mut process_tree, cleanup_deadline);
+                let _ = collect_git_process_workers(
+                    &stdin_writer,
+                    &stdout_reader,
+                    &stderr_reader,
+                    cleanup_deadline,
+                );
                 return Err(GitExecutionError::ProcessIo);
             }
         }
     };
-    let (stdin_result, stdout, stderr) =
-        join_git_threads(stdin_writer, stdout_reader, stderr_reader)?;
-    stdin_result.map_err(|_| GitExecutionError::ProcessIo)?;
+    // Git may exit while a helper or hook descendant still owns its inherited pipes. Kill the
+    // complete supervised tree before bounded worker collection, on success and failure alike.
+    process_tree.terminate_descendants();
+    let (stdout, stderr) = collect_git_process_workers(
+        &stdin_writer,
+        &stdout_reader,
+        &stderr_reader,
+        git_process_cleanup_deadline(),
+    )?;
     if stdout.truncated || stderr.truncated {
         return Err(GitExecutionError::OutputLimitExceeded);
     }
-    if !status.success() {
-        return Err(git_command_failed(status));
+    Ok(GitProcessOutput {
+        status,
+        stdout: stdout.bytes,
+    })
+}
+
+fn copy_exact_git_input(
+    input: &mut fs::File,
+    mut stdin: impl Write,
+    expected_len: u64,
+) -> Result<(), GitExecutionError> {
+    let mut remaining = expected_len;
+    let mut buffer = [0_u8; 8 * 1024];
+    while remaining != 0 {
+        let requested = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| GitExecutionError::ProcessIo)?;
+        let read = input
+            .read(&mut buffer[..requested])
+            .map_err(|_| GitExecutionError::ProcessIo)?;
+        if read == 0 {
+            return Err(GitExecutionError::ProcessIo);
+        }
+        stdin
+            .write_all(&buffer[..read])
+            .map_err(|_| GitExecutionError::ProcessIo)?;
+        remaining = remaining.saturating_sub(read as u64);
     }
-    Ok(stdout.bytes)
+    let mut extra = [0_u8; 1];
+    if input
+        .read(&mut extra)
+        .map_err(|_| GitExecutionError::ProcessIo)?
+        != 0
+    {
+        return Err(GitExecutionError::ProcessIo);
+    }
+    stdin.flush().map_err(|_| GitExecutionError::ProcessIo)
 }
 
-type InputThread = thread::JoinHandle<io::Result<()>>;
-type OutputThread = thread::JoinHandle<Result<CapturedGitOutput, GitExecutionError>>;
-
-fn join_git_threads(
-    stdin_writer: InputThread,
-    stdout_reader: OutputThread,
-    stderr_reader: OutputThread,
-) -> Result<(io::Result<()>, CapturedGitOutput, CapturedGitOutput), GitExecutionError> {
-    let stdin = stdin_writer
-        .join()
-        .map_err(|_| GitExecutionError::ProcessIo)?;
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| GitExecutionError::ProcessIo)??;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| GitExecutionError::ProcessIo)??;
-    Ok((stdin, stdout, stderr))
+fn spawn_git_process_worker<T>(
+    worker: impl FnOnce() -> Result<T, GitExecutionError> + Send + 'static,
+) -> Receiver<Result<T, GitExecutionError>>
+where
+    T: Send + 'static,
+{
+    let (sender, receiver) = mpsc::sync_channel(1);
+    drop(thread::spawn(move || {
+        let _ = sender.send(worker());
+    }));
+    receiver
 }
 
-fn terminate_child(child: &mut std::process::Child) {
+fn collect_git_process_workers(
+    stdin_writer: &Receiver<Result<(), GitExecutionError>>,
+    stdout_reader: &Receiver<Result<CapturedGitOutput, GitExecutionError>>,
+    stderr_reader: &Receiver<Result<CapturedGitOutput, GitExecutionError>>,
+    deadline: Instant,
+) -> Result<(CapturedGitOutput, CapturedGitOutput), GitExecutionError> {
+    receive_git_process_worker(stdin_writer, deadline)?;
+    let stdout = receive_git_process_worker(stdout_reader, deadline)?;
+    let stderr = receive_git_process_worker(stderr_reader, deadline)?;
+    Ok((stdout, stderr))
+}
+
+fn receive_git_process_worker<T>(
+    receiver: &Receiver<Result<T, GitExecutionError>>,
+    deadline: Instant,
+) -> Result<T, GitExecutionError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match receiver.recv_timeout(remaining) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+            Err(GitExecutionError::ProcessIo)
+        }
+    }
+}
+
+fn git_process_cleanup_deadline() -> Instant {
+    Instant::now()
+        .checked_add(GIT_PROCESS_CLEANUP_GRACE)
+        .unwrap_or_else(Instant::now)
+}
+
+struct GitProcessTreeGuard {
+    #[cfg(unix)]
+    process_group: Option<u32>,
+    platform_guard: Option<rustferry_core::process_control::ProcessGroupGuard>,
+}
+
+impl GitProcessTreeGuard {
+    fn from_spawn(
+        child: &Child,
+        platform_guard: rustferry_core::process_control::ProcessGroupGuard,
+    ) -> Self {
+        #[cfg(not(unix))]
+        let _ = child;
+        Self {
+            #[cfg(unix)]
+            process_group: Some(child.id()),
+            platform_guard: Some(platform_guard),
+        }
+    }
+
+    fn terminate_descendants(&mut self) {
+        #[cfg(unix)]
+        if let Some(process_group) = self.process_group.take() {
+            let _ = Command::new("/bin/kill")
+                .args(["-KILL", "--", &format!("-{process_group}")])
+                .env_clear()
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        drop(self.platform_guard.take());
+    }
+}
+
+impl Drop for GitProcessTreeGuard {
+    fn drop(&mut self) {
+        self.terminate_descendants();
+    }
+}
+
+fn terminate_git_process_tree(
+    child: &mut Child,
+    process_tree: &mut GitProcessTreeGuard,
+    deadline: Instant,
+) {
+    process_tree.terminate_descendants();
+    terminate_git_child(child, deadline);
+}
+
+fn terminate_git_child(child: &mut Child, deadline: Instant) {
     let _ = child.kill();
-    let _ = child.wait();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return;
+                }
+                thread::sleep(remaining.min(Duration::from_millis(20)));
+            }
+        }
+    }
 }
 
 struct CapturedGitOutput {
@@ -3573,6 +13981,124 @@ fn is_lower_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn provider_config_sha256(config: &GithubProviderConfig) -> RemoteBuildResult<String> {
+    #[derive(Serialize)]
+    #[allow(
+        clippy::struct_excessive_bools,
+        reason = "canonical provider identity must bind each independent mutation authority bit"
+    )]
+    struct ProviderIdentity<'a> {
+        schema_version: u32,
+        provider: &'static str,
+        execution_repository: String,
+        source_repository: &'a str,
+        trusted_source_ref: &'a str,
+        temporary_ref_namespace: &'a str,
+        workflow_path: String,
+        workflow_sha256: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        run_trigger: Option<&'static str>,
+        worker_version: String,
+        maximum_jobs: usize,
+        discovery_attempts: u16,
+        discovery_window_ms: u64,
+        publish_temporary_ref: bool,
+        cancel_run: bool,
+        delete_temporary_ref: bool,
+        publish_git_snapshot_source: bool,
+        delete_git_snapshot_source: bool,
+        manage_git_snapshot_keepalive: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_fetch_endpoint: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_push_endpoint: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        execution_fetch_endpoint: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        execution_push_endpoint: Option<&'a str>,
+    }
+
+    let identity = ProviderIdentity {
+        schema_version: GITHUB_JOB_RESUME_SCHEMA_VERSION,
+        provider: GITHUB_PROVIDER_ID,
+        execution_repository: repository_url(&config.repository),
+        source_repository: &config.source_repository,
+        trusted_source_ref: config.workflow.trusted_source_ref().as_str(),
+        temporary_ref_namespace: config.workflow.temporary_branch_namespace().as_str(),
+        workflow_path: config.workflow.filename().repository_path(),
+        workflow_sha256: config.workflow_fingerprint.as_str(),
+        run_trigger: (config.workflow.run_trigger() == WorkflowRunTrigger::WorkflowDispatch)
+            .then_some("workflow_dispatch"),
+        worker_version: config.worker_version.to_string(),
+        maximum_jobs: config.max_jobs,
+        discovery_attempts: config.poll_policy.discovery_attempts(),
+        discovery_window_ms: config.poll_policy.discovery_window_ms(),
+        publish_temporary_ref: config.mutation_authorization.publish_temporary_ref,
+        cancel_run: config.mutation_authorization.cancel_run,
+        delete_temporary_ref: config.mutation_authorization.delete_temporary_ref,
+        publish_git_snapshot_source: config.mutation_authorization.publish_git_snapshot_source,
+        delete_git_snapshot_source: config.mutation_authorization.delete_git_snapshot_source,
+        manage_git_snapshot_keepalive: config.mutation_authorization.manage_git_snapshot_keepalive,
+        source_fetch_endpoint: config
+            .git_endpoints
+            .as_ref()
+            .map(|endpoints| endpoints.source.fetch().canonical_url()),
+        source_push_endpoint: config
+            .git_endpoints
+            .as_ref()
+            .map(|endpoints| endpoints.source.push().canonical_url()),
+        execution_fetch_endpoint: config
+            .git_endpoints
+            .as_ref()
+            .map(|endpoints| endpoints.execution.fetch().canonical_url()),
+        execution_push_endpoint: config
+            .git_endpoints
+            .as_ref()
+            .map(|endpoints| endpoints.execution.push().canonical_url()),
+    };
+    serde_json::to_vec(&identity)
+        .map(|bytes| hex_sha256(&bytes))
+        .map_err(|error| RemoteBuildError::Serialization {
+            message: bounded_message(&error.to_string()),
+        })
+}
+
+fn resume_failure(code: &'static str) -> RemoteBuildError {
+    provider_failure(
+        code,
+        "durable GitHub job state failed strict identity validation",
+        false,
+    )
+}
+
+fn ensure_same_run_attempt(
+    previous: Option<&RunSnapshot>,
+    current: &RunSnapshot,
+) -> RemoteBuildResult<()> {
+    if previous.is_some_and(|previous| {
+        previous.handle() != current.handle()
+            || previous.run_number() != current.run_number()
+            || previous.run_attempt() != current.run_attempt()
+            || previous.status() == RunStatus::Completed
+                && (current.status() != RunStatus::Completed
+                    || previous.conclusion() != current.conclusion())
+    }) {
+        return Err(resume_failure("github_run_attempt_changed"));
+    }
+    Ok(())
+}
+
+fn github_run_is_later_attempt(previous: &RunSnapshot, current: &RunSnapshot) -> bool {
+    previous.handle() == current.handle()
+        && previous.run_number() == current.run_number()
+        && current.run_attempt() > previous.run_attempt()
+}
+
+fn run_snapshot_is_successful(snapshot: &RunSnapshot) -> bool {
+    snapshot.status() == RunStatus::Completed
+        && snapshot.conclusion() == Some(RunConclusion::Success)
+}
+
 fn hex_sha256(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let digest = Sha256::digest(bytes);
@@ -3584,6 +14110,39 @@ fn hex_sha256(bytes: &[u8]) -> String {
     encoded
 }
 
+fn publication_lease_scope_sha256(
+    directory: &Path,
+    identity: &rustferry_core::DirectoryFilesystemIdentity,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"rustferry-github-publication-lease-scope-v1\0");
+    digest.update(directory.as_os_str().to_string_lossy().as_bytes());
+    digest.update([0]);
+    digest.update(identity.as_str());
+    hex::encode(digest.finalize())
+}
+
+fn publication_lease_key(request: &TemporaryRefPublicationLeaseRequest<'_>) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"rustferry-github-publication-lease-v1\0");
+    digest.update(repository_url(request.repository));
+    digest.update([0]);
+    digest.update(b"refs/heads/");
+    digest.update(request.temporary_ref.branch().as_str());
+    digest.update([0]);
+    digest.update(request.operation_id);
+    hex::encode(digest.finalize())
+}
+
+fn git_snapshot_source_lease_key(request: &GitSnapshotSourcePublicationLeaseRequest<'_>) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"rustferry-github-snapshot-source-lease-v1\0");
+    digest.update(request.source_repository);
+    digest.update([0]);
+    digest.update(request.source_ref.as_str());
+    hex::encode(digest.finalize())
+}
+
 fn bounded_message(message: &str) -> String {
     message.chars().take(256).collect()
 }
@@ -3592,35 +14151,49 @@ fn bounded_message(message: &str) -> String {
 mod tests {
     use std::{
         collections::{BTreeMap, VecDeque},
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Condvar, Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
         task::{Context, Poll, Waker},
+        thread,
+        time::Duration as StdDuration,
     };
-
-    use rustferry_remote::{
-        BuildProfile, BundleIdentifier, DevelopmentTeam, DevelopmentTeamPlan, DevicePlan,
-        EntitlementPlan, EntitlementSet, IosDeviceProductExpectation, ProvisioningPlan,
-        ProvisioningProfileType, SigningCertificate, SigningIdentity, SigningPlan,
-        SigningPrivateKeyReference, SigningReference, SigningTarget, SigningTargetKind,
-        SourceManifest,
-    };
-    use tempfile::tempdir;
 
     use crate::{
-        transport::{GhRequest, TransportLimits},
+        transport::{
+            ApiMethod, GhRequest, GithubWorkflowDispatchHttpClient,
+            GithubWorkflowDispatchHttpClientFactory, GithubWorkflowDispatchHttpError,
+            GithubWorkflowDispatchHttpRequest, GithubWorkflowDispatchHttpResponse, TransportLimits,
+        },
         workflow::{
             ProtectedEnvironment, PublicSourceRepository, SigningSecretNames,
             TemporaryBranchNamespace, WorkerDistribution, WorkflowFileName,
         },
     };
+    use rustferry_remote::{
+        ArtifactRecord, ArtifactSigningEvidence, BuildProfile, BundleIdentifier,
+        COMPILE_PHASE_EVIDENCE_SCHEMA_VERSION, CompileToolchainEvidence, DevelopmentTeam,
+        DevelopmentTeamPlan, DevicePlan, EntitlementPlan, EntitlementSet,
+        IosDeviceProductExpectation, ProvisioningPlan, ProvisioningProfileType,
+        SEALED_UNSIGNED_ARCHIVE_SCHEMA_VERSION, SealedUnsignedArchive, SigningCertificate,
+        SigningIdentity, SigningPlan, SigningPrivateKeyReference, SigningReference, SigningTarget,
+        SigningTargetKind, SourceArchive, SourceManifest, SourceManifestEntry,
+        UnsignedAppInspection, UnsignedNestedBundleExpectation, UnsignedNestedBundleKind,
+        UnsignedXcarchiveExpectation, UnsignedXcarchiveInspection,
+    };
 
     use super::*;
 
     const SOURCE_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+    const AUTHENTICATED_USER_ID: u64 = 42;
     const TRUSTED_TIP: &str = "123456789abcdef0123456789abcdef012345678";
     const DISPATCH_SHA: &str = "abcdef0123456789abcdef0123456789abcdef01";
     const TREE_SHA: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
     const WORKFLOW_BLOB: &str = "cccccccccccccccccccccccccccccccccccccccc";
     const MANIFEST_BLOB: &str = "dddddddddddddddddddddddddddddddddddddddd";
+    const FAKE_LEASE_SCOPE: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const BRANCH_BASE64: &str = "cnVzdGZlcnJ5L2dvYWwzL2J1aWxkcy9vcGVyYXRpb24tMQ==";
     const WORKFLOW_PATH_BASE64: &str =
         "LmdpdGh1Yi93b3JrZmxvd3MvcnVzdGZlcnJ5LWdvYWwzLWlwaG9uZS55bWw=";
@@ -3631,6 +14204,633 @@ mod tests {
         "UlVTVEZFUlJZX0dPQUwzX0lPU19DRVJUSUZJQ0FURV9QQVNTV09SRA==";
     const PROVISIONING_PROFILE_BASE64: &str =
         "UlVTVEZFUlJZX0dPQUwzX0lPU19QUk9WSVNJT05JTkdfUFJPRklMRQ==";
+    const WIDGET_PROFILE_BASE64: &str =
+        "UlVTVEZFUlJZX0dPQUwzX0lPU19QUk9GSUxFXzI2NEI4RkUyNjhCMDAwOEIzNkYwOUJCNUNEMDA4RUE0";
+    const SNAPSHOT_ARCHIVE_BYTES: &[u8] = b"snapshot archive fixture\n";
+
+    fn base64_fixture(value: &str) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut encoded = String::with_capacity(value.len().div_ceil(3) * 4);
+        for chunk in value.as_bytes().chunks(3) {
+            let first = chunk[0];
+            let second = chunk.get(1).copied().unwrap_or(0);
+            let third = chunk.get(2).copied().unwrap_or(0);
+            encoded.push(char::from(ALPHABET[usize::from(first >> 2)]));
+            encoded.push(char::from(ALPHABET[usize::from((first & 0x03) << 4 | second >> 4)]));
+            encoded.push(if chunk.len() > 1 {
+                char::from(ALPHABET[usize::from((second & 0x0f) << 2 | third >> 6)])
+            } else {
+                '='
+            });
+            encoded.push(if chunk.len() > 2 {
+                char::from(ALPHABET[usize::from(third & 0x3f)])
+            } else {
+                '='
+            });
+        }
+        encoded
+    }
+
+    struct TestPrivateDirectory {
+        _root: tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    impl TestPrivateDirectory {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    fn tempdir() -> io::Result<TestPrivateDirectory> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("private");
+        create_test_private_directory(&path)?;
+        Ok(TestPrivateDirectory { _root: root, path })
+    }
+
+    fn create_test_private_directory(path: &Path) -> io::Result<()> {
+        #[cfg(windows)]
+        {
+            rustferry_core::windows_private_directory::create_private_directory(path)
+                .map(drop)
+                .map_err(io::Error::other)
+        }
+        #[cfg(not(windows))]
+        {
+            fs::create_dir(path)
+        }
+    }
+
+    #[cfg(windows)]
+    fn initialize_caller_git_fixture() -> Option<(tempfile::TempDir, PathBuf, PathBuf)> {
+        let git = crate::git_process::trusted_git_executable().ok()?;
+        let temporary = tempfile::tempdir().expect("caller Git fixture");
+        let checkout = temporary.path().join("checkout");
+        fs::create_dir(&checkout).expect("checkout");
+        assert!(
+            Command::new(&git)
+                .args(["init", "--quiet"])
+                .current_dir(&checkout)
+                .status()
+                .expect("git init")
+                .success()
+        );
+        fs::write(checkout.join("actual.txt"), b"actual\n").expect("source file");
+        assert!(
+            Command::new(&git)
+                .args(["add", "--", "actual.txt"])
+                .current_dir(&checkout)
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            Command::new(&git)
+                .args([
+                    "-c",
+                    "user.name=RustFerry Test",
+                    "-c",
+                    "user.email=rustferry@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "actual",
+                ])
+                .current_dir(&checkout)
+                .status()
+                .expect("git commit")
+                .success()
+        );
+        Some((temporary, checkout, git))
+    }
+
+    #[cfg(windows)]
+    fn fixture_git_output(git: &Path, checkout: &Path, arguments: &[&str]) -> Vec<u8> {
+        let output = Command::new(git)
+            .args(arguments)
+            .current_dir(checkout)
+            .output()
+            .expect("fixture Git command");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    #[test]
+    fn caller_git_config_accepts_legal_subsection_names() {
+        assert_eq!(
+            validate_caller_git_config_names(
+                b"branch.goal3/windows-live-acceptance.remote\0branch.goal3/windows-live-acceptance.merge\0branch.release_candidate.remote\0",
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn caller_git_config_rejects_dangerous_families() {
+        for key in [
+            b"include.path\0".as_slice(),
+            b"includeIf.gitdir:/tmp/**.path\0",
+            b"extensions.worktreeConfig\0",
+            b"extensions.partialClone\0",
+            b"core.worktree\0",
+            b"filter.lfs.process\0",
+            b"protocol.ext.allow\0",
+            b"remote.origin.promisor\0",
+            b"remote.origin.partialCloneFilter\0",
+            b"diff.external\0",
+            b"diff.custom.command\0",
+            b"diff.custom.textconv\0",
+        ] {
+            assert_eq!(
+                validate_caller_git_config_names(key),
+                Err(GitPublisherConfigError::UnsafeCallerRepositoryConfig)
+            );
+        }
+    }
+
+    #[test]
+    fn caller_git_config_rejects_malformed_names_and_framing() {
+        for output in [
+            b"\0".as_slice(),
+            b"core.bare",
+            b"core.bare\0\0",
+            b"branch.topic\x01.remote\0",
+            b"branch.topic\r.remote\0",
+            b"branch.topic\n.remote\0",
+            b"branch.topic.\xff\0",
+        ] {
+            assert_eq!(
+                validate_caller_git_config_names(output),
+                Err(GitPublisherConfigError::UnsafeCallerRepositoryConfig)
+            );
+        }
+
+        let mut oversized = vec![b'a'; 513];
+        oversized.push(0);
+        assert_eq!(
+            validate_caller_git_config_names(&oversized),
+            Err(GitPublisherConfigError::UnsafeCallerRepositoryConfig)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn caller_git_config_allows_branch_name_with_slash_in_repository() {
+        let Some((_temporary, checkout, git)) = initialize_caller_git_fixture() else {
+            return;
+        };
+        fixture_git_output(
+            &git,
+            &checkout,
+            &["branch", "-M", "goal3/windows-live-acceptance"],
+        );
+        fixture_git_output(
+            &git,
+            &checkout,
+            &[
+                "config",
+                "branch.goal3/windows-live-acceptance.remote",
+                "origin",
+            ],
+        );
+        fixture_git_output(
+            &git,
+            &checkout,
+            &[
+                "config",
+                "branch.goal3/windows-live-acceptance.merge",
+                "refs/heads/goal3/windows-live-acceptance",
+            ],
+        );
+
+        CallerGitRepository::open(&checkout).expect("legal branch config");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one adversarial checkout fixture proves every caller-repository invariant together"
+    )]
+    fn caller_git_reader_ignores_replace_refs_and_preserves_git_metadata() {
+        let Some((_temporary, checkout, git)) = initialize_caller_git_fixture() else {
+            return;
+        };
+        let actual_revision =
+            String::from_utf8(fixture_git_output(&git, &checkout, &["rev-parse", "HEAD"]))
+                .expect("revision")
+                .trim()
+                .to_owned();
+        let actual_blob = String::from_utf8(fixture_git_output(
+            &git,
+            &checkout,
+            &["rev-parse", "HEAD:actual.txt"],
+        ))
+        .expect("blob")
+        .trim()
+        .to_owned();
+        fs::write(checkout.join("actual.txt"), b"replacement\n").expect("replacement source");
+        fixture_git_output(&git, &checkout, &["add", "--", "actual.txt"]);
+        fixture_git_output(
+            &git,
+            &checkout,
+            &[
+                "-c",
+                "user.name=RustFerry Test",
+                "-c",
+                "user.email=rustferry@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "replacement",
+            ],
+        );
+        let replacement_revision =
+            String::from_utf8(fixture_git_output(&git, &checkout, &["rev-parse", "HEAD"]))
+                .expect("replacement revision")
+                .trim()
+                .to_owned();
+        fixture_git_output(
+            &git,
+            &checkout,
+            &["checkout", "--quiet", "--detach", &actual_revision],
+        );
+        fixture_git_output(
+            &git,
+            &checkout,
+            &["replace", &actual_revision, &replacement_revision],
+        );
+        fixture_git_output(
+            &git,
+            &checkout,
+            &[
+                "config",
+                "remote.safe.url",
+                "https://github.com/Owner/Repo.git",
+            ],
+        );
+        fixture_git_output(
+            &git,
+            &checkout,
+            &[
+                "config",
+                "remote.safe.pushurl",
+                "git@github.com:owner/repo.git",
+            ],
+        );
+        let canary = checkout.join("escaped-canary");
+        let canary_path = canary.to_string_lossy().replace('\\', "/");
+        let config_path = checkout.join(".git/config");
+        let mut config = fs::read_to_string(&config_path).expect("config");
+        std::fmt::Write::write_fmt(
+            &mut config,
+            format_args!(
+                "\n[credential]\n\thelper = !cmd.exe /c echo escaped > {canary_path}\n[http]\n\tproxy = http://127.0.0.1:9\n[core]\n\tsshCommand = cmd.exe /c echo escaped > {canary_path}\n\tfsmonitor = cmd.exe /c echo escaped > {canary_path}\n"
+            ),
+        )
+        .expect("append adversarial config");
+        fs::write(&config_path, config).expect("malicious inert config");
+        let nested = checkout.join("nested/project");
+        fs::create_dir_all(&nested).expect("nested start");
+        let git_before = test_tree_snapshot(&checkout.join(".git"));
+        let index_before = fs::metadata(checkout.join(".git/index"))
+            .expect("index metadata")
+            .modified()
+            .expect("index timestamp");
+
+        let reader = CallerGitRepository::open(&nested).expect("sealed caller reader");
+        assert_eq!(
+            reader.root(),
+            fs::canonicalize(&checkout).expect("canonical checkout")
+        );
+        assert_eq!(
+            std::str::from_utf8(reader.head_revision().expect("HEAD").stdout())
+                .expect("HEAD UTF-8")
+                .trim(),
+            actual_revision
+        );
+        assert!(reader.working_tree_status().expect("status").success());
+        let remote = reader.discover_remote("safe").expect("remote snapshot");
+        assert_eq!(
+            remote.fetch().canonical_url(),
+            "https://github.com/owner/repo"
+        );
+        assert_eq!(remote.push().canonical_url(), "git@github.com:owner/repo");
+        let tree = reader
+            .tree_entries(&actual_revision, &["actual.txt".to_owned()])
+            .expect("tree");
+        assert!(
+            tree.stdout()
+                .windows(actual_blob.len())
+                .any(|part| part == actual_blob.as_bytes())
+        );
+        let batch = reader
+            .blob_batch(format!("{actual_blob}\n").as_bytes(), 1_024)
+            .expect("blob batch");
+        assert!(batch.stdout().windows(7).any(|part| part == b"actual\n"));
+        assert!(!canary.exists());
+        assert_eq!(test_tree_snapshot(&checkout.join(".git")), git_before);
+        assert_eq!(
+            fs::metadata(checkout.join(".git/index"))
+                .expect("index metadata after reads")
+                .modified()
+                .expect("index timestamp after reads"),
+            index_before
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn caller_git_reader_rejects_external_filters_and_includes_before_execution() {
+        let Some((_temporary, checkout, _git)) = initialize_caller_git_fixture() else {
+            return;
+        };
+        let canary = checkout.join("filter-canary");
+        let canary_path = canary.to_string_lossy().replace('\\', "/");
+        let config_path = checkout.join(".git/config");
+        let mut config = fs::read_to_string(&config_path).expect("config");
+        std::fmt::Write::write_fmt(
+            &mut config,
+            format_args!(
+                "\n[filter \"evil\"]\n\tclean = cmd.exe /c echo escaped > {canary_path}\n[include]\n\tpath = missing.config\n"
+            ),
+        )
+        .expect("append unsafe config");
+        fs::write(config_path, config).expect("unsafe local config");
+        fs::write(checkout.join(".gitattributes"), b"actual.txt filter=evil\n")
+            .expect("filter attributes");
+        assert_eq!(
+            CallerGitRepository::open(&checkout).expect_err("unsafe config must fail closed"),
+            GitPublisherConfigError::UnsafeCallerRepositoryConfig
+        );
+        assert!(!canary.exists());
+        for key in [
+            b"include.path\0".as_slice(),
+            b"filter.evil.process\0",
+            b"protocol.ext.allow\0",
+            b"extensions.partialClone\0",
+            b"remote.origin.promisor\0",
+            b"remote.origin.partialCloneFilter\0",
+        ] {
+            assert_eq!(
+                validate_caller_git_config_names(key),
+                Err(GitPublisherConfigError::UnsafeCallerRepositoryConfig)
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[allow(
+        clippy::permissions_set_readonly_false,
+        reason = "Windows-only fixture clears Git's DOS read-only object bit before removing one loose blob"
+    )]
+    fn caller_partial_clone_cannot_lazy_fetch_a_missing_blob_through_ext() {
+        let Some((_temporary, checkout, git)) = initialize_caller_git_fixture() else {
+            return;
+        };
+        let blob = String::from_utf8(fixture_git_output(
+            &git,
+            &checkout,
+            &["rev-parse", "HEAD:actual.txt"],
+        ))
+        .expect("blob ID")
+        .trim()
+        .to_owned();
+        let canary = checkout.join("partial-clone-canary");
+        let canary_path = canary.to_string_lossy().replace('\\', "/");
+        for arguments in [
+            vec!["config", "core.repositoryformatversion", "1"],
+            vec!["config", "extensions.partialClone", "origin"],
+            vec!["config", "remote.origin.promisor", "true"],
+            vec!["config", "remote.origin.partialCloneFilter", "blob:none"],
+            vec!["config", "protocol.ext.allow", "always"],
+        ] {
+            fixture_git_output(&git, &checkout, &arguments);
+        }
+        fixture_git_output(
+            &git,
+            &checkout,
+            &[
+                "config",
+                "remote.origin.url",
+                &format!("ext::cmd.exe /c echo escaped > {canary_path}"),
+            ],
+        );
+        let object = checkout
+            .join(".git/objects")
+            .join(&blob[..2])
+            .join(&blob[2..]);
+        let mut permissions = fs::metadata(&object).expect("loose blob").permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&object, permissions).expect("writable fixture blob");
+        fs::remove_file(&object).expect("missing promised blob fixture");
+        assert_eq!(
+            CallerGitRepository::open(&checkout)
+                .expect_err("partial clone config must fail closed"),
+            GitPublisherConfigError::UnsafeCallerRepositoryConfig
+        );
+
+        let toolchain = crate::git_process::WindowsGitToolchain::new(&git)
+            .expect("sealed Git-for-Windows toolchain");
+        let process_state = tempfile::tempdir().expect("process state");
+        for name in ["home", "xdg", "tmp"] {
+            fs::create_dir(process_state.path().join(name)).expect("process directory");
+        }
+        let context = crate::git_process::GitProcessContext::new(
+            &checkout,
+            None,
+            process_state.path().join("home"),
+            process_state.path().join("xdg"),
+            process_state.path().join("tmp"),
+        )
+        .expect("offline context");
+        let spec = toolchain
+            .process_spec(
+                &context,
+                GitNetworkPolicy::Offline,
+                [
+                    OsString::from("--git-dir"),
+                    caller_git_argument_path(&checkout.join(".git")),
+                    OsString::from("--work-tree"),
+                    caller_git_argument_path(&checkout),
+                    OsString::from("cat-file"),
+                    OsString::from("--batch"),
+                ],
+            )
+            .expect("offline spec");
+        let mut command = spec.command().expect("sealed command");
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = run_git_process_allow_status(
+            command,
+            format!("{blob}\n").as_bytes(),
+            MAX_GIT_TIMEOUT,
+            MAX_GIT_OUTPUT_BYTES,
+        )
+        .expect("bounded missing-object read");
+        assert!(output.stdout.windows(7).any(|part| part == b"missing"));
+        assert!(!canary.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn caller_git_reader_revalidates_paths_at_the_pre_spawn_boundary() {
+        let Some((_temporary, checkout, _git)) = initialize_caller_git_fixture() else {
+            return;
+        };
+        let reader = CallerGitRepository::open(&checkout).expect("sealed caller reader");
+        assert!(fs::rename(&checkout, checkout.with_extension("moved")).is_err());
+        assert!(
+            fs::rename(&reader.home, reader.home.with_extension("moved")).is_err(),
+            "private HOME guard must deny same-path replacement"
+        );
+        let config_path = checkout.join(".git/config");
+        let config_replaced = std::cell::Cell::new(false);
+        let result = reader.execute_at_with_pre_spawn_hook(
+            reader.root(),
+            ["rev-parse", "--verify", "HEAD"],
+            &[],
+            MAX_GIT_OUTPUT_BYTES,
+            || {
+                config_replaced
+                    .set(fs::rename(&config_path, config_path.with_extension("replaced")).is_ok());
+            },
+        );
+        assert!(!config_replaced.get());
+        assert!(result.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_timeout_terminates_a_descendant_that_holds_inherited_pipes() {
+        let temporary = tempfile::tempdir().expect("fixture");
+        let parent_script = temporary.path().join("parent.sh");
+        let child_script = temporary.path().join("child.sh");
+        let ready = temporary.path().join("ready");
+        let delayed_marker = temporary.path().join("delayed-marker");
+        fs::write(
+            &parent_script,
+            b"#!/bin/sh\n/bin/sh \"$1\" \"$3\" &\n: > \"$2\"\nsleep 30\n",
+        )
+        .expect("parent helper");
+        fs::write(
+            &child_script,
+            b"#!/bin/sh\nsleep 2\nprintf escaped > \"$1\"\nsleep 30\n",
+        )
+        .expect("child helper");
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg(&parent_script)
+            .arg(&child_script)
+            .arg(&ready)
+            .arg(&delayed_marker)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let started = Instant::now();
+        assert_eq!(
+            run_git_process(command, &[], Duration::from_millis(500), 1_024),
+            Err(GitExecutionError::TimedOut)
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(ready.exists(), "parent did not spawn its descendant");
+        thread::sleep(Duration::from_millis(2_250));
+        assert!(!delayed_marker.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn git_timeout_terminates_a_descendant_that_holds_inherited_pipes() {
+        let system_root =
+            PathBuf::from(std::env::var_os("SystemRoot").expect("Windows SystemRoot"));
+        let powershell = system_root
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        let temporary = tempfile::tempdir().expect("fixture");
+        let parent_script = temporary.path().join("parent.ps1");
+        let child_script = temporary.path().join("child.ps1");
+        let ready = temporary.path().join("ready");
+        let delayed_marker = temporary.path().join("delayed-marker");
+        fs::write(
+            &parent_script,
+            concat!(
+                "param([string]$ChildScript,[string]$Ready,[string]$Marker)\n",
+                "$child = Start-Process -FilePath \"$PSHOME\\powershell.exe\" ",
+                "-ArgumentList @('-NoProfile','-NonInteractive','-File',$ChildScript,$Marker) ",
+                "-NoNewWindow -PassThru\n",
+                "[IO.File]::WriteAllText($Ready,'ready')\n",
+                "Start-Sleep -Seconds 30\n",
+            ),
+        )
+        .expect("parent helper");
+        fs::write(
+            &child_script,
+            concat!(
+                "param([string]$Marker)\n",
+                "Start-Sleep -Seconds 4\n",
+                "[IO.File]::WriteAllText($Marker,'escaped')\n",
+                "Start-Sleep -Seconds 30\n",
+            ),
+        )
+        .expect("child helper");
+        let mut command = Command::new(powershell);
+        command
+            .args(["-NoProfile", "-NonInteractive", "-File"])
+            .arg(&parent_script)
+            .arg(&child_script)
+            .arg(&ready)
+            .arg(&delayed_marker)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let started = Instant::now();
+        assert_eq!(
+            run_git_process(command, &[], Duration::from_secs(2), 1_024),
+            Err(GitExecutionError::TimedOut)
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(ready.exists(), "parent did not spawn its descendant");
+        thread::sleep(Duration::from_millis(4_250));
+        assert!(!delayed_marker.exists());
+    }
+
+    fn test_tree_snapshot(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+        fn visit(root: &Path, path: &Path, snapshot: &mut BTreeMap<PathBuf, Option<Vec<u8>>>) {
+            let mut entries = fs::read_dir(path)
+                .expect("read snapshot directory")
+                .map(|entry| entry.expect("read snapshot entry").path())
+                .collect::<Vec<_>>();
+            entries.sort();
+            for entry in entries {
+                let relative = entry
+                    .strip_prefix(root)
+                    .expect("snapshot path below root")
+                    .to_owned();
+                let metadata = fs::symlink_metadata(&entry).expect("snapshot metadata");
+                if metadata.is_dir() {
+                    snapshot.insert(relative, None);
+                    visit(root, &entry, snapshot);
+                } else {
+                    snapshot.insert(relative, Some(fs::read(&entry).expect("snapshot file")));
+                }
+            }
+        }
+
+        let mut snapshot = BTreeMap::new();
+        visit(root, root, &mut snapshot);
+        snapshot
+    }
 
     #[derive(Clone, Debug)]
     struct FixedClock(u64);
@@ -3638,6 +14838,526 @@ mod tests {
     impl ProviderClock for FixedClock {
         fn now_ms(&self) -> u64 {
             self.0
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct MutableClock(Arc<AtomicU64>);
+
+    impl MutableClock {
+        fn new(now_ms: u64) -> Self {
+            Self(Arc::new(AtomicU64::new(now_ms)))
+        }
+
+        fn set(&self, now_ms: u64) {
+            self.0.store(now_ms, Ordering::SeqCst);
+        }
+    }
+
+    impl ProviderClock for MutableClock {
+        fn now_ms(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct CapturingCheckpointSink {
+        checkpoints: Arc<Mutex<Vec<GithubJobResumeV1>>>,
+    }
+
+    impl GithubJobCheckpointSink for CapturingCheckpointSink {
+        fn checkpoint(&mut self, resume: &GithubJobResumeV1) -> RemoteBuildResult<()> {
+            self.checkpoints
+                .lock()
+                .expect("checkpoint capture")
+                .push(resume.clone());
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct FailingCheckpointSink;
+
+    impl GithubJobCheckpointSink for FailingCheckpointSink {
+        fn checkpoint(&mut self, _resume: &GithubJobResumeV1) -> RemoteBuildResult<()> {
+            Err(provider_failure(
+                "checkpoint_fixture_failed",
+                "checkpoint fixture failed",
+                true,
+            ))
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct WriteThenFailCheckpointSink {
+        checkpoints: Arc<Mutex<Vec<GithubJobResumeV1>>>,
+        failed_once: bool,
+    }
+
+    impl GithubJobCheckpointSink for WriteThenFailCheckpointSink {
+        fn checkpoint(&mut self, resume: &GithubJobResumeV1) -> RemoteBuildResult<()> {
+            self.checkpoints
+                .lock()
+                .expect("checkpoint capture")
+                .push(resume.clone());
+            if !self.failed_once {
+                self.failed_once = true;
+                return Err(provider_failure(
+                    "checkpoint_durability_uncertain",
+                    "checkpoint may have been published before durability failed",
+                    true,
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct FailOnWorkflowDispatchReceiptSink {
+        checkpoints: Arc<Mutex<Vec<GithubJobResumeV1>>>,
+    }
+
+    impl GithubJobCheckpointSink for FailOnWorkflowDispatchReceiptSink {
+        fn checkpoint(&mut self, resume: &GithubJobResumeV1) -> RemoteBuildResult<()> {
+            if resume
+                .workflow_dispatch
+                .as_ref()
+                .is_some_and(|dispatch| dispatch.receipt.is_some())
+                && resume.run.is_none()
+            {
+                return Err(provider_failure(
+                    "workflow_dispatch_receipt_checkpoint_failed",
+                    "workflow dispatch receipt checkpoint fixture failed",
+                    true,
+                ));
+            }
+            self.checkpoints
+                .lock()
+                .expect("workflow dispatch checkpoints")
+                .push(resume.clone());
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum SnapshotCleanupAuditEvent {
+        Checkpoint(GithubGitSnapshotPhaseV1),
+        Acquire,
+        Delete,
+        Release,
+    }
+
+    #[derive(Clone, Debug)]
+    struct SnapshotCleanupCheckpointSink {
+        events: Arc<Mutex<Vec<SnapshotCleanupAuditEvent>>>,
+        fail_deleted_once: bool,
+    }
+
+    impl GithubJobCheckpointSink for SnapshotCleanupCheckpointSink {
+        fn checkpoint(&mut self, resume: &GithubJobResumeV1) -> RemoteBuildResult<()> {
+            let phase = resume
+                .git_snapshot
+                .as_ref()
+                .expect("snapshot checkpoint")
+                .phase;
+            self.events
+                .lock()
+                .expect("snapshot cleanup events")
+                .push(SnapshotCleanupAuditEvent::Checkpoint(phase));
+            if phase == GithubGitSnapshotPhaseV1::SourceDeleted && self.fail_deleted_once {
+                self.fail_deleted_once = false;
+                return Err(provider_failure(
+                    "checkpoint_fixture_failed",
+                    "snapshot source deletion checkpoint failed",
+                    true,
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct FailOnSnapshotPhaseSink {
+        checkpoints: Arc<Mutex<Vec<GithubJobResumeV1>>>,
+        phase: GithubGitSnapshotPhaseV1,
+        failed_once: bool,
+    }
+
+    impl GithubJobCheckpointSink for FailOnSnapshotPhaseSink {
+        fn checkpoint(&mut self, resume: &GithubJobResumeV1) -> RemoteBuildResult<()> {
+            self.checkpoints
+                .lock()
+                .expect("snapshot checkpoints")
+                .push(resume.clone());
+            if resume.git_snapshot.as_ref().map(|snapshot| snapshot.phase) == Some(self.phase)
+                && self.failed_once
+            {
+                self.failed_once = false;
+                return Err(provider_failure(
+                    "checkpoint_fixture_failed",
+                    "snapshot phase checkpoint failed",
+                    true,
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct SnapshotCleanupAuditPublisher {
+        events: Arc<Mutex<Vec<SnapshotCleanupAuditEvent>>>,
+        source_lease_owned: bool,
+        deletion_count: usize,
+        keepalive_release_count: usize,
+    }
+
+    impl TemporaryRefPublisher for SnapshotCleanupAuditPublisher {
+        fn supports_git_snapshot(&self) -> bool {
+            true
+        }
+
+        fn doctor(
+            &mut self,
+            _request: &TemporaryRefDoctorRequest<'_>,
+        ) -> Result<TemporaryRefPublisherReadiness, TemporaryRefPublishError> {
+            Ok(TemporaryRefPublisherReadiness {
+                trusted_ref_tip: CommitSha::new(TRUSTED_TIP).expect("trusted tip"),
+            })
+        }
+
+        fn publication_attempt_is_process_fenced(&self) -> bool {
+            true
+        }
+
+        fn publication_lease_scope_sha256(&self) -> Option<&str> {
+            Some(FAKE_LEASE_SCOPE)
+        }
+
+        fn acquire_git_snapshot_source_lease(
+            &mut self,
+            _request: &GitSnapshotSourcePublicationLeaseRequest<'_>,
+        ) -> Result<TemporaryRefPublicationLease, TemporaryRefPublishError> {
+            self.events
+                .lock()
+                .expect("snapshot cleanup events")
+                .push(SnapshotCleanupAuditEvent::Acquire);
+            if self.source_lease_owned {
+                Ok(TemporaryRefPublicationLease::AlreadyOwned)
+            } else {
+                self.source_lease_owned = true;
+                Ok(TemporaryRefPublicationLease::Acquired)
+            }
+        }
+
+        fn release_git_snapshot_source_lease(
+            &mut self,
+            _request: &GitSnapshotSourcePublicationLeaseRequest<'_>,
+        ) {
+            assert!(
+                self.source_lease_owned,
+                "cleanup source lease must be owned"
+            );
+            self.events
+                .lock()
+                .expect("snapshot cleanup events")
+                .push(SnapshotCleanupAuditEvent::Release);
+            self.source_lease_owned = false;
+        }
+
+        fn delete_git_snapshot_source(
+            &mut self,
+            request: &GitSnapshotSourceDeleteRequest<'_>,
+        ) -> Result<(), TemporaryRefPublishError> {
+            assert!(self.source_lease_owned, "delete must hold the source lease");
+            assert_eq!(request.expected_commit.as_str(), SOURCE_SHA);
+            self.events
+                .lock()
+                .expect("snapshot cleanup events")
+                .push(SnapshotCleanupAuditEvent::Delete);
+            self.deletion_count += 1;
+            Ok(())
+        }
+
+        fn release_git_snapshot_keepalive(
+            &mut self,
+            _request: &GitSnapshotKeepaliveRequest<'_>,
+        ) -> Result<(), TemporaryRefPublishError> {
+            self.keepalive_release_count += 1;
+            Ok(())
+        }
+
+        fn publish(
+            &mut self,
+            _request: &TemporaryRefPublishRequest<'_>,
+        ) -> Result<PublishedTemporaryRef, TemporaryRefPublishFailure> {
+            Err(TemporaryRefPublishError::GitSnapshotUnsupported.into())
+        }
+
+        fn delete_temporary_ref(
+            &mut self,
+            _request: &TemporaryRefDeleteRequest<'_>,
+        ) -> Result<(), TemporaryRefPublishError> {
+            Err(TemporaryRefPublishError::GitSnapshotUnsupported)
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum SnapshotFlowEvent {
+        AdoptStage,
+        ReconcileKeepalive,
+        Import,
+        CreateKeepalive,
+        DeleteStage,
+        AcquireSourceLease,
+        PublishSource,
+        ReconcileSource,
+        ReleaseSourceLease,
+        ReleaseKeepalive,
+        PrepareDispatch {
+            execution_repository: String,
+            source_repository: String,
+            source_ref: String,
+        },
+        AcquireDispatchLease,
+        PublishDispatch,
+        ReleaseDispatchLease,
+    }
+
+    #[derive(Debug)]
+    struct SnapshotFlowPublisher {
+        events: Vec<SnapshotFlowEvent>,
+        keepalive_exact: bool,
+        keepalive_reconciliations: VecDeque<GitSnapshotRefReconciliation>,
+        source_publication: GitSnapshotSourcePublication,
+        source_reconciliation: GitSnapshotRefReconciliation,
+        source_reconciliations: VecDeque<GitSnapshotRefReconciliation>,
+        source_lease_owned: bool,
+        dispatch_lease_owned: bool,
+    }
+
+    impl SnapshotFlowPublisher {
+        fn exact() -> Self {
+            Self {
+                events: Vec::new(),
+                keepalive_exact: false,
+                keepalive_reconciliations: VecDeque::new(),
+                source_publication: GitSnapshotSourcePublication::Exact,
+                source_reconciliation: GitSnapshotRefReconciliation::Exact,
+                source_reconciliations: VecDeque::new(),
+                source_lease_owned: false,
+                dispatch_lease_owned: false,
+            }
+        }
+    }
+
+    impl TemporaryRefPublisher for SnapshotFlowPublisher {
+        fn supports_git_snapshot(&self) -> bool {
+            true
+        }
+
+        fn doctor(
+            &mut self,
+            _request: &TemporaryRefDoctorRequest<'_>,
+        ) -> Result<TemporaryRefPublisherReadiness, TemporaryRefPublishError> {
+            Ok(TemporaryRefPublisherReadiness {
+                trusted_ref_tip: CommitSha::new(TRUSTED_TIP).expect("trusted tip"),
+            })
+        }
+
+        fn adopt_git_snapshot_stage(
+            &mut self,
+            _request: &IosDeviceBuildRequest,
+        ) -> Result<(GitSnapshotStageLocatorV1, GitSnapshotStageV1), TemporaryRefPublishError>
+        {
+            self.events.push(SnapshotFlowEvent::AdoptStage);
+            Err(TemporaryRefPublishError::PublicationVerificationFailed)
+        }
+
+        fn import_git_snapshot(
+            &mut self,
+            request: &GitSnapshotImportRequest<'_>,
+        ) -> Result<GitSnapshotObjectGraphV1, TemporaryRefPublishError> {
+            self.events.push(SnapshotFlowEvent::Import);
+            Ok(request.expected_stage.graph.clone())
+        }
+
+        fn delete_git_snapshot_stage(
+            &mut self,
+            _request: &GitSnapshotImportRequest<'_>,
+        ) -> Result<(), TemporaryRefPublishError> {
+            self.events.push(SnapshotFlowEvent::DeleteStage);
+            Ok(())
+        }
+
+        fn reconcile_git_snapshot_keepalive(
+            &mut self,
+            _request: &GitSnapshotKeepaliveRequest<'_>,
+        ) -> Result<GitSnapshotRefReconciliation, TemporaryRefPublishError> {
+            self.events.push(SnapshotFlowEvent::ReconcileKeepalive);
+            Ok(self
+                .keepalive_reconciliations
+                .pop_front()
+                .unwrap_or(if self.keepalive_exact {
+                    GitSnapshotRefReconciliation::Exact
+                } else {
+                    GitSnapshotRefReconciliation::Absent
+                }))
+        }
+
+        fn create_git_snapshot_keepalive(
+            &mut self,
+            _request: &GitSnapshotKeepaliveRequest<'_>,
+        ) -> Result<(), TemporaryRefPublishError> {
+            self.events.push(SnapshotFlowEvent::CreateKeepalive);
+            self.keepalive_exact = true;
+            Ok(())
+        }
+
+        fn release_git_snapshot_keepalive(
+            &mut self,
+            _request: &GitSnapshotKeepaliveRequest<'_>,
+        ) -> Result<(), TemporaryRefPublishError> {
+            self.events.push(SnapshotFlowEvent::ReleaseKeepalive);
+            self.keepalive_exact = false;
+            Ok(())
+        }
+
+        fn publish_git_snapshot_source(
+            &mut self,
+            request: &GitSnapshotSourcePublishRequest<'_>,
+        ) -> Result<GitSnapshotSourcePublication, TemporaryRefPublishError> {
+            assert!(request.authorized);
+            self.events.push(SnapshotFlowEvent::PublishSource);
+            self.source_reconciliation = match self.source_publication {
+                GitSnapshotSourcePublication::Exact => GitSnapshotRefReconciliation::Exact,
+                GitSnapshotSourcePublication::Conflict => GitSnapshotRefReconciliation::Conflict,
+                GitSnapshotSourcePublication::Uncertain => GitSnapshotRefReconciliation::Absent,
+            };
+            Ok(self.source_publication)
+        }
+
+        fn reconcile_git_snapshot_source(
+            &mut self,
+            _request: &GitSnapshotSourcePublishRequest<'_>,
+        ) -> Result<GitSnapshotRefReconciliation, TemporaryRefPublishError> {
+            self.events.push(SnapshotFlowEvent::ReconcileSource);
+            Ok(self
+                .source_reconciliations
+                .pop_front()
+                .unwrap_or(self.source_reconciliation))
+        }
+
+        fn publication_attempt_is_process_fenced(&self) -> bool {
+            true
+        }
+
+        fn publication_lease_scope_sha256(&self) -> Option<&str> {
+            Some(FAKE_LEASE_SCOPE)
+        }
+
+        fn acquire_git_snapshot_source_lease(
+            &mut self,
+            _request: &GitSnapshotSourcePublicationLeaseRequest<'_>,
+        ) -> Result<TemporaryRefPublicationLease, TemporaryRefPublishError> {
+            self.events.push(SnapshotFlowEvent::AcquireSourceLease);
+            if self.source_lease_owned {
+                Ok(TemporaryRefPublicationLease::AlreadyOwned)
+            } else {
+                self.source_lease_owned = true;
+                Ok(TemporaryRefPublicationLease::Acquired)
+            }
+        }
+
+        fn release_git_snapshot_source_lease(
+            &mut self,
+            _request: &GitSnapshotSourcePublicationLeaseRequest<'_>,
+        ) {
+            assert!(self.source_lease_owned);
+            self.events.push(SnapshotFlowEvent::ReleaseSourceLease);
+            self.source_lease_owned = false;
+        }
+
+        fn prepare(
+            &mut self,
+            request: &TemporaryRefPublishRequest<'_>,
+        ) -> Result<Option<PublishedTemporaryRef>, TemporaryRefPublishError> {
+            let source_ref = request
+                .snapshot_source_ref
+                .expect("snapshot dispatch source ref");
+            self.events.push(SnapshotFlowEvent::PrepareDispatch {
+                execution_repository: repository_url(request.repository),
+                source_repository: request.source_repository.to_owned(),
+                source_ref: source_ref.as_str().to_owned(),
+            });
+            Ok(Some(PublishedTemporaryRef::new(
+                request.temporary_ref.clone(),
+                CommitSha::new(DISPATCH_SHA).expect("dispatch commit"),
+            )))
+        }
+
+        fn acquire_publication_lease(
+            &mut self,
+            _request: &TemporaryRefPublicationLeaseRequest<'_>,
+        ) -> Result<TemporaryRefPublicationLease, TemporaryRefPublishError> {
+            self.events.push(SnapshotFlowEvent::AcquireDispatchLease);
+            if self.dispatch_lease_owned {
+                Ok(TemporaryRefPublicationLease::AlreadyOwned)
+            } else {
+                self.dispatch_lease_owned = true;
+                Ok(TemporaryRefPublicationLease::Acquired)
+            }
+        }
+
+        fn release_publication_lease(
+            &mut self,
+            _request: &TemporaryRefPublicationLeaseRequest<'_>,
+        ) {
+            assert!(self.dispatch_lease_owned);
+            self.events.push(SnapshotFlowEvent::ReleaseDispatchLease);
+            self.dispatch_lease_owned = false;
+        }
+
+        fn publish(
+            &mut self,
+            request: &TemporaryRefPublishRequest<'_>,
+        ) -> Result<PublishedTemporaryRef, TemporaryRefPublishFailure> {
+            assert!(request.snapshot_source_ref.is_some());
+            self.events.push(SnapshotFlowEvent::PublishDispatch);
+            Ok(PublishedTemporaryRef::new(
+                request.temporary_ref.clone(),
+                CommitSha::new(DISPATCH_SHA).expect("dispatch commit"),
+            ))
+        }
+
+        fn publish_prepared(
+            &mut self,
+            request: &TemporaryRefPublishRequest<'_>,
+            prepared: Option<&PublishedTemporaryRef>,
+        ) -> Result<PublishedTemporaryRef, TemporaryRefPublishFailure> {
+            let expected = PublishedTemporaryRef::new(
+                request.temporary_ref.clone(),
+                CommitSha::new(DISPATCH_SHA).expect("dispatch commit"),
+            );
+            if prepared != Some(&expected) {
+                return Err(TemporaryRefPublishError::PublicationVerificationFailed.into());
+            }
+            self.publish(request)
+        }
+
+        fn delete_temporary_ref(
+            &mut self,
+            _request: &TemporaryRefDeleteRequest<'_>,
+        ) -> Result<(), TemporaryRefPublishError> {
+            Ok(())
+        }
+    }
+
+    impl TemporaryRefReconciler for SnapshotFlowPublisher {
+        fn reconcile_temporary_ref(
+            &mut self,
+            _request: &TemporaryRefReconcileRequest<'_>,
+        ) -> Result<TemporaryRefReconciliation, TemporaryRefPublishError> {
+            Ok(TemporaryRefReconciliation::Missing)
         }
     }
 
@@ -3655,6 +15375,10 @@ mod tests {
 
         fn supports_removal(&self) -> bool {
             false
+        }
+
+        fn supports_signed_cleanup_evidence(&self) -> bool {
+            true
         }
 
         fn list_verified(
@@ -3763,10 +15487,19 @@ mod tests {
     struct FakePublisher {
         published: Vec<CapturedPublication>,
         deletions: Vec<CapturedDeletion>,
+        doctor_failure: Option<TemporaryRefPublishError>,
+        execution_workflow_failure: Option<TemporaryRefPublishError>,
+        execution_workflow_checks: u64,
+        prepare_failure: Option<TemporaryRefPublishError>,
         failure: Option<TemporaryRefPublishFailure>,
         delete_failure: Option<TemporaryRefPublishError>,
         cancel_on_publish: Option<CancellationToken>,
         returned_temporary_ref: Option<TemporaryGitRef>,
+        prepared_publication: Option<PublishedTemporaryRef>,
+        reconciliation: Option<TemporaryRefReconciliation>,
+        publication_leases: BTreeSet<String>,
+        publication_lease_blocked: bool,
+        publication_lease_unsupported: bool,
     }
 
     #[derive(Debug)]
@@ -3787,13 +15520,72 @@ mod tests {
     }
 
     impl TemporaryRefPublisher for FakePublisher {
+        fn publication_attempt_is_process_fenced(&self) -> bool {
+            true
+        }
+
+        fn publication_lease_scope_sha256(&self) -> Option<&str> {
+            (!self.publication_lease_unsupported).then_some(FAKE_LEASE_SCOPE)
+        }
+
+        fn acquire_publication_lease(
+            &mut self,
+            request: &TemporaryRefPublicationLeaseRequest<'_>,
+        ) -> Result<TemporaryRefPublicationLease, TemporaryRefPublishError> {
+            if self.publication_lease_unsupported {
+                return Ok(TemporaryRefPublicationLease::Unsupported);
+            }
+            if self.publication_lease_blocked {
+                return Ok(TemporaryRefPublicationLease::HeldByOther);
+            }
+            if self
+                .publication_leases
+                .insert(publication_lease_key(request))
+            {
+                Ok(TemporaryRefPublicationLease::Acquired)
+            } else {
+                Ok(TemporaryRefPublicationLease::AlreadyOwned)
+            }
+        }
+
+        fn release_publication_lease(&mut self, request: &TemporaryRefPublicationLeaseRequest<'_>) {
+            self.publication_leases
+                .remove(&publication_lease_key(request));
+        }
+
         fn doctor(
             &mut self,
             _request: &TemporaryRefDoctorRequest<'_>,
         ) -> Result<TemporaryRefPublisherReadiness, TemporaryRefPublishError> {
+            if let Some(error) = self.doctor_failure.take() {
+                return Err(error);
+            }
             Ok(TemporaryRefPublisherReadiness {
                 trusted_ref_tip: CommitSha::new(TRUSTED_TIP).expect("trusted tip"),
             })
+        }
+
+        fn verify_execution_workflow(
+            &mut self,
+            _request: &ExecutionWorkflowDoctorRequest<'_>,
+        ) -> Result<TemporaryRefPublisherReadiness, TemporaryRefPublishError> {
+            self.execution_workflow_checks += 1;
+            if let Some(error) = self.execution_workflow_failure.take() {
+                return Err(error);
+            }
+            Ok(TemporaryRefPublisherReadiness {
+                trusted_ref_tip: CommitSha::new(TRUSTED_TIP).expect("trusted tip"),
+            })
+        }
+
+        fn prepare(
+            &mut self,
+            _request: &TemporaryRefPublishRequest<'_>,
+        ) -> Result<Option<PublishedTemporaryRef>, TemporaryRefPublishError> {
+            if let Some(error) = self.prepare_failure.take() {
+                return Err(error);
+            }
+            Ok(self.prepared_publication.clone())
         }
 
         fn publish(
@@ -3823,6 +15615,23 @@ mod tests {
             ))
         }
 
+        fn publish_prepared(
+            &mut self,
+            request: &TemporaryRefPublishRequest<'_>,
+            prepared: Option<&PublishedTemporaryRef>,
+        ) -> Result<PublishedTemporaryRef, TemporaryRefPublishFailure> {
+            let candidate = PublishedTemporaryRef::new(
+                self.returned_temporary_ref
+                    .clone()
+                    .unwrap_or_else(|| request.temporary_ref.clone()),
+                CommitSha::new(DISPATCH_SHA).expect("dispatch SHA"),
+            );
+            if prepared.is_some_and(|expected| expected != &candidate) {
+                return Err(TemporaryRefPublishError::PublicationVerificationFailed.into());
+            }
+            self.publish(request)
+        }
+
         fn delete_temporary_ref(
             &mut self,
             request: &TemporaryRefDeleteRequest<'_>,
@@ -3839,10 +15648,150 @@ mod tests {
         }
     }
 
+    impl TemporaryRefReconciler for FakePublisher {
+        fn reconcile_temporary_ref(
+            &mut self,
+            _request: &TemporaryRefReconcileRequest<'_>,
+        ) -> Result<TemporaryRefReconciliation, TemporaryRefPublishError> {
+            Ok(self
+                .reconciliation
+                .take()
+                .unwrap_or(TemporaryRefReconciliation::Missing))
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeWorkflowDispatchState {
+        responses: Mutex<
+            VecDeque<Result<GithubWorkflowDispatchHttpResponse, GithubWorkflowDispatchHttpError>>,
+        >,
+        requests: Mutex<Vec<GithubWorkflowDispatchHttpRequest>>,
+        clients_created: AtomicU64,
+        post_gate: Option<Arc<FakeWorkflowDispatchPostGate>>,
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeWorkflowDispatchPostGate {
+        entered: Mutex<bool>,
+        entered_changed: Condvar,
+        released: Mutex<bool>,
+        released_changed: Condvar,
+    }
+
+    impl FakeWorkflowDispatchPostGate {
+        fn block_post(&self) {
+            *self.entered.lock().expect("dispatch gate entered") = true;
+            self.entered_changed.notify_all();
+            let mut released = self.released.lock().expect("dispatch gate released");
+            while !*released {
+                released = self
+                    .released_changed
+                    .wait(released)
+                    .expect("dispatch gate wait");
+            }
+        }
+
+        fn wait_until_entered(&self) {
+            let entered = self.entered.lock().expect("dispatch gate entered");
+            let (entered, timeout) = self
+                .entered_changed
+                .wait_timeout_while(entered, StdDuration::from_secs(5), |entered| !*entered)
+                .expect("dispatch gate wait");
+            assert!(
+                *entered && !timeout.timed_out(),
+                "dispatch POST did not start"
+            );
+        }
+
+        fn release(&self) {
+            *self.released.lock().expect("dispatch gate released") = true;
+            self.released_changed.notify_all();
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct FakeWorkflowDispatchPlan(Arc<FakeWorkflowDispatchState>);
+
+    impl FakeWorkflowDispatchPlan {
+        fn with_response(response: GithubWorkflowDispatchHttpResponse) -> Self {
+            let plan = Self::default();
+            plan.0
+                .responses
+                .lock()
+                .expect("dispatch responses")
+                .push_back(Ok(response));
+            plan
+        }
+
+        fn with_blocking_response(
+            response: GithubWorkflowDispatchHttpResponse,
+        ) -> (Self, Arc<FakeWorkflowDispatchPostGate>) {
+            Self::with_blocking_result(Ok(response))
+        }
+
+        fn with_blocking_result(
+            response: Result<
+                GithubWorkflowDispatchHttpResponse,
+                GithubWorkflowDispatchHttpError,
+            >,
+        ) -> (Self, Arc<FakeWorkflowDispatchPostGate>) {
+            let gate = Arc::new(FakeWorkflowDispatchPostGate::default());
+            let state = FakeWorkflowDispatchState {
+                responses: Mutex::new(VecDeque::from([response])),
+                requests: Mutex::new(Vec::new()),
+                clients_created: AtomicU64::new(0),
+                post_gate: Some(Arc::clone(&gate)),
+            };
+            (Self(Arc::new(state)), gate)
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeWorkflowDispatchFactory(FakeWorkflowDispatchPlan);
+
+    impl GithubWorkflowDispatchHttpClientFactory for FakeWorkflowDispatchFactory {
+        fn create(
+            self: Box<Self>,
+        ) -> Result<Box<dyn GithubWorkflowDispatchHttpClient + Send>, GhExecutionError> {
+            self.0.0.clients_created.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(FakeWorkflowDispatchClient(self.0)))
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeWorkflowDispatchClient(FakeWorkflowDispatchPlan);
+
+    impl GithubWorkflowDispatchHttpClient for FakeWorkflowDispatchClient {
+        fn post(
+            &mut self,
+            request: &GithubWorkflowDispatchHttpRequest,
+        ) -> Result<GithubWorkflowDispatchHttpResponse, GithubWorkflowDispatchHttpError> {
+            self.0
+                .0
+                .requests
+                .lock()
+                .expect("dispatch requests")
+                .push(request.clone());
+            if let Some(gate) = &self.0.0.post_gate {
+                gate.block_post();
+            }
+            self.0
+                .0
+                .responses
+                .lock()
+                .expect("dispatch responses")
+                .pop_front()
+                .expect("unexpected workflow dispatch POST")
+        }
+    }
+
     #[derive(Debug, Default)]
     struct FakeGhRunner {
         responses: VecDeque<Result<Vec<u8>, GhExecutionError>>,
         requests: Arc<Mutex<Vec<GhRequest>>>,
+        workflow_dispatch: Option<FakeWorkflowDispatchPlan>,
+        cancel_before_invocation: Option<(u64, CancellationToken)>,
+        invocations: u64,
     }
 
     impl FakeGhRunner {
@@ -3850,17 +15799,58 @@ mod tests {
             Self {
                 responses: responses.into_iter().collect(),
                 requests: Arc::new(Mutex::new(Vec::new())),
+                workflow_dispatch: None,
+                cancel_before_invocation: None,
+                invocations: 0,
             }
+        }
+
+        fn with_workflow_dispatch(mut self, plan: FakeWorkflowDispatchPlan) -> Self {
+            self.workflow_dispatch = Some(plan);
+            self
+        }
+
+        fn cancelling_before(
+            mut self,
+            invocation: u64,
+            cancellation: CancellationToken,
+        ) -> Self {
+            self.cancel_before_invocation = Some((invocation, cancellation));
+            self
         }
     }
 
     impl GhRunner for FakeGhRunner {
         fn execute(&mut self, request: &GhRequest) -> Result<Vec<u8>, GhExecutionError> {
+            self.invocations = self.invocations.saturating_add(1);
+            if self
+                .cancel_before_invocation
+                .as_ref()
+                .is_some_and(|(invocation, _)| *invocation == self.invocations)
+            {
+                self.cancel_before_invocation
+                    .as_ref()
+                    .expect("checked cancellation")
+                    .1
+                    .cancel();
+            }
             self.requests
                 .lock()
                 .expect("request capture")
                 .push(request.clone());
             self.responses.pop_front().expect("unexpected gh request")
+        }
+
+        fn workflow_dispatch_client_factory(
+            &self,
+        ) -> Result<Box<dyn GithubWorkflowDispatchHttpClientFactory>, GhExecutionError> {
+            self.workflow_dispatch.clone().map_or_else(
+                || Err(GhExecutionError::AuthenticationUnavailable),
+                |plan| {
+                    Ok(Box::new(FakeWorkflowDispatchFactory(plan))
+                        as Box<dyn GithubWorkflowDispatchHttpClientFactory>)
+                },
+            )
         }
     }
 
@@ -3868,13 +15858,16 @@ mod tests {
     struct CapturedGitInvocation {
         arguments: Vec<OsString>,
         stdin_len: usize,
-        environment: Vec<(OsString, OsString)>,
+        environment: Vec<(GitEnvironmentVariable, OsString)>,
+        network: GitNetworkPolicy,
+        stdout_limit: usize,
     }
 
     #[derive(Debug, Default)]
     struct FakeGitRunner {
         responses: VecDeque<Result<Vec<u8>, GitExecutionError>>,
         invocations: Vec<CapturedGitInvocation>,
+        cancel_after_invocations: Option<(usize, CancellationToken)>,
     }
 
     impl FakeGitRunner {
@@ -3882,28 +15875,96 @@ mod tests {
             Self {
                 responses: responses.into_iter().collect(),
                 invocations: Vec::new(),
+                cancel_after_invocations: None,
             }
         }
-    }
 
-    impl GitRunner for FakeGitRunner {
-        fn execute(&mut self, invocation: &GitInvocation) -> Result<Vec<u8>, GitExecutionError> {
+        fn cancelling_after(
+            responses: impl IntoIterator<Item = Result<Vec<u8>, GitExecutionError>>,
+            invocation_count: usize,
+            cancellation: CancellationToken,
+        ) -> Self {
+            Self {
+                responses: responses.into_iter().collect(),
+                invocations: Vec::new(),
+                cancel_after_invocations: Some((invocation_count, cancellation)),
+            }
+        }
+
+        fn record_and_respond(
+            &mut self,
+            invocation: &GitInvocation,
+            stdin_len: usize,
+        ) -> Result<Vec<u8>, GitExecutionError> {
             self.invocations.push(CapturedGitInvocation {
                 arguments: invocation.arguments().to_vec(),
-                stdin_len: invocation.stdin_len(),
+                stdin_len,
                 environment: invocation.environment().to_vec(),
+                network: invocation.network,
+                stdout_limit: invocation.stdout_limit(),
             });
+            if let Some((count, cancellation)) = &self.cancel_after_invocations
+                && self.invocations.len() == *count
+            {
+                cancellation.cancel();
+            }
             self.responses
                 .pop_front()
                 .expect("unexpected git invocation")
         }
     }
 
-    fn workflow_config() -> WorkflowConfig {
-        WorkflowConfig::new(
+    impl GitRunner for FakeGitRunner {
+        fn execute(&mut self, invocation: &GitInvocation) -> Result<Vec<u8>, GitExecutionError> {
+            self.record_and_respond(invocation, invocation.stdin_len())
+        }
+
+        fn execute_file(
+            &mut self,
+            invocation: &GitInvocation,
+            mut input: fs::File,
+            expected_len: u64,
+        ) -> Result<Vec<u8>, GitExecutionError> {
+            let mut bytes = Vec::new();
+            input
+                .read_to_end(&mut bytes)
+                .map_err(|_| GitExecutionError::ProcessIo)?;
+            if u64::try_from(bytes.len()).map_err(|_| GitExecutionError::ProcessIo)? != expected_len
+            {
+                return Err(GitExecutionError::ProcessIo);
+            }
+            self.record_and_respond(invocation, bytes.len())
+        }
+
+        fn process_tree_is_parent_fenced(&self) -> bool {
+            true
+        }
+    }
+
+    fn workflow_config_with_secret_names_and_trigger(
+        secret_names: SigningSecretNames,
+        run_trigger: WorkflowRunTrigger,
+    ) -> WorkflowConfig {
+        let trusted_source_ref = match run_trigger {
+            WorkflowRunTrigger::Push => "refs/heads/goal3/macless-iphone-builds",
+            WorkflowRunTrigger::WorkflowDispatch => "refs/heads/main",
+        };
+        workflow_config_with_secret_names_trigger_and_trusted_ref(
+            secret_names,
+            run_trigger,
+            trusted_source_ref,
+        )
+    }
+
+    fn workflow_config_with_secret_names_trigger_and_trusted_ref(
+        secret_names: SigningSecretNames,
+        run_trigger: WorkflowRunTrigger,
+        trusted_source_ref: &str,
+    ) -> WorkflowConfig {
+        WorkflowConfig::new_with_run_trigger(
             WorkflowFileName::new("rustferry-goal3-iphone.yml").expect("workflow name"),
             ProtectedEnvironment::new("rustferry-goal3-signing").expect("environment"),
-            SigningSecretNames::goal3_defaults(),
+            secret_names,
             WorkerDistribution::new(
                 "https://github.com/ShiroKSH/rust-and-iphone/releases/download/v0.1.0/ferry-worker-macos",
                 "0".repeat(64),
@@ -3912,11 +15973,19 @@ mod tests {
             .expect("worker"),
             PublicSourceRepository::new("shiroksh/rust-and-iphone")
                 .expect("source repository"),
-            TrustedSourceRef::new("refs/heads/goal3/macless-iphone-builds")
-                .expect("trusted ref"),
+            TrustedSourceRef::new(trusted_source_ref).expect("trusted ref"),
             TemporaryBranchNamespace::new("rustferry/goal3/builds").expect("namespace"),
+            run_trigger,
         )
         .expect("workflow config")
+    }
+
+    fn workflow_config_with_secret_names(secret_names: SigningSecretNames) -> WorkflowConfig {
+        workflow_config_with_secret_names_and_trigger(secret_names, WorkflowRunTrigger::Push)
+    }
+
+    fn workflow_config() -> WorkflowConfig {
+        workflow_config_with_secret_names(SigningSecretNames::goal3_defaults())
     }
 
     fn same_repository_provider_config(
@@ -3953,12 +16022,92 @@ mod tests {
         .expect("split provider config")
     }
 
+    fn workflow_dispatch_provider_config(
+        authorization: GithubMutationAuthorization,
+    ) -> GithubProviderConfig {
+        let workflow = workflow_config_with_secret_names_and_trigger(
+            SigningSecretNames::goal3_defaults(),
+            WorkflowRunTrigger::WorkflowDispatch,
+        );
+        let fingerprint = WorkflowFingerprint::for_workflow(&generate_workflow(&workflow));
+        GithubProviderConfig::new(
+            Repository::new("ShiroKSH", "rustferry-signing").expect("execution repository"),
+            "https://github.com/shiroksh/rust-and-iphone",
+            workflow,
+            fingerprint,
+            GithubPollingPolicy::new(3, Duration::from_millis(250)).expect("poll policy"),
+            authorization,
+            &Version::new(0, 1, 0),
+            8,
+        )
+        .expect("workflow dispatch provider config")
+    }
+
+    fn workflow_dispatch_provider_config_with_trusted_ref(
+        authorization: GithubMutationAuthorization,
+        trusted_source_ref: &str,
+    ) -> GithubProviderConfig {
+        let workflow = workflow_config_with_secret_names_trigger_and_trusted_ref(
+            SigningSecretNames::goal3_defaults(),
+            WorkflowRunTrigger::WorkflowDispatch,
+            trusted_source_ref,
+        );
+        let fingerprint = WorkflowFingerprint::for_workflow(&generate_workflow(&workflow));
+        GithubProviderConfig::new(
+            Repository::new("ShiroKSH", "rustferry-signing").expect("execution repository"),
+            "https://github.com/shiroksh/rust-and-iphone",
+            workflow,
+            fingerprint,
+            GithubPollingPolicy::new(3, Duration::from_millis(250)).expect("poll policy"),
+            authorization,
+            &Version::new(0, 1, 0),
+            8,
+        )
+        .expect("workflow dispatch provider config")
+    }
+
+    fn provider_config_with_secret_names(
+        authorization: GithubMutationAuthorization,
+        secret_names: SigningSecretNames,
+    ) -> GithubProviderConfig {
+        let workflow = workflow_config_with_secret_names(secret_names);
+        let fingerprint = WorkflowFingerprint::for_workflow(&generate_workflow(&workflow));
+        GithubProviderConfig::new(
+            Repository::new("ShiroKSH", "rustferry-signing").expect("execution repository"),
+            "https://github.com/shiroksh/rust-and-iphone",
+            workflow,
+            fingerprint,
+            GithubPollingPolicy::new(3, Duration::from_millis(250)).expect("poll policy"),
+            authorization,
+            &Version::new(0, 1, 0),
+            8,
+        )
+        .expect("split provider config")
+    }
+
     fn transport(runner: FakeGhRunner) -> GithubTransport<FakeGhRunner> {
         GithubTransport::new(runner, TransportLimits::secure_defaults())
     }
 
+    fn expected_publication() -> PublishedTemporaryRef {
+        PublishedTemporaryRef::new(
+            TemporaryGitRef::new(
+                provider_config(all_authorized())
+                    .workflow
+                    .temporary_branch_namespace(),
+                BranchName::new("rustferry/goal3/builds/operation-1").expect("branch"),
+            )
+            .expect("temporary ref"),
+            CommitSha::new(DISPATCH_SHA).expect("dispatch commit"),
+        )
+    }
+
     fn private_repository_row() -> Vec<u8> {
         b"991\tShiroKSH/rustferry-signing\ttrue\tfalse\tfalse\tmain\n".to_vec()
+    }
+
+    fn authenticated_user_row() -> Vec<u8> {
+        b"42\tU2hpcm9LU0g=\n".to_vec()
     }
 
     fn public_source_repository_row() -> Vec<u8> {
@@ -4039,7 +16188,7 @@ mod tests {
             source_mode: SourceMode::Git,
             source_repository: Some("https://github.com/shiroksh/rust-and-iphone".to_owned()),
             source_revision: Some(SOURCE_SHA.to_owned()),
-            source: empty_source_manifest(),
+            source: compile_source_manifest(),
             signing,
             requested_artifacts: BTreeSet::from([
                 IosArtifactType::Ipa,
@@ -4048,6 +16197,103 @@ mod tests {
         };
         request.validate().expect("valid Git request");
         request
+    }
+
+    fn multi_profile_request() -> (IosDeviceBuildRequest, SigningSecretNames) {
+        let mut request = valid_request();
+        let targets = vec![
+            request.signing.targets[0].clone(),
+            SigningTarget {
+                name: "Widget".to_owned(),
+                bundle_identifier: BundleIdentifier::new("com.example.app.widget")
+                    .expect("widget bundle"),
+                kind: SigningTargetKind::Extension,
+            },
+        ];
+        let names = SigningSecretNames::for_targets(&targets).expect("profile names");
+        let secret = |name: &str| {
+            SecretReference::new(SecretReferenceKind::GithubActions, name).expect("secret")
+        };
+        request.signing.targets = targets;
+        request.product.nested_bundles = vec![UnsignedNestedBundleExpectation {
+            relative_path: "PlugIns/Widget.appex".to_owned(),
+            bundle_identifier: "com.example.app.widget".to_owned(),
+            executable: "Widget".to_owned(),
+            kind: UnsignedNestedBundleKind::AppExtension,
+        }];
+        request.signing.provisioning = vec![
+            ProvisioningPlan {
+                target: "App".to_owned(),
+                profile: secret(
+                    names
+                        .profile_for_target("App")
+                        .expect("application profile")
+                        .as_str(),
+                ),
+                profile_type: ProvisioningProfileType::Development,
+            },
+            ProvisioningPlan {
+                target: "Widget".to_owned(),
+                profile: secret(
+                    names
+                        .profile_for_target("Widget")
+                        .expect("widget profile")
+                        .as_str(),
+                ),
+                profile_type: ProvisioningProfileType::Development,
+            },
+        ];
+        request.signing.entitlements.push(EntitlementPlan {
+            target: "Widget".to_owned(),
+            required: EntitlementSet::new(BTreeMap::new()).expect("widget entitlements"),
+        });
+        request.validate().expect("valid multi-profile request");
+        (request, names)
+    }
+
+    fn multi_profile_request_with_framework() -> (IosDeviceBuildRequest, SigningSecretNames) {
+        let (mut request, _) = multi_profile_request();
+        request.signing.targets.push(SigningTarget {
+            name: "RuntimeBridge".to_owned(),
+            bundle_identifier: BundleIdentifier::new("com.example.app.runtime-bridge")
+                .expect("framework bundle"),
+            kind: SigningTargetKind::Framework,
+        });
+        request
+            .product
+            .nested_bundles
+            .push(UnsignedNestedBundleExpectation {
+                relative_path: "Frameworks/RuntimeBridge.framework".to_owned(),
+                bundle_identifier: "com.example.app.runtime-bridge".to_owned(),
+                executable: "RuntimeBridge".to_owned(),
+                kind: UnsignedNestedBundleKind::Framework,
+            });
+        request
+            .product
+            .nested_bundles
+            .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        request
+            .validate()
+            .expect("valid multi-profile request with framework");
+        let names = SigningSecretNames::for_targets(&request.signing.targets)
+            .expect("framework-bound profile names");
+        (request, names)
+    }
+
+    fn assert_signing_reference_mismatch(
+        config: &GithubProviderConfig,
+        request: &IosDeviceBuildRequest,
+    ) {
+        let error = validate_submission(config, request)
+            .expect_err("configured signing target graph must remain exact");
+        assert!(matches!(
+            error,
+            RemoteBuildError::ProviderFailure {
+                code,
+                retryable: false,
+                ..
+            } if code == "signing_secret_reference_mismatch"
+        ));
     }
 
     fn unsigned_request() -> IosDeviceBuildRequest {
@@ -4062,17 +16308,492 @@ mod tests {
         request
     }
 
-    fn empty_source_manifest() -> SourceManifest {
+    struct SnapshotResumeFixture {
+        isolation: TestPrivateDirectory,
+        resume: GithubJobResumeV1,
+    }
+
+    fn snapshot_object(byte: char) -> GitSha1ObjectId {
+        GitSha1ObjectId::new(byte.to_string().repeat(40)).expect("snapshot object ID")
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fixture constructs one complete descriptor, stage, locator, and durable resume binding"
+    )]
+    fn snapshot_resume_fixture(phase: GithubGitSnapshotPhaseV1) -> SnapshotResumeFixture {
+        let config = provider_config(all_authorized());
+        let mut request = unsigned_request();
+        request.source_mode = SourceMode::GitSnapshot;
+        request.source_revision = None;
+        let isolation = tempdir().expect("snapshot isolation");
+        let stage_directory = crate::snapshot::GitSnapshotStageDirectory::create(
+            isolation.path(),
+            &request.operation_id,
+        )
+        .expect("snapshot stage directory");
+        let archive_bytes = SNAPSHOT_ARCHIVE_BYTES;
+        let archive = SourceArchive {
+            size: u64::try_from(archive_bytes.len()).expect("archive size"),
+            sha256: hex_sha256(archive_bytes),
+        };
+        let mut archive_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(stage_directory.archive_path())
+            .expect("create snapshot archive");
+        archive_file
+            .write_all(archive_bytes)
+            .expect("write snapshot archive");
+        archive_file.sync_all().expect("sync snapshot archive");
+        drop(archive_file);
+        let archive_identity = stage_directory
+            .seal_archive(&archive)
+            .expect("seal snapshot archive");
+        let descriptor = GitSnapshotDescriptor::from_request(
+            &request,
+            SourceBundleDescriptor::new(archive.clone(), request.source.clone()),
+        )
+        .expect("snapshot descriptor");
+        let descriptor_bytes =
+            rustferry_remote::canonical_git_snapshot_descriptor_bytes(&descriptor)
+                .expect("canonical snapshot descriptor");
+        let descriptor_identity = stage_directory
+            .write_descriptor_create_new(&descriptor)
+            .expect("write snapshot descriptor");
+        let graph = GitSnapshotObjectGraphV1 {
+            schema_version: crate::snapshot::GIT_SNAPSHOT_GRAPH_SCHEMA_VERSION,
+            archive_blob: snapshot_object('1'),
+            descriptor_blob: snapshot_object('2'),
+            goal3_tree: snapshot_object('3'),
+            rustferry_tree: snapshot_object('4'),
+            root_tree: snapshot_object('5'),
+            commit: GitSha1ObjectId::new(SOURCE_SHA).expect("snapshot commit"),
+        };
+        let source_created_at_ms = 1_700_000_000_000;
+        request.source_revision = Some(SOURCE_SHA.to_owned());
+        request.validate().expect("valid snapshot request");
+        let stage = GitSnapshotStageV1 {
+            schema_version: crate::snapshot::GIT_SNAPSHOT_STAGE_SCHEMA_VERSION,
+            operation_id: request.operation_id.clone(),
+            isolation_root_identity: stage_directory.isolation_root_identity().to_owned(),
+            snapshots_store_identity: stage_directory.snapshots_store_identity().to_owned(),
+            stage_directory_identity: stage_directory.stage_directory_identity().to_owned(),
+            source_repository: config.source_repository.clone(),
+            source_ref: GitSnapshotSourceRef::for_operation(&request.operation_id)
+                .expect("snapshot source ref"),
+            keepalive_ref: GitSnapshotKeepaliveRef::for_operation(&request.operation_id)
+                .expect("snapshot keepalive ref"),
+            source_created_at_ms,
+            consent_sha256: "9".repeat(64),
+            request_template_sha256: descriptor.request_template_sha256.clone(),
+            manifest_sha256: request.source.sha256.clone(),
+            archive,
+            descriptor_sha256: hex_sha256(&descriptor_bytes),
+            final_request: request.clone(),
+            archive_file_identity: archive_identity.to_string(),
+            descriptor_file_identity: descriptor_identity.to_string(),
+            graph,
+        };
+        let locator = stage_directory
+            .publish_metadata_create_new(&stage, &descriptor, &request)
+            .expect("publish snapshot metadata");
+        let source_phase = !matches!(
+            phase,
+            GithubGitSnapshotPhaseV1::Prepared
+                | GithubGitSnapshotPhaseV1::KeepaliveIntent
+                | GithubGitSnapshotPhaseV1::KeepaliveExact
+                | GithubGitSnapshotPhaseV1::StageDeleteIntent
+                | GithubGitSnapshotPhaseV1::StageDeleted
+        );
+        let source_armed = matches!(
+            phase,
+            GithubGitSnapshotPhaseV1::SourceExact
+                | GithubGitSnapshotPhaseV1::SourceAbsent
+                | GithubGitSnapshotPhaseV1::SourceConflict
+                | GithubGitSnapshotPhaseV1::SourceCleanupIntent
+                | GithubGitSnapshotPhaseV1::SourceDeleted
+                | GithubGitSnapshotPhaseV1::KeepaliveReleaseIntent
+                | GithubGitSnapshotPhaseV1::KeepaliveReleased
+        );
+        let absence_proven = phase == GithubGitSnapshotPhaseV1::SourceAbsent;
+        let source_started_at_ms = if source_armed {
+            source_created_at_ms
+        } else {
+            0
+        };
+        let source_deadline_ms = if !source_phase {
+            0
+        } else if source_armed {
+            publication_quiescence_deadline(source_started_at_ms, 0)
+        } else {
+            u64::MAX
+        };
+        let mut resume = durable_prepublication_resume();
+        resume.request = request;
+        resume.request_sha256 = canonical_request_sha256(&resume.request).expect("request digest");
+        resume.source_revision = SOURCE_SHA.to_owned();
+        resume.created_at_ms = source_created_at_ms;
+        resume.git_snapshot = Some(GithubGitSnapshotResumeV1 {
+            schema_version: GITHUB_GIT_SNAPSHOT_RESUME_SCHEMA_VERSION,
+            stage_locator: locator,
+            stage,
+            phase,
+            source_publication_attempts: u8::from(source_phase),
+            source_publication_started_at_ms: source_started_at_ms,
+            source_publication_quiescence_deadline_ms: source_deadline_ms,
+            source_publication_process_fenced: source_phase,
+            source_publication_lease_scope_sha256: source_phase
+                .then(|| FAKE_LEASE_SCOPE.to_owned()),
+            source_publication_absence_observations: if absence_proven { 2 } else { 0 },
+            source_publication_absence_first_observed_at_ms: if absence_proven {
+                source_deadline_ms
+            } else {
+                0
+            },
+            source_publication_absence_last_observed_at_ms: if absence_proven {
+                source_deadline_ms
+            } else {
+                0
+            },
+            keepalive_release_authorization_sha256: None,
+        });
+        resume.prepared_dispatch_commit = None;
+        resume.publication_started_at_ms = 0;
+        resume.publication_quiescence_deadline_ms = u64::MAX;
+        resume.publication_intent = false;
+        resume.publication_process_fenced = false;
+        resume.publication_lease_scope_sha256 = None;
+        resume.publication_absence_observations = 0;
+        resume.publication_absence_first_observed_at_ms = 0;
+        resume.run_discovery_deadline_ms =
+            source_created_at_ms.saturating_add(config.poll_policy.discovery_window_ms());
+        resume
+            .git_snapshot
+            .as_ref()
+            .expect("snapshot resume")
+            .validate_for_request(&resume.request)
+            .expect("valid snapshot resume");
+        SnapshotResumeFixture { isolation, resume }
+    }
+
+    fn completed_snapshot_resume(
+        phase: GithubGitSnapshotPhaseV1,
+        state: JobState,
+    ) -> SnapshotResumeFixture {
+        let mut fixture = snapshot_resume_fixture(phase);
+        let snapshot_request = fixture.resume.request.clone();
+        let snapshot = fixture.resume.git_snapshot.take().expect("snapshot resume");
+        let mut resume = durable_success_resume();
+        resume.request = snapshot_request;
+        resume.request_sha256 =
+            canonical_request_sha256(&resume.request).expect("snapshot request digest");
+        resume.source_revision = SOURCE_SHA.to_owned();
+        resume.git_snapshot = Some(snapshot);
+        resume.compile_evidence = Some(compile_evidence_for(&resume.request));
+        resume.state = state;
+        resume.cleanup_requested = matches!(
+            state,
+            JobState::Cleaning | JobState::Cleaned | JobState::CleanupFailed
+        );
+        resume.temporary_ref_deleted = resume.cleanup_requested;
+        fixture.resume = resume;
+        fixture
+    }
+
+    fn durable_identity_for_resume(resume: &GithubJobResumeV1) -> GithubDurableIdentityV1 {
+        GithubDurableIdentityV1 {
+            provider: resume.provider.clone(),
+            provider_config_sha256: resume.provider_config_sha256.clone(),
+            principal: resume.principal.clone(),
+            execution_repository: resume.execution_repository.clone(),
+            execution_repository_id: resume.execution_repository_id,
+        }
+    }
+
+    struct InitialSnapshotPrecomputeFixture {
+        isolation: TestPrivateDirectory,
+        stage_directory: GitSnapshotStageDirectory,
+        archive_identity: rustferry_core::RegularFileFilesystemIdentity,
+        descriptor_identity: rustferry_core::RegularFileFilesystemIdentity,
+        archive: SourceArchive,
+        descriptor: GitSnapshotDescriptor,
+    }
+
+    impl InitialSnapshotPrecomputeFixture {
+        fn inputs(&self) -> GitSnapshotPrecomputeInputs {
+            self.stage_directory
+                .precompute_inputs(
+                    &self.archive_identity,
+                    &self.descriptor_identity,
+                    &self.archive,
+                    &self.descriptor,
+                )
+                .expect("retained initial snapshot inputs")
+        }
+    }
+
+    fn initial_snapshot_precompute_fixture() -> InitialSnapshotPrecomputeFixture {
+        let isolation = tempdir().expect("snapshot precompute isolation");
+        let mut request = unsigned_request();
+        request.source_mode = SourceMode::GitSnapshot;
+        request.source_revision = None;
+        let stage_directory =
+            GitSnapshotStageDirectory::create(isolation.path(), request.operation_id.as_str())
+                .expect("snapshot precompute stage");
+        let archive = SourceArchive {
+            size: u64::try_from(SNAPSHOT_ARCHIVE_BYTES.len()).expect("snapshot archive size"),
+            sha256: hex_sha256(SNAPSHOT_ARCHIVE_BYTES),
+        };
+        let archive_identity = stage_directory
+            .write_archive_bytes_create_new(SNAPSHOT_ARCHIVE_BYTES, &archive)
+            .expect("snapshot precompute archive");
+        let descriptor = GitSnapshotDescriptor::from_request(
+            &request,
+            SourceBundleDescriptor::new(archive.clone(), request.source.clone()),
+        )
+        .expect("snapshot precompute descriptor");
+        let descriptor_identity = stage_directory
+            .write_descriptor_create_new(&descriptor)
+            .expect("snapshot precompute descriptor file");
+        InitialSnapshotPrecomputeFixture {
+            isolation,
+            stage_directory,
+            archive_identity,
+            descriptor_identity,
+            archive,
+            descriptor,
+        }
+    }
+
+    fn initial_snapshot_graph_responses() -> Vec<Result<Vec<u8>, GitExecutionError>> {
+        vec![
+            Ok(b"sha1\n".to_vec()),
+            Ok(format!("{}\n", "1".repeat(40)).into_bytes()),
+            Ok(format!("{}\n", "2".repeat(40)).into_bytes()),
+            Ok(format!("{}\n", "3".repeat(40)).into_bytes()),
+            Ok(format!("{}\n", "4".repeat(40)).into_bytes()),
+            Ok(format!("{}\n", "5".repeat(40)).into_bytes()),
+            Ok(format!("{}\n", "6".repeat(40)).into_bytes()),
+        ]
+    }
+
+    fn exact_retry_git_cycle(
+        parent: &GithubJobResumeV1,
+        archive_bytes: &[u8],
+        archive_blob: char,
+    ) -> Vec<Result<Vec<u8>, GitExecutionError>> {
+        let snapshot = parent.git_snapshot.as_ref().expect("snapshot resume");
+        vec![
+            Ok(format!(
+                "{}\0{}\n",
+                snapshot.stage.keepalive_ref.as_str(),
+                snapshot.stage.graph.commit.as_str()
+            )
+            .into_bytes()),
+            Ok(b"sha1\n".to_vec()),
+            Ok(archive_bytes.to_vec()),
+            Ok(format!("{}\n", archive_blob.to_string().repeat(40)).into_bytes()),
+            Ok(format!("{}\n", "a".repeat(40)).into_bytes()),
+            Ok(format!("{}\n", "b".repeat(40)).into_bytes()),
+            Ok(format!("{}\n", "c".repeat(40)).into_bytes()),
+            Ok(format!("{}\n", "d".repeat(40)).into_bytes()),
+            Ok(format!("{}\n", "e".repeat(40)).into_bytes()),
+            Ok(format!(
+                "{}\0{}\n",
+                snapshot.stage.keepalive_ref.as_str(),
+                snapshot.stage.graph.commit.as_str()
+            )
+            .into_bytes()),
+        ]
+    }
+
+    fn synthetic_exact_retry_plan(parent: &GithubJobResumeV1) -> GithubGitSnapshotExactRetryPlanV1 {
+        let parent_stage = &parent.git_snapshot.as_ref().expect("snapshot").stage;
+        let mut request = parent.request.clone();
+        request.operation_id = "operation-2".to_owned();
+        let mut graph = parent_stage.graph.clone();
+        graph.commit = snapshot_object('e');
+        request.source_revision = Some(graph.commit.as_str().to_owned());
+        request.validate().expect("synthetic retry request");
+        let descriptor = GitSnapshotDescriptor::from_request(
+            &request,
+            SourceBundleDescriptor::new(parent_stage.archive.clone(), request.source.clone()),
+        )
+        .expect("synthetic retry descriptor");
+        let descriptor_bytes = canonical_git_snapshot_descriptor_bytes(&descriptor)
+            .expect("synthetic descriptor bytes");
+        GithubGitSnapshotExactRetryPlanV1 {
+            request,
+            source_created_at_ms: 1_700_000_001_000,
+            request_template_sha256: descriptor.request_template_sha256,
+            manifest_sha256: parent_stage.manifest_sha256.clone(),
+            archive: parent_stage.archive.clone(),
+            descriptor_sha256: hex_sha256(&descriptor_bytes),
+            graph,
+        }
+    }
+
+    fn same_invocation_snapshot_submission(
+        fixture: &SnapshotResumeFixture,
+    ) -> GithubGitSnapshotSubmissionV1 {
+        let resume = &fixture.resume;
+        let snapshot = resume.git_snapshot.as_ref().expect("snapshot resume");
+        GithubGitSnapshotSubmissionV1::same_invocation(
+            GithubDurableIdentityV1 {
+                provider: resume.provider.clone(),
+                provider_config_sha256: resume.provider_config_sha256.clone(),
+                principal: resume.principal.clone(),
+                execution_repository: resume.execution_repository.clone(),
+                execution_repository_id: resume.execution_repository_id,
+            },
+            resume.request.clone(),
+            snapshot.stage.consent_sha256.clone(),
+            snapshot.stage_locator.clone(),
+            snapshot.stage.clone(),
+        )
+        .expect("same-invocation snapshot submission")
+    }
+
+    fn public_snapshot_identity_rows(
+        boundary_count: usize,
+    ) -> Vec<Result<Vec<u8>, GhExecutionError>> {
+        let mut rows = Vec::with_capacity(boundary_count.saturating_mul(3));
+        for _ in 0..boundary_count {
+            rows.push(Ok(authenticated_user_row()));
+            rows.push(Ok(private_repository_row()));
+            rows.push(Ok(public_source_repository_row()));
+        }
+        rows
+    }
+
+    fn compile_source_manifest() -> SourceManifest {
+        let entries = vec![
+            SourceManifestEntry {
+                path: "Cargo.lock".to_owned(),
+                size: 0,
+                sha256: "b".repeat(64),
+                executable: false,
+            },
+            SourceManifestEntry {
+                path: "ferry.toml".to_owned(),
+                size: 0,
+                sha256: "c".repeat(64),
+                executable: false,
+            },
+        ];
         let mut digest = Sha256::new();
         digest.update(b"rustferry-source-manifest-v1\0");
         digest.update(1_u64.to_be_bytes());
         digest.update(b".");
-        digest.update(0_u64.to_be_bytes());
+        digest.update((entries.len() as u64).to_be_bytes());
+        for entry in &entries {
+            digest.update((entry.path.len() as u64).to_be_bytes());
+            digest.update(entry.path.as_bytes());
+            digest.update(entry.size.to_be_bytes());
+            digest.update((entry.sha256.len() as u64).to_be_bytes());
+            digest.update(entry.sha256.as_bytes());
+            digest.update([u8::from(entry.executable)]);
+        }
         digest.update(0_u64.to_be_bytes());
         SourceManifest {
             schema_version: 1,
             project_path: ".".to_owned(),
-            entries: Vec::new(),
+            entries,
+            total_size: 0,
+            sha256: hex::encode(digest.finalize()),
+        }
+    }
+
+    fn compile_evidence_for(request: &IosDeviceBuildRequest) -> CompilePhaseEvidence {
+        let expectation = UnsignedXcarchiveExpectation {
+            app_directory_name: request.product.app_directory_name.clone(),
+            bundle_identifier: request.bundle_identifier.clone(),
+            executable: request.product.executable.clone(),
+            app_version: request.product.app_version.clone(),
+            build_number: request.product.build_number.clone(),
+            minimum_os: request.minimum_ios_version.clone(),
+            sdk_version: "26.0".to_owned(),
+            sdk_build_version: "23A".to_owned(),
+            nested_bundles: request.product.nested_bundles.clone(),
+            required_resources: BTreeMap::new(),
+        };
+        CompilePhaseEvidence {
+            schema_version: COMPILE_PHASE_EVIDENCE_SCHEMA_VERSION,
+            job_id: request.operation_id.clone(),
+            provider: GITHUB_PROVIDER_ID.to_owned(),
+            request_sha256: canonical_request_sha256(request).expect("request digest"),
+            source_sha256: request.source.sha256.clone(),
+            cargo_lock_sha256: "b".repeat(64),
+            config_sha256: "c".repeat(64),
+            rustferry_version: "0.1.0".to_owned(),
+            worker_version: "0.1.0".to_owned(),
+            toolchain: CompileToolchainEvidence {
+                worker_os: "macOS 26.0".to_owned(),
+                worker_architecture: "arm64".to_owned(),
+                xcode_version: "26.0".to_owned(),
+                iphoneos_sdk_version: "26.0".to_owned(),
+                iphoneos_sdk_build_version: "23A".to_owned(),
+                developer_directory_sha256: "d".repeat(64),
+                rust_version: "rustc 1.92.0".to_owned(),
+                rust_target: rustferry_remote::IOS_DEVICE_RUST_TARGET.to_owned(),
+            },
+            sealed_archive: SealedUnsignedArchive {
+                schema_version: SEALED_UNSIGNED_ARCHIVE_SCHEMA_VERSION,
+                transport: SourceArchive {
+                    size: 1,
+                    sha256: "e".repeat(64),
+                },
+                contents: request.source.clone(),
+                expectation,
+            },
+            archive_inspection: UnsignedXcarchiveInspection {
+                application_path: "Applications/App.app".to_owned(),
+                architectures: vec!["arm64".to_owned()],
+                app: UnsignedAppInspection {
+                    app_directory_name: request.product.app_directory_name.clone(),
+                    bundle_identifier: request.bundle_identifier.clone(),
+                    executable: request.product.executable.clone(),
+                    main_executable: Vec::new(),
+                    nested_executables: BTreeMap::new(),
+                    extensions: Vec::new(),
+                    resources: BTreeMap::new(),
+                    entries: Vec::new(),
+                },
+                entries: Vec::new(),
+            },
+            started_at_unix_seconds: 1_700_000_000,
+            finished_at_unix_seconds: 1_700_000_060,
+        }
+    }
+
+    fn large_source_manifest() -> SourceManifest {
+        let entries = (0..20_000)
+            .map(|index| SourceManifestEntry {
+                path: format!("file-{index:05}"),
+                size: 0,
+                sha256: "0".repeat(64),
+                executable: false,
+            })
+            .collect::<Vec<_>>();
+        let mut digest = Sha256::new();
+        digest.update(b"rustferry-source-manifest-v1\0");
+        digest.update(1_u64.to_be_bytes());
+        digest.update(b".");
+        digest.update((entries.len() as u64).to_be_bytes());
+        for entry in &entries {
+            digest.update((entry.path.len() as u64).to_be_bytes());
+            digest.update(entry.path.as_bytes());
+            digest.update(entry.size.to_be_bytes());
+            digest.update((entry.sha256.len() as u64).to_be_bytes());
+            digest.update(entry.sha256.as_bytes());
+            digest.update([u8::from(entry.executable)]);
+        }
+        digest.update(0_u64.to_be_bytes());
+        SourceManifest {
+            schema_version: 1,
+            project_path: ".".to_owned(),
+            entries,
             total_size: 0,
             sha256: hex::encode(digest.finalize()),
         }
@@ -4092,6 +16813,9 @@ mod tests {
             publish_temporary_ref: true,
             cancel_run: true,
             delete_temporary_ref: true,
+            publish_git_snapshot_source: true,
+            delete_git_snapshot_source: true,
+            manage_git_snapshot_keepalive: true,
         }
     }
 
@@ -4100,6 +16824,365 @@ mod tests {
             "41\t17\t{WORKFLOW_PATH_BASE64}\t9\t1\t{DISPATCH_SHA}\t{BRANCH_BASE64}\tpush\tcompleted\t{conclusion}\n"
         )
         .into_bytes()
+    }
+
+    fn queued_run_row() -> Vec<u8> {
+        queued_run_attempt_row(1)
+    }
+
+    fn queued_run_attempt_row(attempt: u64) -> Vec<u8> {
+        format!(
+            "41\t17\t{WORKFLOW_PATH_BASE64}\t9\t{attempt}\t{DISPATCH_SHA}\t{BRANCH_BASE64}\tpush\tqueued\t\n"
+        )
+        .into_bytes()
+    }
+
+    fn workflow_dispatch_registration_row() -> Vec<u8> {
+        format!("17\t{WORKFLOW_PATH_BASE64}\tactive\n").into_bytes()
+    }
+
+    fn workflow_dispatch_run_row(run_id: u64) -> Vec<u8> {
+        let request_sha256 = canonical_request_sha256(&unsigned_request()).expect("request digest");
+        let run_name = crate::transport::canonical_workflow_dispatch_run_name(
+            "operation-1",
+            &request_sha256,
+            &CommitSha::new(SOURCE_SHA).expect("source revision"),
+            &CommitSha::new(DISPATCH_SHA).expect("dispatch revision"),
+        )
+        .expect("workflow dispatch run name");
+        let run_name = base64_fixture(&run_name);
+        workflow_dispatch_run_row_with_title(run_id, &run_name)
+    }
+
+    fn workflow_dispatch_run_row_with_title(run_id: u64, encoded_run_name: &str) -> Vec<u8> {
+        format!(
+            "{run_id}\t17\t{WORKFLOW_PATH_BASE64}\t9\t1\t{DISPATCH_SHA}\t{BRANCH_BASE64}\tworkflow_dispatch\tqueued\t\t{encoded_run_name}\n"
+        )
+        .into_bytes()
+    }
+
+    fn ordinary_workflow_dispatch_run_row(run_id: u64) -> Vec<u8> {
+        format!(
+            "{run_id}\t17\t{WORKFLOW_PATH_BASE64}\t9\t1\t{DISPATCH_SHA}\t{BRANCH_BASE64}\tworkflow_dispatch\tqueued\t\n"
+        )
+        .into_bytes()
+    }
+
+    fn workflow_dispatch_receipt_response(run_id: u64) -> GithubWorkflowDispatchHttpResponse {
+        GithubWorkflowDispatchHttpResponse::new(
+            200,
+            Some("application/json".to_owned()),
+            format!(
+                "{{\"workflow_run_id\":{run_id},\"run_url\":\"https://api.github.com/repos/ShiroKSH/rustferry-signing/actions/runs/{run_id}\",\"html_url\":\"https://github.com/ShiroKSH/rustferry-signing/actions/runs/{run_id}\"}}"
+            )
+            .into_bytes(),
+        )
+    }
+
+    fn workflow_dispatch_submit_responses(run_id: u64) -> Vec<Result<Vec<u8>, GhExecutionError>> {
+        vec![
+            Ok(authenticated_user_row()),
+            Ok(private_repository_row()),
+            Ok(private_repository_row()),
+            Ok(workflow_dispatch_registration_row()),
+            Ok(authenticated_user_row()),
+            Ok(private_repository_row()),
+            Ok(authenticated_user_row()),
+            Ok(private_repository_row()),
+            Ok(private_repository_row()),
+            Ok(workflow_dispatch_registration_row()),
+            Ok(workflow_dispatch_run_row(run_id)),
+            Ok(authenticated_user_row()),
+            Ok(private_repository_row()),
+        ]
+    }
+
+    fn durable_workflow_dispatch_intent_resume() -> GithubJobResumeV1 {
+        let push_config = provider_config(all_authorized());
+        let config = workflow_dispatch_provider_config(all_authorized());
+        let principal = GithubPrincipalIdentityV1::User {
+            id: AUTHENTICATED_USER_ID,
+            login: "ShiroKSH".to_owned(),
+        };
+        let mut record = durable_prepublication_resume()
+            .into_record(&push_config, &principal, 991)
+            .expect("push fixture record");
+        let dispatch_commit = CommitSha::new(DISPATCH_SHA).expect("dispatch commit");
+        record.prepared_dispatch_commit = Some(dispatch_commit.clone());
+        record.dispatch_commit = Some(dispatch_commit.clone());
+        record.publication_uncertain = false;
+        let registration = WorkflowRegistration::restore(
+            config.repository.clone(),
+            crate::transport::WorkflowId::new(17).expect("workflow ID"),
+            config.workflow.filename().repository_path(),
+        )
+        .expect("workflow registration");
+        let request = WorkflowDispatchRequest::new(
+            config.repository.clone(),
+            registration,
+            record.temporary_ref.clone(),
+            record.operation_id.clone(),
+            record.request_sha256.clone(),
+            record.source_revision.clone(),
+            dispatch_commit,
+        )
+        .expect("workflow dispatch request");
+        record.workflow_dispatch = Some(GithubWorkflowDispatchResumeV1::from_request(&request));
+        GithubJobResumeV1::from_record(&config, principal, 991, &record)
+            .expect("workflow dispatch intent resume")
+    }
+
+    fn durable_workflow_dispatch_pre_intent_resume() -> GithubJobResumeV1 {
+        let push_config = provider_config(all_authorized());
+        let config = workflow_dispatch_provider_config(all_authorized());
+        let principal = GithubPrincipalIdentityV1::User {
+            id: AUTHENTICATED_USER_ID,
+            login: "ShiroKSH".to_owned(),
+        };
+        let record = durable_prepared_prepublication_resume()
+            .into_record(&push_config, &principal, 991)
+            .expect("push fixture record");
+        assert!(record.publication_intent);
+        assert!(record.dispatch_commit.is_none());
+        assert!(record.workflow_dispatch.is_none());
+        GithubJobResumeV1::from_record(&config, principal, 991, &record)
+            .expect("workflow dispatch pre-intent resume")
+    }
+
+    fn durable_workflow_dispatch_mapped_resume() -> GithubJobResumeV1 {
+        let mut resume = durable_workflow_dispatch_intent_resume();
+        let dispatch = resume
+            .workflow_dispatch
+            .as_mut()
+            .expect("workflow dispatch intent");
+        dispatch.receipt = Some(GithubWorkflowDispatchReceiptV1 {
+            run_id: 73,
+            workflow_id: dispatch.workflow_id,
+            workflow_path: dispatch.workflow_path.clone(),
+            branch: dispatch.branch.clone(),
+            dispatch_revision: dispatch.dispatch_revision.clone(),
+            run_name: dispatch.run_name.clone(),
+        });
+        dispatch.uncertain = false;
+        resume.run = Some(GithubRunIdentityV1 {
+            run_id: 73,
+            workflow_id: dispatch.workflow_id,
+            workflow_path: dispatch.workflow_path.clone(),
+            head_sha: dispatch.dispatch_revision.clone(),
+            branch: dispatch.branch.clone(),
+            event: GithubRunEventV1::WorkflowDispatch,
+            run_number: 9,
+            run_attempt: 1,
+            status: GithubRunStatusV1::Queued,
+            conclusion: None,
+        });
+        resume.state = JobState::Queued;
+        resume
+            .validate_trigger_binding()
+            .expect("mapped workflow dispatch binding");
+        resume
+    }
+
+    fn durable_resume_with_run() -> GithubJobResumeV1 {
+        let config = provider_config(all_authorized());
+        let request = unsigned_request();
+        let branch = BranchName::new("rustferry/goal3/builds/operation-1").expect("branch");
+        let temporary_ref =
+            TemporaryGitRef::new(config.workflow.temporary_branch_namespace(), branch.clone())
+                .expect("temporary ref");
+        let dispatch_commit = CommitSha::new(DISPATCH_SHA).expect("dispatch commit");
+        let run = RunHandle::restore(
+            41,
+            17,
+            config.workflow.filename().repository_path(),
+            DISPATCH_SHA.to_owned(),
+            branch.as_str().to_owned(),
+            RunEvent::Push,
+        )
+        .expect("run handle");
+        let run_snapshot =
+            RunSnapshot::restore(run.clone(), 9, 1, RunStatus::Queued, None).expect("run snapshot");
+        let record = JobRecord {
+            principal: Some(GithubPrincipalIdentityV1::User {
+                id: AUTHENTICATED_USER_ID,
+                login: "ShiroKSH".to_owned(),
+            }),
+            execution_repository_id: Some(991),
+            operation_id: request.operation_id.clone(),
+            job_id: request.operation_id.clone(),
+            source_revision: CommitSha::new(SOURCE_SHA).expect("source revision"),
+            git_snapshot: None,
+            request_sha256: canonical_request_sha256(&request).expect("request digest"),
+            request,
+            temporary_ref,
+            prepared_dispatch_commit: None,
+            dispatch_commit: Some(dispatch_commit),
+            workflow_dispatch: None,
+            created_at_ms: 1_700_000_000_000,
+            publication_started_at_ms: 1_700_000_000_000,
+            publication_quiescence_deadline_ms: 1_700_000_000_000
+                + GITHUB_PUBLICATION_QUIESCENCE_WINDOW_MS,
+            state: JobState::Queued,
+            run: Some(run),
+            run_snapshot: Some(run_snapshot),
+            publication_intent: true,
+            publication_absent: false,
+            publication_not_attempted: false,
+            publication_process_fenced: true,
+            publication_lease_scope_sha256: Some("a".repeat(64)),
+            publication_takeover_lease_owned: false,
+            snapshot_source_lease_owned: false,
+            publication_absence_observations: 0,
+            publication_absence_first_observed_at_ms: 0,
+            cancellation_requested: false,
+            cancellation_dispatched: false,
+            cleanup_requested: false,
+            remove_artifacts_requested: false,
+            artifacts_removed: false,
+            temporary_ref_deleted: false,
+            verification_pending_event: false,
+            publication_uncertain: false,
+            run_discovery_attempts: 0,
+            run_discovery_deadline_ms: 1_700_000_000_750,
+            manifests: Vec::new(),
+            compile_evidence: None,
+            signed_cleanup_evidence: None,
+            events: Vec::new(),
+        };
+        GithubJobResumeV1::from_record(
+            &config,
+            GithubPrincipalIdentityV1::User {
+                id: AUTHENTICATED_USER_ID,
+                login: "ShiroKSH".to_owned(),
+            },
+            991,
+            &record,
+        )
+        .expect("durable resume")
+    }
+
+    fn durable_prepublication_resume() -> GithubJobResumeV1 {
+        let mut resume = durable_resume_with_run();
+        resume.dispatch_commit = None;
+        resume.run = None;
+        resume.state = JobState::Created;
+        resume.events.clear();
+        resume
+    }
+
+    fn durable_prepared_prepublication_resume() -> GithubJobResumeV1 {
+        let mut resume = durable_prepublication_resume();
+        resume.prepared_dispatch_commit = Some(DISPATCH_SHA.to_owned());
+        resume
+    }
+
+    fn durable_possible_push_resume() -> GithubJobResumeV1 {
+        let mut resume = durable_prepared_prepublication_resume();
+        resume.dispatch_commit = Some(DISPATCH_SHA.to_owned());
+        resume.publication_uncertain = true;
+        resume.state = JobState::Queued;
+        resume
+    }
+
+    fn durable_success_resume() -> GithubJobResumeV1 {
+        let mut resume = durable_resume_with_run();
+        let run = resume.run.as_mut().expect("run identity");
+        run.status = GithubRunStatusV1::Completed;
+        run.conclusion = Some(GithubRunConclusionV1::Success);
+        resume.state = JobState::Succeeded;
+        let mut manifest = ArtifactManifest::new("operation-1", "operation-1");
+        manifest.provider = GITHUB_PROVIDER_ID.to_owned();
+        manifest.source_repository = Some(resume.source_repository.clone());
+        manifest.source_revision = Some(resume.source_revision.clone());
+        resume.manifests = vec![manifest];
+        resume.compile_evidence = Some(compile_evidence_for(&resume.request));
+        resume
+    }
+
+    fn durable_signed_success_resume() -> GithubJobResumeV1 {
+        let mut resume = durable_resume_with_run();
+        resume.request = valid_request();
+        resume.request_sha256 = canonical_request_sha256(&resume.request).expect("request digest");
+        let run = resume.run.as_mut().expect("run identity");
+        run.status = GithubRunStatusV1::Completed;
+        run.conclusion = Some(GithubRunConclusionV1::Success);
+        resume.state = JobState::Succeeded;
+        let compile = compile_evidence_for(&resume.request);
+        let manifest_sha256 = "1".repeat(64);
+        let signing_report_sha256 = "2".repeat(64);
+        let validation_report_sha256 = "3".repeat(64);
+        let mut manifest = ArtifactManifest::new("operation-1", "operation-1");
+        manifest.provider = GITHUB_PROVIDER_ID.to_owned();
+        manifest.source_repository = Some(resume.source_repository.clone());
+        manifest.source_revision = Some(resume.source_revision.clone());
+        manifest.source_sha256 = compile.source_sha256.clone();
+        manifest.cargo_lock_sha256 = compile.cargo_lock_sha256.clone();
+        manifest.config_sha256 = compile.config_sha256.clone();
+        manifest.cleanup_status = CleanupStatus::Confirmed;
+        manifest.signing = ArtifactSigningEvidence {
+            mode: SigningMode::ManualDevelopment,
+            status: SigningStatus::ArtifactValidated,
+            team_id: None,
+            certificate_fingerprint: None,
+            profile_uuid: None,
+            profile_expiration: None,
+            entitlements_sha256: None,
+        };
+        manifest.artifacts = vec![
+            ArtifactRecord {
+                artifact_id: "manifest".to_owned(),
+                kind: ArtifactKind::Manifest,
+                file_name: "artifact-manifest.json".to_owned(),
+                size: 1,
+                sha256: manifest_sha256.clone(),
+                media_type: Some("application/json".to_owned()),
+            },
+            ArtifactRecord {
+                artifact_id: "signing-report".to_owned(),
+                kind: ArtifactKind::SigningReport,
+                file_name: "signing-report.json".to_owned(),
+                size: 1,
+                sha256: signing_report_sha256.clone(),
+                media_type: Some("application/json".to_owned()),
+            },
+            ArtifactRecord {
+                artifact_id: "validation-report".to_owned(),
+                kind: ArtifactKind::ValidationReport,
+                file_name: "validation-report.json".to_owned(),
+                size: 1,
+                sha256: validation_report_sha256.clone(),
+                media_type: Some("application/json".to_owned()),
+            },
+        ];
+        resume.manifests = vec![manifest];
+        resume.compile_evidence = Some(compile.clone());
+        resume.signed_cleanup_evidence = Some(GithubSignedCleanupEvidenceV1 {
+            schema_version: GITHUB_SIGNED_CLEANUP_EVIDENCE_SCHEMA_VERSION,
+            provider: GITHUB_PROVIDER_ID.to_owned(),
+            operation_id: resume.operation_id.clone(),
+            job_id: resume.job_id.clone(),
+            execution_repository: resume.execution_repository.clone(),
+            execution_repository_id: resume.execution_repository_id,
+            request_sha256: resume.request_sha256.clone(),
+            source_repository: resume.source_repository.clone(),
+            source_revision: resume.source_revision.clone(),
+            source_sha256: resume.request.source.sha256.clone(),
+            dispatch_revision: resume.dispatch_commit.clone().expect("dispatch"),
+            run: resume.run.clone().expect("run"),
+            compile_evidence_sha256: compile_evidence_sha256(&compile).expect("compile digest"),
+            manifest_sha256,
+            signing_report_sha256,
+            validation_report_sha256,
+            github_artifact_id: 73,
+            github_artifact_api_sha256: "4".repeat(64),
+        });
+        resume
+            .signed_cleanup_evidence
+            .as_ref()
+            .expect("cleanup evidence")
+            .validate_for_resume(&resume)
+            .expect("valid signed cleanup evidence");
+        resume
     }
 
     fn signing_environment_row(
@@ -4124,6 +17207,105 @@ mod tests {
         .into_bytes()
     }
 
+    fn exact_reconciliation_git_responses(
+        _workflow_path: &str,
+        workflow: &[u8],
+        _manifest: &[u8],
+        final_tip: &str,
+    ) -> Vec<Result<Vec<u8>, GitExecutionError>> {
+        let full_ref = "refs/heads/rustferry/goal3/builds/operation-1";
+        let trusted_ref = "refs/heads/goal3/macless-iphone-builds";
+        vec![
+            Ok(b"https://github.com/ShiroKSH/rust-and-iphone.git\n".to_vec()),
+            Ok(b"https://github.com/ShiroKSH/rust-and-iphone.git\n".to_vec()),
+            Ok(b"https://github.com/ShiroKSH/rustferry-signing.git\n".to_vec()),
+            Ok(b"https://github.com/ShiroKSH/rustferry-signing.git\n".to_vec()),
+            Ok(format!("{TRUSTED_TIP}\t{trusted_ref}\n").into_bytes()),
+            Ok(Vec::new()),
+            Ok(workflow.to_vec()),
+            Ok(Vec::new()),
+            Ok(Vec::new()),
+            Ok(Vec::new()),
+            Ok(format!("{WORKFLOW_BLOB}\n").into_bytes()),
+            Ok(format!("{MANIFEST_BLOB}\n").into_bytes()),
+            Ok(Vec::new()),
+            Ok(Vec::new()),
+            Ok(format!("{TREE_SHA}\n").into_bytes()),
+            Ok(format!("{DISPATCH_SHA}\n").into_bytes()),
+            Ok(format!("{final_tip}\t{full_ref}\n").into_bytes()),
+        ]
+    }
+
+    fn successful_prepare_git_responses(
+        workflow: &[u8],
+    ) -> Vec<Result<Vec<u8>, GitExecutionError>> {
+        let full_trusted_ref = "refs/heads/goal3/macless-iphone-builds";
+        vec![
+            Ok(b"git@github.com:ShiroKSH/rust-and-iphone.git\n".to_vec()),
+            Ok(b"ssh://git@github.com/ShiroKSH/rust-and-iphone\n".to_vec()),
+            Ok(b"git@github.com:ShiroKSH/rustferry-signing.git\n".to_vec()),
+            Ok(b"ssh://git@github.com/ShiroKSH/rustferry-signing\n".to_vec()),
+            Ok(format!("{TRUSTED_TIP}\t{full_trusted_ref}\n").into_bytes()),
+            Ok(Vec::new()),
+            Ok(workflow.to_vec()),
+            Ok(Vec::new()),
+            Ok(Vec::new()),
+            Ok(Vec::new()),
+            Ok(Vec::new()),
+            Ok(format!("{WORKFLOW_BLOB}\n").into_bytes()),
+            Ok(format!("{MANIFEST_BLOB}\n").into_bytes()),
+            Ok(Vec::new()),
+            Ok(Vec::new()),
+            Ok(format!("{TREE_SHA}\n").into_bytes()),
+            Ok(format!("{DISPATCH_SHA}\n").into_bytes()),
+        ]
+    }
+
+    fn successful_snapshot_prepare_git_responses(
+        workflow: &[u8],
+        final_snapshot_tip: &str,
+    ) -> Vec<Result<Vec<u8>, GitExecutionError>> {
+        let trusted_ref = "refs/heads/goal3/macless-iphone-builds";
+        let snapshot_ref = "refs/rustferry/goal3/snapshots/operation-1";
+        vec![
+            Ok(b"git@github.com:ShiroKSH/rust-and-iphone.git\n".to_vec()),
+            Ok(b"ssh://git@github.com/ShiroKSH/rust-and-iphone\n".to_vec()),
+            Ok(b"git@github.com:ShiroKSH/rustferry-signing.git\n".to_vec()),
+            Ok(b"ssh://git@github.com/ShiroKSH/rustferry-signing\n".to_vec()),
+            Ok(format!("{TRUSTED_TIP}\t{trusted_ref}\n").into_bytes()),
+            Ok(Vec::new()),
+            Ok(workflow.to_vec()),
+            Ok(format!("{SOURCE_SHA}\t{snapshot_ref}\n").into_bytes()),
+            Ok(Vec::new()),
+            Ok(Vec::new()),
+            Ok(format!("{final_snapshot_tip}\t{snapshot_ref}\n").into_bytes()),
+            Ok(Vec::new()),
+            Ok(Vec::new()),
+            Ok(format!("{WORKFLOW_BLOB}\n").into_bytes()),
+            Ok(format!("{MANIFEST_BLOB}\n").into_bytes()),
+            Ok(Vec::new()),
+            Ok(Vec::new()),
+            Ok(format!("{TREE_SHA}\n").into_bytes()),
+            Ok(format!("{DISPATCH_SHA}\n").into_bytes()),
+        ]
+    }
+
+    fn snapshot_source_mutation_git_responses(
+        final_tip: Option<&str>,
+    ) -> Vec<Result<Vec<u8>, GitExecutionError>> {
+        let snapshot_ref = "refs/rustferry/goal3/snapshots/operation-1";
+        vec![
+            Ok(b"git@github.com:ShiroKSH/rust-and-iphone.git\n".to_vec()),
+            Ok(b"ssh://git@github.com/ShiroKSH/rust-and-iphone\n".to_vec()),
+            Ok(Vec::new()),
+            Ok(b"git@github.com:ShiroKSH/rust-and-iphone.git\n".to_vec()),
+            Ok(b"ssh://git@github.com/ShiroKSH/rust-and-iphone\n".to_vec()),
+            Ok(final_tip
+                .map(|tip| format!("{tip}\t{snapshot_ref}\n").into_bytes())
+                .unwrap_or_default()),
+        ]
+    }
+
     fn signed_doctor_report(
         environment: Result<Vec<u8>, GhExecutionError>,
         policies: Result<Vec<u8>, GhExecutionError>,
@@ -4138,15 +17320,32 @@ mod tests {
         policies: Result<Vec<u8>, GhExecutionError>,
         secrets: Result<Vec<u8>, GhExecutionError>,
     ) -> ProviderDoctorReport {
+        signed_doctor_report_with_repository_policy(
+            private,
+            Ok(b"true\n".to_vec()),
+            environment,
+            policies,
+            secrets,
+        )
+    }
+
+    fn signed_doctor_report_with_repository_policy(
+        private: bool,
+        actions: Result<Vec<u8>, GhExecutionError>,
+        environment: Result<Vec<u8>, GhExecutionError>,
+        policies: Result<Vec<u8>, GhExecutionError>,
+        secrets: Result<Vec<u8>, GhExecutionError>,
+    ) -> ProviderDoctorReport {
         let provider = GithubBuildProvider::with_artifact_store_and_clock(
             provider_config(all_authorized()),
             transport(FakeGhRunner::with([
-                Ok(b"ShiroKSH\n".to_vec()),
+                Ok(authenticated_user_row()),
                 Ok(
                     format!("991\tShiroKSH/rustferry-signing\t{private}\tfalse\tfalse\tmain\n")
                         .into_bytes(),
                 ),
                 Ok(b"992\tShiroKSH/rust-and-iphone\tfalse\tfalse\tfalse\tmain\n".to_vec()),
+                actions,
                 environment,
                 policies,
                 secrets,
@@ -4166,6 +17365,36 @@ mod tests {
         .expect("doctor report")
     }
 
+    fn workflow_dispatch_doctor_report(
+        registration: Result<Vec<u8>, GhExecutionError>,
+    ) -> ProviderDoctorReport {
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            workflow_dispatch_provider_config(all_authorized()),
+            transport(FakeGhRunner::with([
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(public_source_repository_row()),
+                Ok(b"true\n".to_vec()),
+                registration,
+                Ok(signing_environment_row(false, true, true)),
+                Ok(exact_signing_policy_row()),
+                Ok(exact_signing_secret_rows()),
+            ])),
+            FakePublisher::default(),
+            DoctorArtifactStore,
+            FixedClock(1_700_000_000_000),
+        );
+        poll_ready(provider.doctor(
+            ProviderDoctorRequest {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+                operation_id: "workflow-dispatch-doctor".to_owned(),
+                require_signing: true,
+            },
+            CancellationToken::new(),
+        ))
+        .expect("workflow dispatch doctor report")
+    }
+
     #[test]
     fn workflow_fingerprint_is_exact_lowercase_sha256() {
         let workflow = generate_workflow(&workflow_config());
@@ -4176,26 +17405,4613 @@ mod tests {
     }
 
     #[test]
-    fn git_process_environment_excludes_ambient_tokens_and_signing_material() {
-        let mut command = Command::new("git");
-        command
-            .env("GH_TOKEN", "token-canary")
-            .env("GITHUB_TOKEN", "token-canary")
-            .env("RUSTFERRY_GOAL3_IOS_CERTIFICATE_PASSWORD", "secret-canary");
-        apply_allowlisted_git_environment(&mut command);
-
-        let names = command
-            .get_envs()
-            .map(|(name, _)| name.to_string_lossy().into_owned())
-            .collect::<BTreeSet<_>>();
-        assert!(
-            names
-                .iter()
-                .all(|name| GIT_AMBIENT_ENVIRONMENT_ALLOWLIST.contains(&name.as_str()))
+    fn workflow_dispatch_resume_state_is_heap_indirected() {
+        assert_eq!(
+            std::mem::size_of::<Option<Box<GithubWorkflowDispatchResumeV1>>>(),
+            std::mem::size_of::<usize>()
         );
-        assert!(!names.contains("GH_TOKEN"));
-        assert!(!names.contains("GITHUB_TOKEN"));
-        assert!(!names.contains("RUSTFERRY_GOAL3_IOS_CERTIFICATE_PASSWORD"));
+        assert!(std::mem::size_of::<GithubJobResumeV1>() <= 4_352);
+    }
+
+    #[test]
+    fn workflow_dispatch_submit_checkpoints_intent_receipt_then_exact_run_and_posts_once() {
+        let plan = FakeWorkflowDispatchPlan::with_response(workflow_dispatch_receipt_response(73));
+        let sink = CapturingCheckpointSink::default();
+        let checkpoints = Arc::clone(&sink.checkpoints);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            workflow_dispatch_provider_config(all_authorized()),
+            transport(
+                FakeGhRunner::with(workflow_dispatch_submit_responses(73))
+                    .with_workflow_dispatch(plan.clone()),
+            ),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(sink);
+
+        let handle = poll_ready(provider.submit(unsigned_request(), CancellationToken::new()))
+            .unwrap_or_else(|error| {
+                let requests = provider
+                    .transport
+                    .lock()
+                    .expect("transport")
+                    .runner()
+                    .requests
+                    .lock()
+                    .expect("requests")
+                    .iter()
+                    .map(|request| request.endpoint().to_owned())
+                    .collect::<Vec<_>>();
+                panic!("workflow dispatch submit failed: {error:?}; requests: {requests:?}")
+            });
+        assert_eq!(handle.state, JobState::Queued);
+        assert_eq!(plan.0.clients_created.load(Ordering::SeqCst), 1);
+        assert_eq!(plan.0.requests.lock().expect("dispatch requests").len(), 1);
+        assert_eq!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .published
+                .len(),
+            1
+        );
+
+        let checkpoints = checkpoints.lock().expect("dispatch checkpoints");
+        let intent = checkpoints
+            .iter()
+            .position(|resume| {
+                resume
+                    .workflow_dispatch
+                    .as_ref()
+                    .is_some_and(|dispatch| dispatch.receipt.is_none())
+                    && resume.run.is_none()
+            })
+            .expect("durable dispatch intent");
+        let receipt = checkpoints
+            .iter()
+            .position(|resume| {
+                resume
+                    .workflow_dispatch
+                    .as_ref()
+                    .is_some_and(|dispatch| dispatch.receipt.is_some())
+                    && resume.run.is_none()
+            })
+            .expect("durable dispatch receipt");
+        let run = checkpoints
+            .iter()
+            .position(|resume| {
+                resume.run.as_ref().is_some_and(|run| {
+                    run.run_id == 73 && run.event == GithubRunEventV1::WorkflowDispatch
+                })
+            })
+            .expect("durable workflow dispatch run");
+        assert!(intent < receipt && receipt < run);
+        assert!(
+            checkpoints[..intent]
+                .iter()
+                .any(|resume| resume.dispatch_commit.as_deref() == Some(DISPATCH_SHA))
+        );
+    }
+
+    #[test]
+    fn workflow_dispatch_post_releases_state_and_transport_and_late_cancel_maps_exact_run() {
+        let (plan, gate) = FakeWorkflowDispatchPlan::with_blocking_response(
+            workflow_dispatch_receipt_response(73),
+        );
+        let mut responses = workflow_dispatch_submit_responses(73);
+        responses.extend([
+            Ok(ordinary_workflow_dispatch_run_row(73)),
+            Ok(authenticated_user_row()),
+            Ok(private_repository_row()),
+            Ok(ordinary_workflow_dispatch_run_row(73)),
+            Ok(authenticated_user_row()),
+            Ok(private_repository_row()),
+            Ok(Vec::new()),
+        ]);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            workflow_dispatch_provider_config(all_authorized()),
+            transport(FakeGhRunner::with(responses).with_workflow_dispatch(plan.clone())),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(CapturingCheckpointSink::default());
+        let cancellation = CancellationToken::new();
+
+        thread::scope(|scope| {
+            let submitted = scope.spawn(|| {
+                poll_ready(provider.submit(unsigned_request(), cancellation.clone()))
+            });
+            gate.wait_until_entered();
+            assert!(provider.state.try_lock().is_ok());
+            assert!(provider.transport.try_lock().is_ok());
+            cancellation.cancel();
+            gate.release();
+            let handle = submitted.join().expect("dispatch submit thread").expect("submit");
+            assert_eq!(handle.state, JobState::Cancelling);
+        });
+
+        assert_eq!(plan.0.requests.lock().expect("dispatch requests").len(), 1);
+        let state = provider.lock_state().expect("dispatch state");
+        let record = state.jobs.get("operation-1").expect("dispatch record");
+        assert!(record.cancellation_requested);
+        assert!(record.cancellation_dispatched);
+        assert_eq!(record.run.as_ref().map(RunHandle::id), Some(RunId::new(73).expect("run")));
+    }
+
+    #[test]
+    fn late_cancellation_checkpoint_preserves_every_terminal_state() {
+        let mapped = durable_workflow_dispatch_mapped_resume();
+        let sink = CapturingCheckpointSink::default();
+        let checkpoints = Arc::clone(&sink.checkpoints);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            workflow_dispatch_provider_config(all_authorized()),
+            transport(FakeGhRunner::with([])),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(sink);
+        provider
+            .restore_job_resumes_offline(
+                vec![mapped.clone()],
+                &durable_identity_for_resume(&mapped),
+            )
+            .expect("restore mapped dispatch run");
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        for terminal in [
+            JobState::Succeeded,
+            JobState::Failed,
+            JobState::Cancelled,
+            JobState::Cleaned,
+        ] {
+            {
+                let mut state = provider.lock_state().expect("dispatch state");
+                let record = state.jobs.get_mut("operation-1").expect("dispatch record");
+                record.state = terminal;
+                record.cancellation_requested = false;
+            }
+            assert!(
+                !provider
+                    .checkpoint_workflow_dispatch_cancellation("operation-1", &cancellation)
+                    .expect("terminal cancellation check")
+            );
+            let state = provider.lock_state().expect("dispatch state");
+            let record = state.jobs.get("operation-1").expect("dispatch record");
+            assert_eq!(record.state, terminal);
+            assert!(!record.cancellation_requested);
+        }
+        assert!(checkpoints.lock().expect("checkpoints").is_empty());
+    }
+
+    #[test]
+    fn cancelled_ambiguous_dispatch_persists_intent_then_restart_adopts_and_cancels() {
+        let (plan, gate) = FakeWorkflowDispatchPlan::with_blocking_result(Err(
+            GithubWorkflowDispatchHttpError::TimedOut,
+        ));
+        let sink = CapturingCheckpointSink::default();
+        let durable = Arc::clone(&sink.checkpoints);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            workflow_dispatch_provider_config(all_authorized()),
+            transport(
+                FakeGhRunner::with(workflow_dispatch_submit_responses(73))
+                    .with_workflow_dispatch(plan.clone()),
+            ),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(sink);
+        let cancellation = CancellationToken::new();
+        thread::scope(|scope| {
+            let submitted = scope.spawn(|| {
+                poll_ready(provider.submit(unsigned_request(), cancellation.clone()))
+            });
+            gate.wait_until_entered();
+            cancellation.cancel();
+            gate.release();
+            submitted
+                .join()
+                .expect("dispatch submit thread")
+                .expect_err("ambiguous dispatch response");
+        });
+        let resume = durable
+            .lock()
+            .expect("dispatch checkpoints")
+            .last()
+            .cloned()
+            .expect("cancelled dispatch intent");
+        assert!(resume.cancellation_requested);
+        assert!(resume.run.is_none());
+        assert!(resume.workflow_dispatch.as_ref().is_some_and(|dispatch| {
+            dispatch.uncertain && dispatch.receipt.is_none()
+        }));
+
+        let restarted = GithubBuildProvider::with_artifact_store_and_clock(
+            workflow_dispatch_provider_config(all_authorized()),
+            transport(FakeGhRunner::with([
+                Ok(workflow_dispatch_run_row(73)),
+                Ok(workflow_dispatch_run_row(73)),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(ordinary_workflow_dispatch_run_row(73)),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(ordinary_workflow_dispatch_run_row(73)),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(Vec::new()),
+            ])),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(CapturingCheckpointSink::default());
+        restarted
+            .restore_job_resumes_offline(vec![resume.clone()], &durable_identity_for_resume(&resume))
+            .expect("restore cancelled dispatch intent");
+        restarted
+            .reconcile_restored_job("operation-1", &CancellationToken::new())
+            .expect("adopt and cancel exact dispatch run");
+        let state = restarted.lock_state().expect("restarted dispatch state");
+        let record = state.jobs.get("operation-1").expect("dispatch record");
+        assert!(record.cancellation_requested);
+        assert!(record.cancellation_dispatched);
+    }
+
+    #[test]
+    fn cancellation_during_dispatch_mapping_error_is_checkpointed_before_return() {
+        let plan = FakeWorkflowDispatchPlan::with_response(workflow_dispatch_receipt_response(73));
+        let cancellation = CancellationToken::new();
+        let mut responses = workflow_dispatch_submit_responses(73);
+        responses[10] = Err(GhExecutionError::CommandFailed { exit_code: Some(1) });
+        let sink = CapturingCheckpointSink::default();
+        let durable = Arc::clone(&sink.checkpoints);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            workflow_dispatch_provider_config(all_authorized()),
+            transport(
+                FakeGhRunner::with(responses)
+                    .cancelling_before(11, cancellation.clone())
+                    .with_workflow_dispatch(plan),
+            ),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(sink);
+
+        poll_ready(provider.submit(unsigned_request(), cancellation))
+            .expect_err("run mapping failure");
+        let resume = durable
+            .lock()
+            .expect("dispatch checkpoints")
+            .last()
+            .cloned()
+            .expect("cancelled receipt checkpoint");
+        assert!(resume.cancellation_requested);
+        assert!(resume.run.is_none());
+        assert!(resume.workflow_dispatch.as_ref().is_some_and(|dispatch| {
+            !dispatch.uncertain
+                && dispatch
+                    .receipt
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.run_id == 73)
+        }));
+    }
+
+    #[test]
+    fn crash_after_dispatch_post_reconciles_exact_run_without_a_second_post() {
+        let plan = FakeWorkflowDispatchPlan::with_response(workflow_dispatch_receipt_response(73));
+        let crash_sink = FailOnWorkflowDispatchReceiptSink::default();
+        let durable = Arc::clone(&crash_sink.checkpoints);
+        let first = GithubBuildProvider::with_artifact_store_and_clock(
+            workflow_dispatch_provider_config(all_authorized()),
+            transport(
+                FakeGhRunner::with(workflow_dispatch_submit_responses(73))
+                    .with_workflow_dispatch(plan.clone()),
+            ),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(crash_sink);
+
+        let error = poll_ready(first.submit(unsigned_request(), CancellationToken::new()))
+            .expect_err("receipt checkpoint crash");
+        assert!(matches!(
+            error,
+            RemoteBuildError::ProviderFailure { code, .. }
+                if code == "workflow_dispatch_receipt_checkpoint_failed"
+        ));
+        assert_eq!(plan.0.requests.lock().expect("dispatch requests").len(), 1);
+        let intent = durable
+            .lock()
+            .expect("durable checkpoints")
+            .last()
+            .cloned()
+            .expect("durable dispatch intent");
+        assert!(
+            intent
+                .workflow_dispatch
+                .as_ref()
+                .is_some_and(|dispatch| dispatch.receipt.is_none() && dispatch.uncertain)
+        );
+        assert!(intent.run.is_none());
+
+        let recovery_sink = CapturingCheckpointSink::default();
+        let recovered = Arc::clone(&recovery_sink.checkpoints);
+        let restarted = GithubBuildProvider::with_artifact_store_and_clock(
+            workflow_dispatch_provider_config(all_authorized()),
+            transport(FakeGhRunner::with([
+                Ok(workflow_dispatch_run_row(73)),
+                Ok(workflow_dispatch_run_row(73)),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(ordinary_workflow_dispatch_run_row(73)),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+            ])),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(recovery_sink);
+        let identity = durable_identity_for_resume(&intent);
+        restarted
+            .restore_job_resumes_offline(vec![intent], &identity)
+            .expect("restore dispatch intent");
+        assert_eq!(
+            restarted
+                .reconcile_restored_job("operation-1", &CancellationToken::new())
+                .expect("GET-only dispatch reconciliation"),
+            GithubJobReconciliation::AlreadyMapped
+        );
+        let latest = recovered
+            .lock()
+            .expect("recovery checkpoints")
+            .last()
+            .cloned()
+            .expect("recovered run checkpoint");
+        assert_eq!(latest.run.as_ref().map(|run| run.run_id), Some(73));
+        assert!(latest.workflow_dispatch.as_ref().is_some_and(|dispatch| {
+            dispatch
+                .receipt
+                .as_ref()
+                .is_some_and(|receipt| receipt.run_id == 73)
+        }));
+    }
+
+    #[test]
+    fn existing_dispatch_intent_missing_or_ambiguous_run_never_reposts() {
+        let intent = durable_workflow_dispatch_intent_resume();
+        for (rows, expected_code) in [
+            (Vec::new(), "github_workflow_dispatch_run_not_found"),
+            (
+                workflow_dispatch_run_row_with_title(
+                    73,
+                    &base64_fixture("rustferry-v1|wrong-public-input-correlation"),
+                ),
+                "github_workflow_dispatch_run_not_found",
+            ),
+            (
+                [workflow_dispatch_run_row(73), workflow_dispatch_run_row(74)].concat(),
+                "github_workflow_dispatch_run_ambiguous",
+            ),
+        ] {
+            let provider = GithubBuildProvider::with_artifact_store_and_clock(
+                workflow_dispatch_provider_config(all_authorized()),
+                transport(FakeGhRunner::with([Ok(rows)])),
+                FakePublisher::default(),
+                NoVerifiedArtifactStore,
+                FixedClock(1_700_000_000_000),
+            )
+            .with_checkpoint_sink(CapturingCheckpointSink::default());
+            let identity = durable_identity_for_resume(&intent);
+            provider
+                .restore_job_resumes_offline(vec![intent.clone()], &identity)
+                .expect("restore dispatch intent");
+            let error = provider
+                .refresh_restored_job_get_only("operation-1", &CancellationToken::new())
+                .expect_err("unresolved dispatch run");
+            assert!(matches!(
+                error,
+                RemoteBuildError::ProviderFailure { code, .. } if code == expected_code
+            ));
+            let state = provider.lock_state().expect("dispatch state");
+            assert!(
+                state
+                    .jobs
+                    .get("operation-1")
+                    .expect("dispatch job")
+                    .workflow_dispatch
+                    .as_ref()
+                    .is_some_and(|dispatch| dispatch.receipt.is_none() && dispatch.uncertain)
+            );
+        }
+    }
+
+    #[test]
+    fn cancelled_failing_intent_reconciliation_is_durable_before_restart_adoption() {
+        let intent = durable_workflow_dispatch_intent_resume();
+        let cancellation = CancellationToken::new();
+        let sink = CapturingCheckpointSink::default();
+        let durable = Arc::clone(&sink.checkpoints);
+        let failing = GithubBuildProvider::with_artifact_store_and_clock(
+            workflow_dispatch_provider_config(all_authorized()),
+            transport(
+                FakeGhRunner::with([Err(GhExecutionError::CommandFailed {
+                    exit_code: Some(1),
+                })])
+                .cancelling_before(1, cancellation.clone()),
+            ),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(sink);
+        let identity = durable_identity_for_resume(&intent);
+        failing
+            .restore_job_resumes_offline(vec![intent], &identity)
+            .expect("restore dispatch intent");
+
+        failing
+            .refresh_restored_job_get_only("operation-1", &cancellation)
+            .expect_err("failing run lookup");
+        let cancelled = durable
+            .lock()
+            .expect("dispatch checkpoints")
+            .last()
+            .cloned()
+            .expect("durable cancellation after failing lookup");
+        assert!(cancelled.cancellation_requested);
+        assert!(cancelled.run.is_none());
+
+        let restarted = GithubBuildProvider::with_artifact_store_and_clock(
+            workflow_dispatch_provider_config(all_authorized()),
+            transport(FakeGhRunner::with([
+                Ok(workflow_dispatch_run_row(73)),
+                Ok(workflow_dispatch_run_row(73)),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(ordinary_workflow_dispatch_run_row(73)),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(ordinary_workflow_dispatch_run_row(73)),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(Vec::new()),
+            ])),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(CapturingCheckpointSink::default());
+        restarted
+            .restore_job_resumes_offline(
+                vec![cancelled.clone()],
+                &durable_identity_for_resume(&cancelled),
+            )
+            .expect("restore cancelled dispatch intent");
+        restarted
+            .reconcile_restored_job("operation-1", &CancellationToken::new())
+            .expect("adopt and cancel exact dispatch run");
+        let state = restarted.lock_state().expect("restarted dispatch state");
+        let record = state.jobs.get("operation-1").expect("dispatch record");
+        assert!(record.cancellation_requested);
+        assert!(record.cancellation_dispatched);
+    }
+
+    #[test]
+    fn cancelled_failing_live_observation_is_durable_before_restart_cancel() {
+        let mapped = durable_workflow_dispatch_mapped_resume();
+        let cancellation = CancellationToken::new();
+        let sink = CapturingCheckpointSink::default();
+        let durable = Arc::clone(&sink.checkpoints);
+        let failing = GithubBuildProvider::with_artifact_store_and_clock(
+            workflow_dispatch_provider_config(all_authorized()),
+            transport(
+                FakeGhRunner::with([Err(GhExecutionError::CommandFailed {
+                    exit_code: Some(1),
+                })])
+                .cancelling_before(1, cancellation.clone()),
+            ),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(sink);
+        failing
+            .restore_job_resumes_offline(
+                vec![mapped.clone()],
+                &durable_identity_for_resume(&mapped),
+            )
+            .expect("restore mapped dispatch run");
+
+        failing
+            .revalidate_restored_job_live("operation-1", &cancellation)
+            .expect_err("failing live run observation");
+        let cancelled = durable
+            .lock()
+            .expect("dispatch checkpoints")
+            .last()
+            .cloned()
+            .expect("durable cancellation after failing observation");
+        assert!(cancelled.cancellation_requested);
+        assert_eq!(cancelled.run.as_ref().map(|run| run.run_id), Some(73));
+
+        let restarted = GithubBuildProvider::with_artifact_store_and_clock(
+            workflow_dispatch_provider_config(all_authorized()),
+            transport(FakeGhRunner::with([
+                Ok(ordinary_workflow_dispatch_run_row(73)),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(ordinary_workflow_dispatch_run_row(73)),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(Vec::new()),
+            ])),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(CapturingCheckpointSink::default());
+        restarted
+            .restore_job_resumes_offline(
+                vec![cancelled.clone()],
+                &durable_identity_for_resume(&cancelled),
+            )
+            .expect("restore cancelled mapped run");
+        restarted
+            .reconcile_restored_job("operation-1", &CancellationToken::new())
+            .expect("cancel exact mapped run");
+        let state = restarted.lock_state().expect("restarted dispatch state");
+        let record = state.jobs.get("operation-1").expect("dispatch record");
+        assert!(record.cancellation_requested);
+        assert!(record.cancellation_dispatched);
+    }
+
+    #[test]
+    fn workflow_dispatch_preflight_failures_leave_no_ref_or_intent() {
+        let cases = [
+            (
+                workflow_dispatch_provider_config_with_trusted_ref(
+                    all_authorized(),
+                    "refs/heads/not-default",
+                ),
+                vec![
+                    Ok(authenticated_user_row()),
+                    Ok(private_repository_row()),
+                    Ok(private_repository_row()),
+                ],
+                Some(FakeWorkflowDispatchPlan::with_response(
+                    workflow_dispatch_receipt_response(73),
+                )),
+            ),
+            (
+                workflow_dispatch_provider_config(all_authorized()),
+                vec![
+                    Ok(authenticated_user_row()),
+                    Ok(private_repository_row()),
+                    Ok(private_repository_row()),
+                    Ok(format!("17\t{WORKFLOW_PATH_BASE64}\tdisabled_manually\n").into_bytes()),
+                ],
+                Some(FakeWorkflowDispatchPlan::with_response(
+                    workflow_dispatch_receipt_response(73),
+                )),
+            ),
+            (
+                workflow_dispatch_provider_config(all_authorized()),
+                vec![
+                    Ok(authenticated_user_row()),
+                    Ok(private_repository_row()),
+                    Ok(private_repository_row()),
+                    Ok(workflow_dispatch_registration_row()),
+                ],
+                None,
+            ),
+        ];
+        for (config, responses, plan) in cases {
+            let sink = CapturingCheckpointSink::default();
+            let checkpoints = Arc::clone(&sink.checkpoints);
+            let mut runner = FakeGhRunner::with(responses);
+            if let Some(plan) = plan {
+                runner = runner.with_workflow_dispatch(plan);
+            }
+            let provider = GithubBuildProvider::with_artifact_store_and_clock(
+                config,
+                transport(runner),
+                FakePublisher::default(),
+                NoVerifiedArtifactStore,
+                FixedClock(1_700_000_000_000),
+            )
+            .with_checkpoint_sink(sink);
+            poll_ready(provider.submit(unsigned_request(), CancellationToken::new()))
+                .expect_err("workflow dispatch preflight must fail");
+            assert!(checkpoints.lock().expect("checkpoints").is_empty());
+            assert!(
+                provider
+                    .publisher
+                    .lock()
+                    .expect("publisher")
+                    .published
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn active_push_only_default_workflow_is_rejected_before_ref_or_dispatch_intent() {
+        let plan = FakeWorkflowDispatchPlan::with_response(workflow_dispatch_receipt_response(73));
+        let sink = CapturingCheckpointSink::default();
+        let checkpoints = Arc::clone(&sink.checkpoints);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            workflow_dispatch_provider_config(all_authorized()),
+            transport(
+                FakeGhRunner::with([
+                    Ok(authenticated_user_row()),
+                    Ok(private_repository_row()),
+                    Ok(private_repository_row()),
+                    Ok(workflow_dispatch_registration_row()),
+                ])
+                .with_workflow_dispatch(plan.clone()),
+            ),
+            FakePublisher {
+                execution_workflow_failure: Some(
+                    TemporaryRefPublishError::WorkflowFingerprintMismatch,
+                ),
+                ..FakePublisher::default()
+            },
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(sink);
+
+        poll_ready(provider.submit(unsigned_request(), CancellationToken::new()))
+            .expect_err("Push-only default workflow bytes");
+        assert_eq!(plan.0.clients_created.load(Ordering::SeqCst), 0);
+        assert!(
+            plan.0
+                .requests
+                .lock()
+                .expect("dispatch requests")
+                .is_empty()
+        );
+        assert!(checkpoints.lock().expect("checkpoints").is_empty());
+        assert_eq!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .execution_workflow_checks,
+            1
+        );
+        assert!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .published
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn durable_identity_is_live_secret_free_and_stably_bound() {
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with([
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+            ])),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        );
+        let identity = provider.durable_identity().expect("durable identity");
+        assert_eq!(identity.provider, GITHUB_PROVIDER_ID);
+        assert_eq!(identity.execution_repository_id, 991);
+        assert_eq!(
+            identity.execution_repository,
+            "https://github.com/ShiroKSH/rustferry-signing"
+        );
+        assert_eq!(
+            identity.principal,
+            GithubPrincipalIdentityV1::User {
+                id: AUTHENTICATED_USER_ID,
+                login: "ShiroKSH".to_owned(),
+            }
+        );
+        assert!(is_lower_sha256(&identity.provider_config_sha256));
+    }
+
+    #[test]
+    fn repository_credential_list_id_must_match_execution_metadata_id() {
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            workflow_dispatch_provider_config(all_authorized()),
+            transport(FakeGhRunner::with([
+                Err(GhExecutionError::CommandFailed { exit_code: Some(1) }),
+                Ok(b"992\tU2hpcm9LU0gvcnVzdGZlcnJ5LXNpZ25pbmc=\n".to_vec()),
+                Ok(private_repository_row()),
+            ])),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        );
+
+        assert!(matches!(
+            provider.durable_identity(),
+            Err(RemoteBuildError::ProviderFailure { code, .. })
+                if code == "resume_repository_credential_repository_mismatch"
+        ));
+    }
+
+    #[test]
+    fn uncheckpointed_visible_submission_cannot_be_exported_or_cancelled() {
+        let config = provider_config(all_authorized());
+        let principal = GithubPrincipalIdentityV1::User {
+            id: AUTHENTICATED_USER_ID,
+            login: "ShiroKSH".to_owned(),
+        };
+        let mut record = durable_prepublication_resume()
+            .into_record(&config, &principal, 991)
+            .expect("record fixture");
+        record.publication_intent = false;
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            config,
+            transport(FakeGhRunner::default()),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        );
+        provider
+            .lock_state()
+            .expect("state")
+            .jobs
+            .insert(record.job_id.clone(), record);
+
+        assert!(provider.export_job_resumes().is_err());
+        assert!(
+            poll_ready(provider.cancel(
+                CancellationRequest {
+                    job_id: "operation-1".to_owned(),
+                    reason: "user-requested".to_owned(),
+                },
+                CancellationToken::new(),
+            ))
+            .is_err()
+        );
+        let state = provider.lock_state().expect("state");
+        let record = state.jobs.get("operation-1").expect("pending job");
+        assert_eq!(record.state, JobState::Created);
+        assert!(!record.cancellation_requested);
+    }
+
+    #[test]
+    fn export_rejects_jobs_without_their_creation_identity() {
+        let config = provider_config(all_authorized());
+        let principal = GithubPrincipalIdentityV1::User {
+            id: AUTHENTICATED_USER_ID,
+            login: "ShiroKSH".to_owned(),
+        };
+        let mut record = durable_prepublication_resume()
+            .into_record(&config, &principal, 991)
+            .expect("record fixture");
+        record.principal = None;
+        record.execution_repository_id = None;
+        let runner = FakeGhRunner::default();
+        let requests = Arc::clone(&runner.requests);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            config,
+            transport(runner),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        );
+        provider
+            .lock_state()
+            .expect("state")
+            .jobs
+            .insert(record.job_id.clone(), record);
+
+        assert!(provider.export_job_resumes().is_err());
+        assert!(requests.lock().expect("requests").is_empty());
+    }
+
+    #[test]
+    fn checkpoint_sink_captures_pre_push_intent_and_export_restores_strict_state() {
+        let sink = CapturingCheckpointSink::default();
+        let checkpoints = Arc::clone(&sink.checkpoints);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with([
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+            ])),
+            FakePublisher {
+                prepared_publication: Some(expected_publication()),
+                ..FakePublisher::default()
+            },
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(sink);
+
+        poll_ready(provider.submit(unsigned_request(), CancellationToken::new()))
+            .expect("checkpointed submission");
+        let captured = checkpoints.lock().expect("captured checkpoints");
+        assert_eq!(captured.len(), 4);
+        assert!(captured[0].publication_intent);
+        assert_eq!(
+            captured[0].prepared_dispatch_commit.as_deref(),
+            Some(DISPATCH_SHA)
+        );
+        assert_eq!(captured[0].dispatch_commit, None);
+        assert_eq!(captured[0].publication_started_at_ms, 0);
+        assert_eq!(captured[0].publication_quiescence_deadline_ms, u64::MAX);
+        assert_eq!(captured[1].publication_started_at_ms, 1_700_000_000_000);
+        assert_eq!(
+            captured[1].publication_quiescence_deadline_ms,
+            1_700_000_000_000 + GITHUB_PUBLICATION_QUIESCENCE_WINDOW_MS
+        );
+        assert_eq!(captured[1].dispatch_commit, None);
+        assert_eq!(captured[2].dispatch_commit.as_deref(), Some(DISPATCH_SHA));
+        assert_eq!(captured[3].state, JobState::Queued);
+        assert!(
+            captured
+                .iter()
+                .all(|resume| resume.publication_process_fenced)
+        );
+        assert!(captured.iter().all(|resume| {
+            resume.principal
+                == GithubPrincipalIdentityV1::User {
+                    id: AUTHENTICATED_USER_ID,
+                    login: "ShiroKSH".to_owned(),
+                }
+                && resume.execution_repository_id == 991
+        }));
+        drop(captured);
+
+        let exported = provider.export_job_resumes().expect("durable export");
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0].state, JobState::Queued);
+        let encoded_resume = exported[0].encode().expect("encoded resume");
+        assert_eq!(
+            GithubJobResumeV1::decode(&encoded_resume).expect("strict resume JSON"),
+            exported[0]
+        );
+        let mut duplicate = encoded_resume;
+        duplicate.pop();
+        duplicate.splice(1..1, b"\"schema_version\":1,".iter().copied());
+        assert!(GithubJobResumeV1::decode(&duplicate).is_err());
+        let mut encoded = serde_json::to_value(&exported[0]).expect("resume JSON");
+        encoded
+            .as_object_mut()
+            .expect("resume object")
+            .insert("unexpected".to_owned(), serde_json::json!(true));
+        let mut unknown = serde_json::to_vec(&encoded).expect("unknown field JSON");
+        unknown.push(b'\n');
+        assert!(GithubJobResumeV1::decode(&unknown).is_err());
+        let mut encoded = serde_json::to_value(&exported[0]).expect("resume JSON");
+        encoded
+            .get_mut("request")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("nested request object")
+            .insert("future_safety_field".to_owned(), serde_json::json!(true));
+        let mut nested_unknown = serde_json::to_vec(&encoded).expect("nested unknown field JSON");
+        nested_unknown.push(b'\n');
+        assert!(GithubJobResumeV1::decode(&nested_unknown).is_err());
+
+        let restored = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with([
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+            ])),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        );
+        restored
+            .restore_job_resumes(exported)
+            .expect("strict restore");
+        assert_eq!(restored.lock_state().expect("state").jobs.len(), 1);
+    }
+
+    #[test]
+    fn resume_successor_rejects_stale_replacements_but_allows_skipped_internal_states() {
+        let prepublication = durable_prepublication_resume();
+        let queued = durable_resume_with_run();
+        prepublication
+            .validate_successor(&queued)
+            .expect("publication and run identity bind once");
+
+        let succeeded = durable_success_resume();
+        queued
+            .validate_successor(&succeeded)
+            .expect("queued checkpoint may complete before the next durable write");
+        let mut cleaned = succeeded.clone();
+        cleaned.state = JobState::Cleaned;
+        cleaned.cleanup_requested = true;
+        cleaned.temporary_ref_deleted = true;
+        succeeded
+            .validate_successor(&cleaned)
+            .expect("cleanup may skip its in-memory intermediate state");
+
+        let mut signed_succeeded = succeeded.clone();
+        signed_succeeded.request = valid_request();
+        signed_succeeded.request_sha256 =
+            canonical_request_sha256(&signed_succeeded.request).expect("signed request digest");
+        let mut signed_cleaned = signed_succeeded.clone();
+        signed_cleaned.state = JobState::Cleaned;
+        signed_cleaned.cleanup_requested = true;
+        signed_cleaned.temporary_ref_deleted = true;
+        assert!(
+            signed_succeeded
+                .validate_successor(&signed_cleaned)
+                .is_err(),
+            "signed cleanup needs attempt-bound worker evidence"
+        );
+
+        assert!(queued.validate_successor(&prepublication).is_err());
+        let mut changed_attempt = queued.clone();
+        changed_attempt.run.as_mut().expect("run").run_attempt = 2;
+        assert!(queued.validate_successor(&changed_attempt).is_err());
+        let mut changed_fence = queued.clone();
+        changed_fence.publication_process_fenced = !changed_fence.publication_process_fenced;
+        assert!(queued.validate_successor(&changed_fence).is_err());
+        let mut changed_lease_scope = queued.clone();
+        changed_lease_scope.publication_lease_scope_sha256 = Some("b".repeat(64));
+        assert!(queued.validate_successor(&changed_lease_scope).is_err());
+        let mut removed_run = queued.clone();
+        removed_run.run = None;
+        assert!(queued.validate_successor(&removed_run).is_err());
+        let mut mismatched_dispatch = prepublication.clone();
+        mismatched_dispatch.prepared_dispatch_commit = Some(SOURCE_SHA.to_owned());
+        let mut mismatched_successor = mismatched_dispatch.clone();
+        mismatched_successor.dispatch_commit = Some(DISPATCH_SHA.to_owned());
+        assert!(
+            mismatched_dispatch
+                .validate_successor(&mismatched_successor)
+                .is_err()
+        );
+        let mut changed_manifests = cleaned.clone();
+        changed_manifests.manifests[0].project_id = "different".to_owned();
+        assert!(cleaned.validate_successor(&changed_manifests).is_err());
+    }
+
+    #[test]
+    fn legacy_resume_bytes_omit_the_optional_git_snapshot_checkpoint() {
+        let resume = durable_resume_with_run();
+        let bytes = resume.encode().expect("legacy resume bytes");
+        assert!(
+            !bytes
+                .windows(b"git_snapshot".len())
+                .any(|part| part == b"git_snapshot")
+        );
+        let decoded = GithubJobResumeV1::decode(&bytes).expect("legacy resume decode");
+        assert_eq!(decoded.git_snapshot, None);
+        assert_eq!(decoded.encode().expect("legacy resume reencode"), bytes);
+    }
+
+    #[test]
+    fn snapshot_successor_validates_the_complete_next_phase_shape() {
+        let fixture = snapshot_resume_fixture(GithubGitSnapshotPhaseV1::Prepared);
+        let mut malformed = fixture.resume.clone();
+        let snapshot = malformed.git_snapshot.as_mut().expect("snapshot resume");
+        snapshot.source_publication_started_at_ms = malformed.created_at_ms;
+        snapshot.source_publication_quiescence_deadline_ms =
+            publication_quiescence_deadline(snapshot.source_publication_started_at_ms, 0);
+        let error = fixture
+            .resume
+            .validate_successor(&malformed)
+            .expect_err("same-phase malformed successor must fail");
+        assert!(matches!(
+            error,
+            RemoteBuildError::ProviderFailure { code, .. }
+                if code == "resume_git_snapshot_source_started_early"
+        ));
+    }
+
+    #[test]
+    fn snapshot_exact_source_requires_an_armed_publication_boundary() {
+        let mut fixture = snapshot_resume_fixture(GithubGitSnapshotPhaseV1::SourceExact);
+        let snapshot = fixture
+            .resume
+            .git_snapshot
+            .as_mut()
+            .expect("snapshot resume");
+        snapshot.source_publication_started_at_ms = 0;
+        snapshot.source_publication_quiescence_deadline_ms = u64::MAX;
+        let error = snapshot
+            .validate_for_request(&fixture.resume.request)
+            .expect_err("unarmed exact source must not be adopted");
+        assert!(matches!(
+            error,
+            RemoteBuildError::ProviderFailure { code, .. }
+                if code == "resume_git_snapshot_source_ownership_unarmed"
+        ));
+    }
+
+    #[test]
+    fn standalone_cleanup_restore_requires_terminal_snapshot_source_proof() {
+        let config = provider_config(all_authorized());
+        let principal = GithubPrincipalIdentityV1::User {
+            id: AUTHENTICATED_USER_ID,
+            login: "ShiroKSH".to_owned(),
+        };
+        for state in [JobState::Cleaned, JobState::CleanupFailed] {
+            let exact = completed_snapshot_resume(GithubGitSnapshotPhaseV1::SourceExact, state);
+            let error = exact
+                .resume
+                .clone()
+                .into_record(&config, &principal, 991)
+                .expect_err("cleanup state cannot retain an owned source ref");
+            assert!(matches!(
+                error,
+                RemoteBuildError::ProviderFailure { code, .. }
+                    if code == "resume_state_inconsistent"
+            ));
+
+            let deleted = completed_snapshot_resume(GithubGitSnapshotPhaseV1::SourceDeleted, state);
+            deleted
+                .resume
+                .clone()
+                .into_record(&config, &principal, 991)
+                .expect("terminal source deletion proof permits cleanup restore");
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one adversarial regression proves the no-write boundary, capability and operation gates, and both cancellation checks"
+    )]
+    fn initial_snapshot_graph_precompute_is_exact_no_write_and_cancellation_bounded() {
+        let fixture = initial_snapshot_precompute_fixture();
+        let mut inputs = fixture.inputs();
+        let git_runner = FakeGitRunner::with(initial_snapshot_graph_responses());
+        let gh_runner = FakeGhRunner::with([]);
+        let gh_requests = Arc::clone(&gh_runner.requests);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(gh_runner),
+            GitTemporaryRefPublisher::new(
+                git_runner,
+                fixture.isolation.path(),
+                "source",
+                "execution",
+                Duration::from_secs(30),
+            )
+            .expect("snapshot precompute publisher"),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        );
+        let tree_before = test_tree_snapshot(fixture.isolation.path());
+
+        let graph = provider
+            .precompute_git_snapshot_graph(
+                &mut inputs,
+                "operation-1",
+                1_700_000_000_000,
+                &CancellationToken::new(),
+            )
+            .expect("initial snapshot graph");
+        assert_eq!(
+            graph,
+            GitSnapshotObjectGraphV1 {
+                schema_version: crate::snapshot::GIT_SNAPSHOT_GRAPH_SCHEMA_VERSION,
+                archive_blob: snapshot_object('1'),
+                descriptor_blob: snapshot_object('2'),
+                goal3_tree: snapshot_object('3'),
+                rustferry_tree: snapshot_object('4'),
+                root_tree: snapshot_object('5'),
+                commit: snapshot_object('6'),
+            }
+        );
+        inputs
+            .verify_contents()
+            .expect("retained inputs after precompute");
+        assert_eq!(test_tree_snapshot(fixture.isolation.path()), tree_before);
+        assert!(gh_requests.lock().expect("GitHub requests").is_empty());
+        {
+            let publisher = provider.publisher.lock().expect("publisher");
+            assert!(publisher.snapshot_imports.is_empty());
+            assert!(publisher.publication_leases.is_empty());
+            assert!(publisher.frozen_remotes.is_none());
+            assert!(publisher.runner.responses.is_empty());
+            assert_eq!(publisher.runner.invocations.len(), 7);
+            for invocation in &publisher.runner.invocations {
+                assert_eq!(invocation.network, GitNetworkPolicy::Offline);
+                let arguments = invocation
+                    .arguments
+                    .iter()
+                    .map(|argument| argument.to_string_lossy())
+                    .collect::<Vec<_>>();
+                assert!(!arguments.iter().any(|argument| argument == "-w"));
+                assert!(!arguments.iter().any(|argument| matches!(
+                    argument.as_ref(),
+                    "push" | "fetch" | "update-ref" | "checkout"
+                )));
+            }
+        }
+
+        let invocation_count = provider
+            .publisher
+            .lock()
+            .expect("publisher")
+            .runner
+            .invocations
+            .len();
+        let invalid_operation = provider
+            .precompute_git_snapshot_graph(
+                &mut fixture.inputs(),
+                "../unsafe",
+                1_700_000_000_000,
+                &CancellationToken::new(),
+            )
+            .expect_err("unsafe operation must fail before Git");
+        assert!(matches!(
+            invalid_operation,
+            RemoteBuildError::ProviderFailure { code, .. } if code == "git_snapshot_invalid"
+        ));
+        let cancelled_before = CancellationToken::new();
+        assert!(cancelled_before.cancel());
+        assert_eq!(
+            provider.precompute_git_snapshot_graph(
+                &mut fixture.inputs(),
+                "operation-1",
+                1_700_000_000_000,
+                &cancelled_before,
+            ),
+            Err(RemoteBuildError::Cancelled)
+        );
+        assert_eq!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .runner
+                .invocations
+                .len(),
+            invocation_count
+        );
+        assert_eq!(test_tree_snapshot(fixture.isolation.path()), tree_before);
+
+        let unsupported = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with([])),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        );
+        assert!(matches!(
+            unsupported.precompute_git_snapshot_graph(
+                &mut fixture.inputs(),
+                "operation-1",
+                1_700_000_000_000,
+                &CancellationToken::new(),
+            ),
+            Err(RemoteBuildError::UnsupportedCapability {
+                feature: ProviderFeature::SourceMode(SourceMode::GitSnapshot),
+                ..
+            })
+        ));
+        assert_eq!(test_tree_snapshot(fixture.isolation.path()), tree_before);
+        drop(provider);
+
+        let cancelled_after = CancellationToken::new();
+        let post_cancel_gh = FakeGhRunner::with([]);
+        let post_cancel_requests = Arc::clone(&post_cancel_gh.requests);
+        let post_cancel_provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(post_cancel_gh),
+            GitTemporaryRefPublisher::new(
+                FakeGitRunner::cancelling_after(
+                    initial_snapshot_graph_responses(),
+                    7,
+                    cancelled_after.clone(),
+                ),
+                fixture.isolation.path(),
+                "source",
+                "execution",
+                Duration::from_secs(30),
+            )
+            .expect("post-compute cancellation publisher"),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        );
+        assert_eq!(
+            post_cancel_provider.precompute_git_snapshot_graph(
+                &mut fixture.inputs(),
+                "operation-1",
+                1_700_000_000_000,
+                &cancelled_after,
+            ),
+            Err(RemoteBuildError::Cancelled)
+        );
+        assert!(cancelled_after.is_cancelled());
+        assert!(
+            post_cancel_requests
+                .lock()
+                .expect("post-cancel GitHub requests")
+                .is_empty()
+        );
+        let publisher = post_cancel_provider.publisher.lock().expect("publisher");
+        assert_eq!(publisher.runner.invocations.len(), 7);
+        assert!(publisher.publication_leases.is_empty());
+        assert!(publisher.snapshot_imports.is_empty());
+        assert!(publisher.frozen_remotes.is_none());
+        assert_eq!(test_tree_snapshot(fixture.isolation.path()), tree_before);
+    }
+
+    #[test]
+    fn snapshot_recovery_discovery_is_read_only_and_filters_provider_owned_operations() {
+        let fixture = snapshot_resume_fixture(GithubGitSnapshotPhaseV1::Prepared);
+        let isolation = fixture.isolation.path().to_path_buf();
+        let resume = fixture.resume.clone();
+        let snapshot = resume.git_snapshot.as_ref().expect("snapshot resume");
+        let archive_path =
+            crate::snapshot::git_snapshot_stage_directory(&isolation, &resume.operation_id)
+                .expect("stage path")
+                .join(crate::snapshot::GIT_SNAPSHOT_STAGE_ARCHIVE_FILE);
+        let descriptor_path =
+            crate::snapshot::git_snapshot_stage_directory(&isolation, &resume.operation_id)
+                .expect("stage path")
+                .join(crate::snapshot::GIT_SNAPSHOT_STAGE_DESCRIPTOR_FILE);
+        let metadata_path =
+            crate::snapshot::git_snapshot_stage_directory(&isolation, &resume.operation_id)
+                .expect("stage path")
+                .join(crate::snapshot::GIT_SNAPSHOT_STAGE_METADATA_FILE);
+        let before = [
+            fs::read(&archive_path).expect("archive bytes"),
+            fs::read(&descriptor_path).expect("descriptor bytes"),
+            fs::read(&metadata_path).expect("metadata bytes"),
+        ];
+        let publisher = GitTemporaryRefPublisher::new(
+            FakeGitRunner::default(),
+            &isolation,
+            "source",
+            "execution",
+            Duration::from_secs(1),
+        )
+        .expect("snapshot publisher");
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with([])),
+            publisher,
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        );
+
+        let candidates = provider
+            .discover_uncheckpointed_git_snapshot_stages()
+            .expect("read-only discovery");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].stage_locator, snapshot.stage_locator);
+        assert_eq!(candidates[0].stage, snapshot.stage);
+        assert_eq!(candidates[0].final_request, resume.request);
+        assert!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .runner
+                .invocations
+                .is_empty()
+        );
+        assert_eq!(
+            [
+                fs::read(&archive_path).expect("archive bytes"),
+                fs::read(&descriptor_path).expect("descriptor bytes"),
+                fs::read(&metadata_path).expect("metadata bytes"),
+            ],
+            before
+        );
+
+        provider
+            .restore_job_resumes_offline(
+                vec![resume.clone()],
+                &durable_identity_for_resume(&resume),
+            )
+            .expect("restore provider owner");
+        assert!(
+            provider
+                .discover_uncheckpointed_git_snapshot_stages()
+                .expect("owned-stage discovery")
+                .is_empty()
+        );
+        assert!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .runner
+                .invocations
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn fresh_reconsent_reserves_the_operation_before_any_stage_adoption() {
+        let fixture = snapshot_resume_fixture(GithubGitSnapshotPhaseV1::Prepared);
+        let resume = fixture.resume.clone();
+        let snapshot = resume.git_snapshot.as_ref().expect("snapshot resume");
+        let submission = GithubGitSnapshotSubmissionV1::after_fresh_reconsent(
+            durable_identity_for_resume(&resume),
+            resume.request.clone(),
+            snapshot.stage.consent_sha256.clone(),
+        )
+        .expect("fresh reconsent submission");
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with([])),
+            SnapshotFlowPublisher::exact(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(CapturingCheckpointSink::default());
+        let reservation = JobReservation::acquire(
+            &provider.state,
+            resume.operation_id.clone(),
+            provider.config.max_jobs,
+            false,
+        )
+        .expect("concurrent operation reservation");
+
+        let error = provider
+            .submit_git_snapshot(submission, &CancellationToken::new())
+            .expect_err("active operation reservation wins before adoption");
+        assert!(matches!(
+            error,
+            RemoteBuildError::ProviderFailure { code, .. } if code == "duplicate_job_id"
+        ));
+        assert!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .events
+                .is_empty()
+        );
+        drop(reservation);
+    }
+
+    #[test]
+    fn snapshot_source_cleanup_holds_lease_until_deleted_checkpoint_is_durable() {
+        let config = provider_config(all_authorized());
+        let principal = GithubPrincipalIdentityV1::User {
+            id: AUTHENTICATED_USER_ID,
+            login: "ShiroKSH".to_owned(),
+        };
+        let fixture =
+            completed_snapshot_resume(GithubGitSnapshotPhaseV1::SourceExact, JobState::Succeeded);
+        let mut record = fixture
+            .resume
+            .clone()
+            .into_record(&config, &principal, 991)
+            .expect("snapshot record");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let publisher = SnapshotCleanupAuditPublisher {
+            events: Arc::clone(&events),
+            source_lease_owned: false,
+            deletion_count: 0,
+            keepalive_release_count: 0,
+        };
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            config,
+            transport(FakeGhRunner::with([
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+            ])),
+            publisher,
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(SnapshotCleanupCheckpointSink {
+            events: Arc::clone(&events),
+            fail_deleted_once: true,
+        });
+
+        let error = provider
+            .cleanup_git_snapshot_source(&mut record)
+            .expect_err("first SourceDeleted checkpoint must fail");
+        assert!(matches!(
+            error,
+            RemoteBuildError::ProviderFailure { code, .. }
+                if code == "checkpoint_fixture_failed"
+        ));
+        assert_eq!(
+            record.git_snapshot.as_ref().expect("snapshot").phase,
+            GithubGitSnapshotPhaseV1::SourceDeleted
+        );
+        {
+            let publisher = provider.publisher.lock().expect("publisher");
+            assert!(publisher.source_lease_owned);
+            assert_eq!(publisher.deletion_count, 1);
+            assert_eq!(publisher.keepalive_release_count, 0);
+        }
+        assert_eq!(
+            *events.lock().expect("snapshot cleanup events"),
+            vec![
+                SnapshotCleanupAuditEvent::Checkpoint(
+                    GithubGitSnapshotPhaseV1::SourceCleanupIntent,
+                ),
+                SnapshotCleanupAuditEvent::Acquire,
+                SnapshotCleanupAuditEvent::Delete,
+                SnapshotCleanupAuditEvent::Checkpoint(GithubGitSnapshotPhaseV1::SourceDeleted,),
+            ]
+        );
+
+        provider
+            .cleanup_git_snapshot_source(&mut record)
+            .expect("replay deletion checkpoint and release lease");
+        let publisher = provider.publisher.lock().expect("publisher");
+        assert!(!publisher.source_lease_owned);
+        assert_eq!(publisher.deletion_count, 1);
+        assert_eq!(publisher.keepalive_release_count, 0);
+        drop(publisher);
+        assert_eq!(
+            *events.lock().expect("snapshot cleanup events"),
+            vec![
+                SnapshotCleanupAuditEvent::Checkpoint(
+                    GithubGitSnapshotPhaseV1::SourceCleanupIntent,
+                ),
+                SnapshotCleanupAuditEvent::Acquire,
+                SnapshotCleanupAuditEvent::Delete,
+                SnapshotCleanupAuditEvent::Checkpoint(GithubGitSnapshotPhaseV1::SourceDeleted,),
+                SnapshotCleanupAuditEvent::Checkpoint(GithubGitSnapshotPhaseV1::SourceDeleted,),
+                SnapshotCleanupAuditEvent::Release,
+            ]
+        );
+    }
+
+    #[test]
+    fn snapshot_keepalive_prune_checkpoints_intent_before_release_and_replays() {
+        let fixture =
+            completed_snapshot_resume(GithubGitSnapshotPhaseV1::SourceDeleted, JobState::Cleaned);
+        let resume = fixture.resume.clone();
+        let expected = GithubDurableIdentityV1 {
+            provider: resume.provider.clone(),
+            provider_config_sha256: resume.provider_config_sha256.clone(),
+            principal: resume.principal.clone(),
+            execution_repository: resume.execution_repository.clone(),
+            execution_repository_id: resume.execution_repository_id,
+        };
+        let checkpoints = Arc::new(Mutex::new(Vec::new()));
+        let mut publisher = SnapshotFlowPublisher::exact();
+        publisher.keepalive_exact = true;
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with([])),
+            publisher,
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(FailOnSnapshotPhaseSink {
+            checkpoints: Arc::clone(&checkpoints),
+            phase: GithubGitSnapshotPhaseV1::KeepaliveReleased,
+            failed_once: true,
+        });
+        provider
+            .restore_job_resumes_offline(vec![resume], &expected)
+            .expect("offline snapshot restore");
+        let authorization =
+            GithubGitSnapshotKeepaliveReleaseAuthorizationV1::new("operation-1", "7".repeat(64))
+                .expect("prune authorization");
+
+        let error = provider
+            .release_git_snapshot_keepalive_for_prune(&authorization, &CancellationToken::new())
+            .expect_err("Released checkpoint acknowledgement fails once");
+        assert!(matches!(
+            error,
+            RemoteBuildError::ProviderFailure { code, .. }
+                if code == "checkpoint_fixture_failed"
+        ));
+        let publisher = provider.publisher.lock().expect("publisher");
+        assert_eq!(
+            publisher.events,
+            [
+                SnapshotFlowEvent::ReconcileKeepalive,
+                SnapshotFlowEvent::ReleaseKeepalive,
+                SnapshotFlowEvent::ReconcileKeepalive,
+            ]
+        );
+        assert!(!publisher.keepalive_exact);
+        drop(publisher);
+        assert_eq!(
+            checkpoints
+                .lock()
+                .expect("snapshot checkpoints")
+                .iter()
+                .map(|resume| resume.git_snapshot.as_ref().expect("snapshot").phase)
+                .collect::<Vec<_>>(),
+            [
+                GithubGitSnapshotPhaseV1::KeepaliveReleaseIntent,
+                GithubGitSnapshotPhaseV1::KeepaliveReleased,
+            ]
+        );
+
+        provider
+            .release_git_snapshot_keepalive_for_prune(&authorization, &CancellationToken::new())
+            .expect("replay Released checkpoint without another mutation");
+        let publisher = provider.publisher.lock().expect("publisher");
+        assert_eq!(
+            publisher.events,
+            [
+                SnapshotFlowEvent::ReconcileKeepalive,
+                SnapshotFlowEvent::ReleaseKeepalive,
+                SnapshotFlowEvent::ReconcileKeepalive,
+            ]
+        );
+        drop(publisher);
+        let state = provider.lock_state().expect("state");
+        let snapshot = state.jobs["operation-1"]
+            .git_snapshot
+            .as_ref()
+            .expect("snapshot");
+        assert_eq!(snapshot.phase, GithubGitSnapshotPhaseV1::KeepaliveReleased);
+        assert_eq!(
+            snapshot.keepalive_release_authorization_sha256.as_deref(),
+            Some("7777777777777777777777777777777777777777777777777777777777777777")
+        );
+    }
+
+    #[test]
+    fn snapshot_keepalive_prune_requires_terminal_cleanup_and_stable_transaction() {
+        let fixture =
+            completed_snapshot_resume(GithubGitSnapshotPhaseV1::SourceDeleted, JobState::Succeeded);
+        let resume = fixture.resume.clone();
+        let expected = GithubDurableIdentityV1 {
+            provider: resume.provider.clone(),
+            provider_config_sha256: resume.provider_config_sha256.clone(),
+            principal: resume.principal.clone(),
+            execution_repository: resume.execution_repository.clone(),
+            execution_repository_id: resume.execution_repository_id,
+        };
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with([])),
+            SnapshotFlowPublisher::exact(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(CapturingCheckpointSink::default());
+        provider
+            .restore_job_resumes_offline(vec![resume], &expected)
+            .expect("offline snapshot restore");
+        let authorization =
+            GithubGitSnapshotKeepaliveReleaseAuthorizationV1::new("operation-1", "7".repeat(64))
+                .expect("prune authorization");
+        let error = provider
+            .release_git_snapshot_keepalive_for_prune(&authorization, &CancellationToken::new())
+            .expect_err("build-terminal is not cleanup-complete");
+        assert!(matches!(
+            error,
+            RemoteBuildError::ProviderFailure { code, .. }
+                if code == "snapshot_keepalive_prune_not_terminal"
+        ));
+        assert!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .events
+                .is_empty()
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one regression proves no-write planning, durable-plan staging, complete-stage replay, and fixed-Git policy"
+    )]
+    fn exact_retry_precompute_is_no_write_and_complete_stage_replay_is_exact() {
+        let fixture =
+            completed_snapshot_resume(GithubGitSnapshotPhaseV1::SourceDeleted, JobState::Cleaned);
+        let resume = fixture.resume.clone();
+        let expected = durable_identity_for_resume(&resume);
+        let mut responses = Vec::new();
+        for _ in 0..3 {
+            responses.extend(exact_retry_git_cycle(&resume, SNAPSHOT_ARCHIVE_BYTES, '1'));
+        }
+        let publisher = GitTemporaryRefPublisher::new(
+            FakeGitRunner::with(responses),
+            fixture.isolation.path(),
+            "origin",
+            "signing",
+            Duration::from_secs(30),
+        )
+        .expect("exact retry publisher");
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with([])),
+            publisher,
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(CapturingCheckpointSink::default());
+        provider
+            .restore_job_resumes_offline(vec![resume.clone()], &expected)
+            .expect("offline parent restore");
+        let child_stage_path =
+            crate::snapshot::git_snapshot_stage_directory(fixture.isolation.path(), "operation-2")
+                .expect("child stage path");
+
+        let plan = provider
+            .precompute_exact_git_snapshot_retry(
+                "operation-1",
+                "operation-2",
+                1_700_000_001_000,
+                &CancellationToken::new(),
+            )
+            .expect("exact retry plan");
+        assert!(
+            !child_stage_path.exists(),
+            "planning must not create a stage"
+        );
+        assert_eq!(plan.request.operation_id, "operation-2");
+        let expected_child_commit = "e".repeat(40);
+        assert_eq!(
+            plan.request.source_revision.as_deref(),
+            Some(expected_child_commit.as_str())
+        );
+        assert_eq!(plan.graph.archive_blob, snapshot_object('1'));
+        assert_eq!(plan.graph.descriptor_blob, snapshot_object('a'));
+        assert_eq!(plan.graph.goal3_tree, snapshot_object('b'));
+        assert_eq!(plan.graph.rustferry_tree, snapshot_object('c'));
+        assert_eq!(plan.graph.root_tree, snapshot_object('d'));
+        assert_eq!(plan.graph.commit, snapshot_object('e'));
+
+        let authorization = GithubGitSnapshotExactRetryAuthorizationV1::new(
+            "operation-1",
+            "operation-2",
+            1_700_000_001_000,
+            "6".repeat(64),
+        )
+        .expect("retry lineage authorization");
+        let staged = provider
+            .stage_exact_git_snapshot_retry(&authorization, &plan, &CancellationToken::new())
+            .expect("materialize exact retry stage");
+        assert_eq!(staged.request, plan.request);
+        assert_eq!(staged.stage.graph, plan.graph);
+        assert_eq!(staged.stage.final_request, plan.request);
+        assert_eq!(staged.stage.consent_sha256, "6".repeat(64));
+        let replay = provider
+            .stage_exact_git_snapshot_retry(&authorization, &plan, &CancellationToken::new())
+            .expect("adopt exact complete retry stage");
+        assert_eq!(replay, staged);
+        let inputs = GitSnapshotImportInputs::load(
+            fixture.isolation.path(),
+            &replay.stage_locator,
+            &replay.request,
+        )
+        .expect("reopen replayed child stage");
+        assert_eq!(inputs.stage(), &replay.stage);
+        drop(inputs);
+        GithubGitSnapshotSubmissionV1::exact_retry_lineage(expected, &authorization, replay)
+            .expect("distinct exact retry submission authority");
+
+        let publisher = provider.publisher.lock().expect("publisher");
+        assert!(publisher.runner.responses.is_empty());
+        let cat_file = publisher
+            .runner
+            .invocations
+            .iter()
+            .filter(|invocation| {
+                invocation
+                    .arguments
+                    .first()
+                    .and_then(|value| value.to_str())
+                    == Some("cat-file")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(cat_file.len(), 3);
+        assert!(
+            cat_file
+                .iter()
+                .all(|invocation| { invocation.stdout_limit == SNAPSHOT_ARCHIVE_BYTES.len() + 1 })
+        );
+        for invocation in &publisher.runner.invocations {
+            assert_eq!(invocation.network, GitNetworkPolicy::Offline);
+            let arguments = invocation
+                .arguments
+                .iter()
+                .map(|value| value.to_string_lossy())
+                .collect::<Vec<_>>();
+            assert!(!arguments.iter().any(|argument| argument == "-w"));
+            assert!(!arguments.iter().any(|argument| matches!(
+                argument.as_ref(),
+                "push" | "fetch" | "update-ref" | "checkout"
+            )));
+        }
+    }
+
+    #[test]
+    fn exact_retry_and_prune_reject_cleanup_failed_parent_without_publisher_calls() {
+        let fixture = completed_snapshot_resume(
+            GithubGitSnapshotPhaseV1::SourceDeleted,
+            JobState::CleanupFailed,
+        );
+        let resume = fixture.resume.clone();
+        let expected = durable_identity_for_resume(&resume);
+        let plan = synthetic_exact_retry_plan(&resume);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with([])),
+            SnapshotFlowPublisher::exact(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(CapturingCheckpointSink::default());
+        provider
+            .restore_job_resumes_offline(vec![resume], &expected)
+            .expect("offline cleanup-failed parent restore");
+        let retry = GithubGitSnapshotExactRetryAuthorizationV1::new(
+            "operation-1",
+            "operation-2",
+            1_700_000_001_000,
+            "6".repeat(64),
+        )
+        .expect("retry authorization");
+        let error = provider
+            .stage_exact_git_snapshot_retry(&retry, &plan, &CancellationToken::new())
+            .expect_err("CleanupFailed parent cannot stage exact retry");
+        assert!(matches!(
+            error,
+            RemoteBuildError::ProviderFailure { code, .. }
+                if code == "snapshot_exact_retry_parent_not_terminal"
+        ));
+        let prune =
+            GithubGitSnapshotKeepaliveReleaseAuthorizationV1::new("operation-1", "7".repeat(64))
+                .expect("prune authorization");
+        let error = provider
+            .release_git_snapshot_keepalive_for_prune(&prune, &CancellationToken::new())
+            .expect_err("CleanupFailed parent cannot release keepalive");
+        assert!(matches!(
+            error,
+            RemoteBuildError::ProviderFailure { code, .. }
+                if code == "snapshot_keepalive_prune_not_terminal"
+        ));
+        assert!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .events
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn exact_retry_rejects_releasing_missing_and_conflicting_parent_keepalives() {
+        let mut releasing =
+            completed_snapshot_resume(GithubGitSnapshotPhaseV1::SourceDeleted, JobState::Cleaned);
+        let releasing_plan = synthetic_exact_retry_plan(&releasing.resume);
+        {
+            let snapshot = releasing.resume.git_snapshot.as_mut().expect("snapshot");
+            snapshot.phase = GithubGitSnapshotPhaseV1::KeepaliveReleaseIntent;
+            snapshot.keepalive_release_authorization_sha256 = Some("7".repeat(64));
+        }
+        let expected = durable_identity_for_resume(&releasing.resume);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with([])),
+            SnapshotFlowPublisher::exact(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(CapturingCheckpointSink::default());
+        provider
+            .restore_job_resumes_offline(vec![releasing.resume.clone()], &expected)
+            .expect("offline releasing parent restore");
+        let authorization = GithubGitSnapshotExactRetryAuthorizationV1::new(
+            "operation-1",
+            "operation-2",
+            1_700_000_001_000,
+            "6".repeat(64),
+        )
+        .expect("retry authorization");
+        let error = provider
+            .stage_exact_git_snapshot_retry(
+                &authorization,
+                &releasing_plan,
+                &CancellationToken::new(),
+            )
+            .expect_err("releasing parent is unavailable");
+        assert!(matches!(
+            error,
+            RemoteBuildError::ProviderFailure { code, .. }
+                if code == "snapshot_exact_retry_parent_releasing"
+        ));
+        assert!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .events
+                .is_empty()
+        );
+
+        for (reconciliation, expected_code) in [
+            (
+                GitSnapshotRefReconciliation::Absent,
+                "snapshot_exact_retry_parent_keepalive_missing",
+            ),
+            (
+                GitSnapshotRefReconciliation::Conflict,
+                "snapshot_exact_retry_parent_keepalive_conflict",
+            ),
+        ] {
+            let fixture = completed_snapshot_resume(
+                GithubGitSnapshotPhaseV1::SourceDeleted,
+                JobState::Cleaned,
+            );
+            let resume = fixture.resume.clone();
+            let expected = durable_identity_for_resume(&resume);
+            let plan = synthetic_exact_retry_plan(&resume);
+            let mut publisher = SnapshotFlowPublisher::exact();
+            publisher
+                .keepalive_reconciliations
+                .push_back(reconciliation);
+            let provider = GithubBuildProvider::with_artifact_store_and_clock(
+                provider_config(all_authorized()),
+                transport(FakeGhRunner::with([])),
+                publisher,
+                NoVerifiedArtifactStore,
+                FixedClock(1_700_000_000_000),
+            )
+            .with_checkpoint_sink(CapturingCheckpointSink::default());
+            provider
+                .restore_job_resumes_offline(vec![resume], &expected)
+                .expect("offline parent restore");
+            let error = provider
+                .stage_exact_git_snapshot_retry(&authorization, &plan, &CancellationToken::new())
+                .expect_err("parent keepalive proof fails");
+            assert!(matches!(
+                error,
+                RemoteBuildError::ProviderFailure { code, .. } if code == expected_code
+            ));
+            let publisher = provider.publisher.lock().expect("publisher");
+            assert_eq!(
+                publisher.events,
+                [
+                    SnapshotFlowEvent::AcquireSourceLease,
+                    SnapshotFlowEvent::ReconcileKeepalive,
+                    SnapshotFlowEvent::ReleaseSourceLease,
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn exact_retry_precompute_rejects_parent_archive_byte_and_object_mismatch() {
+        for (archive_bytes, archive_object) in [
+            (b"snapshot archive fixturf\n".as_slice(), '1'),
+            (SNAPSHOT_ARCHIVE_BYTES, '2'),
+        ] {
+            let fixture = completed_snapshot_resume(
+                GithubGitSnapshotPhaseV1::SourceDeleted,
+                JobState::Cleaned,
+            );
+            let resume = fixture.resume.clone();
+            let expected = durable_identity_for_resume(&resume);
+            let snapshot = resume.git_snapshot.as_ref().expect("snapshot");
+            let responses = vec![
+                Ok(format!(
+                    "{}\0{}\n",
+                    snapshot.stage.keepalive_ref.as_str(),
+                    snapshot.stage.graph.commit.as_str()
+                )
+                .into_bytes()),
+                Ok(b"sha1\n".to_vec()),
+                Ok(archive_bytes.to_vec()),
+                Ok(format!("{}\n", archive_object.to_string().repeat(40)).into_bytes()),
+            ];
+            let publisher = GitTemporaryRefPublisher::new(
+                FakeGitRunner::with(responses),
+                fixture.isolation.path(),
+                "origin",
+                "signing",
+                Duration::from_secs(30),
+            )
+            .expect("exact retry publisher");
+            let provider = GithubBuildProvider::with_artifact_store_and_clock(
+                provider_config(all_authorized()),
+                transport(FakeGhRunner::with([])),
+                publisher,
+                NoVerifiedArtifactStore,
+                FixedClock(1_700_000_000_000),
+            )
+            .with_checkpoint_sink(CapturingCheckpointSink::default());
+            provider
+                .restore_job_resumes_offline(vec![resume], &expected)
+                .expect("offline parent restore");
+            let error = provider
+                .precompute_exact_git_snapshot_retry(
+                    "operation-1",
+                    "operation-2",
+                    1_700_000_001_000,
+                    &CancellationToken::new(),
+                )
+                .expect_err("parent archive proof must remain exact");
+            assert!(matches!(
+                error,
+                RemoteBuildError::ProviderFailure { code, .. } if code == "git_snapshot_invalid"
+            ));
+            assert!(
+                !crate::snapshot::git_snapshot_stage_directory(
+                    fixture.isolation.path(),
+                    "operation-2"
+                )
+                .expect("child stage path")
+                .exists()
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_prepared_checkpoint_precedes_all_git_and_network_activity() {
+        let fixture = snapshot_resume_fixture(GithubGitSnapshotPhaseV1::Prepared);
+        let submission = same_invocation_snapshot_submission(&fixture);
+        let runner = FakeGhRunner::with([]);
+        let requests = Arc::clone(&runner.requests);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(runner),
+            SnapshotFlowPublisher::exact(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(FailingCheckpointSink);
+
+        let error = provider
+            .submit_git_snapshot(submission, &CancellationToken::new())
+            .expect_err("Prepared checkpoint must be durable");
+        assert!(matches!(
+            error,
+            RemoteBuildError::ProviderFailure { code, .. }
+                if code == "checkpoint_fixture_failed"
+        ));
+        assert!(requests.lock().expect("transport requests").is_empty());
+        assert!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .events
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn snapshot_submission_publishes_exact_source_before_split_repo_dispatch() {
+        let fixture = snapshot_resume_fixture(GithubGitSnapshotPhaseV1::Prepared);
+        let submission = same_invocation_snapshot_submission(&fixture);
+        let sink = CapturingCheckpointSink::default();
+        let checkpoints = Arc::clone(&sink.checkpoints);
+        let runner = FakeGhRunner::with(public_snapshot_identity_rows(5));
+        let requests = Arc::clone(&runner.requests);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(runner),
+            SnapshotFlowPublisher::exact(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(sink);
+
+        let handle = provider
+            .submit_git_snapshot(submission, &CancellationToken::new())
+            .expect("snapshot submission");
+        assert_eq!(handle.state, JobState::Queued);
+        assert_eq!(requests.lock().expect("transport requests").len(), 15);
+        let checkpoints = checkpoints.lock().expect("snapshot checkpoints");
+        let phases = checkpoints
+            .iter()
+            .map(|resume| resume.git_snapshot.as_ref().expect("snapshot").phase)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &phases[..8],
+            &[
+                GithubGitSnapshotPhaseV1::Prepared,
+                GithubGitSnapshotPhaseV1::KeepaliveIntent,
+                GithubGitSnapshotPhaseV1::KeepaliveExact,
+                GithubGitSnapshotPhaseV1::StageDeleteIntent,
+                GithubGitSnapshotPhaseV1::StageDeleted,
+                GithubGitSnapshotPhaseV1::SourcePublishIntent,
+                GithubGitSnapshotPhaseV1::SourcePublishIntent,
+                GithubGitSnapshotPhaseV1::SourceExact,
+            ]
+        );
+        let first_dispatch_intent = checkpoints
+            .iter()
+            .position(|resume| resume.publication_intent)
+            .expect("dispatch intent checkpoint");
+        assert!(checkpoints[..first_dispatch_intent].iter().any(|resume| {
+            resume.git_snapshot.as_ref().map(|snapshot| snapshot.phase)
+                == Some(GithubGitSnapshotPhaseV1::SourceExact)
+        }));
+        drop(checkpoints);
+
+        let publisher = provider.publisher.lock().expect("publisher");
+        let publish_source = publisher
+            .events
+            .iter()
+            .position(|event| event == &SnapshotFlowEvent::PublishSource)
+            .expect("source publication");
+        let prepare_dispatch = publisher
+            .events
+            .iter()
+            .position(|event| matches!(event, SnapshotFlowEvent::PrepareDispatch { .. }))
+            .expect("dispatch preparation");
+        let publish_dispatch = publisher
+            .events
+            .iter()
+            .position(|event| event == &SnapshotFlowEvent::PublishDispatch)
+            .expect("dispatch publication");
+        assert!(publish_source < prepare_dispatch && prepare_dispatch < publish_dispatch);
+        assert!(publisher.events.iter().any(|event| {
+            matches!(
+                event,
+                SnapshotFlowEvent::PrepareDispatch {
+                    execution_repository,
+                    source_repository,
+                    source_ref,
+                } if execution_repository == "https://github.com/ShiroKSH/rustferry-signing"
+                    && source_repository == "https://github.com/shiroksh/rust-and-iphone"
+                    && source_ref == "refs/rustferry/goal3/snapshots/operation-1"
+            )
+        }));
+        assert!(!publisher.source_lease_owned);
+        assert!(!publisher.dispatch_lease_owned);
+    }
+
+    #[test]
+    fn snapshot_source_conflict_fails_without_dispatch_publication() {
+        let fixture = snapshot_resume_fixture(GithubGitSnapshotPhaseV1::Prepared);
+        let submission = same_invocation_snapshot_submission(&fixture);
+        let mut publisher = SnapshotFlowPublisher::exact();
+        publisher.source_publication = GitSnapshotSourcePublication::Conflict;
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with(public_snapshot_identity_rows(2))),
+            publisher,
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(CapturingCheckpointSink::default());
+
+        let handle = provider
+            .submit_git_snapshot(submission, &CancellationToken::new())
+            .expect("conflict is durably terminal");
+        assert_eq!(handle.state, JobState::Failed);
+        let publisher = provider.publisher.lock().expect("publisher");
+        assert!(publisher.events.contains(&SnapshotFlowEvent::PublishSource));
+        assert!(!publisher.events.iter().any(|event| matches!(
+            event,
+            SnapshotFlowEvent::PrepareDispatch { .. } | SnapshotFlowEvent::PublishDispatch
+        )));
+        assert!(!publisher.source_lease_owned);
+    }
+
+    #[test]
+    fn snapshot_source_ref_drift_after_exact_checkpoint_blocks_dispatch() {
+        let fixture = snapshot_resume_fixture(GithubGitSnapshotPhaseV1::Prepared);
+        let submission = same_invocation_snapshot_submission(&fixture);
+        let mut publisher = SnapshotFlowPublisher::exact();
+        publisher
+            .source_reconciliations
+            .push_back(GitSnapshotRefReconciliation::Conflict);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with(public_snapshot_identity_rows(3))),
+            publisher,
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(CapturingCheckpointSink::default());
+
+        let handle = provider
+            .submit_git_snapshot(submission, &CancellationToken::new())
+            .expect("source drift is durably terminal");
+        assert_eq!(handle.state, JobState::Failed);
+        let publisher = provider.publisher.lock().expect("publisher");
+        assert!(
+            publisher
+                .events
+                .contains(&SnapshotFlowEvent::ReconcileSource)
+        );
+        assert!(!publisher.events.iter().any(|event| matches!(
+            event,
+            SnapshotFlowEvent::PrepareDispatch { .. } | SnapshotFlowEvent::PublishDispatch
+        )));
+    }
+
+    #[test]
+    fn snapshot_source_exact_checkpoint_crash_replays_before_dispatch() {
+        let fixture = snapshot_resume_fixture(GithubGitSnapshotPhaseV1::Prepared);
+        let submission = same_invocation_snapshot_submission(&fixture);
+        let checkpoints = Arc::new(Mutex::new(Vec::new()));
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with(public_snapshot_identity_rows(5))),
+            SnapshotFlowPublisher::exact(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(FailOnSnapshotPhaseSink {
+            checkpoints: Arc::clone(&checkpoints),
+            phase: GithubGitSnapshotPhaseV1::SourceExact,
+            failed_once: true,
+        });
+
+        let error = provider
+            .submit_git_snapshot(submission, &CancellationToken::new())
+            .expect_err("SourceExact checkpoint acknowledgement fails");
+        assert!(matches!(
+            error,
+            RemoteBuildError::ProviderFailure { code, .. }
+                if code == "checkpoint_fixture_failed"
+        ));
+        {
+            let publisher = provider.publisher.lock().expect("publisher");
+            assert!(publisher.source_lease_owned);
+            assert!(!publisher.events.iter().any(|event| matches!(
+                event,
+                SnapshotFlowEvent::PrepareDispatch { .. } | SnapshotFlowEvent::PublishDispatch
+            )));
+        }
+
+        provider
+            .continue_git_snapshot_submission("operation-1", &CancellationToken::new())
+            .expect("replay exact source then dispatch");
+        let state = provider.lock_state().expect("state");
+        assert_eq!(state.jobs["operation-1"].state, JobState::Queued);
+        drop(state);
+        let publisher = provider.publisher.lock().expect("publisher");
+        assert!(!publisher.source_lease_owned);
+        assert!(
+            publisher
+                .events
+                .contains(&SnapshotFlowEvent::PublishDispatch)
+        );
+        drop(publisher);
+        for pair in checkpoints.lock().expect("snapshot checkpoints").windows(2) {
+            pair[0]
+                .validate_successor(&pair[1])
+                .expect("replayed snapshot checkpoint successor");
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one table proves every submission mutation phase is re-acknowledged after an ambiguous checkpoint"
+    )]
+    fn snapshot_submission_phase_entry_failure_blocks_mutation_until_same_phase_reack() {
+        for (phase, armed_source_intent, expected_event) in [
+            (
+                GithubGitSnapshotPhaseV1::KeepaliveIntent,
+                false,
+                SnapshotFlowEvent::ReconcileKeepalive,
+            ),
+            (
+                GithubGitSnapshotPhaseV1::KeepaliveExact,
+                false,
+                SnapshotFlowEvent::ReconcileKeepalive,
+            ),
+            (
+                GithubGitSnapshotPhaseV1::StageDeleteIntent,
+                false,
+                SnapshotFlowEvent::DeleteStage,
+            ),
+            (
+                GithubGitSnapshotPhaseV1::StageDeleted,
+                false,
+                SnapshotFlowEvent::AcquireSourceLease,
+            ),
+            (
+                GithubGitSnapshotPhaseV1::SourcePublishIntent,
+                false,
+                SnapshotFlowEvent::PublishSource,
+            ),
+            (
+                GithubGitSnapshotPhaseV1::SourcePublishIntent,
+                true,
+                SnapshotFlowEvent::ReconcileSource,
+            ),
+            (
+                GithubGitSnapshotPhaseV1::SourceExact,
+                false,
+                SnapshotFlowEvent::ReconcileSource,
+            ),
+            (
+                GithubGitSnapshotPhaseV1::SourceAbsent,
+                false,
+                SnapshotFlowEvent::AcquireSourceLease,
+            ),
+            (
+                GithubGitSnapshotPhaseV1::SourceConflict,
+                false,
+                SnapshotFlowEvent::ReleaseSourceLease,
+            ),
+        ] {
+            let mut fixture = snapshot_resume_fixture(phase);
+            if armed_source_intent {
+                let snapshot = fixture
+                    .resume
+                    .git_snapshot
+                    .as_mut()
+                    .expect("snapshot resume");
+                snapshot.source_publication_started_at_ms = fixture.resume.created_at_ms;
+                snapshot.source_publication_quiescence_deadline_ms =
+                    publication_quiescence_deadline(fixture.resume.created_at_ms, 0);
+                snapshot
+                    .validate_for_request(&fixture.resume.request)
+                    .expect("armed source intent");
+            }
+            let resume = fixture.resume.clone();
+            let checkpoints = Arc::new(Mutex::new(Vec::new()));
+            let mut publisher = SnapshotFlowPublisher::exact();
+            publisher.keepalive_exact = phase != GithubGitSnapshotPhaseV1::KeepaliveIntent;
+            let provider = GithubBuildProvider::with_artifact_store_and_clock(
+                provider_config(all_authorized()),
+                transport(FakeGhRunner::with(public_snapshot_identity_rows(6))),
+                publisher,
+                NoVerifiedArtifactStore,
+                FixedClock(1_700_000_000_000),
+            )
+            .with_checkpoint_sink(FailOnSnapshotPhaseSink {
+                checkpoints: Arc::clone(&checkpoints),
+                phase,
+                failed_once: true,
+            });
+            provider
+                .restore_job_resumes_offline(
+                    vec![resume.clone()],
+                    &durable_identity_for_resume(&resume),
+                )
+                .expect("restore snapshot phase");
+            if phase == GithubGitSnapshotPhaseV1::SourceConflict {
+                provider
+                    .lock_state()
+                    .expect("provider state")
+                    .jobs
+                    .get_mut(&resume.operation_id)
+                    .expect("snapshot job")
+                    .snapshot_source_lease_owned = true;
+                provider
+                    .publisher
+                    .lock()
+                    .expect("publisher")
+                    .source_lease_owned = true;
+            }
+
+            let error = provider
+                .continue_git_snapshot_submission(&resume.operation_id, &CancellationToken::new())
+                .expect_err("current phase acknowledgement fails once");
+            assert!(matches!(
+                error,
+                RemoteBuildError::ProviderFailure { code, .. }
+                    if code == "checkpoint_fixture_failed"
+            ));
+            assert!(
+                provider
+                    .publisher
+                    .lock()
+                    .expect("publisher")
+                    .events
+                    .is_empty(),
+                "{phase:?} mutated before its checkpoint"
+            );
+
+            provider
+                .continue_git_snapshot_submission(&resume.operation_id, &CancellationToken::new())
+                .expect("same phase re-acknowledges before progressing");
+            assert!(
+                provider
+                    .publisher
+                    .lock()
+                    .expect("publisher")
+                    .events
+                    .contains(&expected_event),
+                "{phase:?} did not reach its expected mutation after re-acknowledgement"
+            );
+            assert!(
+                checkpoints
+                    .lock()
+                    .expect("snapshot checkpoints")
+                    .iter()
+                    .filter(|resume| {
+                        resume.git_snapshot.as_ref().map(|snapshot| snapshot.phase) == Some(phase)
+                    })
+                    .count()
+                    >= 2,
+                "{phase:?} was not re-acknowledged"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_cleanup_intent_failure_reacks_before_exact_source_deletion() {
+        let config = provider_config(all_authorized());
+        let principal = GithubPrincipalIdentityV1::User {
+            id: AUTHENTICATED_USER_ID,
+            login: "ShiroKSH".to_owned(),
+        };
+        let fixture =
+            completed_snapshot_resume(GithubGitSnapshotPhaseV1::SourceExact, JobState::Succeeded);
+        let mut record = fixture
+            .resume
+            .clone()
+            .into_record(&config, &principal, 991)
+            .expect("snapshot record");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let checkpoints = Arc::new(Mutex::new(Vec::new()));
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            config,
+            transport(FakeGhRunner::with([
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+            ])),
+            SnapshotCleanupAuditPublisher {
+                events: Arc::clone(&events),
+                source_lease_owned: false,
+                deletion_count: 0,
+                keepalive_release_count: 0,
+            },
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(FailOnSnapshotPhaseSink {
+            checkpoints: Arc::clone(&checkpoints),
+            phase: GithubGitSnapshotPhaseV1::SourceCleanupIntent,
+            failed_once: true,
+        });
+
+        let error = provider
+            .cleanup_git_snapshot_source(&mut record)
+            .expect_err("cleanup intent checkpoint fails once");
+        assert!(matches!(
+            error,
+            RemoteBuildError::ProviderFailure { code, .. } if code == "checkpoint_fixture_failed"
+        ));
+        assert!(events.lock().expect("cleanup events").is_empty());
+        provider
+            .cleanup_git_snapshot_source(&mut record)
+            .expect("cleanup intent re-acknowledges before delete");
+        assert_eq!(
+            checkpoints
+                .lock()
+                .expect("snapshot checkpoints")
+                .iter()
+                .map(|resume| resume.git_snapshot.as_ref().expect("snapshot").phase)
+                .collect::<Vec<_>>(),
+            [
+                GithubGitSnapshotPhaseV1::SourceCleanupIntent,
+                GithubGitSnapshotPhaseV1::SourceCleanupIntent,
+                GithubGitSnapshotPhaseV1::SourceDeleted,
+            ]
+        );
+        assert!(
+            events
+                .lock()
+                .expect("cleanup events")
+                .contains(&SnapshotCleanupAuditEvent::Delete)
+        );
+    }
+
+    #[test]
+    fn snapshot_keepalive_release_intent_failure_reacks_before_local_ref_deletion() {
+        let fixture =
+            completed_snapshot_resume(GithubGitSnapshotPhaseV1::SourceDeleted, JobState::Cleaned);
+        let resume = fixture.resume.clone();
+        let checkpoints = Arc::new(Mutex::new(Vec::new()));
+        let mut publisher = SnapshotFlowPublisher::exact();
+        publisher.keepalive_exact = true;
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with([])),
+            publisher,
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(FailOnSnapshotPhaseSink {
+            checkpoints: Arc::clone(&checkpoints),
+            phase: GithubGitSnapshotPhaseV1::KeepaliveReleaseIntent,
+            failed_once: true,
+        });
+        provider
+            .restore_job_resumes_offline(
+                vec![resume.clone()],
+                &durable_identity_for_resume(&resume),
+            )
+            .expect("restore snapshot parent");
+        let authorization =
+            GithubGitSnapshotKeepaliveReleaseAuthorizationV1::new("operation-1", "7".repeat(64))
+                .expect("prune authorization");
+
+        let error = provider
+            .release_git_snapshot_keepalive_for_prune(&authorization, &CancellationToken::new())
+            .expect_err("release intent checkpoint fails once");
+        assert!(matches!(
+            error,
+            RemoteBuildError::ProviderFailure { code, .. } if code == "checkpoint_fixture_failed"
+        ));
+        assert!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .events
+                .is_empty()
+        );
+        provider
+            .release_git_snapshot_keepalive_for_prune(&authorization, &CancellationToken::new())
+            .expect("release intent re-acknowledges before delete");
+        assert_eq!(
+            checkpoints
+                .lock()
+                .expect("snapshot checkpoints")
+                .iter()
+                .map(|resume| resume.git_snapshot.as_ref().expect("snapshot").phase)
+                .collect::<Vec<_>>(),
+            [
+                GithubGitSnapshotPhaseV1::KeepaliveReleaseIntent,
+                GithubGitSnapshotPhaseV1::KeepaliveReleaseIntent,
+                GithubGitSnapshotPhaseV1::KeepaliveReleased,
+            ]
+        );
+        assert!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .events
+                .contains(&SnapshotFlowEvent::ReleaseKeepalive)
+        );
+    }
+
+    #[test]
+    fn snapshot_consent_mismatch_stops_before_checkpoint_or_publisher() {
+        let fixture = snapshot_resume_fixture(GithubGitSnapshotPhaseV1::Prepared);
+        let resume = &fixture.resume;
+        let snapshot = resume.git_snapshot.as_ref().expect("snapshot resume");
+        let submission = GithubGitSnapshotSubmissionV1::same_invocation(
+            GithubDurableIdentityV1 {
+                provider: resume.provider.clone(),
+                provider_config_sha256: resume.provider_config_sha256.clone(),
+                principal: resume.principal.clone(),
+                execution_repository: resume.execution_repository.clone(),
+                execution_repository_id: resume.execution_repository_id,
+            },
+            resume.request.clone(),
+            "8".repeat(64),
+            snapshot.stage_locator.clone(),
+            snapshot.stage.clone(),
+        )
+        .expect("mismatched consent submission envelope");
+        let runner = FakeGhRunner::with([]);
+        let requests = Arc::clone(&runner.requests);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(runner),
+            SnapshotFlowPublisher::exact(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(CapturingCheckpointSink::default());
+
+        let error = provider
+            .submit_git_snapshot(submission, &CancellationToken::new())
+            .expect_err("consent mismatch");
+        assert!(matches!(
+            error,
+            RemoteBuildError::ProviderFailure { code, .. }
+                if code == "snapshot_consent_changed"
+        ));
+        assert!(requests.lock().expect("transport requests").is_empty());
+        assert!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .events
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn failed_pre_push_checkpoint_blocks_remote_mutation_and_retains_intent() {
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with([
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+            ])),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(FailingCheckpointSink);
+        assert!(poll_ready(provider.submit(unsigned_request(), CancellationToken::new())).is_err());
+        assert!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .published
+                .is_empty()
+        );
+        assert_eq!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .publication_leases
+                .len(),
+            1
+        );
+        let state = provider.lock_state().expect("state");
+        let record = state.jobs.get("operation-1").expect("retained job");
+        assert!(record.publication_intent);
+        assert_eq!(record.state, JobState::Created);
+        assert!(state.reservations.is_empty());
+    }
+
+    #[test]
+    fn checkpoint_write_with_uncertain_ack_keeps_live_successor_chain() {
+        let sink = WriteThenFailCheckpointSink::default();
+        let checkpoints = Arc::clone(&sink.checkpoints);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with([
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+            ])),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(sink);
+
+        assert!(poll_ready(provider.submit(unsigned_request(), CancellationToken::new())).is_err());
+        assert!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .published
+                .is_empty()
+        );
+        assert_eq!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .publication_leases
+                .len(),
+            1
+        );
+        let written = checkpoints
+            .lock()
+            .expect("checkpoints")
+            .first()
+            .cloned()
+            .expect("possibly durable checkpoint");
+        let exported = provider
+            .export_job_resumes()
+            .expect("retained in-memory intent can be exported");
+        assert_eq!(exported.len(), 1);
+        written
+            .validate_successor(&exported[0])
+            .expect("retained record preserves the durable successor chain");
+    }
+
+    #[test]
+    fn live_identity_failure_records_proven_no_publication_before_returning() {
+        let sink = CapturingCheckpointSink::default();
+        let checkpoints = Arc::clone(&sink.checkpoints);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with([
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(b"43\tYXR0YWNrZXI=\n".to_vec()),
+                Ok(private_repository_row()),
+            ])),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(sink);
+        assert!(poll_ready(provider.submit(unsigned_request(), CancellationToken::new())).is_err());
+        let checkpoints = checkpoints.lock().expect("checkpoints");
+        assert_eq!(checkpoints.len(), 2);
+        checkpoints[0]
+            .validate_successor(&checkpoints[1])
+            .expect("terminal no-publication evidence is monotonic");
+        assert_eq!(checkpoints[1].state, JobState::Failed);
+        assert!(checkpoints[1].publication_not_attempted);
+        assert!(!checkpoints[1].publication_absent);
+        assert!(!checkpoints[1].temporary_ref_deleted);
+        assert!(!checkpoints[1].publication_uncertain);
+        drop(checkpoints);
+        let state = provider.lock_state().expect("state");
+        let record = state.jobs.get("operation-1").expect("durably owned job");
+        assert!(record.publication_intent);
+        assert_eq!(record.dispatch_commit, None);
+        assert_eq!(record.state, JobState::Failed);
+        assert!(record.publication_not_attempted);
+        assert!(!record.publication_absent);
+        assert!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .published
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn existing_ref_pre_mutation_failure_does_not_claim_ref_absence_or_deletion() {
+        let sink = CapturingCheckpointSink::default();
+        let checkpoints = Arc::clone(&sink.checkpoints);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with([
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+            ])),
+            FakePublisher {
+                prepared_publication: Some(expected_publication()),
+                failure: Some(TemporaryRefPublishError::TemporaryRefExists.into()),
+                ..FakePublisher::default()
+            },
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(sink);
+
+        assert!(poll_ready(provider.submit(unsigned_request(), CancellationToken::new())).is_err());
+        let checkpoints = checkpoints.lock().expect("checkpoints");
+        assert_eq!(checkpoints.len(), 3);
+        checkpoints[0]
+            .validate_successor(&checkpoints[1])
+            .expect("publication boundary checkpoint");
+        checkpoints[1]
+            .validate_successor(&checkpoints[2])
+            .expect("definite failure checkpoint");
+        assert_eq!(checkpoints[2].state, JobState::Failed);
+        assert_eq!(
+            checkpoints[2].prepared_dispatch_commit.as_deref(),
+            Some(DISPATCH_SHA)
+        );
+        assert!(checkpoints[2].publication_not_attempted);
+        assert!(!checkpoints[2].publication_absent);
+        assert!(!checkpoints[2].temporary_ref_deleted);
+        assert!(!checkpoints[2].publication_uncertain);
+        drop(checkpoints);
+        assert_eq!(
+            provider
+                .reconcile_restored_job("operation-1", &CancellationToken::new())
+                .expect("definite pre-mutation result"),
+            GithubJobReconciliation::NotStarted
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn resume_validation_rejects_every_security_identity_dimension() {
+        let config = provider_config(all_authorized());
+        let principal = GithubPrincipalIdentityV1::User {
+            id: AUTHENTICATED_USER_ID,
+            login: "ShiroKSH".to_owned(),
+        };
+        let base = durable_resume_with_run();
+        base.clone()
+            .into_record(&config, &principal, 991)
+            .expect("valid resume fixture");
+        let assert_rejected = |candidate: GithubJobResumeV1| {
+            assert!(candidate.into_record(&config, &principal, 991).is_err());
+        };
+
+        let mut candidate = base.clone();
+        candidate.execution_repository_id = 992;
+        assert_rejected(candidate);
+        let mut candidate = base.clone();
+        candidate.principal = GithubPrincipalIdentityV1::User {
+            id: AUTHENTICATED_USER_ID + 1,
+            login: "attacker".to_owned(),
+        };
+        assert_rejected(candidate);
+        let mut candidate = base.clone();
+        candidate.provider_config_sha256 = "f".repeat(64);
+        assert_rejected(candidate);
+        let mut candidate = base.clone();
+        candidate.workflow_sha256 = "f".repeat(64);
+        assert_rejected(candidate);
+        let mut candidate = base.clone();
+        candidate.request.product_name = "Different".to_owned();
+        assert_rejected(candidate);
+        let mut candidate = base.clone();
+        candidate.temporary_ref = "refs/heads/rustferry/goal3/builds/operation-2".to_owned();
+        assert_rejected(candidate);
+        let mut candidate = base.clone();
+        candidate.publication_absent = true;
+        candidate.temporary_ref_deleted = true;
+        assert_rejected(candidate);
+        let mut candidate = base.clone();
+        candidate.publication_lease_scope_sha256 = None;
+        assert_rejected(candidate);
+        let mut candidate = base.clone();
+        candidate.publication_lease_scope_sha256 = Some("A".repeat(64));
+        assert_rejected(candidate);
+        let mut candidate = durable_prepublication_resume();
+        candidate.state = JobState::Failed;
+        candidate.publication_absent = true;
+        candidate.publication_uncertain = false;
+        candidate.publication_absence_observations = 2;
+        candidate.temporary_ref_deleted = true;
+        assert_rejected(candidate);
+        let mut candidate = durable_prepared_prepublication_resume();
+        candidate.state = JobState::Failed;
+        candidate.publication_absent = true;
+        candidate.publication_uncertain = false;
+        candidate.publication_absence_observations = 2;
+        candidate.publication_absence_first_observed_at_ms = candidate.publication_started_at_ms;
+        candidate.temporary_ref_deleted = true;
+        candidate.publication_process_fenced = false;
+        assert_rejected(candidate);
+        let mut candidate = base.clone();
+        candidate.publication_intent = false;
+        assert_rejected(candidate);
+        let mut candidate = base.clone();
+        candidate.run_discovery_deadline_ms = u64::MAX;
+        assert_rejected(candidate);
+        let mut candidate = base.clone();
+        candidate.request.source = large_source_manifest();
+        candidate.request_sha256 =
+            canonical_request_sha256(&candidate.request).expect("large request digest");
+        assert!(
+            candidate.encode().expect("bounded resume record").len() < GITHUB_JOB_RESUME_MAX_BYTES
+        );
+        assert_rejected(candidate);
+        let mut candidate = base.clone();
+        candidate.state = JobState::Cancelling;
+        assert_rejected(candidate);
+        let mut candidate = base.clone();
+        candidate.state = JobState::Cancelling;
+        candidate.cancellation_requested = true;
+        candidate.cancellation_dispatched = true;
+        candidate.run = None;
+        assert_rejected(candidate);
+        let mut candidate = durable_success_resume();
+        candidate.run.as_mut().expect("run").status = GithubRunStatusV1::Queued;
+        candidate.run.as_mut().expect("run").conclusion = None;
+        assert_rejected(candidate);
+        let mut candidate = base.clone();
+        candidate.state = JobState::Cancelled;
+        candidate.cancellation_requested = true;
+        assert_rejected(candidate);
+        let mut candidate = durable_success_resume();
+        candidate.state = JobState::Cleaned;
+        candidate.cleanup_requested = true;
+        assert_rejected(candidate);
+        let mut candidate = base.clone();
+        candidate.run.as_mut().expect("run").head_sha = "0".repeat(40);
+        assert_rejected(candidate);
+        let mut candidate = base.clone();
+        candidate.run.as_mut().expect("run").branch =
+            "rustferry/goal3/builds/operation-2".to_owned();
+        assert_rejected(candidate);
+        let mut candidate = base.clone();
+        candidate.run.as_mut().expect("run").event = GithubRunEventV1::WorkflowDispatch;
+        assert_rejected(candidate);
+        let mut candidate = base.clone();
+        candidate.events.push(
+            RemoteBuildEvent::new(
+                "different-operation",
+                "operation-1",
+                1_700_000_000_000,
+                GITHUB_PROVIDER_ID,
+                "queue",
+                1,
+                RemoteBuildEventKind::JobQueued { position: None },
+            )
+            .expect("valid but foreign event"),
+        );
+        assert_rejected(candidate);
+        let mut candidate = base;
+        candidate.run.as_mut().expect("run").run_attempt = 0;
+        assert_rejected(candidate);
+    }
+
+    #[test]
+    fn restored_cancel_revalidates_exact_run_and_attempt_before_post() {
+        let runner = FakeGhRunner::with([
+            Ok(authenticated_user_row()),
+            Ok(private_repository_row()),
+            Ok(queued_run_row()),
+            Ok(authenticated_user_row()),
+            Ok(private_repository_row()),
+            Ok(queued_run_row()),
+            Ok(queued_run_row()),
+            Ok(authenticated_user_row()),
+            Ok(private_repository_row()),
+            Ok(Vec::new()),
+        ]);
+        let requests = Arc::clone(&runner.requests);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(runner),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        );
+        provider
+            .restore_job_resumes(vec![durable_resume_with_run()])
+            .expect("live run restore");
+        let acknowledgement = poll_ready(provider.cancel(
+            CancellationRequest {
+                job_id: "operation-1".to_owned(),
+                reason: "user-requested".to_owned(),
+            },
+            CancellationToken::new(),
+        ))
+        .expect("checked cancellation");
+        assert!(acknowledgement.accepted);
+
+        let requests = requests.lock().expect("captured requests");
+        let final_get = &requests[requests.len() - 4];
+        assert_eq!(final_get.method(), ApiMethod::Get);
+        assert_eq!(
+            final_get.endpoint(),
+            "/repos/ShiroKSH/rustferry-signing/actions/runs/41"
+        );
+        assert_eq!(requests[requests.len() - 3].endpoint(), "/user");
+        assert_eq!(
+            requests[requests.len() - 2].endpoint(),
+            "/repos/ShiroKSH/rustferry-signing"
+        );
+        let cancel = &requests[requests.len() - 1];
+        assert_eq!(cancel.method(), ApiMethod::Post);
+        assert_eq!(
+            cancel.endpoint(),
+            "/repos/ShiroKSH/rustferry-signing/actions/runs/41/cancel"
+        );
+    }
+
+    #[test]
+    fn offline_restore_performs_no_transport_or_publisher_operation() {
+        let runner = FakeGhRunner::with([]);
+        let requests = Arc::clone(&runner.requests);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(runner),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        );
+        let resume = durable_resume_with_run();
+        let expected = GithubDurableIdentityV1 {
+            provider: resume.provider.clone(),
+            provider_config_sha256: resume.provider_config_sha256.clone(),
+            principal: resume.principal.clone(),
+            execution_repository: resume.execution_repository.clone(),
+            execution_repository_id: resume.execution_repository_id,
+        };
+
+        provider
+            .restore_job_resumes_offline(vec![resume], &expected)
+            .expect("offline restore");
+
+        assert!(requests.lock().expect("requests").is_empty());
+        assert!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .published
+                .is_empty()
+        );
+        assert!(
+            provider
+                .lock_state()
+                .expect("state")
+                .jobs
+                .contains_key("operation-1")
+        );
+        assert_eq!(
+            provider
+                .restored_terminal_job_log_identity("operation-1")
+                .expect("offline log identity"),
+            None
+        );
+    }
+
+    #[test]
+    fn offline_terminal_restore_exposes_only_a_durable_log_marker_identity() {
+        let runner = FakeGhRunner::with([]);
+        let requests = Arc::clone(&runner.requests);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(runner),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        );
+        let resume = durable_success_resume();
+        let expected = GithubDurableIdentityV1 {
+            provider: resume.provider.clone(),
+            provider_config_sha256: resume.provider_config_sha256.clone(),
+            principal: resume.principal.clone(),
+            execution_repository: resume.execution_repository.clone(),
+            execution_repository_id: resume.execution_repository_id,
+        };
+        provider
+            .restore_job_resumes_offline(vec![resume], &expected)
+            .expect("offline terminal restore");
+
+        let identity = provider
+            .restored_terminal_job_log_identity("operation-1")
+            .expect("durable log identity")
+            .expect("terminal attempt");
+        assert_eq!(
+            identity.expected_completion_source_sequence(),
+            (1_u64 << 32) | u64::from(u32::MAX)
+        );
+        assert!(requests.lock().expect("requests").is_empty());
+        assert!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .published
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn get_only_cancel_reconciliation_never_posts() {
+        let runner = FakeGhRunner::with([
+            Ok(authenticated_user_row()),
+            Ok(private_repository_row()),
+            Ok(queued_run_row()),
+        ]);
+        let requests = Arc::clone(&runner.requests);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(runner),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        );
+        let mut resume = durable_resume_with_run();
+        resume.state = JobState::Cancelling;
+        resume.cancellation_requested = true;
+        let expected = GithubDurableIdentityV1 {
+            provider: resume.provider.clone(),
+            provider_config_sha256: resume.provider_config_sha256.clone(),
+            principal: resume.principal.clone(),
+            execution_repository: resume.execution_repository.clone(),
+            execution_repository_id: resume.execution_repository_id,
+        };
+        provider
+            .restore_job_resumes_offline(vec![resume], &expected)
+            .expect("offline cancelled restore");
+
+        provider
+            .refresh_restored_job_get_only("operation-1", &CancellationToken::new())
+            .expect("GET-only refresh");
+
+        let requests = requests.lock().expect("requests");
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.method() == ApiMethod::Get)
+        );
+        let state = provider.lock_state().expect("state");
+        let record = state.jobs.get("operation-1").expect("restored job");
+        assert!(record.cancellation_requested);
+        assert!(!record.cancellation_dispatched);
+    }
+
+    #[test]
+    fn get_only_exact_ref_recovery_never_creates_dispatch_intent_or_posts() {
+        let resume = durable_workflow_dispatch_pre_intent_resume();
+        let runner = FakeGhRunner::with([
+            Ok(authenticated_user_row()),
+            Ok(private_repository_row()),
+        ]);
+        let requests = Arc::clone(&runner.requests);
+        let plan = FakeWorkflowDispatchPlan::with_response(workflow_dispatch_receipt_response(73));
+        let sink = CapturingCheckpointSink::default();
+        let checkpoints = Arc::clone(&sink.checkpoints);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            workflow_dispatch_provider_config(all_authorized()),
+            transport(runner.with_workflow_dispatch(plan.clone())),
+            FakePublisher {
+                reconciliation: Some(TemporaryRefReconciliation::Exact(
+                    PublishedTemporaryRef::new(
+                        TemporaryGitRef::new(
+                            workflow_dispatch_provider_config(all_authorized())
+                                .workflow
+                                .temporary_branch_namespace(),
+                            BranchName::new("rustferry/goal3/builds/operation-1")
+                                .expect("branch"),
+                        )
+                        .expect("temporary ref"),
+                        CommitSha::new(DISPATCH_SHA).expect("dispatch commit"),
+                    ),
+                )),
+                ..FakePublisher::default()
+            },
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(sink);
+        provider
+            .restore_job_resumes_offline(
+                vec![resume.clone()],
+                &durable_identity_for_resume(&resume),
+            )
+            .expect("restore pre-intent publication");
+
+        let error = provider
+            .reconcile_restored_job_get_only("operation-1", &CancellationToken::new())
+            .expect_err("GET-only recovery cannot start a workflow");
+        assert!(matches!(
+            error,
+            RemoteBuildError::ProviderFailure { code, .. }
+                if code == "workflow_dispatch_mutation_required"
+        ));
+        assert_eq!(plan.0.clients_created.load(Ordering::SeqCst), 0);
+        assert!(plan.0.requests.lock().expect("dispatch requests").is_empty());
+        assert!(
+            requests
+                .lock()
+                .expect("requests")
+                .iter()
+                .all(|request| request.method() == ApiMethod::Get)
+        );
+        assert!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .published
+                .is_empty()
+        );
+        let latest = checkpoints
+            .lock()
+            .expect("checkpoints")
+            .last()
+            .cloned()
+            .expect("recovered exact ref checkpoint");
+        assert_eq!(latest.dispatch_commit.as_deref(), Some(DISPATCH_SHA));
+        assert!(latest.workflow_dispatch.is_none());
+        assert!(latest.run.is_none());
+    }
+
+    #[test]
+    fn unarmed_dispatch_publication_intent_is_retired_without_ref_or_workflow_mutation() {
+        let mut resume = durable_workflow_dispatch_pre_intent_resume();
+        resume.publication_started_at_ms = 0;
+        resume.publication_quiescence_deadline_ms = u64::MAX;
+        resume.publication_absence_first_observed_at_ms = 0;
+        let plan = FakeWorkflowDispatchPlan::with_response(workflow_dispatch_receipt_response(73));
+        let sink = CapturingCheckpointSink::default();
+        let checkpoints = Arc::clone(&sink.checkpoints);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            workflow_dispatch_provider_config(all_authorized()),
+            transport(FakeGhRunner::with([]).with_workflow_dispatch(plan.clone())),
+            FakePublisher {
+                reconciliation: Some(TemporaryRefReconciliation::Exact(
+                    PublishedTemporaryRef::new(
+                        TemporaryGitRef::new(
+                            workflow_dispatch_provider_config(all_authorized())
+                                .workflow
+                                .temporary_branch_namespace(),
+                            BranchName::new("rustferry/goal3/builds/operation-1")
+                                .expect("branch"),
+                        )
+                        .expect("temporary ref"),
+                        CommitSha::new(DISPATCH_SHA).expect("dispatch commit"),
+                    ),
+                )),
+                ..FakePublisher::default()
+            },
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(sink);
+        provider
+            .restore_job_resumes_offline(
+                vec![resume.clone()],
+                &durable_identity_for_resume(&resume),
+            )
+            .expect("restore unarmed publication intent");
+
+        assert_eq!(
+            provider
+                .reconcile_restored_job("operation-1", &CancellationToken::new())
+                .expect("retire unarmed publication intent"),
+            GithubJobReconciliation::NotStarted
+        );
+        assert_eq!(plan.0.clients_created.load(Ordering::SeqCst), 0);
+        assert!(plan.0.requests.lock().expect("dispatch requests").is_empty());
+        let publisher = provider.publisher.lock().expect("publisher");
+        assert!(publisher.published.is_empty());
+        assert!(publisher.reconciliation.is_some());
+        drop(publisher);
+        let latest = checkpoints
+            .lock()
+            .expect("checkpoints")
+            .last()
+            .cloned()
+            .expect("unarmed retirement checkpoint");
+        assert!(latest.publication_not_attempted);
+        assert_eq!(latest.state, JobState::Failed);
+        assert!(latest.dispatch_commit.is_none());
+        assert!(latest.workflow_dispatch.is_none());
+        assert!(latest.run.is_none());
+    }
+
+    #[test]
+    fn restored_cancel_rejects_changed_live_principal_before_post() {
+        let runner = FakeGhRunner::with([
+            Ok(authenticated_user_row()),
+            Ok(private_repository_row()),
+            Ok(queued_run_row()),
+            Ok(b"43\tYXR0YWNrZXI=\n".to_vec()),
+            Ok(private_repository_row()),
+        ]);
+        let requests = Arc::clone(&runner.requests);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(runner),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        );
+        provider
+            .restore_job_resumes(vec![durable_resume_with_run()])
+            .expect("live run restore");
+        assert!(
+            poll_ready(provider.cancel(
+                CancellationRequest {
+                    job_id: "operation-1".to_owned(),
+                    reason: "user-requested".to_owned(),
+                },
+                CancellationToken::new(),
+            ))
+            .is_err()
+        );
+        assert!(
+            requests
+                .lock()
+                .expect("requests")
+                .iter()
+                .all(|request| request.method() == ApiMethod::Get)
+        );
+    }
+
+    #[test]
+    fn restore_rejects_a_changed_run_attempt_before_any_mutation() {
+        let runner = FakeGhRunner::with([
+            Ok(authenticated_user_row()),
+            Ok(private_repository_row()),
+            Ok(queued_run_attempt_row(2)),
+            Ok(queued_run_attempt_row(2)),
+        ]);
+        let requests = Arc::clone(&runner.requests);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(runner),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        );
+        assert!(
+            provider
+                .restore_job_resumes(vec![durable_resume_with_run()])
+                .is_err()
+        );
+        assert!(
+            requests
+                .lock()
+                .expect("requests")
+                .iter()
+                .all(|request| request.method() == ApiMethod::Get)
+        );
+        assert!(provider.lock_state().expect("state").jobs.is_empty());
+    }
+
+    #[test]
+    fn restore_rejects_live_run_regression_from_persisted_success() {
+        let runner = FakeGhRunner::with([
+            Ok(authenticated_user_row()),
+            Ok(private_repository_row()),
+            Ok(queued_run_row()),
+        ]);
+        let requests = Arc::clone(&runner.requests);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(runner),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        );
+        assert!(
+            provider
+                .restore_job_resumes(vec![durable_success_resume()])
+                .is_err()
+        );
+        assert!(
+            requests
+                .lock()
+                .expect("requests")
+                .iter()
+                .all(|request| request.method() == ApiMethod::Get)
+        );
+        assert!(provider.lock_state().expect("state").jobs.is_empty());
+    }
+
+    #[test]
+    fn pre_push_resume_reconciles_exact_ref_without_duplicate_publication() {
+        let resume = durable_prepared_prepublication_resume();
+        let publisher = FakePublisher {
+            reconciliation: Some(TemporaryRefReconciliation::Exact(
+                PublishedTemporaryRef::new(
+                    TemporaryGitRef::new(
+                        provider_config(all_authorized())
+                            .workflow
+                            .temporary_branch_namespace(),
+                        BranchName::new("rustferry/goal3/builds/operation-1").expect("branch"),
+                    )
+                    .expect("temporary ref"),
+                    CommitSha::new(DISPATCH_SHA).expect("dispatch commit"),
+                ),
+            )),
+            ..FakePublisher::default()
+        };
+        let sink = CapturingCheckpointSink::default();
+        let checkpoints = Arc::clone(&sink.checkpoints);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with([
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(Vec::new()),
+            ])),
+            publisher,
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(sink);
+        provider
+            .restore_job_resumes(vec![resume])
+            .expect("restore publication intent");
+        assert_eq!(
+            provider
+                .reconcile_restored_job("operation-1", &CancellationToken::new())
+                .expect("reconciliation"),
+            GithubJobReconciliation::Recovered
+        );
+        assert!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .published
+                .is_empty()
+        );
+        assert!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .publication_leases
+                .is_empty()
+        );
+        assert_eq!(
+            checkpoints
+                .lock()
+                .expect("checkpoints")
+                .last()
+                .and_then(|resume| resume.dispatch_commit.as_deref()),
+            Some(DISPATCH_SHA)
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn possible_push_checkpoint_requires_exact_missing_or_conflict_reconciliation() {
+        let exact_resume = durable_possible_push_resume();
+        let exact_sink = CapturingCheckpointSink::default();
+        let exact_checkpoints = Arc::clone(&exact_sink.checkpoints);
+        let exact_provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with([
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(Vec::new()),
+            ])),
+            FakePublisher {
+                reconciliation: Some(TemporaryRefReconciliation::Exact(expected_publication())),
+                ..FakePublisher::default()
+            },
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(exact_sink);
+        exact_provider
+            .restore_job_resumes(vec![exact_resume.clone()])
+            .expect("restore possible push");
+        assert_eq!(
+            exact_provider
+                .reconcile_restored_job("operation-1", &CancellationToken::new())
+                .expect("exact reconciliation"),
+            GithubJobReconciliation::Recovered
+        );
+        let exact = exact_checkpoints
+            .lock()
+            .expect("exact checkpoints")
+            .last()
+            .cloned()
+            .expect("exact checkpoint");
+        exact_resume
+            .validate_successor(&exact)
+            .expect("exact evidence is monotonic");
+        assert!(!exact.publication_uncertain);
+        assert!(
+            exact_provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .publication_leases
+                .is_empty()
+        );
+
+        let missing_resume = durable_possible_push_resume();
+        let missing_sink = CapturingCheckpointSink::default();
+        let missing_checkpoints = Arc::clone(&missing_sink.checkpoints);
+        let missing_provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with([
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(Vec::new()),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+            ])),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(missing_sink);
+        missing_provider
+            .restore_job_resumes(vec![missing_resume.clone()])
+            .expect("restore possible push");
+        assert_eq!(
+            missing_provider
+                .reconcile_restored_job("operation-1", &CancellationToken::new())
+                .expect("missing reconciliation"),
+            GithubJobReconciliation::Missing
+        );
+        let missing = missing_checkpoints
+            .lock()
+            .expect("missing checkpoints")
+            .last()
+            .cloned()
+            .expect("missing checkpoint");
+        missing_resume
+            .validate_successor(&missing)
+            .expect("missing observation is monotonic");
+        assert_eq!(missing.state, JobState::Queued);
+        assert!(missing.publication_uncertain);
+        assert_eq!(missing.publication_absence_observations, 1);
+        assert_eq!(
+            missing_provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .publication_leases
+                .len(),
+            1
+        );
+
+        let conflict_resume = durable_possible_push_resume();
+        let conflict_sink = CapturingCheckpointSink::default();
+        let conflict_checkpoints = Arc::clone(&conflict_sink.checkpoints);
+        let conflict_clock = MutableClock::new(1_700_000_000_000);
+        let conflict_provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with([
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(Vec::new()),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(Vec::new()),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+            ])),
+            FakePublisher {
+                reconciliation: Some(TemporaryRefReconciliation::Conflict),
+                ..FakePublisher::default()
+            },
+            NoVerifiedArtifactStore,
+            conflict_clock.clone(),
+        )
+        .with_checkpoint_sink(conflict_sink);
+        conflict_provider
+            .restore_job_resumes(vec![conflict_resume.clone()])
+            .expect("restore possible push");
+        assert_eq!(
+            conflict_provider
+                .reconcile_restored_job("operation-1", &CancellationToken::new())
+                .expect("conflict reconciliation"),
+            GithubJobReconciliation::Conflict
+        );
+        let conflict = conflict_checkpoints
+            .lock()
+            .expect("conflict checkpoints")
+            .last()
+            .cloned()
+            .expect("conflict checkpoint");
+        conflict_resume
+            .validate_successor(&conflict)
+            .expect("conflict observation is monotonic");
+        assert_eq!(conflict.state, JobState::Queued);
+        assert!(conflict.publication_uncertain);
+        assert_eq!(conflict.publication_absence_observations, 1);
+        assert_eq!(
+            conflict_provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .publication_leases
+                .len(),
+            1
+        );
+
+        conflict_provider
+            .publisher
+            .lock()
+            .expect("publisher")
+            .reconciliation = Some(TemporaryRefReconciliation::Conflict);
+        conflict_clock.set(1_700_000_000_000 + GITHUB_PUBLICATION_QUIESCENCE_WINDOW_MS);
+        assert_eq!(
+            conflict_provider
+                .reconcile_restored_job("operation-1", &CancellationToken::new())
+                .expect("bounded conflict reconciliation"),
+            GithubJobReconciliation::ConflictResolved
+        );
+        let resolved_conflict = conflict_checkpoints
+            .lock()
+            .expect("conflict checkpoints")
+            .last()
+            .cloned()
+            .expect("resolved conflict checkpoint");
+        conflict
+            .validate_successor(&resolved_conflict)
+            .expect("bounded conflict resolution is monotonic");
+        assert_eq!(resolved_conflict.state, JobState::Failed);
+        assert!(resolved_conflict.publication_uncertain);
+        assert_eq!(resolved_conflict.publication_absence_observations, 2);
+        assert!(
+            conflict_provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .publication_leases
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn restored_unarmed_publication_waits_for_the_original_process_lease() {
+        let mut resume = durable_prepared_prepublication_resume();
+        resume.publication_started_at_ms = 0;
+        resume.publication_quiescence_deadline_ms = u64::MAX;
+        let sink = CapturingCheckpointSink::default();
+        let checkpoints = Arc::clone(&sink.checkpoints);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with([
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+            ])),
+            FakePublisher {
+                publication_lease_blocked: true,
+                ..FakePublisher::default()
+            },
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(sink);
+        provider
+            .restore_job_resumes(vec![resume])
+            .expect("restore unarmed intent");
+
+        let error = provider
+            .reconcile_restored_job("operation-1", &CancellationToken::new())
+            .expect_err("live original owner must block takeover");
+        assert!(matches!(
+            error,
+            RemoteBuildError::ProviderFailure {
+                code,
+                retryable: true,
+                ..
+            } if code == "publication_owner_active"
+        ));
+        assert!(checkpoints.lock().expect("checkpoints").is_empty());
+        let state = provider.lock_state().expect("state");
+        let record = state.jobs.get("operation-1").expect("restored job");
+        assert_eq!(record.state, JobState::Created);
+        assert_eq!(record.publication_absence_observations, 0);
+        assert!(!record.publication_not_attempted);
+    }
+
+    #[test]
+    fn unsupported_publication_lease_never_retires_unarmed_intent() {
+        let mut resume = durable_prepared_prepublication_resume();
+        resume.publication_started_at_ms = 0;
+        resume.publication_quiescence_deadline_ms = u64::MAX;
+        resume.publication_process_fenced = false;
+        resume.publication_lease_scope_sha256 = None;
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with([
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+            ])),
+            FakePublisher {
+                publication_lease_unsupported: true,
+                ..FakePublisher::default()
+            },
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        );
+        provider
+            .restore_job_resumes(vec![resume])
+            .expect("restore unsupported intent");
+        assert!(matches!(
+            provider.reconcile_restored_job("operation-1", &CancellationToken::new()),
+            Err(RemoteBuildError::ProviderFailure {
+                code,
+                retryable: true,
+                ..
+            }) if code == "publication_lease_unavailable"
+        ));
+        let state = provider.lock_state().expect("state");
+        let record = state.jobs.get("operation-1").expect("restored job");
+        assert_eq!(record.state, JobState::Created);
+        assert_eq!(record.publication_absence_observations, 0);
+    }
+
+    #[test]
+    fn absent_pre_push_ref_keeps_cancellation_fail_closed_and_non_recyclable() {
+        let sink = CapturingCheckpointSink::default();
+        let checkpoints = Arc::clone(&sink.checkpoints);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with([
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(Vec::new()),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+            ])),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(sink);
+        provider
+            .restore_job_resumes(vec![durable_prepared_prepublication_resume()])
+            .expect("restore publication intent");
+        poll_ready(provider.cancel(
+            CancellationRequest {
+                job_id: "operation-1".to_owned(),
+                reason: "user-requested".to_owned(),
+            },
+            CancellationToken::new(),
+        ))
+        .expect("durable cancellation intent");
+        assert_eq!(
+            provider
+                .reconcile_restored_job("operation-1", &CancellationToken::new())
+                .expect("missing ref reconciliation"),
+            GithubJobReconciliation::Missing
+        );
+        let latest = checkpoints
+            .lock()
+            .expect("checkpoints")
+            .last()
+            .cloned()
+            .expect("latest checkpoint");
+        assert!(latest.publication_uncertain);
+        assert!(!latest.publication_absent);
+        assert!(!latest.temporary_ref_deleted);
+        assert_eq!(latest.state, JobState::Cancelling);
+
+        assert!(poll_ready(provider.submit(unsigned_request(), CancellationToken::new())).is_err());
+    }
+
+    #[test]
+    fn absent_pre_push_ref_does_not_claim_publication_absence() {
+        let sink = CapturingCheckpointSink::default();
+        let checkpoints = Arc::clone(&sink.checkpoints);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with([
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(Vec::new()),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+            ])),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(sink);
+        provider
+            .restore_job_resumes(vec![durable_prepared_prepublication_resume()])
+            .expect("restore publication intent");
+        assert_eq!(
+            provider
+                .reconcile_restored_job("operation-1", &CancellationToken::new())
+                .expect("missing ref reconciliation"),
+            GithubJobReconciliation::Missing
+        );
+        let latest = checkpoints
+            .lock()
+            .expect("checkpoints")
+            .last()
+            .cloned()
+            .expect("latest checkpoint");
+        assert_eq!(latest.state, JobState::Created);
+        assert!(latest.publication_uncertain);
+        assert!(!latest.publication_absent);
+        assert!(!latest.temporary_ref_deleted);
+    }
+
+    #[test]
+    fn missing_pre_push_ref_can_be_reconciled_when_exact_ref_appears_later() {
+        let sink = CapturingCheckpointSink::default();
+        let checkpoints = Arc::clone(&sink.checkpoints);
+        let responses = [
+            Ok(authenticated_user_row()),
+            Ok(private_repository_row()),
+            Ok(authenticated_user_row()),
+            Ok(private_repository_row()),
+            Ok(authenticated_user_row()),
+            Ok(private_repository_row()),
+            Ok(Vec::new()),
+            Ok(authenticated_user_row()),
+            Ok(private_repository_row()),
+            Ok(authenticated_user_row()),
+            Ok(private_repository_row()),
+            Ok(authenticated_user_row()),
+            Ok(private_repository_row()),
+            Ok(authenticated_user_row()),
+            Ok(private_repository_row()),
+            Ok(Vec::new()),
+        ];
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with(responses)),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(sink);
+        provider
+            .restore_job_resumes(vec![durable_prepared_prepublication_resume()])
+            .expect("restore publication intent");
+
+        assert_eq!(
+            provider
+                .reconcile_restored_job("operation-1", &CancellationToken::new())
+                .expect("initial missing reconciliation"),
+            GithubJobReconciliation::Missing
+        );
+        let missing = checkpoints
+            .lock()
+            .expect("checkpoints")
+            .last()
+            .cloned()
+            .expect("missing checkpoint");
+        assert_eq!(missing.state, JobState::Created);
+        assert!(missing.publication_uncertain);
+
+        provider.publisher.lock().expect("publisher").reconciliation = Some(
+            TemporaryRefReconciliation::Exact(PublishedTemporaryRef::new(
+                TemporaryGitRef::new(
+                    provider_config(all_authorized())
+                        .workflow
+                        .temporary_branch_namespace(),
+                    BranchName::new("rustferry/goal3/builds/operation-1").expect("branch"),
+                )
+                .expect("temporary ref"),
+                CommitSha::new(DISPATCH_SHA).expect("dispatch commit"),
+            )),
+        );
+        assert_eq!(
+            provider
+                .reconcile_restored_job("operation-1", &CancellationToken::new())
+                .expect("later exact reconciliation"),
+            GithubJobReconciliation::Recovered
+        );
+
+        let latest = checkpoints
+            .lock()
+            .expect("checkpoints")
+            .last()
+            .cloned()
+            .expect("exact checkpoint");
+        missing
+            .validate_successor(&latest)
+            .expect("exact evidence safely resolves publication uncertainty");
+        assert_eq!(latest.state, JobState::Queued);
+        assert_eq!(latest.dispatch_commit.as_deref(), Some(DISPATCH_SHA));
+        assert!(!latest.publication_uncertain);
+        assert!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .published
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn missing_prepared_ref_recovers_exact_run_history_without_duplicate_push() {
+        let mut responses = Vec::new();
+        for _ in 0..6 {
+            responses.push(Ok(authenticated_user_row()));
+            responses.push(Ok(private_repository_row()));
+        }
+        responses.insert(6, Ok(queued_run_row()));
+        responses.insert(9, Ok(queued_run_row()));
+        responses.push(Ok(queued_run_row()));
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with(responses)),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        );
+        provider
+            .restore_job_resumes(vec![durable_prepared_prepublication_resume()])
+            .expect("restore prepared publication");
+
+        assert_eq!(
+            provider
+                .reconcile_restored_job("operation-1", &CancellationToken::new())
+                .expect("run-history recovery"),
+            GithubJobReconciliation::Recovered
+        );
+        let state = provider.lock_state().expect("state");
+        let record = state.jobs.get("operation-1").expect("job");
+        assert_eq!(
+            record.dispatch_commit.as_ref().map(CommitSha::as_str),
+            Some(DISPATCH_SHA)
+        );
+        assert!(record.run.is_some());
+        assert_eq!(record.state, JobState::Queued);
+        assert!(!record.publication_uncertain);
+        assert!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .published
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn missing_prepared_ref_rejects_an_external_rerun_before_mapping() {
+        let mut responses = Vec::new();
+        for _ in 0..6 {
+            responses.push(Ok(authenticated_user_row()));
+            responses.push(Ok(private_repository_row()));
+        }
+        responses.insert(6, Ok(queued_run_attempt_row(2)));
+        responses.insert(9, Ok(queued_run_attempt_row(2)));
+        responses.push(Ok(queued_run_attempt_row(2)));
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with(responses)),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        );
+        provider
+            .restore_job_resumes(vec![durable_prepared_prepublication_resume()])
+            .expect("restore prepared publication");
+
+        assert!(
+            provider
+                .reconcile_restored_job("operation-1", &CancellationToken::new())
+                .is_err()
+        );
+        let state = provider.lock_state().expect("state");
+        let record = state.jobs.get("operation-1").expect("job");
+        assert!(record.dispatch_commit.is_none());
+        assert!(record.run.is_none());
+        assert!(record.publication_uncertain);
+        assert!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .published
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn restored_unarmed_publication_is_retired_without_remote_reads_and_releases_capacity() {
+        let base_config = provider_config(all_authorized());
+        let principal = GithubPrincipalIdentityV1::User {
+            id: AUTHENTICATED_USER_ID,
+            login: "ShiroKSH".to_owned(),
+        };
+        let mut unarmed = durable_prepared_prepublication_resume();
+        unarmed.publication_started_at_ms = 0;
+        unarmed.publication_quiescence_deadline_ms = u64::MAX;
+        let record = unarmed
+            .into_record(&base_config, &principal, 991)
+            .expect("unarmed prepared record");
+        let mut config = base_config;
+        config.max_jobs = 1;
+        let resume = GithubJobResumeV1::from_record(&config, principal, 991, &record)
+            .expect("capacity-bound unarmed resume");
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            config,
+            transport(FakeGhRunner::with([
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+            ])),
+            FakePublisher {
+                reconciliation: Some(TemporaryRefReconciliation::Conflict),
+                ..FakePublisher::default()
+            },
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        );
+        provider
+            .restore_job_resumes(vec![resume])
+            .expect("restore unarmed publication");
+
+        assert_eq!(
+            provider
+                .reconcile_restored_job("operation-1", &CancellationToken::new())
+                .expect("retire unarmed intent"),
+            GithubJobReconciliation::NotStarted
+        );
+        {
+            let state = provider.lock_state().expect("state");
+            let retired = state.jobs.get("operation-1").expect("retired job");
+            assert_eq!(retired.state, JobState::Failed);
+            assert!(retired.publication_not_attempted);
+            assert!(record_is_recyclable(retired));
+        }
+
+        let mut replacement = unsigned_request();
+        replacement.operation_id = "operation-2".to_owned();
+        let handle = poll_ready(provider.submit(replacement, CancellationToken::new()))
+            .expect("unarmed intent releases bounded capacity");
+        assert_eq!(handle.job_id, "operation-2");
+        assert!(matches!(
+            provider.publisher.lock().expect("publisher").reconciliation,
+            Some(TemporaryRefReconciliation::Conflict)
+        ));
+    }
+
+    #[test]
+    fn bounded_missing_prepared_publication_becomes_recyclable_without_guessing_once() {
+        let base_config = provider_config(all_authorized());
+        let principal = GithubPrincipalIdentityV1::User {
+            id: AUTHENTICATED_USER_ID,
+            login: "ShiroKSH".to_owned(),
+        };
+        let record = durable_prepared_prepublication_resume()
+            .into_record(&base_config, &principal, 991)
+            .expect("prepared record");
+        let mut config = base_config;
+        config.max_jobs = 1;
+        let resume = GithubJobResumeV1::from_record(&config, principal.clone(), 991, &record)
+            .expect("capacity-bound resume");
+        let mut previous = resume.clone();
+        let mut responses = vec![Ok(authenticated_user_row()), Ok(private_repository_row())];
+        for _ in 0..3 {
+            responses.push(Ok(authenticated_user_row()));
+            responses.push(Ok(private_repository_row()));
+            responses.push(Ok(authenticated_user_row()));
+            responses.push(Ok(private_repository_row()));
+            responses.push(Ok(Vec::new()));
+            responses.push(Ok(authenticated_user_row()));
+            responses.push(Ok(private_repository_row()));
+        }
+        let clock = MutableClock::new(1_700_000_000_000);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            config,
+            transport(FakeGhRunner::with(responses)),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            clock.clone(),
+        );
+        provider
+            .restore_job_resumes(vec![resume])
+            .expect("restore prepared publication");
+
+        for attempt in 1..=3 {
+            if attempt == 3 {
+                clock.set(1_700_000_000_000 + GITHUB_PUBLICATION_QUIESCENCE_WINDOW_MS);
+            }
+            assert_eq!(
+                provider
+                    .reconcile_restored_job("operation-1", &CancellationToken::new())
+                    .expect("bounded missing reconciliation"),
+                GithubJobReconciliation::Missing
+            );
+            let state = provider.lock_state().expect("state");
+            let record = state.jobs.get("operation-1").expect("job");
+            if attempt < 3 {
+                assert_eq!(record.state, JobState::Created);
+                assert!(!record.publication_absent);
+                assert_eq!(
+                    record.publication_absence_observations,
+                    u8::try_from(attempt).unwrap_or(2)
+                );
+            } else {
+                assert_eq!(record.state, JobState::Failed);
+                assert!(record.publication_absent);
+                assert!(record.temporary_ref_deleted);
+            }
+            let next =
+                GithubJobResumeV1::from_record(&provider.config, principal.clone(), 991, record)
+                    .expect("reconciliation checkpoint");
+            previous
+                .validate_successor(&next)
+                .expect("bounded reconciliation advances monotonically");
+            previous = next;
+        }
+
+        let mut replacement = unsigned_request();
+        replacement.operation_id = "operation-2".to_owned();
+        let handle = poll_ready(provider.submit(replacement, CancellationToken::new()))
+            .expect("strongly absent terminal record is recyclable");
+        assert_eq!(handle.job_id, "operation-2");
+    }
+
+    #[test]
+    fn first_missing_observation_restarts_quiescence_after_a_delayed_push_checkpoint() {
+        let mut responses = vec![Ok(authenticated_user_row()), Ok(private_repository_row())];
+        for _ in 0..3 {
+            responses.push(Ok(authenticated_user_row()));
+            responses.push(Ok(private_repository_row()));
+            responses.push(Ok(authenticated_user_row()));
+            responses.push(Ok(private_repository_row()));
+            responses.push(Ok(Vec::new()));
+            responses.push(Ok(authenticated_user_row()));
+            responses.push(Ok(private_repository_row()));
+        }
+        let delayed_now = 1_700_000_000_000 + 10 * GITHUB_PUBLICATION_QUIESCENCE_WINDOW_MS;
+        let clock = MutableClock::new(delayed_now);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with(responses)),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            clock.clone(),
+        );
+        provider
+            .restore_job_resumes(vec![durable_prepared_prepublication_resume()])
+            .expect("restore aged publication boundary");
+
+        for _ in 0..2 {
+            assert_eq!(
+                provider
+                    .reconcile_restored_job("operation-1", &CancellationToken::new())
+                    .expect("immediate missing observation"),
+                GithubJobReconciliation::Missing
+            );
+        }
+        {
+            let state = provider.lock_state().expect("state");
+            let record = state.jobs.get("operation-1").expect("job");
+            assert_eq!(record.state, JobState::Created);
+            assert_eq!(record.publication_absence_first_observed_at_ms, delayed_now);
+            assert_eq!(
+                record.publication_quiescence_deadline_ms,
+                delayed_now + GITHUB_PUBLICATION_QUIESCENCE_WINDOW_MS
+            );
+            assert_eq!(record.publication_absence_observations, 2);
+            assert!(!record.publication_absent);
+        }
+
+        clock.set(delayed_now + GITHUB_PUBLICATION_QUIESCENCE_WINDOW_MS);
+        assert_eq!(
+            provider
+                .reconcile_restored_job("operation-1", &CancellationToken::new())
+                .expect("quiesced missing observation"),
+            GithubJobReconciliation::Missing
+        );
+        let state = provider.lock_state().expect("state");
+        let record = state.jobs.get("operation-1").expect("job");
+        assert_eq!(record.state, JobState::Failed);
+        assert!(record.publication_absent);
+    }
+
+    #[test]
+    fn unfenced_publication_never_uses_time_as_strong_absence_evidence() {
+        let mut responses = vec![Ok(authenticated_user_row()), Ok(private_repository_row())];
+        for _ in 0..2 {
+            responses.push(Ok(authenticated_user_row()));
+            responses.push(Ok(private_repository_row()));
+            responses.push(Ok(authenticated_user_row()));
+            responses.push(Ok(private_repository_row()));
+            responses.push(Ok(Vec::new()));
+            responses.push(Ok(authenticated_user_row()));
+            responses.push(Ok(private_repository_row()));
+        }
+        let delayed_now = 1_700_000_000_000 + 10 * GITHUB_PUBLICATION_QUIESCENCE_WINDOW_MS;
+        let clock = MutableClock::new(delayed_now);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with(responses)),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            clock.clone(),
+        );
+        let mut resume = durable_prepared_prepublication_resume();
+        resume.publication_process_fenced = false;
+        provider
+            .restore_job_resumes(vec![resume])
+            .expect("restore unfenced publication");
+
+        assert_eq!(
+            provider
+                .reconcile_restored_job("operation-1", &CancellationToken::new())
+                .expect("first missing observation"),
+            GithubJobReconciliation::Missing
+        );
+        clock.set(delayed_now + GITHUB_PUBLICATION_QUIESCENCE_WINDOW_MS);
+        assert_eq!(
+            provider
+                .reconcile_restored_job("operation-1", &CancellationToken::new())
+                .expect("post-quiescence missing observation"),
+            GithubJobReconciliation::Missing
+        );
+        let state = provider.lock_state().expect("state");
+        let record = state.jobs.get("operation-1").expect("job");
+        assert_eq!(record.publication_absence_observations, 2);
+        assert_eq!(record.state, JobState::Created);
+        assert!(!record.publication_absent);
+        assert!(!record_is_recyclable(record));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one regression binds takeover lease, crash residue, recomputation, and no-fetch proof"
+    )]
+    fn git_reconciliation_recomputes_the_prepared_commit_without_fetching_remote_objects() {
+        let directory = tempdir().expect("directory");
+        let stale_lock = directory.path().join("operation-1.lock");
+        let stale_index = directory.path().join("operation-1.index");
+        let stale_attempt = directory.path().join(".rustferry-index-crash-residue");
+        fs::write(&stale_lock, b"crash-owner").expect("stale legacy reservation lock");
+        fs::write(&stale_index, b"partial-index").expect("stale legacy index");
+        fs::create_dir(&stale_attempt).expect("stale attempt directory");
+        fs::write(stale_attempt.join("index"), b"partial-index").expect("stale attempt index");
+        fs::write(stale_attempt.join("index.lock"), b"crash-owner").expect("stale attempt lock");
+        let workflow_path = ".github/workflows/rustferry-goal3-iphone.yml";
+        let workflow = b"name: exact\n";
+        let manifest = vec![b'm'; MAX_GIT_OUTPUT_BYTES + 1];
+        let runner = FakeGitRunner::with(exact_reconciliation_git_responses(
+            workflow_path,
+            workflow,
+            &manifest,
+            DISPATCH_SHA,
+        ));
+        let mut publisher = GitTemporaryRefPublisher::new(
+            runner,
+            directory.path(),
+            "origin",
+            "signing",
+            Duration::from_secs(30),
+        )
+        .expect("publisher");
+        let namespace =
+            TemporaryBranchNamespace::new("rustferry/goal3/builds").expect("temporary namespace");
+        let temporary_ref = TemporaryGitRef::new(
+            &namespace,
+            BranchName::new("rustferry/goal3/builds/operation-1").expect("branch"),
+        )
+        .expect("temporary ref");
+        let config = provider_config(all_authorized());
+        let source_revision = CommitSha::new(SOURCE_SHA).expect("source revision");
+        let expected_prepared_commit = CommitSha::new(DISPATCH_SHA).expect("prepared commit");
+        let workflow_fingerprint = WorkflowFingerprint::for_workflow_bytes(workflow);
+        assert_eq!(
+            publisher.acquire_publication_lease(&TemporaryRefPublicationLeaseRequest {
+                repository: &config.repository,
+                operation_id: "operation-1",
+                temporary_ref: &temporary_ref,
+            }),
+            Ok(TemporaryRefPublicationLease::Acquired)
+        );
+        let result = publisher
+            .reconcile_temporary_ref(&TemporaryRefReconcileRequest {
+                repository: &config.repository,
+                source_repository: &config.source_repository,
+                trusted_source_ref: config.workflow.trusted_source_ref(),
+                source_revision: &source_revision,
+                snapshot_source_ref: None,
+                temporary_ref: &temporary_ref,
+                workflow_path,
+                workflow_bytes: workflow,
+                workflow_fingerprint: &workflow_fingerprint,
+                manifest_bytes: &manifest,
+                operation_id: "operation-1",
+                created_at_ms: 1_700_000_000_000,
+                expected_prepared_commit: &expected_prepared_commit,
+            })
+            .expect("exact reconciliation");
+        assert!(matches!(
+            result,
+            TemporaryRefReconciliation::Exact(publication)
+                if publication.commit().as_str() == DISPATCH_SHA
+                    && publication.temporary_ref() == &temporary_ref
+        ));
+        assert_eq!(
+            fs::read(&stale_lock).expect("legacy lock retained"),
+            b"crash-owner"
+        );
+        assert_eq!(
+            fs::read(&stale_index).expect("legacy index retained"),
+            b"partial-index"
+        );
+        assert_eq!(
+            fs::read(stale_attempt.join("index")).expect("stale attempt retained"),
+            b"partial-index"
+        );
+        let runner = publisher.into_runner();
+        assert!(!runner.invocations.iter().any(|invocation| {
+            invocation.arguments.first() == Some(&OsString::from("fetch"))
+                && invocation
+                    .arguments
+                    .iter()
+                    .any(|argument| argument == "refs/heads/rustferry/goal3/builds/operation-1")
+        }));
+        assert!(
+            runner
+                .invocations
+                .iter()
+                .filter(|invocation| matches!(
+                    invocation
+                        .arguments
+                        .first()
+                        .and_then(|argument| argument.to_str()),
+                    Some("show" | "cat-file" | "merge-base")
+                ))
+                .all(|invocation| invocation.environment.is_empty())
+        );
+    }
+
+    #[test]
+    fn git_reconciliation_rejects_exact_ref_when_source_is_not_trusted() {
+        let directory = tempdir().expect("directory");
+        let workflow_path = ".github/workflows/rustferry-goal3-iphone.yml";
+        let workflow = b"name: exact\n";
+        let manifest = b"{}\n";
+        let mut responses =
+            exact_reconciliation_git_responses(workflow_path, workflow, manifest, DISPATCH_SHA);
+        responses[9] = Err(GitExecutionError::CommandFailed { exit_code: Some(1) });
+        let runner = FakeGitRunner::with(responses);
+        let mut publisher = GitTemporaryRefPublisher::new(
+            runner,
+            directory.path(),
+            "origin",
+            "signing",
+            Duration::from_secs(30),
+        )
+        .expect("publisher");
+        let config = provider_config(all_authorized());
+        let temporary_ref = TemporaryGitRef::new(
+            config.workflow.temporary_branch_namespace(),
+            BranchName::new("rustferry/goal3/builds/operation-1").expect("branch"),
+        )
+        .expect("temporary ref");
+        let source_revision = CommitSha::new(SOURCE_SHA).expect("source revision");
+        let expected_prepared_commit = CommitSha::new(DISPATCH_SHA).expect("prepared commit");
+        let workflow_fingerprint = WorkflowFingerprint::for_workflow_bytes(workflow);
+
+        assert_eq!(
+            publisher.reconcile_temporary_ref(&TemporaryRefReconcileRequest {
+                repository: &config.repository,
+                source_repository: &config.source_repository,
+                trusted_source_ref: config.workflow.trusted_source_ref(),
+                source_revision: &source_revision,
+                snapshot_source_ref: None,
+                temporary_ref: &temporary_ref,
+                workflow_path,
+                workflow_bytes: workflow,
+                workflow_fingerprint: &workflow_fingerprint,
+                manifest_bytes: manifest,
+                operation_id: "operation-1",
+                created_at_ms: 1_700_000_000_000,
+                expected_prepared_commit: &expected_prepared_commit,
+            }),
+            Err(TemporaryRefPublishError::SourceRevisionNotTrusted)
+        );
+        let runner = publisher.into_runner();
+        assert!(!runner.invocations.iter().any(|invocation| {
+            invocation.arguments.first() == Some(&OsString::from("ls-remote"))
+                && invocation
+                    .arguments
+                    .iter()
+                    .any(|argument| argument == "refs/heads/rustferry/goal3/builds/operation-1")
+        }));
+    }
+
+    #[test]
+    fn git_reconciliation_rejects_a_ref_that_changes_during_content_verification() {
+        let directory = tempdir().expect("directory");
+        let workflow_path = ".github/workflows/rustferry-goal3-iphone.yml";
+        let workflow = b"name: exact\n";
+        let manifest = b"{}\n";
+        let runner = FakeGitRunner::with(exact_reconciliation_git_responses(
+            workflow_path,
+            workflow,
+            manifest,
+            SOURCE_SHA,
+        ));
+        let mut publisher = GitTemporaryRefPublisher::new(
+            runner,
+            directory.path(),
+            "origin",
+            "signing",
+            Duration::from_secs(30),
+        )
+        .expect("publisher");
+        let namespace =
+            TemporaryBranchNamespace::new("rustferry/goal3/builds").expect("temporary namespace");
+        let temporary_ref = TemporaryGitRef::new(
+            &namespace,
+            BranchName::new("rustferry/goal3/builds/operation-1").expect("branch"),
+        )
+        .expect("temporary ref");
+        let config = provider_config(all_authorized());
+        let source_revision = CommitSha::new(SOURCE_SHA).expect("source revision");
+        let expected_prepared_commit = CommitSha::new(DISPATCH_SHA).expect("prepared commit");
+        let workflow_fingerprint = WorkflowFingerprint::for_workflow_bytes(workflow);
+        assert_eq!(
+            publisher
+                .reconcile_temporary_ref(&TemporaryRefReconcileRequest {
+                    repository: &config.repository,
+                    source_repository: &config.source_repository,
+                    trusted_source_ref: config.workflow.trusted_source_ref(),
+                    source_revision: &source_revision,
+                    snapshot_source_ref: None,
+                    temporary_ref: &temporary_ref,
+                    workflow_path,
+                    workflow_bytes: workflow,
+                    workflow_fingerprint: &workflow_fingerprint,
+                    manifest_bytes: manifest,
+                    operation_id: "operation-1",
+                    created_at_ms: 1_700_000_000_000,
+                    expected_prepared_commit: &expected_prepared_commit,
+                })
+                .expect("bounded reconciliation"),
+            TemporaryRefReconciliation::Conflict
+        );
+    }
+
+    #[test]
+    fn git_publication_lease_is_cross_instance_and_key_scoped() {
+        let root = tempdir().expect("root");
+        let isolation = root.path().join("isolation");
+        create_test_private_directory(&isolation).expect("isolation directory");
+        let mut first = GitTemporaryRefPublisher::new(
+            FakeGitRunner::default(),
+            &isolation,
+            "origin",
+            "signing",
+            Duration::from_secs(30),
+        )
+        .expect("first publisher");
+        let mut second = GitTemporaryRefPublisher::new(
+            FakeGitRunner::default(),
+            &isolation,
+            "origin",
+            "signing",
+            Duration::from_secs(30),
+        )
+        .expect("second publisher");
+        assert_eq!(
+            first.publication_lease_scope_sha256(),
+            second.publication_lease_scope_sha256()
+        );
+        let config = provider_config(all_authorized());
+        let temporary_ref = TemporaryGitRef::new(
+            config.workflow.temporary_branch_namespace(),
+            BranchName::new("rustferry/goal3/builds/operation-1").expect("branch"),
+        )
+        .expect("temporary ref");
+        let request = TemporaryRefPublicationLeaseRequest {
+            repository: &config.repository,
+            operation_id: "operation-1",
+            temporary_ref: &temporary_ref,
+        };
+        assert_eq!(
+            first.acquire_publication_lease(&request),
+            Ok(TemporaryRefPublicationLease::Acquired)
+        );
+        assert_eq!(
+            second.acquire_publication_lease(&request),
+            Ok(TemporaryRefPublicationLease::HeldByOther)
+        );
+
+        let independent_ref = TemporaryGitRef::new(
+            config.workflow.temporary_branch_namespace(),
+            BranchName::new("rustferry/goal3/builds/operation-2").expect("branch"),
+        )
+        .expect("temporary ref");
+        assert_eq!(
+            second.acquire_publication_lease(&TemporaryRefPublicationLeaseRequest {
+                repository: &config.repository,
+                operation_id: "operation-2",
+                temporary_ref: &independent_ref,
+            }),
+            Ok(TemporaryRefPublicationLease::Acquired)
+        );
+        drop(first);
+        assert_eq!(
+            second.acquire_publication_lease(&request),
+            Ok(TemporaryRefPublicationLease::Acquired)
+        );
+    }
+
+    #[test]
+    fn git_snapshot_source_lease_is_cross_instance_and_exact_ref_scoped() {
+        let root = tempdir().expect("root");
+        let isolation = root.path().join("isolation");
+        create_test_private_directory(&isolation).expect("isolation directory");
+        let mut first = GitTemporaryRefPublisher::new(
+            FakeGitRunner::default(),
+            &isolation,
+            "origin",
+            "signing",
+            Duration::from_secs(30),
+        )
+        .expect("first publisher");
+        let mut second = GitTemporaryRefPublisher::new(
+            FakeGitRunner::default(),
+            &isolation,
+            "origin",
+            "signing",
+            Duration::from_secs(30),
+        )
+        .expect("second publisher");
+        let config = provider_config(all_authorized());
+        let source_ref =
+            GitSnapshotSourceRef::for_operation("operation-1").expect("snapshot source ref");
+        let request = GitSnapshotSourcePublicationLeaseRequest {
+            source_repository: &config.source_repository,
+            source_ref: &source_ref,
+        };
+        assert_eq!(
+            first.acquire_git_snapshot_source_lease(&request),
+            Ok(TemporaryRefPublicationLease::Acquired)
+        );
+        assert_eq!(
+            first.acquire_git_snapshot_source_lease(&request),
+            Ok(TemporaryRefPublicationLease::AlreadyOwned)
+        );
+        assert_eq!(
+            second.acquire_git_snapshot_source_lease(&request),
+            Ok(TemporaryRefPublicationLease::HeldByOther)
+        );
+
+        let other_source_ref = GitSnapshotSourceRef::for_operation("operation-2")
+            .expect("independent snapshot source ref");
+        assert_eq!(
+            second.acquire_git_snapshot_source_lease(&GitSnapshotSourcePublicationLeaseRequest {
+                source_repository: &config.source_repository,
+                source_ref: &other_source_ref,
+            },),
+            Ok(TemporaryRefPublicationLease::Acquired)
+        );
+        assert_eq!(
+            second.acquire_git_snapshot_source_lease(&GitSnapshotSourcePublicationLeaseRequest {
+                source_repository: "https://github.com/shiroksh/other-public-source",
+                source_ref: &source_ref,
+            },),
+            Ok(TemporaryRefPublicationLease::Acquired)
+        );
+        drop(first);
+        assert_eq!(
+            second.acquire_git_snapshot_source_lease(&request),
+            Ok(TemporaryRefPublicationLease::Acquired)
+        );
+    }
+
+    #[test]
+    fn git_publication_lease_scope_rejects_same_path_directory_replacement() {
+        let root = tempdir().expect("root");
+        let isolation = root.path().join("isolation");
+        let moved = root.path().join("isolation-old");
+        create_test_private_directory(&isolation).expect("isolation directory");
+        let mut original = GitTemporaryRefPublisher::new(
+            FakeGitRunner::default(),
+            &isolation,
+            "origin",
+            "signing",
+            Duration::from_secs(30),
+        )
+        .expect("original publisher");
+        let original_scope = original
+            .publication_lease_scope_sha256()
+            .expect("scope")
+            .to_owned();
+        let config = provider_config(all_authorized());
+        let temporary_ref = TemporaryGitRef::new(
+            config.workflow.temporary_branch_namespace(),
+            BranchName::new("rustferry/goal3/builds/operation-1").expect("branch"),
+        )
+        .expect("temporary ref");
+
+        #[cfg(windows)]
+        {
+            assert!(
+                fs::rename(&isolation, &moved).is_err(),
+                "retained directory handle must deny replacement before lease acquisition"
+            );
+            assert_eq!(
+                original.publication_lease_scope_sha256(),
+                Some(original_scope.as_str())
+            );
+            assert_eq!(
+                original.acquire_publication_lease(&TemporaryRefPublicationLeaseRequest {
+                    repository: &config.repository,
+                    operation_id: "operation-1",
+                    temporary_ref: &temporary_ref,
+                }),
+                Ok(TemporaryRefPublicationLease::Acquired)
+            );
+        }
+
+        #[cfg(not(windows))]
+        {
+            fs::rename(&isolation, &moved).expect("move original isolation directory");
+            create_test_private_directory(&isolation).expect("replacement isolation directory");
+            let replacement = GitTemporaryRefPublisher::new(
+                FakeGitRunner::default(),
+                &isolation,
+                "origin",
+                "signing",
+                Duration::from_secs(30),
+            )
+            .expect("replacement publisher");
+            assert_ne!(
+                replacement.publication_lease_scope_sha256(),
+                Some(original_scope.as_str())
+            );
+            assert_eq!(
+                original.acquire_publication_lease(&TemporaryRefPublicationLeaseRequest {
+                    repository: &config.repository,
+                    operation_id: "operation-1",
+                    temporary_ref: &temporary_ref,
+                }),
+                Err(TemporaryRefPublishError::LocalIsolationFailed)
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn production_runner_writes_only_its_private_bare_object_database() {
+        let git = PathBuf::from(r"C:\Program Files\Git\cmd\git.exe");
+        if !git.is_file() {
+            return;
+        }
+        let temporary = tempfile::tempdir().expect("fixture");
+        let checkout = temporary.path().join("checkout");
+        fs::create_dir(&checkout).expect("checkout directory");
+        assert!(
+            Command::new(&git)
+                .args(["init", "--quiet"])
+                .current_dir(&checkout)
+                .status()
+                .expect("git init")
+                .success()
+        );
+        let caller_config = fs::read(checkout.join(".git/config")).expect("caller config");
+        let caller_git = test_tree_snapshot(&checkout.join(".git"));
+        let isolation = temporary.path().join("isolation");
+        create_test_private_directory(&isolation).expect("private isolation");
+        let mut runner = GitProcessRunner::new(&git, &isolation).expect("isolated runner");
+
+        let object = runner
+            .execute(
+                &GitInvocation::new(["hash-object", "-w", "--stdin"], Duration::from_secs(5))
+                    .with_stdin(b"private object\n"),
+            )
+            .expect("private object write");
+
+        let object = parse_object_id(&object).expect("object ID");
+        assert!(
+            runner
+                .repository
+                .paths()
+                .bare()
+                .join("objects")
+                .join(&object[..2])
+                .join(&object[2..])
+                .is_file()
+        );
+        assert_eq!(
+            fs::read(checkout.join(".git/config")).expect("caller config after write"),
+            caller_config
+        );
+        assert_eq!(test_tree_snapshot(&checkout.join(".git")), caller_git);
     }
 
     #[test]
@@ -4300,6 +22116,71 @@ mod tests {
     }
 
     #[test]
+    fn provider_identity_binds_persisted_git_transports() {
+        let base = same_repository_provider_config(all_authorized());
+        let base_sha = provider_config_sha256(&base).expect("base identity");
+        let https = GithubRemoteSnapshot::new(
+            GithubGitEndpoint::parse("https://github.com/shiroksh/rust-and-iphone")
+                .expect("HTTPS fetch"),
+            GithubGitEndpoint::parse("https://github.com/shiroksh/rust-and-iphone")
+                .expect("HTTPS push"),
+        )
+        .expect("HTTPS snapshot");
+        let mixed = GithubRemoteSnapshot::new(
+            GithubGitEndpoint::parse("https://github.com/shiroksh/rust-and-iphone")
+                .expect("HTTPS fetch"),
+            GithubGitEndpoint::parse("git@github.com:shiroksh/rust-and-iphone").expect("SSH push"),
+        )
+        .expect("mixed snapshot");
+        #[cfg(unix)]
+        let ssh = GithubRemoteSnapshot::new(
+            GithubGitEndpoint::parse("git@github.com:shiroksh/rust-and-iphone").expect("SSH fetch"),
+            GithubGitEndpoint::parse("git@github.com:shiroksh/rust-and-iphone").expect("SSH push"),
+        )
+        .expect("SSH snapshot");
+        #[cfg(windows)]
+        let https_sha = provider_config_sha256(
+            &base
+                .clone()
+                .bind_git_endpoints(https.clone(), https.clone())
+                .expect("HTTPS binding"),
+        )
+        .expect("HTTPS identity");
+        #[cfg(unix)]
+        assert_eq!(
+            base.clone()
+                .bind_git_endpoints(https.clone(), https.clone()),
+            Err(GithubProviderConfigError::UnsupportedExecutionTransport)
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            base.clone()
+                .bind_git_endpoints(mixed.clone(), mixed.clone()),
+            Err(GithubProviderConfigError::UnsupportedExecutionTransport)
+        );
+        #[cfg(windows)]
+        let mixed_sha = provider_config_sha256(
+            &base
+                .bind_git_endpoints(mixed.clone(), mixed)
+                .expect("mixed binding"),
+        )
+        .expect("mixed identity");
+        #[cfg(unix)]
+        let ssh_sha = provider_config_sha256(
+            &base
+                .bind_git_endpoints(ssh.clone(), ssh)
+                .expect("SSH binding"),
+        )
+        .expect("SSH identity");
+        #[cfg(windows)]
+        assert_ne!(base_sha, https_sha);
+        #[cfg(windows)]
+        assert_ne!(https_sha, mixed_sha);
+        #[cfg(unix)]
+        assert_ne!(base_sha, ssh_sha);
+    }
+
+    #[test]
     fn split_repository_artifact_context_keeps_execution_and_source_identities_separate() {
         let workflow = workflow_config();
         let fingerprint = WorkflowFingerprint::for_workflow(&generate_workflow(&workflow));
@@ -4344,6 +22225,7 @@ mod tests {
         let context = captured.first().expect("artifact context");
         assert_eq!(context.repository.owner(), "ShiroKSH");
         assert_eq!(context.repository.name(), "rustferry-signing");
+        assert_eq!(context.execution_repository_id, None);
         assert_eq!(
             context.source_repository,
             "https://github.com/shiroksh/rust-and-iphone"
@@ -4391,11 +22273,213 @@ mod tests {
                 repository: &config.repository,
                 source_repository: &config.source_repository,
                 trusted_source_ref: config.workflow.trusted_source_ref(),
+                temporary_branch_namespace: config.workflow.temporary_branch_namespace(),
                 workflow_path: &workflow_path,
                 workflow_fingerprint: &config.workflow_fingerprint,
             })
             .expect_err("unapproved trusted-tip workflow bytes");
         assert_eq!(error, TemporaryRefPublishError::WorkflowFingerprintMismatch);
+    }
+
+    #[test]
+    fn execution_workflow_verifier_reads_only_the_stable_execution_default_ref() {
+        let config = workflow_dispatch_provider_config(all_authorized());
+        let workflow = generate_workflow(&config.workflow);
+        let source = GithubRemoteSnapshot::new(
+            GithubGitEndpoint::parse("https://github.com/ShiroKSH/rust-and-iphone.git")
+                .expect("source fetch"),
+            GithubGitEndpoint::parse("https://github.com/ShiroKSH/rust-and-iphone.git")
+                .expect("source push"),
+        )
+        .expect("source endpoints");
+        let execution = GithubRemoteSnapshot::new(
+            GithubGitEndpoint::parse("https://github.com/ShiroKSH/rustferry-signing.git")
+                .expect("execution fetch"),
+            GithubGitEndpoint::parse("https://github.com/ShiroKSH/rustferry-signing.git")
+                .expect("execution push"),
+        )
+        .expect("execution endpoints");
+        let default_ref = config.workflow.trusted_source_ref();
+        let responses = [
+            Ok(format!("{TRUSTED_TIP}\t{}\n", default_ref.as_str()).into_bytes()),
+            Ok(Vec::new()),
+            Ok(format!("{TRUSTED_TIP}\t{}\n", default_ref.as_str()).into_bytes()),
+            Ok(workflow.yaml().as_bytes().to_vec()),
+        ];
+        let directory = tempdir().expect("isolation directory");
+        let mut publisher = GitTemporaryRefPublisher::new_with_endpoints(
+            FakeGitRunner::with(responses),
+            directory.path(),
+            &source,
+            &execution,
+            Duration::from_secs(5),
+        )
+        .expect("publisher");
+
+        publisher
+            .verify_execution_workflow(&ExecutionWorkflowDoctorRequest {
+                repository: &config.repository,
+                default_branch_ref: default_ref,
+                workflow_path: &config.workflow.filename().repository_path(),
+                workflow_fingerprint: &config.workflow_fingerprint,
+            })
+            .expect("execution workflow proof");
+
+        let runner = publisher.into_runner();
+        assert_eq!(runner.invocations.len(), 4);
+        assert_eq!(
+            runner
+                .invocations
+                .iter()
+                .map(|invocation| invocation.network)
+                .collect::<Vec<_>>(),
+            [
+                GitNetworkPolicy::HttpsWithCredentialManager,
+                GitNetworkPolicy::HttpsWithCredentialManager,
+                GitNetworkPolicy::HttpsWithCredentialManager,
+                GitNetworkPolicy::Offline,
+            ]
+        );
+        assert!(runner.invocations[..3].iter().all(|invocation| {
+            invocation.arguments.iter().any(|argument| {
+                argument == OsStr::new("https://github.com/shiroksh/rustferry-signing")
+            }) && invocation.arguments.iter().all(|argument| {
+                argument != OsStr::new("https://github.com/shiroksh/rust-and-iphone")
+            })
+        }));
+        assert_eq!(
+            runner.invocations[3].arguments.first(),
+            Some(&OsString::from("show"))
+        );
+    }
+
+    #[test]
+    fn execution_workflow_verifier_rejects_push_only_bytes() {
+        let config = workflow_dispatch_provider_config(all_authorized());
+        let source = GithubRemoteSnapshot::new(
+            GithubGitEndpoint::parse("https://github.com/ShiroKSH/rust-and-iphone.git")
+                .expect("source fetch"),
+            GithubGitEndpoint::parse("https://github.com/ShiroKSH/rust-and-iphone.git")
+                .expect("source push"),
+        )
+        .expect("source endpoints");
+        let execution = GithubRemoteSnapshot::new(
+            GithubGitEndpoint::parse("https://github.com/ShiroKSH/rustferry-signing.git")
+                .expect("execution fetch"),
+            GithubGitEndpoint::parse("https://github.com/ShiroKSH/rustferry-signing.git")
+                .expect("execution push"),
+        )
+        .expect("execution endpoints");
+        let default_ref = config.workflow.trusted_source_ref();
+        let push_workflow = generate_workflow(&workflow_config());
+        let responses = [
+            Ok(format!("{TRUSTED_TIP}\t{}\n", default_ref.as_str()).into_bytes()),
+            Ok(Vec::new()),
+            Ok(format!("{TRUSTED_TIP}\t{}\n", default_ref.as_str()).into_bytes()),
+            Ok(push_workflow.yaml().as_bytes().to_vec()),
+        ];
+        let directory = tempdir().expect("isolation directory");
+        let mut publisher = GitTemporaryRefPublisher::new_with_endpoints(
+            FakeGitRunner::with(responses),
+            directory.path(),
+            &source,
+            &execution,
+            Duration::from_secs(5),
+        )
+        .expect("publisher");
+
+        assert_eq!(
+            publisher.verify_execution_workflow(&ExecutionWorkflowDoctorRequest {
+                repository: &config.repository,
+                default_branch_ref: default_ref,
+                workflow_path: &config.workflow.filename().repository_path(),
+                workflow_fingerprint: &config.workflow_fingerprint,
+            }),
+            Err(TemporaryRefPublishError::WorkflowFingerprintMismatch)
+        );
+    }
+
+    #[test]
+    fn frozen_endpoints_skip_remote_config_and_select_exact_network_policies() {
+        let config = same_repository_provider_config(all_authorized());
+        let workflow_path = config.workflow.filename().repository_path();
+        let workflow = generate_workflow(&config.workflow);
+        let responses = [
+            Ok(format!(
+                "{TRUSTED_TIP}\t{}\n",
+                config.workflow.trusted_source_ref().as_str()
+            )
+            .into_bytes()),
+            Ok(Vec::new()),
+            Ok(workflow.yaml().as_bytes().to_vec()),
+            Ok(Vec::new()),
+            Ok(Vec::new()),
+            Ok(Vec::new()),
+            Ok(Vec::new()),
+        ];
+        let endpoints = GithubRemoteSnapshot::new(
+            GithubGitEndpoint::parse("https://github.com/ShiroKSH/rust-and-iphone.git")
+                .expect("fetch endpoint"),
+            GithubGitEndpoint::parse("git@github.com:ShiroKSH/rust-and-iphone.git")
+                .expect("push endpoint"),
+        )
+        .expect("endpoint snapshot");
+        let directory = tempdir().expect("isolation directory");
+        let mut publisher = GitTemporaryRefPublisher::new_with_endpoints(
+            FakeGitRunner::with(responses),
+            directory.path(),
+            &endpoints,
+            &endpoints,
+            Duration::from_secs(5),
+        )
+        .expect("publisher");
+
+        publisher
+            .doctor(&TemporaryRefDoctorRequest {
+                repository: &config.repository,
+                source_repository: &config.source_repository,
+                trusted_source_ref: config.workflow.trusted_source_ref(),
+                temporary_branch_namespace: config.workflow.temporary_branch_namespace(),
+                workflow_path: &workflow_path,
+                workflow_fingerprint: &config.workflow_fingerprint,
+            })
+            .expect("frozen endpoint readiness");
+
+        let runner = publisher.into_runner();
+        assert_eq!(runner.invocations.len(), 7);
+        assert!(
+            runner.invocations.iter().all(|invocation| {
+                invocation.arguments.first() != Some(&OsString::from("remote"))
+            })
+        );
+        assert_eq!(
+            runner
+                .invocations
+                .iter()
+                .map(|invocation| invocation.network)
+                .collect::<Vec<_>>(),
+            [
+                GitNetworkPolicy::HttpsWithCredentialManager,
+                GitNetworkPolicy::HttpsWithCredentialManager,
+                GitNetworkPolicy::Offline,
+                GitNetworkPolicy::HttpsWithCredentialManager,
+                GitNetworkPolicy::GithubSsh,
+                GitNetworkPolicy::GithubSsh,
+                GitNetworkPolicy::GithubSsh,
+            ]
+        );
+        assert!(runner.invocations[0].arguments.contains(&OsString::from(
+            "https://github.com/shiroksh/rust-and-iphone"
+        )));
+        assert_eq!(
+            runner.invocations[5].arguments.first(),
+            Some(&OsString::from("push"))
+        );
+        assert!(
+            runner.invocations[5]
+                .arguments
+                .contains(&OsString::from("--dry-run"))
+        );
     }
 
     #[test]
@@ -4421,6 +22505,7 @@ mod tests {
                 repository: &config.repository,
                 source_repository: &config.source_repository,
                 trusted_source_ref: config.workflow.trusted_source_ref(),
+                temporary_branch_namespace: config.workflow.temporary_branch_namespace(),
                 workflow_path: &workflow_path,
                 workflow_fingerprint: &config.workflow_fingerprint,
             })
@@ -4432,27 +22517,12 @@ mod tests {
     }
 
     #[test]
-    fn provider_doctor_accepts_approved_branch_only_workflow_without_numeric_registration() {
-        let transport_responses = [
-            Ok(b"ShiroKSH\n".to_vec()),
-            Ok(b"991\tShiroKSH/rust-and-iphone\tfalse\tfalse\tfalse\tmain\n".to_vec()),
-        ];
-        let provider = GithubBuildProvider::with_artifact_store_and_clock(
-            same_repository_provider_config(all_authorized()),
-            transport(FakeGhRunner::with(transport_responses)),
-            FakePublisher::default(),
-            DoctorArtifactStore,
-            FixedClock(1_700_000_000_000),
+    fn signed_push_doctor_accepts_approved_branch_only_workflow_without_registration() {
+        let report = signed_doctor_report(
+            Ok(signing_environment_row(false, true, true)),
+            Ok(exact_signing_policy_row()),
+            Ok(exact_signing_secret_rows()),
         );
-        let report = poll_ready(provider.doctor(
-            ProviderDoctorRequest {
-                protocol_version: CURRENT_PROTOCOL_VERSION,
-                operation_id: "doctor-1".to_owned(),
-                require_signing: false,
-            },
-            CancellationToken::new(),
-        ))
-        .expect("doctor report");
         assert!(report.ready);
         assert!(report.checks.iter().any(|check| {
             check.code == "github.trusted_source" && check.status == ProviderCheckStatus::Ready
@@ -4466,11 +22536,77 @@ mod tests {
     }
 
     #[test]
+    fn push_doctor_rejects_repository_scoped_credentials() {
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with([
+                Err(GhExecutionError::CommandFailed { exit_code: Some(1) }),
+                Ok(b"991\tU2hpcm9LU0gvcnVzdGZlcnJ5LXNpZ25pbmc=\n".to_vec()),
+                Ok(private_repository_row()),
+                Ok(public_source_repository_row()),
+            ])),
+            FakePublisher::default(),
+            DoctorArtifactStore,
+            FixedClock(1_700_000_000_000),
+        );
+
+        let report = poll_ready(provider.doctor(
+            ProviderDoctorRequest {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+                operation_id: "push-repository-credential-doctor".to_owned(),
+                require_signing: false,
+            },
+            CancellationToken::new(),
+        ))
+        .expect("doctor report");
+        assert!(!report.ready);
+        assert!(report.checks.iter().any(|check| {
+            check.code == "github.authentication"
+                && check.status == ProviderCheckStatus::Error
+        }));
+    }
+
+    #[test]
+    fn workflow_dispatch_doctor_accepts_exact_repository_scoped_credentials() {
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            workflow_dispatch_provider_config(all_authorized()),
+            transport(FakeGhRunner::with([
+                Err(GhExecutionError::CommandFailed { exit_code: Some(1) }),
+                Ok(b"991\tU2hpcm9LU0gvcnVzdGZlcnJ5LXNpZ25pbmc=\n".to_vec()),
+                Ok(private_repository_row()),
+                Ok(public_source_repository_row()),
+                Ok(workflow_dispatch_registration_row()),
+            ])),
+            FakePublisher::default(),
+            DoctorArtifactStore,
+            FixedClock(1_700_000_000_000),
+        );
+
+        let report = poll_ready(provider.doctor(
+            ProviderDoctorRequest {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+                operation_id: "dispatch-repository-credential-doctor".to_owned(),
+                require_signing: false,
+            },
+            CancellationToken::new(),
+        ))
+        .expect("doctor report");
+        assert!(report.checks.iter().any(|check| {
+            check.code == "github.authentication"
+                && check.status == ProviderCheckStatus::Ready
+        }));
+        assert!(report.checks.iter().any(|check| {
+            check.code == "github.workflow_dispatch_default_workflow"
+                && check.status == ProviderCheckStatus::Ready
+        }));
+    }
+
+    #[test]
     fn provider_doctor_rejects_a_private_source_repository() {
         let provider = GithubBuildProvider::with_artifact_store_and_clock(
             provider_config(all_authorized()),
             transport(FakeGhRunner::with([
-                Ok(b"ShiroKSH\n".to_vec()),
+                Ok(authenticated_user_row()),
                 Ok(b"991\tShiroKSH/rustferry-signing\ttrue\tfalse\tfalse\tmain\n".to_vec()),
                 Ok(b"992\tShiroKSH/rust-and-iphone\ttrue\tfalse\tfalse\tmain\n".to_vec()),
             ])),
@@ -4495,7 +22631,80 @@ mod tests {
     }
 
     #[test]
-    fn signed_doctor_requires_exact_environment_policy_and_secret_metadata() {
+    fn signed_doctor_requires_distinct_stable_repository_ids() {
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with([
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(b"991\tShiroKSH/rust-and-iphone\tfalse\tfalse\tfalse\tmain\n".to_vec()),
+                Ok(b"true\n".to_vec()),
+                Ok(signing_environment_row(false, true, true)),
+                Ok(exact_signing_policy_row()),
+                Ok(exact_signing_secret_rows()),
+            ])),
+            FakePublisher::default(),
+            DoctorArtifactStore,
+            FixedClock(1_700_000_000_000),
+        );
+        let report = poll_ready(provider.doctor(
+            ProviderDoctorRequest {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+                operation_id: "same-repository-id-doctor".to_owned(),
+                require_signing: true,
+            },
+            CancellationToken::new(),
+        ))
+        .expect("doctor report");
+
+        assert!(!report.ready);
+        assert!(report.checks.iter().any(|check| {
+            check.code == "github.signing_repository_distinct"
+                && check.status == ProviderCheckStatus::Error
+        }));
+    }
+
+    #[test]
+    fn signed_doctor_requires_github_actions_to_be_enabled() {
+        let report = signed_doctor_report_with_repository_policy(
+            true,
+            Ok(b"false\n".to_vec()),
+            Ok(signing_environment_row(false, true, true)),
+            Ok(exact_signing_policy_row()),
+            Ok(exact_signing_secret_rows()),
+        );
+
+        assert!(!report.ready);
+        assert!(report.checks.iter().any(|check| {
+            check.code == "github.actions.enabled" && check.status == ProviderCheckStatus::Error
+        }));
+    }
+
+    #[test]
+    fn workflow_dispatch_signing_doctor_requires_an_active_exact_registration() {
+        let active = workflow_dispatch_doctor_report(Ok(format!(
+            "17\t{WORKFLOW_PATH_BASE64}\tactive\n"
+        )
+        .into_bytes()));
+        assert!(active.ready);
+        assert!(active.checks.iter().any(|check| {
+            check.code == "github.workflow_registration"
+                && check.status == ProviderCheckStatus::Ready
+        }));
+
+        let inactive = workflow_dispatch_doctor_report(Ok(format!(
+            "17\t{WORKFLOW_PATH_BASE64}\tdisabled_manually\n"
+        )
+        .into_bytes()));
+        assert!(!inactive.ready);
+        assert!(inactive.checks.iter().any(|check| {
+            check.code == "github.workflow_registration"
+                && check.status == ProviderCheckStatus::Error
+        }));
+    }
+
+    #[test]
+    fn signed_doctor_accepts_attempt_scoped_cleanup_evidence_after_other_checks_are_ready() {
         let report = signed_doctor_report(
             Ok(signing_environment_row(false, true, true)),
             Ok(exact_signing_policy_row()),
@@ -4504,6 +22713,9 @@ mod tests {
 
         assert!(report.ready);
         for code in [
+            "github.signing_repository_visibility",
+            "github.signing_repository_distinct",
+            "github.actions.enabled",
             "github.signing_environment",
             "github.signing_branch_policy",
             "github.signing_secrets",
@@ -4515,6 +22727,39 @@ mod tests {
                 })
             );
         }
+        assert!(report.checks.iter().any(|check| {
+            check.code == "github.signing_cleanup_evidence"
+                && check.status == ProviderCheckStatus::Ready
+        }));
+    }
+
+    #[test]
+    fn multi_profile_secret_metadata_requires_the_exact_configured_set() {
+        let (_request, names) = multi_profile_request();
+        let config = provider_config_with_secret_names(all_authorized(), names);
+        let exact_rows = format!(
+            "{CERTIFICATE_P12_BASE64}\n{CERTIFICATE_PASSWORD_BASE64}\n{PROVISIONING_PROFILE_BASE64}\n{WIDGET_PROFILE_BASE64}\n"
+        )
+        .into_bytes();
+        let mut checks = Vec::new();
+        append_signing_secret_check(
+            &mut checks,
+            &mut transport(FakeGhRunner::with([Ok(exact_rows)])),
+            &config,
+        );
+        assert!(checks.iter().any(|check| {
+            check.code == "github.signing_secrets" && check.status == ProviderCheckStatus::Ready
+        }));
+
+        let mut checks = Vec::new();
+        append_signing_secret_check(
+            &mut checks,
+            &mut transport(FakeGhRunner::with([Ok(exact_signing_secret_rows())])),
+            &config,
+        );
+        assert!(checks.iter().any(|check| {
+            check.code == "github.signing_secrets" && check.status == ProviderCheckStatus::Error
+        }));
     }
 
     #[test]
@@ -4683,6 +22928,7 @@ mod tests {
                 source_repository: &config.source_repository,
                 trusted_source_ref: config.workflow.trusted_source_ref(),
                 source_revision: &CommitSha::new(SOURCE_SHA).expect("source"),
+                snapshot_source_ref: None,
                 temporary_ref: &temporary_ref,
                 workflow_path: workflow.path(),
                 workflow_bytes: workflow.yaml().as_bytes(),
@@ -4695,6 +22941,592 @@ mod tests {
             .expect_err("authorization required");
         assert_eq!(error.error(), TemporaryRefPublishError::Unauthorized);
         assert!(publisher.into_runner().invocations.is_empty());
+    }
+
+    #[test]
+    fn git_snapshot_source_publication_is_create_only_on_the_full_custom_ref() {
+        let directory = tempdir().expect("isolation directory");
+        let mut publisher = GitTemporaryRefPublisher::new(
+            FakeGitRunner::with(snapshot_source_mutation_git_responses(Some(SOURCE_SHA))),
+            directory.path(),
+            "source",
+            "execution",
+            Duration::from_secs(5),
+        )
+        .expect("publisher");
+        let config = provider_config(all_authorized());
+        let source_ref =
+            GitSnapshotSourceRef::for_operation("operation-1").expect("snapshot source ref");
+        let commit = GitSha1ObjectId::new(SOURCE_SHA).expect("snapshot commit");
+        assert_eq!(
+            publisher
+                .publish_git_snapshot_source(&GitSnapshotSourcePublishRequest {
+                    source_repository: &config.source_repository,
+                    source_ref: &source_ref,
+                    commit: &commit,
+                    authorized: true,
+                })
+                .expect("snapshot source publication"),
+            GitSnapshotSourcePublication::Exact
+        );
+        let runner = publisher.into_runner();
+        assert!(runner.responses.is_empty());
+        let push = runner
+            .invocations
+            .iter()
+            .find(|invocation| invocation.arguments.first() == Some(&OsString::from("push")))
+            .expect("source push");
+        assert!(push.arguments.contains(&OsString::from("--no-verify")));
+        assert!(push.arguments.contains(&OsString::from("--atomic")));
+        assert!(push.arguments.contains(&OsString::from(format!(
+            "--force-with-lease={}:",
+            source_ref.as_str()
+        ))));
+        assert!(push.arguments.contains(&OsString::from(format!(
+            "{}:{}",
+            commit.as_str(),
+            source_ref.as_str()
+        ))));
+        assert!(
+            push.arguments
+                .contains(&OsString::from("git@github.com:shiroksh/rust-and-iphone"))
+        );
+        assert!(
+            !push
+                .arguments
+                .iter()
+                .any(|argument| { argument == "git@github.com:shiroksh/rustferry-signing" })
+        );
+    }
+
+    #[test]
+    fn git_snapshot_source_deletion_uses_the_exact_expected_commit_lease() {
+        let directory = tempdir().expect("isolation directory");
+        let mut publisher = GitTemporaryRefPublisher::new(
+            FakeGitRunner::with(snapshot_source_mutation_git_responses(None)),
+            directory.path(),
+            "source",
+            "execution",
+            Duration::from_secs(5),
+        )
+        .expect("publisher");
+        let config = provider_config(all_authorized());
+        let source_ref =
+            GitSnapshotSourceRef::for_operation("operation-1").expect("snapshot source ref");
+        let commit = GitSha1ObjectId::new(SOURCE_SHA).expect("snapshot commit");
+        publisher
+            .delete_git_snapshot_source(&GitSnapshotSourceDeleteRequest {
+                source_repository: &config.source_repository,
+                source_ref: &source_ref,
+                expected_commit: &commit,
+                authorized: true,
+            })
+            .expect("exact source deletion");
+        let runner = publisher.into_runner();
+        assert!(runner.responses.is_empty());
+        let push = runner
+            .invocations
+            .iter()
+            .find(|invocation| invocation.arguments.first() == Some(&OsString::from("push")))
+            .expect("source deletion push");
+        assert!(push.arguments.contains(&OsString::from(format!(
+            "--force-with-lease={}:{}",
+            source_ref.as_str(),
+            commit.as_str()
+        ))));
+        assert!(
+            push.arguments
+                .contains(&OsString::from(format!(":{}", source_ref.as_str())))
+        );
+        assert!(push.arguments.contains(&OsString::from("--no-verify")));
+    }
+
+    #[test]
+    fn git_snapshot_source_deletion_rejects_a_foreign_tip_without_claiming_absence() {
+        let directory = tempdir().expect("isolation directory");
+        let mut publisher = GitTemporaryRefPublisher::new(
+            FakeGitRunner::with(snapshot_source_mutation_git_responses(Some(DISPATCH_SHA))),
+            directory.path(),
+            "source",
+            "execution",
+            Duration::from_secs(5),
+        )
+        .expect("publisher");
+        let config = provider_config(all_authorized());
+        let source_ref =
+            GitSnapshotSourceRef::for_operation("operation-1").expect("snapshot source ref");
+        let commit = GitSha1ObjectId::new(SOURCE_SHA).expect("snapshot commit");
+        assert_eq!(
+            publisher.delete_git_snapshot_source(&GitSnapshotSourceDeleteRequest {
+                source_repository: &config.source_repository,
+                source_ref: &source_ref,
+                expected_commit: &commit,
+                authorized: true,
+            }),
+            Err(TemporaryRefPublishError::GitSnapshotRefConflict)
+        );
+        let runner = publisher.into_runner();
+        let push = runner
+            .invocations
+            .iter()
+            .find(|invocation| invocation.arguments.first() == Some(&OsString::from("push")))
+            .expect("lease-protected deletion attempt");
+        assert!(push.arguments.contains(&OsString::from(format!(
+            "--force-with-lease={}:{}",
+            source_ref.as_str(),
+            commit.as_str()
+        ))));
+    }
+
+    #[test]
+    fn git_prepare_binds_deterministic_commit_without_remote_mutation() {
+        let full_trusted_ref = "refs/heads/goal3/macless-iphone-builds";
+        let config = provider_config(all_authorized());
+        let workflow = generate_workflow(&config.workflow);
+        let responses = [
+            Ok(b"git@github.com:ShiroKSH/rust-and-iphone.git\n".to_vec()),
+            Ok(b"ssh://git@github.com/ShiroKSH/rust-and-iphone\n".to_vec()),
+            Ok(b"git@github.com:ShiroKSH/rustferry-signing.git\n".to_vec()),
+            Ok(b"ssh://git@github.com/ShiroKSH/rustferry-signing\n".to_vec()),
+            Ok(format!("{TRUSTED_TIP}\t{full_trusted_ref}\n").into_bytes()),
+            Ok(Vec::new()),
+            Ok(workflow.yaml().as_bytes().to_vec()),
+            Ok(Vec::new()),
+            Ok(Vec::new()),
+            Ok(Vec::new()),
+            Ok(Vec::new()),
+            Ok(format!("{WORKFLOW_BLOB}\n").into_bytes()),
+            Ok(format!("{MANIFEST_BLOB}\n").into_bytes()),
+            Ok(Vec::new()),
+            Ok(Vec::new()),
+            Ok(format!("{TREE_SHA}\n").into_bytes()),
+            Ok(format!("{DISPATCH_SHA}\n").into_bytes()),
+        ];
+        let directory = tempdir().expect("isolation directory");
+        let mut publisher = GitTemporaryRefPublisher::new(
+            FakeGitRunner::with(responses),
+            directory.path(),
+            "source",
+            "execution",
+            Duration::from_secs(5),
+        )
+        .expect("publisher");
+        let temporary_ref = TemporaryGitRef::new(
+            config.workflow.temporary_branch_namespace(),
+            BranchName::new("rustferry/goal3/builds/operation-1").expect("branch"),
+        )
+        .expect("temporary ref");
+        let prepared = publisher
+            .prepare(&TemporaryRefPublishRequest {
+                repository: &config.repository,
+                source_repository: &config.source_repository,
+                trusted_source_ref: config.workflow.trusted_source_ref(),
+                source_revision: &CommitSha::new(SOURCE_SHA).expect("source"),
+                snapshot_source_ref: None,
+                temporary_ref: &temporary_ref,
+                workflow_path: workflow.path(),
+                workflow_bytes: workflow.yaml().as_bytes(),
+                workflow_fingerprint: &config.workflow_fingerprint,
+                manifest_bytes: b"{\"schema_version\":1}\n",
+                operation_id: "operation-1",
+                created_at_ms: 1_700_000_000_000,
+                authorized: true,
+            })
+            .expect("read-only preparation")
+            .expect("prepared commit");
+        assert_eq!(prepared.commit().as_str(), DISPATCH_SHA);
+        let runner = publisher.into_runner();
+        assert!(runner.responses.is_empty());
+        assert!(!runner.invocations.iter().any(|invocation| {
+            invocation
+                .arguments
+                .first()
+                .and_then(|argument| argument.to_str())
+                == Some("push")
+        }));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the regression proves split-repository custom-ref trust and the absence of ordinary ancestry fallback"
+    )]
+    fn git_snapshot_prepare_fetches_the_exact_custom_ref_from_the_source_repository() {
+        let config = provider_config(all_authorized());
+        let workflow = generate_workflow(&config.workflow);
+        let directory = tempdir().expect("isolation directory");
+        let mut publisher = GitTemporaryRefPublisher::new(
+            FakeGitRunner::with(successful_snapshot_prepare_git_responses(
+                workflow.yaml().as_bytes(),
+                SOURCE_SHA,
+            )),
+            directory.path(),
+            "source",
+            "execution",
+            Duration::from_secs(5),
+        )
+        .expect("publisher");
+        let temporary_ref = TemporaryGitRef::new(
+            config.workflow.temporary_branch_namespace(),
+            BranchName::new("rustferry/goal3/builds/operation-1").expect("branch"),
+        )
+        .expect("temporary ref");
+        let source_revision = CommitSha::new(SOURCE_SHA).expect("source revision");
+        let snapshot_ref =
+            GitSnapshotSourceRef::for_operation("operation-1").expect("snapshot ref");
+        let prepared = publisher
+            .prepare(&TemporaryRefPublishRequest {
+                repository: &config.repository,
+                source_repository: &config.source_repository,
+                trusted_source_ref: config.workflow.trusted_source_ref(),
+                source_revision: &source_revision,
+                snapshot_source_ref: Some(&snapshot_ref),
+                temporary_ref: &temporary_ref,
+                workflow_path: workflow.path(),
+                workflow_bytes: workflow.yaml().as_bytes(),
+                workflow_fingerprint: &config.workflow_fingerprint,
+                manifest_bytes: b"{\"schema_version\":1}\n",
+                operation_id: "operation-1",
+                created_at_ms: 1_700_000_000_000,
+                authorized: true,
+            })
+            .expect("snapshot dispatch preparation")
+            .expect("prepared dispatch");
+        assert_eq!(prepared.commit().as_str(), DISPATCH_SHA);
+        let runner = publisher.into_runner();
+        assert!(runner.responses.is_empty());
+        assert!(!runner.invocations.iter().any(|invocation| {
+            invocation.arguments.first() == Some(&OsString::from("merge-base"))
+        }));
+        assert_eq!(
+            runner
+                .invocations
+                .iter()
+                .filter(|invocation| {
+                    invocation.arguments.first() == Some(&OsString::from("ls-remote"))
+                        && invocation.arguments.last()
+                            == Some(&OsString::from(snapshot_ref.as_str()))
+                })
+                .count(),
+            2
+        );
+        let snapshot_fetch = runner
+            .invocations
+            .iter()
+            .find(|invocation| {
+                invocation.arguments.first() == Some(&OsString::from("fetch"))
+                    && invocation.arguments.last() == Some(&OsString::from(snapshot_ref.as_str()))
+            })
+            .expect("snapshot source fetch");
+        assert!(
+            snapshot_fetch
+                .arguments
+                .contains(&OsString::from("git@github.com:shiroksh/rust-and-iphone"))
+        );
+        let temporary_ref_lookup = runner
+            .invocations
+            .iter()
+            .find(|invocation| {
+                invocation.arguments.first() == Some(&OsString::from("ls-remote"))
+                    && invocation.arguments.last()
+                        == Some(&OsString::from(
+                            "refs/heads/rustferry/goal3/builds/operation-1",
+                        ))
+            })
+            .expect("execution temporary-ref lookup");
+        assert!(
+            temporary_ref_lookup
+                .arguments
+                .contains(&OsString::from("git@github.com:shiroksh/rustferry-signing"))
+        );
+    }
+
+    #[test]
+    fn git_snapshot_prepare_rejects_custom_ref_drift_before_object_writes() {
+        let config = provider_config(all_authorized());
+        let workflow = generate_workflow(&config.workflow);
+        let directory = tempdir().expect("isolation directory");
+        let mut publisher = GitTemporaryRefPublisher::new(
+            FakeGitRunner::with(successful_snapshot_prepare_git_responses(
+                workflow.yaml().as_bytes(),
+                DISPATCH_SHA,
+            )),
+            directory.path(),
+            "source",
+            "execution",
+            Duration::from_secs(5),
+        )
+        .expect("publisher");
+        let temporary_ref = TemporaryGitRef::new(
+            config.workflow.temporary_branch_namespace(),
+            BranchName::new("rustferry/goal3/builds/operation-1").expect("branch"),
+        )
+        .expect("temporary ref");
+        let source_revision = CommitSha::new(SOURCE_SHA).expect("source revision");
+        let snapshot_ref =
+            GitSnapshotSourceRef::for_operation("operation-1").expect("snapshot ref");
+        let error = publisher
+            .prepare(&TemporaryRefPublishRequest {
+                repository: &config.repository,
+                source_repository: &config.source_repository,
+                trusted_source_ref: config.workflow.trusted_source_ref(),
+                source_revision: &source_revision,
+                snapshot_source_ref: Some(&snapshot_ref),
+                temporary_ref: &temporary_ref,
+                workflow_path: workflow.path(),
+                workflow_bytes: workflow.yaml().as_bytes(),
+                workflow_fingerprint: &config.workflow_fingerprint,
+                manifest_bytes: b"{\"schema_version\":1}\n",
+                operation_id: "operation-1",
+                created_at_ms: 1_700_000_000_000,
+                authorized: true,
+            })
+            .expect_err("changed source ref must fail closed");
+        assert_eq!(error, TemporaryRefPublishError::GitSnapshotRefConflict);
+        let runner = publisher.into_runner();
+        assert!(!runner.invocations.iter().any(|invocation| {
+            matches!(
+                invocation
+                    .arguments
+                    .first()
+                    .and_then(|argument| argument.to_str()),
+                Some("hash-object" | "update-index" | "write-tree" | "commit-tree" | "push")
+            )
+        }));
+    }
+
+    #[test]
+    fn snapshot_publish_prepared_rechecks_the_custom_ref_before_push() {
+        let config = provider_config(all_authorized());
+        let workflow = generate_workflow(&config.workflow);
+        let mut responses =
+            successful_snapshot_prepare_git_responses(workflow.yaml().as_bytes(), SOURCE_SHA);
+        responses.extend(successful_snapshot_prepare_git_responses(
+            workflow.yaml().as_bytes(),
+            DISPATCH_SHA,
+        ));
+        let directory = tempdir().expect("isolation directory");
+        let mut publisher = GitTemporaryRefPublisher::new(
+            FakeGitRunner::with(responses),
+            directory.path(),
+            "source",
+            "execution",
+            Duration::from_secs(5),
+        )
+        .expect("publisher");
+        let temporary_ref = TemporaryGitRef::new(
+            config.workflow.temporary_branch_namespace(),
+            BranchName::new("rustferry/goal3/builds/operation-1").expect("branch"),
+        )
+        .expect("temporary ref");
+        let source_revision = CommitSha::new(SOURCE_SHA).expect("source revision");
+        let snapshot_ref =
+            GitSnapshotSourceRef::for_operation("operation-1").expect("snapshot ref");
+        let request = TemporaryRefPublishRequest {
+            repository: &config.repository,
+            source_repository: &config.source_repository,
+            trusted_source_ref: config.workflow.trusted_source_ref(),
+            source_revision: &source_revision,
+            snapshot_source_ref: Some(&snapshot_ref),
+            temporary_ref: &temporary_ref,
+            workflow_path: workflow.path(),
+            workflow_bytes: workflow.yaml().as_bytes(),
+            workflow_fingerprint: &config.workflow_fingerprint,
+            manifest_bytes: b"{\"schema_version\":1}\n",
+            operation_id: "operation-1",
+            created_at_ms: 1_700_000_000_000,
+            authorized: true,
+        };
+        let prepared = publisher
+            .prepare(&request)
+            .expect("initial exact source check")
+            .expect("prepared dispatch");
+        let failure = publisher
+            .publish_prepared(&request, Some(&prepared))
+            .expect_err("source ref drift must block dispatch push");
+        assert_eq!(
+            failure.error(),
+            TemporaryRefPublishError::GitSnapshotRefConflict
+        );
+        assert!(failure.possible_publication().is_none());
+        let runner = publisher.into_runner();
+        assert!(
+            !runner.invocations.iter().any(|invocation| {
+                invocation.arguments.first() == Some(&OsString::from("push"))
+            })
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn prepared_publications_do_not_share_mutable_cross_job_state() {
+        let config = provider_config(all_authorized());
+        let workflow = generate_workflow(&config.workflow);
+        let temporary_ref_a = TemporaryGitRef::new(
+            config.workflow.temporary_branch_namespace(),
+            BranchName::new("rustferry/goal3/builds/operation-1").expect("branch A"),
+        )
+        .expect("temporary ref A");
+        let temporary_ref_b = TemporaryGitRef::new(
+            config.workflow.temporary_branch_namespace(),
+            BranchName::new("rustferry/goal3/builds/operation-2").expect("branch B"),
+        )
+        .expect("temporary ref B");
+        let source_revision = CommitSha::new(SOURCE_SHA).expect("source");
+        let mut responses = successful_prepare_git_responses(workflow.yaml().as_bytes());
+        responses.extend(successful_prepare_git_responses(workflow.yaml().as_bytes()));
+        responses.extend(successful_prepare_git_responses(workflow.yaml().as_bytes()));
+        responses.push(Ok(Vec::new()));
+        responses.push(Ok(format!(
+            "{DISPATCH_SHA}\trefs/heads/{}\n",
+            temporary_ref_a.branch().as_str()
+        )
+        .into_bytes()));
+        let directory = tempdir().expect("isolation directory");
+        let mut publisher = GitTemporaryRefPublisher::new(
+            FakeGitRunner::with(responses),
+            directory.path(),
+            "source",
+            "execution",
+            Duration::from_secs(5),
+        )
+        .expect("publisher");
+
+        let prepared_a = publisher
+            .prepare(&TemporaryRefPublishRequest {
+                repository: &config.repository,
+                source_repository: &config.source_repository,
+                trusted_source_ref: config.workflow.trusted_source_ref(),
+                source_revision: &source_revision,
+                snapshot_source_ref: None,
+                temporary_ref: &temporary_ref_a,
+                workflow_path: workflow.path(),
+                workflow_bytes: workflow.yaml().as_bytes(),
+                workflow_fingerprint: &config.workflow_fingerprint,
+                manifest_bytes: b"{\"schema_version\":1}\n",
+                operation_id: "operation-1",
+                created_at_ms: 1_700_000_000_000,
+                authorized: true,
+            })
+            .expect("prepare A")
+            .expect("prepared A");
+        publisher
+            .prepare(&TemporaryRefPublishRequest {
+                repository: &config.repository,
+                source_repository: &config.source_repository,
+                trusted_source_ref: config.workflow.trusted_source_ref(),
+                source_revision: &source_revision,
+                snapshot_source_ref: None,
+                temporary_ref: &temporary_ref_b,
+                workflow_path: workflow.path(),
+                workflow_bytes: workflow.yaml().as_bytes(),
+                workflow_fingerprint: &config.workflow_fingerprint,
+                manifest_bytes: b"{\"schema_version\":1}\n",
+                operation_id: "operation-2",
+                created_at_ms: 1_700_000_000_000,
+                authorized: true,
+            })
+            .expect("interleaved prepare B")
+            .expect("prepared B");
+        let published_a = publisher
+            .publish_prepared(
+                &TemporaryRefPublishRequest {
+                    repository: &config.repository,
+                    source_repository: &config.source_repository,
+                    trusted_source_ref: config.workflow.trusted_source_ref(),
+                    source_revision: &source_revision,
+                    snapshot_source_ref: None,
+                    temporary_ref: &temporary_ref_a,
+                    workflow_path: workflow.path(),
+                    workflow_bytes: workflow.yaml().as_bytes(),
+                    workflow_fingerprint: &config.workflow_fingerprint,
+                    manifest_bytes: b"{\"schema_version\":1}\n",
+                    operation_id: "operation-1",
+                    created_at_ms: 1_700_000_000_000,
+                    authorized: true,
+                },
+                Some(&prepared_a),
+            )
+            .expect("publish A after interleaved prepare B");
+        assert_eq!(published_a, prepared_a);
+        let runner = publisher.into_runner();
+        assert!(runner.responses.is_empty());
+        assert_eq!(
+            runner
+                .invocations
+                .iter()
+                .filter(|invocation| {
+                    invocation
+                        .arguments
+                        .first()
+                        .and_then(|argument| argument.to_str())
+                        == Some("push")
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn publish_prepared_revalidates_source_trust_immediately_before_push() {
+        let config = provider_config(all_authorized());
+        let workflow = generate_workflow(&config.workflow);
+        let temporary_ref = TemporaryGitRef::new(
+            config.workflow.temporary_branch_namespace(),
+            BranchName::new("rustferry/goal3/builds/operation-1").expect("branch"),
+        )
+        .expect("temporary ref");
+        let source_revision = CommitSha::new(SOURCE_SHA).expect("source");
+        let mut responses = successful_prepare_git_responses(workflow.yaml().as_bytes());
+        let mut revoked = successful_prepare_git_responses(workflow.yaml().as_bytes());
+        revoked.truncate(10);
+        revoked[9] = Err(GitExecutionError::CommandFailed { exit_code: Some(1) });
+        responses.extend(revoked);
+        let directory = tempdir().expect("isolation directory");
+        let mut publisher = GitTemporaryRefPublisher::new(
+            FakeGitRunner::with(responses),
+            directory.path(),
+            "source",
+            "execution",
+            Duration::from_secs(5),
+        )
+        .expect("publisher");
+        let request = TemporaryRefPublishRequest {
+            repository: &config.repository,
+            source_repository: &config.source_repository,
+            trusted_source_ref: config.workflow.trusted_source_ref(),
+            source_revision: &source_revision,
+            snapshot_source_ref: None,
+            temporary_ref: &temporary_ref,
+            workflow_path: workflow.path(),
+            workflow_bytes: workflow.yaml().as_bytes(),
+            workflow_fingerprint: &config.workflow_fingerprint,
+            manifest_bytes: b"{\"schema_version\":1}\n",
+            operation_id: "operation-1",
+            created_at_ms: 1_700_000_000_000,
+            authorized: true,
+        };
+        let prepared = publisher
+            .prepare(&request)
+            .expect("initial trust preflight")
+            .expect("prepared publication");
+        let failure = publisher
+            .publish_prepared(&request, Some(&prepared))
+            .expect_err("revoked source trust must block publication");
+        assert_eq!(
+            failure.error(),
+            TemporaryRefPublishError::SourceRevisionNotTrusted
+        );
+        assert!(failure.possible_publication().is_none());
+        let runner = publisher.into_runner();
+        assert!(runner.responses.is_empty());
+        assert!(!runner.invocations.iter().any(|invocation| {
+            invocation
+                .arguments
+                .first()
+                .and_then(|argument| argument.to_str())
+                == Some("push")
+        }));
     }
 
     #[test]
@@ -4746,6 +23578,7 @@ mod tests {
                 source_repository: &config.source_repository,
                 trusted_source_ref: config.workflow.trusted_source_ref(),
                 source_revision: &CommitSha::new(SOURCE_SHA).expect("source"),
+                snapshot_source_ref: None,
                 temporary_ref: &temporary_ref,
                 workflow_path: workflow.path(),
                 workflow_bytes: workflow.yaml().as_bytes(),
@@ -4805,17 +23638,20 @@ mod tests {
         assert!(push.arguments.contains(&OsString::from(format!(
             "{DISPATCH_SHA}:{full_temporary_ref}"
         ))));
-        assert!(push.arguments.contains(&OsString::from(
-            "ssh://git@github.com/ShiroKSH/rustferry-signing"
-        )));
+        assert!(
+            push.arguments
+                .contains(&OsString::from("git@github.com:shiroksh/rustferry-signing"))
+        );
         let fetch = runner
             .invocations
             .iter()
             .find(|invocation| invocation.arguments.first() == Some(&OsString::from("fetch")))
             .expect("trusted-ref fetch");
-        assert!(fetch.arguments.contains(&OsString::from(
-            "git@github.com:ShiroKSH/rust-and-iphone.git"
-        )));
+        assert!(
+            fetch
+                .arguments
+                .contains(&OsString::from("git@github.com:shiroksh/rust-and-iphone"))
+        );
         assert_eq!(
             runner
                 .invocations
@@ -4836,22 +23672,28 @@ mod tests {
         );
         assert!(commit.stdin_len > 0);
         for expected in [
-            ("GIT_AUTHOR_NAME", "ShiroKSH"),
-            ("GIT_AUTHOR_EMAIL", "kushidashiro@gmail.com"),
-            ("GIT_COMMITTER_NAME", "ShiroKSH"),
-            ("GIT_COMMITTER_EMAIL", "kushidashiro@gmail.com"),
+            (GitEnvironmentVariable::AuthorName, "ShiroKSH"),
+            (
+                GitEnvironmentVariable::AuthorEmail,
+                "kushidashiro@gmail.com",
+            ),
+            (GitEnvironmentVariable::CommitterName, "ShiroKSH"),
+            (
+                GitEnvironmentVariable::CommitterEmail,
+                "kushidashiro@gmail.com",
+            ),
         ] {
             assert!(
                 commit
                     .environment
-                    .contains(&(OsString::from(expected.0), OsString::from(expected.1),))
+                    .contains(&(expected.0, OsString::from(expected.1),))
             );
         }
         assert!(
             commit
                 .environment
                 .iter()
-                .any(|(name, _)| name == "GIT_AUTHOR_DATE")
+                .any(|(name, _)| *name == GitEnvironmentVariable::AuthorDate)
         );
     }
 
@@ -4968,6 +23810,7 @@ mod tests {
         );
         assert_eq!(captured.manifest.request, valid_request());
         assert!(captured.authorized);
+        assert!(publisher.publication_leases.is_empty());
         assert!(!provider.capabilities().artifact_download);
         let state = provider.state.lock().expect("state");
         let record = state.jobs.get("operation-1").expect("job record");
@@ -5013,7 +23856,7 @@ mod tests {
     }
 
     #[test]
-    fn submission_requires_worker_supported_artifacts_and_one_profile() {
+    fn submission_requires_worker_supported_artifacts_and_bounded_profiles() {
         let config = provider_config(all_authorized());
         let provider = GithubBuildProvider::with_artifact_store_and_clock(
             config.clone(),
@@ -5026,6 +23869,8 @@ mod tests {
             provider.capabilities().artifact_types,
             BTreeSet::from([
                 IosArtifactType::Ipa,
+                IosArtifactType::AppBundle,
+                IosArtifactType::Dsym,
                 IosArtifactType::SigningReport,
                 IosArtifactType::Xcarchive,
             ])
@@ -5036,6 +23881,27 @@ mod tests {
                 SigningMode::ManualDevelopment,
                 SigningMode::UnsignedCompileOnly,
             ])
+        );
+
+        let mut optional_artifacts = valid_request();
+        optional_artifacts.requested_artifacts.extend([
+            IosArtifactType::AppBundle,
+            IosArtifactType::Dsym,
+            IosArtifactType::Xcarchive,
+        ]);
+        validate_submission(&config, &optional_artifacts)
+            .expect("provider accepts supported optional signed artifacts");
+
+        let mut missing_ipa = valid_request();
+        missing_ipa
+            .requested_artifacts
+            .remove(&IosArtifactType::Ipa);
+        assert_eq!(
+            validate_submission(&config, &missing_ipa).expect_err("signed IPA is mandatory"),
+            RemoteBuildError::InvalidEventPayload {
+                event: "ios_device_build_request",
+                reason: "signed builds must request the installable IPA",
+            }
         );
 
         let mut extra_artifact = valid_request();
@@ -5050,18 +23916,163 @@ mod tests {
             ))
         );
 
-        let mut multiple_profiles = valid_request();
-        multiple_profiles
-            .signing
-            .provisioning
-            .push(multiple_profiles.signing.provisioning[0].clone());
-        let error = poll_ready(provider.submit(multiple_profiles, CancellationToken::new()))
-            .expect_err("multiple profile mapping is not implemented");
+        let mut too_many_profiles = valid_request();
+        for _ in 0..MAX_SIGNING_PROFILES {
+            too_many_profiles
+                .signing
+                .provisioning
+                .push(too_many_profiles.signing.provisioning[0].clone());
+        }
+        let error = poll_ready(provider.submit(too_many_profiles, CancellationToken::new()))
+            .expect_err("more than three profiles must fail closed");
         assert!(matches!(
             error,
             RemoteBuildError::ProviderFailure { code, .. }
                 if code == "profile_mapping_unsupported"
         ));
+    }
+
+    #[test]
+    fn submission_accepts_exact_static_multi_profile_map_and_rejects_role_swaps() {
+        let (request, names) = multi_profile_request();
+        let config = provider_config_with_secret_names(all_authorized(), names);
+        validate_submission(&config, &request).expect("exact multi-profile map");
+
+        let mut swapped = request.clone();
+        let first = swapped.signing.provisioning[0].profile.clone();
+        swapped.signing.provisioning[0].profile = swapped.signing.provisioning[1].profile.clone();
+        swapped.signing.provisioning[1].profile = first;
+        let error = validate_submission(&config, &swapped).expect_err("profile roles are bound");
+        assert!(matches!(
+            error,
+            RemoteBuildError::ProviderFailure { code, retryable: false, .. }
+                if code == "signing_secret_reference_mismatch"
+        ));
+
+        let legacy = provider_config(all_authorized());
+        let error = validate_submission(&legacy, &request)
+            .expect_err("legacy profile binding must remain single-profile only");
+        assert!(matches!(
+            error,
+            RemoteBuildError::ProviderFailure { code, retryable: false, .. }
+                if code == "signing_secret_reference_mismatch"
+        ));
+    }
+
+    #[test]
+    fn submission_rejects_application_and_extension_identity_drift() {
+        let (request, names) = multi_profile_request();
+        let config = provider_config_with_secret_names(all_authorized(), names);
+
+        let mut app_bundle_drift = request.clone();
+        app_bundle_drift.bundle_identifier = "com.example.renamed-app".to_owned();
+        app_bundle_drift
+            .signing
+            .targets
+            .iter_mut()
+            .find(|target| target.kind == SigningTargetKind::Application)
+            .expect("application target")
+            .bundle_identifier =
+            BundleIdentifier::new("com.example.renamed-app").expect("drifted app bundle");
+        app_bundle_drift
+            .validate()
+            .expect("internally valid app bundle drift");
+        assert_signing_reference_mismatch(&config, &app_bundle_drift);
+
+        let mut extension_bundle_drift = request.clone();
+        extension_bundle_drift
+            .signing
+            .targets
+            .iter_mut()
+            .find(|target| target.kind == SigningTargetKind::Extension)
+            .expect("extension target")
+            .bundle_identifier = BundleIdentifier::new("com.example.app.renamed-widget")
+            .expect("drifted extension bundle");
+        extension_bundle_drift
+            .product
+            .nested_bundles
+            .iter_mut()
+            .find(|bundle| bundle.kind == UnsignedNestedBundleKind::AppExtension)
+            .expect("extension bundle")
+            .bundle_identifier = "com.example.app.renamed-widget".to_owned();
+        extension_bundle_drift
+            .validate()
+            .expect("internally valid extension bundle drift");
+        assert_signing_reference_mismatch(&config, &extension_bundle_drift);
+
+        let mut extension_name_drift = request.clone();
+        extension_name_drift
+            .signing
+            .targets
+            .iter_mut()
+            .find(|target| target.kind == SigningTargetKind::Extension)
+            .expect("extension target")
+            .name = "RenamedWidget".to_owned();
+        extension_name_drift
+            .signing
+            .provisioning
+            .iter_mut()
+            .find(|profile| profile.target == "Widget")
+            .expect("extension profile")
+            .target = "RenamedWidget".to_owned();
+        extension_name_drift
+            .signing
+            .entitlements
+            .iter_mut()
+            .find(|entitlements| entitlements.target == "Widget")
+            .expect("extension entitlements")
+            .target = "RenamedWidget".to_owned();
+        extension_name_drift
+            .validate()
+            .expect("internally valid extension name drift");
+        assert_signing_reference_mismatch(&config, &extension_name_drift);
+    }
+
+    #[test]
+    fn submission_target_graph_match_is_order_insensitive_and_exact() {
+        let (request, names) = multi_profile_request_with_framework();
+        let config = provider_config_with_secret_names(all_authorized(), names);
+        validate_submission(&config, &request).expect("exact full target graph");
+
+        let mut reordered = request.clone();
+        reordered.signing.targets.reverse();
+        reordered.validate().expect("valid reordered target graph");
+        validate_submission(&config, &reordered).expect("target order is not identity");
+
+        let mut omitted = request.clone();
+        omitted
+            .signing
+            .targets
+            .retain(|target| target.name != "RuntimeBridge");
+        omitted
+            .product
+            .nested_bundles
+            .retain(|bundle| bundle.executable != "RuntimeBridge");
+        omitted.validate().expect("valid omitted framework graph");
+        assert_signing_reference_mismatch(&config, &omitted);
+
+        let mut extra = request.clone();
+        extra.signing.targets.push(SigningTarget {
+            name: "SupportKit".to_owned(),
+            bundle_identifier: BundleIdentifier::new("com.example.app.support-kit")
+                .expect("extra framework bundle"),
+            kind: SigningTargetKind::Framework,
+        });
+        extra
+            .product
+            .nested_bundles
+            .push(UnsignedNestedBundleExpectation {
+                relative_path: "Frameworks/SupportKit.framework".to_owned(),
+                bundle_identifier: "com.example.app.support-kit".to_owned(),
+                executable: "SupportKit".to_owned(),
+                kind: UnsignedNestedBundleKind::Framework,
+            });
+        extra
+            .product
+            .nested_bundles
+            .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        extra.validate().expect("valid extra framework graph");
+        assert_signing_reference_mismatch(&config, &extra);
     }
 
     #[test]
@@ -5289,7 +24300,7 @@ mod tests {
     }
 
     #[test]
-    fn uncertain_push_retains_exact_cleanup_ownership() {
+    fn uncertain_push_requires_exact_reconciliation_before_normal_polling() {
         let publication = PublishedTemporaryRef::new(
             TemporaryGitRef::new(
                 provider_config(all_authorized())
@@ -5301,33 +24312,68 @@ mod tests {
             CommitSha::new(DISPATCH_SHA).expect("dispatch SHA"),
         );
         let publisher = FakePublisher {
+            prepared_publication: Some(publication.clone()),
             failure: Some(TemporaryRefPublishFailure::uncertain(
                 TemporaryRefPublishError::Git(GitExecutionError::TimedOut),
-                publication,
+                publication.clone(),
             )),
+            reconciliation: Some(TemporaryRefReconciliation::Exact(publication)),
             ..FakePublisher::default()
         };
         let provider = GithubBuildProvider::with_artifact_store_and_clock(
             provider_config(all_authorized()),
-            signed_transport(FakeGhRunner::default()),
+            transport(FakeGhRunner::with([Ok(Vec::new())])),
             publisher,
             NoVerifiedArtifactStore,
             FixedClock(1_700_000_000_000),
         );
-        let handle = poll_ready(provider.submit(valid_request(), CancellationToken::new()))
+        let handle = poll_ready(provider.submit(unsigned_request(), CancellationToken::new()))
             .expect("uncertain publication returns owned handle");
-        assert_eq!(handle.state, JobState::Queued);
+        assert_eq!(handle.state, JobState::Created);
         let state = provider.state.lock().expect("state");
         let record = state.jobs.get("operation-1").expect("durable record");
         assert!(record.publication_uncertain);
+        assert!(record.dispatch_commit.is_none());
+        assert!(record.publication_takeover_lease_owned);
+        drop(state);
+
+        let error = poll_ready(provider.events(
+            EventRequest {
+                job_id: "operation-1".to_owned(),
+                after_sequence: None,
+                limit: 100,
+            },
+            CancellationToken::new(),
+        ))
+        .expect_err("ordinary polling must not adopt a possible push");
+        assert!(matches!(
+            error,
+            RemoteBuildError::ProviderFailure {
+                code,
+                retryable: true,
+                ..
+            } if code == "publication_reconciliation_required"
+        ));
+
+        assert_eq!(
+            provider
+                .reconcile_restored_job("operation-1", &CancellationToken::new())
+                .expect("exact possible-push reconciliation"),
+            GithubJobReconciliation::Recovered
+        );
+        let state = provider.state.lock().expect("state");
+        let record = state.jobs.get("operation-1").expect("reconciled record");
+        assert_eq!(record.state, JobState::Queued);
+        assert!(!record.publication_uncertain);
         assert_eq!(
             record.dispatch_commit.as_ref().map(CommitSha::as_str),
             Some(DISPATCH_SHA)
         );
+        assert!(!record.publication_takeover_lease_owned);
     }
 
     #[test]
-    fn publisher_identity_mismatch_returns_failed_owned_handle() {
+    fn publisher_binding_mismatch_fails_without_adopting_cleanup_ownership() {
         let config = provider_config(all_authorized());
         let returned_ref = TemporaryGitRef::new(
             config.workflow.temporary_branch_namespace(),
@@ -5355,10 +24401,7 @@ mod tests {
             record.temporary_ref.branch().as_str(),
             "rustferry/goal3/builds/operation-1"
         );
-        assert_eq!(
-            record.dispatch_commit.as_ref().map(CommitSha::as_str),
-            Some(DISPATCH_SHA)
-        );
+        assert_eq!(record.dispatch_commit, None);
         assert!(record.publication_uncertain);
     }
 
@@ -5454,6 +24497,358 @@ mod tests {
         assert_eq!(deletion.branch, "rustferry/goal3/builds/operation-1");
         assert_eq!(deletion.expected_commit, DISPATCH_SHA);
         assert!(deletion.authorized);
+    }
+
+    #[test]
+    fn unsupported_artifact_removal_does_not_bind_cleanup_intent() {
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with([
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(completed_run_row("success")),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(completed_run_row("success")),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(completed_run_row("success")),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(completed_run_row("success")),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+            ])),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        );
+        provider
+            .restore_job_resumes(vec![durable_success_resume()])
+            .expect("restore successful job");
+
+        let error = poll_ready(provider.cleanup(
+            CleanupRequest {
+                job_id: "operation-1".to_owned(),
+                remove_artifacts: true,
+            },
+            CancellationToken::new(),
+        ))
+        .expect_err("unsupported removal must fail before durable intent");
+        assert!(matches!(
+            error,
+            RemoteBuildError::ProviderFailure { code, .. }
+                if code == "artifact_removal_unsupported"
+        ));
+        {
+            let state = provider.state.lock().expect("state");
+            let record = state.jobs.get("operation-1").expect("job");
+            assert!(!record.cleanup_requested);
+            assert!(!record.remove_artifacts_requested);
+            assert!(!record.artifacts_removed);
+            assert!(!record.temporary_ref_deleted);
+        }
+
+        poll_ready(provider.cleanup(
+            CleanupRequest {
+                job_id: "operation-1".to_owned(),
+                remove_artifacts: false,
+            },
+            CancellationToken::new(),
+        ))
+        .expect("ref-only retry remains available");
+        assert_eq!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .deletions
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn cleanup_revalidates_exact_run_attempt_before_binding_or_mutating() {
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with([
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(completed_run_row("success")),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(queued_run_attempt_row(2)),
+            ])),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        );
+        provider
+            .restore_job_resumes(vec![durable_success_resume()])
+            .expect("restore successful attempt");
+
+        assert!(
+            poll_ready(provider.cleanup(
+                CleanupRequest {
+                    job_id: "operation-1".to_owned(),
+                    remove_artifacts: false,
+                },
+                CancellationToken::new(),
+            ))
+            .is_err()
+        );
+        let state = provider.lock_state().expect("state");
+        let record = state.jobs.get("operation-1").expect("job");
+        assert!(!record.cleanup_requested);
+        assert!(!record.temporary_ref_deleted);
+        assert!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .deletions
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cleanup_never_confirms_after_a_rerun_starts_during_ref_deletion() {
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with([
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(completed_run_row("success")),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(completed_run_row("success")),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(completed_run_row("success")),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(queued_run_attempt_row(2)),
+            ])),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        );
+        provider
+            .restore_job_resumes(vec![durable_success_resume()])
+            .expect("restore successful attempt");
+
+        let error = poll_ready(provider.cleanup(
+            CleanupRequest {
+                job_id: "operation-1".to_owned(),
+                remove_artifacts: false,
+            },
+            CancellationToken::new(),
+        ))
+        .expect_err("rerun drift must prevent positive cleanup confirmation");
+        assert!(
+            matches!(
+                &error,
+                RemoteBuildError::ProviderFailure {
+                    code,
+                    retryable: true,
+                    ..
+                } if code == "cleanup_run_changed_after_mutation"
+            ),
+            "{error:?}"
+        );
+        let state = provider.lock_state().expect("state");
+        let record = state.jobs.get("operation-1").expect("job");
+        assert!(record.temporary_ref_deleted);
+        assert_ne!(record.state, JobState::Cleaned);
+        assert!(
+            !record
+                .events
+                .iter()
+                .any(|event| matches!(event.kind, RemoteBuildEventKind::CleanupFinished { .. }))
+        );
+        drop(state);
+        assert_eq!(
+            provider
+                .publisher
+                .lock()
+                .expect("publisher")
+                .deletions
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn signed_cleanup_evidence_survives_a_distinct_later_attempt() {
+        let mut responses = vec![
+            Ok(authenticated_user_row()),
+            Ok(private_repository_row()),
+            Ok(queued_run_attempt_row(2)),
+        ];
+        for response in [
+            authenticated_user_row(),
+            private_repository_row(),
+            queued_run_attempt_row(2),
+            authenticated_user_row(),
+            private_repository_row(),
+            queued_run_attempt_row(2),
+            authenticated_user_row(),
+            private_repository_row(),
+            authenticated_user_row(),
+            private_repository_row(),
+            queued_run_attempt_row(2),
+            authenticated_user_row(),
+            private_repository_row(),
+        ] {
+            responses.push(Ok(response));
+        }
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with(responses)),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        );
+        provider
+            .restore_job_resumes(vec![durable_signed_success_resume()])
+            .expect("restore attempt-one evidence while attempt two exists");
+
+        let confirmation = poll_ready(provider.cleanup(
+            CleanupRequest {
+                job_id: "operation-1".to_owned(),
+                remove_artifacts: false,
+            },
+            CancellationToken::new(),
+        ))
+        .expect("attempt-one cleanup evidence remains valid");
+
+        assert!(confirmation.workspace_removed);
+        assert!(confirmation.signing_material_removed);
+        let state = provider.lock_state().expect("state");
+        let record = state.jobs.get("operation-1").expect("job");
+        assert_eq!(record.state, JobState::Cleaned);
+        assert_eq!(
+            record
+                .run_snapshot
+                .as_ref()
+                .expect("bound attempt")
+                .run_attempt(),
+            1
+        );
+    }
+
+    #[test]
+    fn signed_cleanup_evidence_is_bind_once_and_rejects_attempt_replay() {
+        let resume = durable_signed_success_resume();
+        let mut replay = resume.clone();
+        replay
+            .signed_cleanup_evidence
+            .as_mut()
+            .expect("evidence")
+            .run
+            .run_attempt = 2;
+        assert!(
+            replay
+                .signed_cleanup_evidence
+                .as_ref()
+                .expect("evidence")
+                .validate_for_resume(&replay)
+                .is_err()
+        );
+        assert!(resume.validate_successor(&replay).is_err());
+
+        let mut removed = resume.clone();
+        removed.signed_cleanup_evidence = None;
+        assert!(resume.validate_successor(&removed).is_err());
+    }
+
+    #[test]
+    fn signed_cleanup_evidence_rejects_manifest_and_envelope_forgery() {
+        let resume = durable_signed_success_resume();
+        let mut candidates = Vec::new();
+
+        let mut candidate = resume.clone();
+        candidate.manifests[0].operation_id = "other-operation".to_owned();
+        candidates.push(candidate);
+        let mut candidate = resume.clone();
+        candidate.manifests[0].job_id = "other-job".to_owned();
+        candidates.push(candidate);
+        let mut candidate = resume.clone();
+        candidate.manifests[0].source_repository =
+            Some("https://github.com/other/source".to_owned());
+        candidates.push(candidate);
+        let mut candidate = resume.clone();
+        candidate.manifests[0].source_sha256 = "9".repeat(64);
+        candidates.push(candidate);
+        let mut candidate = resume.clone();
+        candidate.manifests[0]
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.kind == ArtifactKind::SigningReport)
+            .expect("signing report")
+            .sha256 = "8".repeat(64);
+        candidates.push(candidate);
+        let mut candidate = resume.clone();
+        candidate
+            .signed_cleanup_evidence
+            .as_mut()
+            .expect("evidence")
+            .execution_repository_id += 1;
+        candidates.push(candidate);
+        let mut candidate = resume.clone();
+        candidate
+            .signed_cleanup_evidence
+            .as_mut()
+            .expect("evidence")
+            .dispatch_revision = SOURCE_SHA.to_owned();
+        candidates.push(candidate);
+        let mut candidate = resume.clone();
+        candidate
+            .signed_cleanup_evidence
+            .as_mut()
+            .expect("evidence")
+            .compile_evidence_sha256 = "7".repeat(64);
+        candidates.push(candidate);
+
+        for candidate in candidates {
+            assert!(
+                candidate
+                    .signed_cleanup_evidence
+                    .as_ref()
+                    .expect("evidence")
+                    .validate_for_resume(&candidate)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn failed_signed_attempt_restores_cleanup_failure_without_positive_evidence() {
+        let config = provider_config(all_authorized());
+        let principal = GithubPrincipalIdentityV1::User {
+            id: AUTHENTICATED_USER_ID,
+            login: "ShiroKSH".to_owned(),
+        };
+        let mut resume = durable_resume_with_run();
+        resume.request = valid_request();
+        resume.request_sha256 = canonical_request_sha256(&resume.request).expect("request digest");
+        let run = resume.run.as_mut().expect("run");
+        run.status = GithubRunStatusV1::Completed;
+        run.conclusion = Some(GithubRunConclusionV1::Failure);
+        resume.state = JobState::CleanupFailed;
+        resume.cleanup_requested = true;
+        resume.temporary_ref_deleted = true;
+
+        let record = resume
+            .into_record(&config, &principal, 991)
+            .expect("negative cleanup evidence remains restorable");
+        assert_eq!(record.state, JobState::CleanupFailed);
+        assert!(record.signed_cleanup_evidence.is_none());
     }
 
     #[test]
@@ -5598,8 +24993,11 @@ mod tests {
     }
 
     #[test]
-    fn terminal_run_can_be_cleaned_after_artifact_verification_error() {
+    fn signed_terminal_run_cannot_claim_signing_material_cleanup_without_worker_evidence() {
         let responses = [
+            Ok(completed_run_row("success")),
+            Ok(completed_run_row("success")),
+            Ok(completed_run_row("success")),
             Ok(completed_run_row("success")),
             Ok(completed_run_row("success")),
         ];
@@ -5635,11 +25033,11 @@ mod tests {
         ))
         .expect("terminal run cleanup");
         assert!(confirmation.workspace_removed);
-        assert!(confirmation.signing_material_removed);
+        assert!(!confirmation.signing_material_removed);
         let state = provider.state.lock().expect("state");
         assert_eq!(
             state.jobs.get("operation-1").expect("job").state,
-            JobState::Cleaned
+            JobState::CleanupFailed
         );
         drop(state);
         assert_eq!(
@@ -5651,6 +25049,74 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn unsigned_cleanup_failure_can_retry_to_positive_confirmation() {
+        let mut resume = durable_resume_with_run();
+        let run = resume.run.as_mut().expect("run");
+        run.status = GithubRunStatusV1::Completed;
+        run.conclusion = Some(GithubRunConclusionV1::Cancelled);
+        resume.state = JobState::CleanupFailed;
+        resume.cleanup_requested = true;
+        resume.temporary_ref_deleted = true;
+        let previous = resume.clone();
+        let sink = CapturingCheckpointSink::default();
+        let checkpoints = Arc::clone(&sink.checkpoints);
+        let provider = GithubBuildProvider::with_artifact_store_and_clock(
+            provider_config(all_authorized()),
+            transport(FakeGhRunner::with([
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(completed_run_row("cancelled")),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(completed_run_row("cancelled")),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+                Ok(completed_run_row("cancelled")),
+                Ok(authenticated_user_row()),
+                Ok(private_repository_row()),
+            ])),
+            FakePublisher::default(),
+            NoVerifiedArtifactStore,
+            FixedClock(1_700_000_000_000),
+        )
+        .with_checkpoint_sink(sink);
+        provider
+            .restore_job_resumes(vec![resume])
+            .expect("restore cleanup failure");
+
+        let confirmation = poll_ready(provider.cleanup(
+            CleanupRequest {
+                job_id: "operation-1".to_owned(),
+                remove_artifacts: false,
+            },
+            CancellationToken::new(),
+        ))
+        .expect("retry unsigned cleanup");
+        assert!(confirmation.workspace_removed);
+        assert!(confirmation.signing_material_removed);
+        let latest = checkpoints
+            .lock()
+            .expect("checkpoints")
+            .last()
+            .cloned()
+            .expect("positive cleanup checkpoint");
+        previous
+            .validate_successor(&latest)
+            .expect("cleanup retry remains a monotonic successor");
+        assert_eq!(latest.state, JobState::Cleaned);
+        assert!(matches!(
+            latest.events[latest.events.len() - 2].kind,
+            RemoteBuildEventKind::CleanupStarted
+        ));
+        assert!(matches!(
+            latest.events.last().expect("finish event").kind,
+            RemoteBuildEventKind::CleanupFinished { .. }
+        ));
     }
 
     #[test]

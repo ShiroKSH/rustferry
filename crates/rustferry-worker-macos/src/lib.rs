@@ -23,5 +23,13 @@ pub mod profile;
 pub mod provisioning;
 /// Sealed unsigned-archive handoff between compile and protected signing jobs.
 pub mod sealed;
+/// Bounded one-shot output lifecycle for snapshot worker sessions.
+pub mod session_output;
 /// Signed IPA validation and export evidence.
 pub mod signed_ipa;
+/// Optional signed app, XCArchive, and dSYM transports.
+pub(crate) mod signed_products;
+/// One-shot framed SSH snapshot-build session.
+pub mod snapshot_session;
+/// One-request, read-only stdio control plane for the SSH provider.
+pub mod stdio;
