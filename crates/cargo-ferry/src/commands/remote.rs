@@ -7,7 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
 use rustferry_core::{
     DirectoryFilesystemIdentity, RegularFileFilesystemIdentity, RetainedDirectoryIdentity,
     regular_file_identity_from_file, verify_directory_identity, verify_regular_file_identity,
@@ -7395,20 +7395,18 @@ fn ensure_provider_metadata_ignored(
             "Keep the RustFerry project inside its selected Git repository.",
         )
     })?;
+    let pathspec = repository_relative_git_pathspec(relative)?;
     reporter.verbose("git (sealed offline reader) check-ignore");
-    let output = git
-        .caller_git
-        .check_ignore(relative.as_str())
-        .map_err(|_| {
-            caller_git_command_error("verify private provider metadata is ignored", None)
-        })?;
+    let output = git.caller_git.check_ignore(&pathspec).map_err(|_| {
+        caller_git_command_error("verify private provider metadata is ignored", None)
+    })?;
     match output.exit_code() {
         Some(0) => Ok(()),
         Some(1) => Err(remote_error_with_details(
             "provider_config_not_ignored",
             "the private project-local GitHub provider directory is not ignored by Git",
             "Add target/ (or this exact target/ferry/github path) to the repository ignore rules before setup; never commit provider metadata or caches.",
-            vec![format!("path={relative}")],
+            vec![format!("path={pathspec}")],
         )),
         status => Err(CliError::CommandFailed {
             tool: "git".to_owned(),
@@ -7419,6 +7417,58 @@ fn ensure_provider_metadata_ignored(
             help: "Correct the Git repository configuration and retry setup.".to_owned(),
         }),
     }
+}
+
+fn repository_relative_git_pathspec(path: &Utf8Path) -> Result<String, CliError> {
+    const MAX_GIT_PATHSPEC_BYTES: usize = 4_096;
+
+    let invalid_path = || {
+        remote_error(
+            "invalid_provider_git_pathspec",
+            "the repository-relative provider path cannot be represented as a safe Git pathspec",
+            "Keep provider metadata under a normal repository-relative target/ferry path.",
+        )
+    };
+    let raw = path.as_str();
+    if raw.is_empty()
+        || raw.chars().any(char::is_control)
+        || raw
+            .split(['/', '\\'])
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        return Err(invalid_path());
+    }
+
+    let mut pathspec = String::new();
+    for (index, component) in path.components().enumerate() {
+        let Utf8Component::Normal(component) = component else {
+            return Err(invalid_path());
+        };
+        if component.is_empty()
+            || component.contains(['/', '\\'])
+            || component.chars().any(char::is_control)
+            || (index == 0 && component.starts_with('-'))
+        {
+            return Err(invalid_path());
+        }
+        let separator_bytes = usize::from(!pathspec.is_empty());
+        if pathspec
+            .len()
+            .saturating_add(separator_bytes)
+            .saturating_add(component.len())
+            > MAX_GIT_PATHSPEC_BYTES
+        {
+            return Err(invalid_path());
+        }
+        if separator_bytes != 0 {
+            pathspec.push('/');
+        }
+        pathspec.push_str(component);
+    }
+    if pathspec.is_empty() {
+        return Err(invalid_path());
+    }
+    Ok(pathspec)
 }
 
 fn parse_repository_spec(value: &str) -> Result<(Repository, String, String), CliError> {
@@ -17060,5 +17110,63 @@ mod tests {
             paths.workflow,
             repository.join(".github/workflows/rustferry-goal3-iphone.yml")
         );
+    }
+
+    #[test]
+    fn provider_metadata_ignore_preserves_portable_pathspec() {
+        let path = camino::Utf8Path::new("examples/counter/target/ferry/github/provider.json");
+
+        assert_eq!(
+            super::repository_relative_git_pathspec(path).expect("portable Git pathspec"),
+            "examples/counter/target/ferry/github/provider.json"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn provider_metadata_ignore_normalizes_windows_native_pathspec() {
+        let path = camino::Utf8PathBuf::from("examples")
+            .join("counter")
+            .join("target")
+            .join("ferry")
+            .join("github")
+            .join("provider.json");
+        assert!(path.as_str().contains('\\'));
+
+        assert_eq!(
+            super::repository_relative_git_pathspec(&path).expect("normalized Git pathspec"),
+            "examples/counter/target/ferry/github/provider.json"
+        );
+    }
+
+    #[test]
+    fn provider_metadata_ignore_rejects_unsafe_paths() {
+        #[cfg(windows)]
+        let absolute = camino::Utf8Path::new(r"C:\repository\target\provider.json");
+        #[cfg(not(windows))]
+        let absolute = camino::Utf8Path::new("/repository/target/provider.json");
+        assert!(super::repository_relative_git_pathspec(absolute).is_err());
+
+        for invalid in [
+            "",
+            ".",
+            "../provider.json",
+            "target/../provider.json",
+            "-target/provider.json",
+            "target//provider.json",
+            "target/provider.json/",
+            "target/\0/provider.json",
+            "target/\r/provider.json",
+            "target/\n/provider.json",
+            "target/\u{1f}/provider.json",
+        ] {
+            assert!(
+                super::repository_relative_git_pathspec(camino::Utf8Path::new(invalid)).is_err(),
+                "accepted unsafe path"
+            );
+        }
+
+        let overlong = camino::Utf8PathBuf::from("a".repeat(4_097));
+        assert!(super::repository_relative_git_pathspec(&overlong).is_err());
     }
 }
