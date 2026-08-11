@@ -24,18 +24,35 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 2
           persist-credentials: false
       - name: Permit exactly one APK attempt
         id: gate
         shell: bash
         run: |
           set -euo pipefail
-          changed="$(git diff-tree --no-commit-id --name-only -r HEAD)"
-          if test "$changed" = '.github/workflows/android-source-beta-acceptance.yml'; then
+          expected_head='${{ github.event.pull_request.head.sha }}'
+          actual_head="$(git rev-parse HEAD)"
+          if test "$actual_head" != "$expected_head"; then
+            echo "Checked-out HEAD does not match the pull-request head." >&2
+            exit 1
+          fi
+          parent="$(git rev-parse HEAD^)"
+          changed="$(
+            git diff-tree \
+              --no-commit-id \
+              --name-only \
+              -r \
+              "$parent" \
+              HEAD
+          )"
+          if test "$changed" = \
+            '.github/workflows/android-source-beta-acceptance.yml'
+          then
             echo 'run=true' >> "$GITHUB_OUTPUT"
           else
             echo 'run=false' >> "$GITHUB_OUTPUT"
-            echo 'No APK build: the triggering commit is not the acceptance-workflow commit.'
+            echo 'No APK build: the head commit is not workflow-only.'
           fi
       - name: Check out exact accepted source
         if: steps.gate.outputs.run == 'true'
