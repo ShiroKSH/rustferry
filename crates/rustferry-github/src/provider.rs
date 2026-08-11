@@ -2946,21 +2946,19 @@ fn caller_git_control_sha256(path: &Path) -> Result<String, GitPublisherConfigEr
     reason = "the suffix is a Git config-key component, not a file extension"
 )]
 fn validate_caller_git_config_names(output: &[u8]) -> Result<(), GitPublisherConfigError> {
-    if output.len() > MAX_GIT_OUTPUT_BYTES || output.last().is_some_and(|byte| *byte != 0) {
+    if output.len() > MAX_GIT_OUTPUT_BYTES {
         return Err(GitPublisherConfigError::UnsafeCallerRepositoryConfig);
     }
-    for raw in output
-        .split(|byte| *byte == 0)
-        .filter(|value| !value.is_empty())
-    {
+    if output.is_empty() {
+        return Ok(());
+    }
+    let Some(output) = output.strip_suffix(&[0]) else {
+        return Err(GitPublisherConfigError::UnsafeCallerRepositoryConfig);
+    };
+    for raw in output.split(|byte| *byte == 0) {
         let key = std::str::from_utf8(raw)
             .map_err(|_| GitPublisherConfigError::UnsafeCallerRepositoryConfig)?;
-        if key.is_empty()
-            || key.len() > 512
-            || !key
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
-        {
+        if key.is_empty() || key.len() > 512 || key.chars().any(char::is_control) {
             return Err(GitPublisherConfigError::UnsafeCallerRepositoryConfig);
         }
         let key = key.to_ascii_lowercase();
@@ -14321,6 +14319,97 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         output.stdout
+    }
+
+    #[test]
+    fn caller_git_config_accepts_legal_subsection_names() {
+        assert_eq!(
+            validate_caller_git_config_names(
+                b"branch.goal3/windows-live-acceptance.remote\0branch.goal3/windows-live-acceptance.merge\0branch.release_candidate.remote\0",
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn caller_git_config_rejects_dangerous_families() {
+        for key in [
+            b"include.path\0".as_slice(),
+            b"includeIf.gitdir:/tmp/**.path\0",
+            b"extensions.worktreeConfig\0",
+            b"extensions.partialClone\0",
+            b"core.worktree\0",
+            b"filter.lfs.process\0",
+            b"protocol.ext.allow\0",
+            b"remote.origin.promisor\0",
+            b"remote.origin.partialCloneFilter\0",
+            b"diff.external\0",
+            b"diff.custom.command\0",
+            b"diff.custom.textconv\0",
+        ] {
+            assert_eq!(
+                validate_caller_git_config_names(key),
+                Err(GitPublisherConfigError::UnsafeCallerRepositoryConfig)
+            );
+        }
+    }
+
+    #[test]
+    fn caller_git_config_rejects_malformed_names_and_framing() {
+        for output in [
+            b"\0".as_slice(),
+            b"core.bare",
+            b"core.bare\0\0",
+            b"branch.topic\x01.remote\0",
+            b"branch.topic\r.remote\0",
+            b"branch.topic\n.remote\0",
+            b"branch.topic.\xff\0",
+        ] {
+            assert_eq!(
+                validate_caller_git_config_names(output),
+                Err(GitPublisherConfigError::UnsafeCallerRepositoryConfig)
+            );
+        }
+
+        let mut oversized = vec![b'a'; 513];
+        oversized.push(0);
+        assert_eq!(
+            validate_caller_git_config_names(&oversized),
+            Err(GitPublisherConfigError::UnsafeCallerRepositoryConfig)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn caller_git_config_allows_branch_name_with_slash_in_repository() {
+        let Some((_temporary, checkout, git)) = initialize_caller_git_fixture() else {
+            return;
+        };
+        fixture_git_output(
+            &git,
+            &checkout,
+            &["branch", "-M", "goal3/windows-live-acceptance"],
+        );
+        fixture_git_output(
+            &git,
+            &checkout,
+            &[
+                "config",
+                "branch.goal3/windows-live-acceptance.remote",
+                "origin",
+            ],
+        );
+        fixture_git_output(
+            &git,
+            &checkout,
+            &[
+                "config",
+                "branch.goal3/windows-live-acceptance.merge",
+                "refs/heads/goal3/windows-live-acceptance",
+            ],
+        );
+
+        CallerGitRepository::open(&checkout).expect("legal branch config");
     }
 
     #[cfg(windows)]
