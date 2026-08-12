@@ -114,16 +114,62 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          fail_phase() {
+            local phase="$1"
+            local message="$2"
+            echo "::error title=Android starter failure::$phase: $message" >&2
+            exit 1
+          }
           cli="$GITHUB_WORKSPACE/target/release/cargo-ferry"
           metadata="$RUNNER_TEMP/workspace-metadata.json"
-          cargo metadata --locked --no-deps --format-version 1 > "$metadata"
-          runtime_manifest="$(jq -er \
-            '.packages[] | select(.name == "rustferry") | .manifest_path' \
-            "$metadata")"
+          if ! cargo metadata \
+            --locked \
+            --no-deps \
+            --format-version 1 > "$metadata"
+          then
+            fail_phase \
+              "workspace_metadata" \
+              "cargo metadata failed for the exact accepted source"
+          fi
+          runtime_count="$(
+            jq \
+              '[.packages[] | select(.name == "rustferry")] | length' \
+              "$metadata"
+          )"
+          if test "$runtime_count" != '1'; then
+            fail_phase \
+              "runtime_package_selection" \
+              "expected exactly one workspace package named rustferry"
+          fi
+          if ! runtime_manifest="$(
+            jq -er \
+              '.packages[] |
+               select(.name == "rustferry") |
+               .manifest_path' \
+              "$metadata"
+          )"
+          then
+            fail_phase \
+              "runtime_manifest_selection" \
+              "could not obtain the rustferry manifest path"
+          fi
           runtime="$(dirname "$runtime_manifest")"
-          test "$runtime" = "$GITHUB_WORKSPACE/crates/rustferry"
+          if test "$runtime" != "$GITHUB_WORKSPACE/crates/rustferry"; then
+            fail_phase \
+              "runtime_path_binding" \
+              "workspace runtime package is not at the expected checked-out path"
+          fi
           project="$RUNNER_TEMP/rustferry-android-ubuntu-acceptance"
           new_result="$RUNNER_TEMP/android-new.json"
+          new_stderr_raw="$RUNNER_TEMP/android-new.raw.stderr"
+          new_result_sanitized="$RUNNER_TEMP/android-new.sanitized.json"
+          new_stderr_sanitized="$RUNNER_TEMP/android-new.stderr"
+          if test -e "$project"; then
+            fail_phase \
+              "starter_destination" \
+              "starter destination already exists"
+          fi
+          set +e
           "$cli" new rustferry-android-ubuntu-acceptance \
             --id org.rustferry.ubuntuacceptance \
             --parent "$RUNNER_TEMP" \
@@ -132,27 +178,149 @@ jobs:
             --runtime-path "$runtime" \
             --no-git \
             --no-check \
-            --json > "$new_result"
-          jq -e '.status == "ok"' "$new_result" > /dev/null
-          test -s "$project/Cargo.toml"
-          test -s "$project/Cargo.lock"
-          test -s "$project/ferry.toml"
-          test -d "$project/src"
-          test -d "$project/assets"
+            --json \
+            > "$new_result" \
+            2> "$new_stderr_raw"
+          new_status=$?
+          set -e
+          python3 - \
+            "$new_result" \
+            "$new_stderr_raw" \
+            "$new_result_sanitized" \
+            "$new_stderr_sanitized" <<'PY'
+          from pathlib import Path
+          import os
+          import sys
+
+          source_json, source_stderr, output_json, output_stderr = map(
+              Path, sys.argv[1:]
+          )
+
+          replacements = []
+          for name in (
+              "GITHUB_WORKSPACE",
+              "RUNNER_TEMP",
+              "HOME",
+              "ANDROID_SDK_ROOT",
+              "ANDROID_NDK",
+          ):
+              value = os.environ.get(name)
+              if value:
+                  replacements.append((value, f"${name}"))
+
+          replacements.sort(key=lambda item: len(item[0]), reverse=True)
+
+          def sanitize(path: Path) -> str:
+              if not path.exists():
+                  return ""
+              value = path.read_text(encoding="utf-8", errors="replace")
+              for original, replacement in replacements:
+                  value = value.replace(original, replacement)
+              return value[:65536]
+
+          output_json.write_text(sanitize(source_json), encoding="utf-8")
+          output_stderr.write_text(sanitize(source_stderr), encoding="utf-8")
+          PY
+          if test "$new_status" -ne 0; then
+            echo \
+              "::error title=RustFerry starter generation failed::cargo-ferry exited with status $new_status" \
+              >&2
+            if jq -e . "$new_result_sanitized" > /dev/null 2>&1; then
+              jq '{
+                schema_version,
+                command,
+                status,
+                error: {
+                  code: .error.code,
+                  message: .error.message,
+                  help: .error.help,
+                  details: .error.details
+                }
+              }' "$new_result_sanitized"
+            else
+              echo \
+                "cargo-ferry did not emit a valid structured JSON response." \
+                >&2
+              if test -s "$new_result_sanitized"; then
+                echo "Sanitized stdout:" >&2
+                sed -n '1,200p' "$new_result_sanitized" >&2
+              fi
+            fi
+            if test -s "$new_stderr_sanitized"; then
+              echo "Sanitized stderr:" >&2
+              sed -n '1,200p' "$new_stderr_sanitized" >&2
+            fi
+            exit "$new_status"
+          fi
+          if ! jq -e \
+            '.status == "ok" and .command == "new"' \
+            "$new_result" > /dev/null
+          then
+            echo "Unexpected sanitized JSON envelope:" >&2
+            jq '{
+              schema_version,
+              command,
+              status,
+              error
+            }' "$new_result_sanitized" >&2 || true
+            fail_phase \
+              "starter_result_envelope" \
+              "cargo-ferry returned success without the expected JSON envelope"
+          fi
+          test -s "$project/Cargo.toml" ||
+            fail_phase "starter_files" "generated Cargo.toml is missing"
+          test -s "$project/Cargo.lock" ||
+            fail_phase "starter_files" "generated Cargo.lock is missing"
+          test -s "$project/ferry.toml" ||
+            fail_phase "starter_files" "generated ferry.toml is missing"
+          test -d "$project/src" ||
+            fail_phase "starter_files" "generated src directory is missing"
+          test -d "$project/assets" ||
+            fail_phase "starter_files" "generated assets directory is missing"
           project_metadata="$RUNNER_TEMP/project-metadata.json"
-          cargo metadata --locked --no-deps --format-version 1 \
-            --manifest-path "$project/Cargo.toml" > "$project_metadata"
-          test "$(jq -er \
-            '.packages[] | select(.name == "rustferry-android-ubuntu-acceptance")
-             | .dependencies[] | select(.name == "rustferry") | .path' \
-            "$project_metadata")" = "$runtime"
+          if ! cargo metadata \
+            --locked \
+            --no-deps \
+            --format-version 1 \
+            --manifest-path "$project/Cargo.toml" \
+            > "$project_metadata"
+          then
+            fail_phase \
+              "generated_project_metadata" \
+              "Cargo could not load the generated starter"
+          fi
+          if ! generated_runtime="$(
+            jq -er \
+              '.packages[] |
+               select(.name == "rustferry-android-ubuntu-acceptance") |
+               .dependencies[] |
+               select(.name == "rustferry") |
+               .path' \
+              "$project_metadata"
+          )"
+          then
+            fail_phase \
+              "generated_runtime_dependency" \
+              "generated project does not contain the expected rustferry path dependency"
+          fi
+          if test "$generated_runtime" != "$runtime"; then
+            fail_phase \
+              "generated_runtime_dependency" \
+              "generated runtime dependency is not bound to the accepted workspace package"
+          fi
           forbidden="$(find "$project" -path "$project/target" -prune -o \
             \( -type f \( -name 'build.gradle' -o -name 'build.gradle.*' \
               -o -name 'settings.gradle' -o -name 'settings.gradle.*' \
               -o -name 'gradlew' -o -name '*.kt' -o -name '*.java' \) \
               -o -type d \( -name gradle -o -name android \) \) \
             -print -quit)"
-          test -z "$forbidden"
+          if test -n "$forbidden"; then
+            relative_forbidden="${forbidden#"$project"/}"
+            echo \
+              "::error title=Generated project is not Rust-only::unexpected path: $relative_forbidden" \
+              >&2
+            exit 1
+          fi
           echo "project=$project" >> "$GITHUB_OUTPUT"
           echo "cli=$cli" >> "$GITHUB_OUTPUT"
       - name: Run Android doctor
