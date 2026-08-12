@@ -642,6 +642,7 @@ fn validate_unix_identity_ancestors(
         }
         let mode = metadata.mode();
         let writable_by_another_principal = mode & 0o022 != 0;
+        #[allow(clippy::useless_conversion)]
         let sticky = mode & u32::from(libc::S_ISVTX) != 0;
         if !metadata.file_type().is_dir()
             || !trusted_owner

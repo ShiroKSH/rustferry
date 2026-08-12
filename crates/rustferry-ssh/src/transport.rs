@@ -428,6 +428,7 @@ fn validate_unix_temp_ancestors(directory: &Path, current_uid: u32) -> Result<()
         let mode = metadata.mode();
         let owned_by_trusted_principal = metadata.uid() == current_uid || metadata.uid() == 0;
         let writable_by_another_principal = mode & 0o022 != 0;
+        #[allow(clippy::useless_conversion)]
         let sticky = mode & u32::from(libc::S_ISVTX) != 0;
         if metadata.file_type().is_symlink()
             || !metadata.file_type().is_dir()
