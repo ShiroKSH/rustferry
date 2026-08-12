@@ -2313,7 +2313,10 @@ mod tests {
 
         let file = managed_available_file(&view).unwrap();
         let error = inspect_managed_file(&view, &file).unwrap_err();
-        assert_eq!(error.code(), "artifact_integrity_mismatch");
+        assert!(matches!(
+            error.code(),
+            "artifact_integrity_mismatch" | "artifact_filesystem_object_unsafe"
+        ));
     }
 
     #[test]

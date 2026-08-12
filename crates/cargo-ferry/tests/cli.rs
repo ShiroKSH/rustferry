@@ -244,7 +244,13 @@ fn ide_validate_returns_zero_based_diagnostics_for_unicode_workspace() {
     assert_eq!(document["protocol_version"], 1);
     assert_eq!(document["valid"], false);
     let diagnostic = &document["diagnostics"][0];
-    assert_eq!(diagnostic["file"], path.to_string_lossy().as_ref());
+    assert_eq!(
+        diagnostic["file"],
+        path.canonicalize()
+            .expect("canonical manifest path")
+            .to_string_lossy()
+            .as_ref()
+    );
     assert_eq!(diagnostic["range"]["start"]["character"], 0);
 }
 
@@ -280,7 +286,10 @@ fn ide_validate_uses_unsaved_manifest_stdin_without_writing_it_to_disk() {
     assert_eq!(document["valid"], false);
     assert_eq!(
         document["diagnostics"][0]["file"],
-        path.to_string_lossy().as_ref()
+        path.canonicalize()
+            .expect("canonical manifest path")
+            .to_string_lossy()
+            .as_ref()
     );
     assert_eq!(document["diagnostics"][0]["range"]["start"]["character"], 0);
     assert_eq!(
