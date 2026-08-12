@@ -603,19 +603,19 @@ fn scan_zip(
         }
         register_zip_path(&portable_name, entry.is_dir(), &mut files, &mut directories)?;
         validate_zip_metadata(&entry)?;
-        if entry.header_start() >= entry.data_start() || entry.data_start() > archive_size {
+        let data_start = entry.data_start().ok_or(OfflineArtifactError::InvalidZip)?;
+        if entry.header_start() >= data_start || data_start > archive_size {
             return Err(OfflineArtifactError::InvalidZip);
         }
-        let end = entry
-            .data_start()
+        let end = data_start
             .checked_add(entry.compressed_size())
             .ok_or(OfflineArtifactError::InvalidZip)?;
         if end > archive_size {
             return Err(OfflineArtifactError::InvalidZip);
         }
-        ranges.push((entry.header_start(), entry.data_start()));
+        ranges.push((entry.header_start(), data_start));
         if entry.compressed_size() != 0 {
-            ranges.push((entry.data_start(), end));
+            ranges.push((data_start, end));
         }
         expanded_size = expanded_size
             .checked_add(entry.size())

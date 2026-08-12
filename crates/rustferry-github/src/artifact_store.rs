@@ -779,14 +779,16 @@ fn scan_unsigned_envelope(
         if !header_starts.insert(entry.header_start()) {
             return Err(GithubArtifactStoreError::InvalidUnsignedEnvelope);
         }
-        let data_end = entry
+        let data_start = entry
             .data_start()
+            .ok_or(GithubArtifactStoreError::InvalidUnsignedEnvelope)?;
+        let data_end = data_start
             .checked_add(entry.compressed_size())
             .ok_or(GithubArtifactStoreError::InvalidUnsignedEnvelope)?;
         if data_end > archive_size {
             return Err(GithubArtifactStoreError::InvalidUnsignedEnvelope);
         }
-        compressed_ranges.push((entry.data_start(), data_end));
+        compressed_ranges.push((data_start, data_end));
         expanded_size = expanded_size
             .checked_add(entry.size())
             .ok_or(GithubArtifactStoreError::InvalidUnsignedEnvelope)?;
