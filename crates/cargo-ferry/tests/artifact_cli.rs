@@ -30,6 +30,9 @@ fn inspect_accepts_an_absolute_path_without_opening_a_managed_store() {
     let path = Utf8PathBuf::from_path_buf(temporary.path().join("standalone.log"))
         .expect("UTF-8 standalone path");
     fs::write(&path, ARTIFACT_BYTES).expect("standalone artifact");
+    let path = path
+        .canonicalize_utf8()
+        .expect("canonical standalone artifact path");
 
     let output = run(&config, &["--json", "artifact", "inspect", path.as_str()]);
     assert!(
@@ -54,7 +57,15 @@ fn inspect_accepts_an_absolute_path_without_opening_a_managed_store() {
         .output()
         .expect("relative artifact inspection");
     assert!(relative.status.success());
-    assert_eq!(parse_json(&relative.stdout)["data"]["path"], path.as_str());
+    let relative_value = parse_json(&relative.stdout);
+    let relative_path = Utf8PathBuf::from(
+        relative_value["data"]["path"]
+            .as_str()
+            .expect("relative inspection path"),
+    )
+    .canonicalize_utf8()
+    .expect("canonical relative inspection path");
+    assert_eq!(relative_path, path);
     assert!(!config.exists(), "standalone inspection created a store");
 }
 
@@ -128,6 +139,9 @@ fn unmanaged_verify_reports_measurement_without_claiming_integrity() {
     let path = Utf8PathBuf::from_path_buf(temporary.path().join("standalone.log"))
         .expect("UTF-8 standalone path");
     fs::write(&path, ARTIFACT_BYTES).expect("standalone artifact");
+    let path = path
+        .canonicalize_utf8()
+        .expect("canonical standalone artifact path");
 
     let json = run(&config, &["--json", "artifact", "verify", path.as_str()]);
     assert_eq!(json.status.code(), Some(3));
@@ -144,6 +158,34 @@ fn unmanaged_verify_reports_measurement_without_claiming_integrity() {
     let stderr = String::from_utf8(human.stderr).expect("UTF-8 diagnostic");
     assert!(stderr.contains("bytes were inspected"));
     assert!(!stderr.contains("integrity is verified"));
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn unsafe_artifact_links_share_one_cli_exit_class() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let config = temporary.path().join("absent-config");
+    let root = Utf8PathBuf::from_path_buf(temporary.path().canonicalize().expect("canonical root"))
+        .expect("UTF-8 canonical root");
+    let target = root.join("target.log");
+    let linked = root.join("linked.log");
+    fs::write(&target, ARTIFACT_BYTES).expect("target artifact");
+    if create_file_symlink(&target, &linked).is_err() {
+        return;
+    }
+
+    for command in ["inspect", "verify"] {
+        let output = run(
+            &config,
+            &["--json", "artifact", command, linked.as_str()],
+        );
+        assert_eq!(output.status.code(), Some(4), "{command}");
+        assert_eq!(
+            parse_json(&output.stdout)["error"]["code"],
+            "artifact_filesystem_object_unsafe",
+            "{command}"
+        );
+    }
 }
 
 #[test]
@@ -448,6 +490,16 @@ fn run_json(config: &std::path::Path, arguments: &[&str]) -> Value {
 
 fn parse_json(bytes: &[u8]) -> Value {
     serde_json::from_slice(bytes).expect("one JSON output object")
+}
+
+#[cfg(unix)]
+fn create_file_symlink(target: &Utf8PathBuf, link: &Utf8PathBuf) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_file_symlink(target: &Utf8PathBuf, link: &Utf8PathBuf) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
 }
 
 struct ArtifactFixture {

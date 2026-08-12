@@ -1293,11 +1293,12 @@ mod platform {
     }
 
     fn open_directory(path: &Path) -> Result<std::fs::File, DirectoryIdentityError> {
+        reject_final_symlink(path)?;
         OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(path)
-            .map_err(|error| open_error(&error))
+            .map_err(|error| open_error(path, &error))
     }
 
     fn query_directory_identity(
@@ -1400,11 +1401,12 @@ mod platform {
     }
 
     fn open_regular_file(path: &Path) -> Result<std::fs::File, DirectoryIdentityError> {
+        reject_final_symlink(path)?;
         OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
             .open(path)
-            .map_err(|error| open_regular_file_error(&error))
+            .map_err(|error| open_regular_file_error(path, &error))
     }
 
     fn query_regular_file_identity(
@@ -1433,11 +1435,21 @@ mod platform {
         Ok((metadata.dev(), metadata.ino()))
     }
 
-    fn open_error(error: &std::io::Error) -> DirectoryIdentityError {
+    fn reject_final_symlink(path: &Path) -> Result<(), DirectoryIdentityError> {
+        if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            return Err(DirectoryIdentityError::new(
+                DirectoryIdentityErrorKind::ReparsePoint,
+                None,
+            ));
+        }
+        Ok(())
+    }
+
+    fn open_error(path: &Path, error: &std::io::Error) -> DirectoryIdentityError {
         let os_code = error.raw_os_error();
-        let kind = match os_code {
-            Some(libc::ELOOP) => DirectoryIdentityErrorKind::ReparsePoint,
-            Some(libc::ENOTDIR) => DirectoryIdentityErrorKind::NotDirectory,
+        let kind = match (final_path_is_symlink(path), os_code) {
+            (true, _) | (_, Some(libc::ELOOP)) => DirectoryIdentityErrorKind::ReparsePoint,
+            (_, Some(libc::ENOTDIR)) => DirectoryIdentityErrorKind::NotDirectory,
             _ => DirectoryIdentityErrorKind::OperatingSystem(
                 DirectoryIdentityOperation::OpenDirectory,
             ),
@@ -1445,14 +1457,18 @@ mod platform {
         DirectoryIdentityError::new(kind, os_code)
     }
 
-    fn open_regular_file_error(error: &std::io::Error) -> DirectoryIdentityError {
+    fn open_regular_file_error(path: &Path, error: &std::io::Error) -> DirectoryIdentityError {
         let os_code = error.raw_os_error();
-        let kind = if os_code == Some(libc::ELOOP) {
+        let kind = if final_path_is_symlink(path) || os_code == Some(libc::ELOOP) {
             DirectoryIdentityErrorKind::ReparsePoint
         } else {
             DirectoryIdentityErrorKind::OperatingSystem(DirectoryIdentityOperation::OpenRegularFile)
         };
         DirectoryIdentityError::new(kind, os_code)
+    }
+
+    fn final_path_is_symlink(path: &Path) -> bool {
+        std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
     }
 
     fn identity_mismatch() -> DirectoryIdentityError {
@@ -1630,6 +1646,16 @@ mod tests {
                 .unwrap_err()
                 .kind(),
             DirectoryIdentityErrorKind::NotDirectory
+        );
+
+        let missing = file.path().with_extension("missing");
+        assert_eq!(
+            RetainedDirectoryIdentity::open(&missing)
+                .unwrap_err()
+                .kind(),
+            DirectoryIdentityErrorKind::OperatingSystem(
+                DirectoryIdentityOperation::OpenDirectory
+            )
         );
     }
 
@@ -2220,7 +2246,12 @@ mod tests {
         std::fs::create_dir(&target).unwrap();
         symlink(&target, &link).unwrap();
 
-        assert!(DirectoryFilesystemIdentity::capture(&link).is_err());
+        assert_eq!(
+            DirectoryFilesystemIdentity::capture(&link)
+                .unwrap_err()
+                .kind(),
+            DirectoryIdentityErrorKind::ReparsePoint
+        );
         assert_eq!(
             RetainedDirectoryIdentity::open(&link).unwrap_err().kind(),
             DirectoryIdentityErrorKind::ReparsePoint
