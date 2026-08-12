@@ -434,7 +434,7 @@ jobs:
           jq -e '.status == "ok" and .data.validated == true' "$result" > /dev/null
           echo "result=$result" >> "$GITHUB_OUTPUT"
           echo "log=$sanitized_log" >> "$GITHUB_OUTPUT"
-      - name: Inspect and diagnose APK
+      - name: Inspect APK and diagnose alignment
         if: steps.gate.outputs.run == 'true'
         id: diagnostics
         shell: bash
@@ -672,6 +672,75 @@ jobs:
           else
             alignment_status=native_16k_alignment_failed
           fi
+          {
+            echo "zipalign_basic_status=$zipalign_basic_status"
+            echo "zipalign_16k_status=$zipalign_16k_status"
+            echo "alignment_status=$alignment_status"
+            echo "validation_zipalign_path=$validation_public"
+            echo "validation_zipalign_sha256=$validation_binary_sha"
+            echo "validation_build_tools=$validation_build_tools"
+            echo "validation_help_status=$validation_help_status"
+            echo "rustferry_zipalign_path=$rustferry_public"
+            echo "rustferry_zipalign_sha256=$rustferry_binary_sha"
+            echo "rustferry_build_tools=$rustferry_build_tools"
+            echo "binaries_match=$binaries_match"
+            echo "canonical_paths_match=$canonical_paths_match"
+            echo "binary_hashes_match=$binary_hashes_match"
+            echo "build_tools_match=$build_tools_match"
+          } >> "$GITHUB_OUTPUT"
+      - name: Create APK acceptance evidence
+        if: steps.gate.outputs.run == 'true'
+        id: evidence
+        shell: bash
+        env:
+          RF_DIAG_PROJECT: ${{ steps.starter.outputs.project }}
+          RF_DIAG_BUILD_RESULT: ${{ steps.build.outputs.result }}
+          RF_DIAG_APK: ${{ steps.diagnostics.outputs.apk }}
+          RF_DIAG_APK_NAME: ${{ steps.diagnostics.outputs.apk_name }}
+          RF_DIAG_APK_SIZE: ${{ steps.diagnostics.outputs.apk_size }}
+          RF_DIAG_APK_SHA256: ${{ steps.diagnostics.outputs.apk_sha256 }}
+          RF_DIAG_DIRECTORY: ${{ steps.diagnostics.outputs.directory }}
+          RF_DIAG_ZIPALIGN_BASIC_STATUS: ${{ steps.diagnostics.outputs.zipalign_basic_status }}
+          RF_DIAG_ZIPALIGN_16K_STATUS: ${{ steps.diagnostics.outputs.zipalign_16k_status }}
+          RF_DIAG_ALIGNMENT_STATUS: ${{ steps.diagnostics.outputs.alignment_status }}
+          RF_DIAG_VALIDATION_ZIPALIGN_PATH: ${{ steps.diagnostics.outputs.validation_zipalign_path }}
+          RF_DIAG_VALIDATION_ZIPALIGN_SHA256: ${{ steps.diagnostics.outputs.validation_zipalign_sha256 }}
+          RF_DIAG_VALIDATION_BUILD_TOOLS: ${{ steps.diagnostics.outputs.validation_build_tools }}
+          RF_DIAG_VALIDATION_HELP_STATUS: ${{ steps.diagnostics.outputs.validation_help_status }}
+          RF_DIAG_RUSTFERRY_ZIPALIGN_PATH: ${{ steps.diagnostics.outputs.rustferry_zipalign_path }}
+          RF_DIAG_RUSTFERRY_ZIPALIGN_SHA256: ${{ steps.diagnostics.outputs.rustferry_zipalign_sha256 }}
+          RF_DIAG_RUSTFERRY_BUILD_TOOLS: ${{ steps.diagnostics.outputs.rustferry_build_tools }}
+          RF_DIAG_BINARIES_MATCH: ${{ steps.diagnostics.outputs.binaries_match }}
+          RF_DIAG_CANONICAL_PATHS_MATCH: ${{ steps.diagnostics.outputs.canonical_paths_match }}
+          RF_DIAG_BINARY_HASHES_MATCH: ${{ steps.diagnostics.outputs.binary_hashes_match }}
+          RF_DIAG_BUILD_TOOLS_MATCH: ${{ steps.diagnostics.outputs.build_tools_match }}
+        run: |
+          set -euo pipefail
+          project="$RF_DIAG_PROJECT"
+          result="$RF_DIAG_BUILD_RESULT"
+          apk="$RF_DIAG_APK"
+          apk_name="$RF_DIAG_APK_NAME"
+          apk_size="$RF_DIAG_APK_SIZE"
+          apk_sha_before="$RF_DIAG_APK_SHA256"
+          out="$RF_DIAG_DIRECTORY"
+          sanitizer="$RUNNER_TEMP/sanitize-android-diagnostic.py"
+          entries="$RUNNER_TEMP/apk-entries.txt"
+          signature="$RUNNER_TEMP/apk-signature.txt"
+          build_tools="$ANDROID_SDK_ROOT/build-tools/$BUILD_TOOLS_VERSION"
+          zipalign_basic_status="$RF_DIAG_ZIPALIGN_BASIC_STATUS"
+          zipalign_16k_status="$RF_DIAG_ZIPALIGN_16K_STATUS"
+          alignment_status="$RF_DIAG_ALIGNMENT_STATUS"
+          validation_public="$RF_DIAG_VALIDATION_ZIPALIGN_PATH"
+          validation_binary_sha="$RF_DIAG_VALIDATION_ZIPALIGN_SHA256"
+          validation_build_tools="$RF_DIAG_VALIDATION_BUILD_TOOLS"
+          validation_help_status="$RF_DIAG_VALIDATION_HELP_STATUS"
+          rustferry_public="$RF_DIAG_RUSTFERRY_ZIPALIGN_PATH"
+          rustferry_binary_sha="$RF_DIAG_RUSTFERRY_ZIPALIGN_SHA256"
+          rustferry_build_tools="$RF_DIAG_RUSTFERRY_BUILD_TOOLS"
+          binaries_match="$RF_DIAG_BINARIES_MATCH"
+          canonical_paths_match="$RF_DIAG_CANONICAL_PATHS_MATCH"
+          binary_hashes_match="$RF_DIAG_BINARY_HASHES_MATCH"
+          build_tools_match="$RF_DIAG_BUILD_TOOLS_MATCH"
           badging="$RUNNER_TEMP/apk-badging.txt"
           "$build_tools/aapt2" dump badging "$apk" > "$badging"
           package="$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" "$badging")"
@@ -1088,20 +1157,22 @@ jobs:
         env:
           BUILD_RESULT: ${{ steps.build.conclusion }}
           DIAGNOSTICS_RESULT: ${{ steps.diagnostics.conclusion }}
+          EVIDENCE_RESULT: ${{ steps.evidence.conclusion }}
           UPLOAD_RESULT: ${{ steps.upload.conclusion }}
           APK_CREATED: ${{ steps.diagnostics.outputs.apk_created }}
-          APK_SHA_STABLE: ${{ steps.diagnostics.outputs.apk_sha_stable }}
-          SIGNATURE_RESULT: ${{ steps.diagnostics.outputs.signature_result }}
-          ZIP_CONTENT_STATUS: ${{ steps.diagnostics.outputs.zip_content_status }}
-          SHARED_LIBRARY_STATUS: ${{ steps.diagnostics.outputs.shared_library_status }}
-          LAUNCHER_STATUS: ${{ steps.diagnostics.outputs.launcher_status }}
-          ZIPALIGN_BASIC_STATUS: ${{ steps.diagnostics.outputs.zipalign_basic_status }}
-          ZIPALIGN_16K_STATUS: ${{ steps.diagnostics.outputs.zipalign_16k_status }}
-          EVIDENCE_CREATED: ${{ steps.diagnostics.outputs.evidence_created }}
+          APK_SHA_STABLE: ${{ steps.evidence.outputs.apk_sha_stable }}
+          SIGNATURE_RESULT: ${{ steps.evidence.outputs.signature_result }}
+          ZIP_CONTENT_STATUS: ${{ steps.evidence.outputs.zip_content_status }}
+          SHARED_LIBRARY_STATUS: ${{ steps.evidence.outputs.shared_library_status }}
+          LAUNCHER_STATUS: ${{ steps.evidence.outputs.launcher_status }}
+          ZIPALIGN_BASIC_STATUS: ${{ steps.evidence.outputs.zipalign_basic_status }}
+          ZIPALIGN_16K_STATUS: ${{ steps.evidence.outputs.zipalign_16k_status }}
+          EVIDENCE_CREATED: ${{ steps.evidence.outputs.evidence_created }}
         run: |
           set -euo pipefail
           test "$BUILD_RESULT" = success
           test "$DIAGNOSTICS_RESULT" = success
+          test "$EVIDENCE_RESULT" = success
           test "$APK_CREATED" = true
           test "$APK_SHA_STABLE" = true
           test "$SIGNATURE_RESULT" = 'v2=true;v3=true'
