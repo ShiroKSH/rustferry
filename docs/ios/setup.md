@@ -1,6 +1,10 @@
 # iOS setup
 
-iOS builds require macOS, full Xcode, and the Apple Silicon Simulator Rust target. An Apple Account, provisioning profile, connected iPhone, booted Simulator, and installed Simulator runtime are not required for build-only use.
+Local iOS builds require macOS, full Xcode, and the relevant Apple Rust target. A Linux or Windows
+client can request a remote physical-iPhone build without installing Xcode or an Apple SDK locally;
+the trusted macOS worker still requires Apple tooling. An Apple Account, provisioning profile,
+connected iPhone, booted Simulator, and installed Simulator runtime are not required for local
+Simulator build-only use.
 
 Install Xcode, open it once so its components finish installing, then select it if necessary:
 
@@ -21,6 +25,9 @@ cargo ferry doctor
 - installed CoreSimulator runtimes as an optional run-time check.
 
 A missing runtime is a warning, not a build failure. Install a runtime from Xcode Settings > Platforms only when `install` or `run` support needs one.
+
+For remote device archives and their separate signing/validation limits, see
+[physical iPhone development](physical-device.md).
 
 ## Xcode selection
 

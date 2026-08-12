@@ -1,0 +1,1349 @@
+name: Android source beta acceptance
+
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_SHA: ed45328d6fc375e81b20ab10c1014c4b8d224a85
+  NDK_VERSION: 29.0.14206865
+  ANDROID_PLATFORM: android-35
+  BUILD_TOOLS_VERSION: 35.0.0
+
+jobs:
+  android-source-beta:
+    name: Ubuntu Android source acceptance
+    if: github.head_ref == 'release/android-beta-landing'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Inspect triggering head commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Permit exactly one APK attempt
+        id: gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_head='${{ github.event.pull_request.head.sha }}'
+          actual_head="$(git rev-parse HEAD)"
+          if test "$actual_head" != "$expected_head"; then
+            echo "Checked-out HEAD does not match the pull-request head." >&2
+            exit 1
+          fi
+          parent="$(git rev-parse HEAD^)"
+          changed="$(
+            git diff-tree \
+              --no-commit-id \
+              --name-only \
+              -r \
+              "$parent" \
+              HEAD
+          )"
+          if test "$changed" = \
+            '.github/workflows/android-source-beta-acceptance.yml'
+          then
+            echo 'run=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'run=false' >> "$GITHUB_OUTPUT"
+            echo 'No APK build: the head commit is not workflow-only.'
+          fi
+      - name: Check out exact accepted source
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - name: Verify exact source revision
+        if: steps.gate.outputs.run == 'true'
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - name: Set up Java
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Set up Android SDK
+        if: steps.gate.outputs.run == 'true'
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
+        with:
+          packages: ""
+          accept-android-sdk-licenses: "true"
+          log-accepted-android-sdk-licenses: "false"
+      - name: Install pinned Android components
+        if: steps.gate.outputs.run == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            "platforms;$ANDROID_PLATFORM" \
+            "build-tools;$BUILD_TOOLS_VERSION" \
+            "ndk;$NDK_VERSION" < /dev/null
+          ndk="$ANDROID_SDK_ROOT/ndk/$NDK_VERSION"
+          test -s "$ndk/source.properties"
+          test -d "$ndk/toolchains/llvm/prebuilt/linux-x86_64"
+          {
+            echo "ANDROID_NDK=$ndk"
+            echo "ANDROID_NDK_ROOT=$ndk"
+            echo "ANDROID_NDK_HOME=$ndk"
+          } >> "$GITHUB_ENV"
+      - name: Set up Rust
+        if: steps.gate.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+          targets: aarch64-linux-android
+      - name: Restore Rust cache
+        if: steps.gate.outputs.run == 'true'
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-bin: "false"
+      - name: Build release CLI
+        if: steps.gate.outputs.run == 'true'
+        run: cargo build -p cargo-ferry --release
+      - name: Generate path-runtime Android starter
+        if: steps.gate.outputs.run == 'true'
+        id: starter
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail_phase() {
+            local phase="$1"
+            local message="$2"
+            echo "::error title=Android starter failure::$phase: $message" >&2
+            exit 1
+          }
+          cli="$GITHUB_WORKSPACE/target/release/cargo-ferry"
+          metadata="$RUNNER_TEMP/workspace-metadata.json"
+          if ! cargo metadata \
+            --locked \
+            --no-deps \
+            --format-version 1 > "$metadata"
+          then
+            fail_phase \
+              "workspace_metadata" \
+              "cargo metadata failed for the exact accepted source"
+          fi
+          runtime_count="$(
+            jq \
+              '[.packages[] | select(.name == "rustferry")] | length' \
+              "$metadata"
+          )"
+          if test "$runtime_count" != '1'; then
+            fail_phase \
+              "runtime_package_selection" \
+              "expected exactly one workspace package named rustferry"
+          fi
+          if ! runtime_manifest="$(
+            jq -er \
+              '.packages[] |
+               select(.name == "rustferry") |
+               .manifest_path' \
+              "$metadata"
+          )"
+          then
+            fail_phase \
+              "runtime_manifest_selection" \
+              "could not obtain the rustferry manifest path"
+          fi
+          runtime="$(dirname "$runtime_manifest")"
+          if test "$runtime" != "$GITHUB_WORKSPACE/crates/rustferry"; then
+            fail_phase \
+              "runtime_path_binding" \
+              "workspace runtime package is not at the expected checked-out path"
+          fi
+          project="$RUNNER_TEMP/rustferry-android-ubuntu-acceptance"
+          new_result="$RUNNER_TEMP/android-new.json"
+          new_stderr_raw="$RUNNER_TEMP/android-new.raw.stderr"
+          new_result_sanitized="$RUNNER_TEMP/android-new.sanitized.json"
+          new_stderr_sanitized="$RUNNER_TEMP/android-new.stderr"
+          if test -e "$project"; then
+            fail_phase \
+              "starter_destination" \
+              "starter destination already exists"
+          fi
+          set +e
+          "$cli" new rustferry-android-ubuntu-acceptance \
+            --id org.rustferry.ubuntuacceptance \
+            --parent "$RUNNER_TEMP" \
+            --platform android \
+            --runtime-source path \
+            --runtime-path "$runtime" \
+            --no-git \
+            --no-check \
+            --json \
+            > "$new_result" \
+            2> "$new_stderr_raw"
+          new_status=$?
+          set -e
+          python3 - \
+            "$new_result" \
+            "$new_stderr_raw" \
+            "$new_result_sanitized" \
+            "$new_stderr_sanitized" <<'PY'
+          from pathlib import Path
+          import os
+          import sys
+
+          source_json, source_stderr, output_json, output_stderr = map(
+              Path, sys.argv[1:]
+          )
+
+          replacements = []
+          for name in (
+              "GITHUB_WORKSPACE",
+              "RUNNER_TEMP",
+              "HOME",
+              "ANDROID_SDK_ROOT",
+              "ANDROID_NDK",
+          ):
+              value = os.environ.get(name)
+              if value:
+                  replacements.append((value, f"${name}"))
+
+          replacements.sort(key=lambda item: len(item[0]), reverse=True)
+
+          def sanitize(path: Path) -> str:
+              if not path.exists():
+                  return ""
+              value = path.read_text(encoding="utf-8", errors="replace")
+              for original, replacement in replacements:
+                  value = value.replace(original, replacement)
+              return value[:65536]
+
+          output_json.write_text(sanitize(source_json), encoding="utf-8")
+          output_stderr.write_text(sanitize(source_stderr), encoding="utf-8")
+          PY
+          if test "$new_status" -ne 0; then
+            echo \
+              "::error title=RustFerry starter generation failed::cargo-ferry exited with status $new_status" \
+              >&2
+            if jq -e . "$new_result_sanitized" > /dev/null 2>&1; then
+              jq '{
+                schema_version,
+                command,
+                status,
+                error: {
+                  code: .error.code,
+                  message: .error.message,
+                  help: .error.help,
+                  details: .error.details
+                }
+              }' "$new_result_sanitized"
+            else
+              echo \
+                "cargo-ferry did not emit a valid structured JSON response." \
+                >&2
+              if test -s "$new_result_sanitized"; then
+                echo "Sanitized stdout:" >&2
+                sed -n '1,200p' "$new_result_sanitized" >&2
+              fi
+            fi
+            if test -s "$new_stderr_sanitized"; then
+              echo "Sanitized stderr:" >&2
+              sed -n '1,200p' "$new_stderr_sanitized" >&2
+            fi
+            exit "$new_status"
+          fi
+          if ! jq -e \
+            '.status == "ok" and .command == "new"' \
+            "$new_result" > /dev/null
+          then
+            echo "Unexpected sanitized JSON envelope:" >&2
+            jq '{
+              schema_version,
+              command,
+              status,
+              error
+            }' "$new_result_sanitized" >&2 || true
+            fail_phase \
+              "starter_result_envelope" \
+              "cargo-ferry returned success without the expected JSON envelope"
+          fi
+          test -s "$project/Cargo.toml" ||
+            fail_phase "starter_files" "generated Cargo.toml is missing"
+          test -s "$project/ferry.toml" ||
+            fail_phase "starter_files" "generated ferry.toml is missing"
+          test -d "$project/src" ||
+            fail_phase "starter_files" "generated src directory is missing"
+          test -d "$project/assets" ||
+            fail_phase "starter_files" "generated assets directory is missing"
+          lock_stderr_raw="$RUNNER_TEMP/android-lock.raw.stderr"
+          lock_stderr_sanitized="$RUNNER_TEMP/android-lock.stderr"
+          set +e
+          cargo generate-lockfile \
+            --manifest-path "$project/Cargo.toml" \
+            2> "$lock_stderr_raw"
+          lock_status=$?
+          set -e
+          python3 - \
+            "$lock_stderr_raw" \
+            "$lock_stderr_sanitized" <<'PY'
+          from pathlib import Path
+          import os
+          import sys
+
+          source_stderr, output_stderr = map(Path, sys.argv[1:])
+
+          replacements = []
+          for name in (
+              "GITHUB_WORKSPACE",
+              "RUNNER_TEMP",
+              "HOME",
+              "ANDROID_SDK_ROOT",
+              "ANDROID_NDK",
+          ):
+              value = os.environ.get(name)
+              if value:
+                  replacements.append((value, f"${name}"))
+
+          replacements.sort(key=lambda item: len(item[0]), reverse=True)
+          value = source_stderr.read_text(
+              encoding="utf-8",
+              errors="replace",
+          ) if source_stderr.exists() else ""
+          for original, replacement in replacements:
+              value = value.replace(original, replacement)
+          output_stderr.write_text(value[:65536], encoding="utf-8")
+          PY
+          if test "$lock_status" -ne 0; then
+            echo \
+              "::error title=Android starter lockfile failure::cargo generate-lockfile exited with status $lock_status" \
+              >&2
+            if test -s "$lock_stderr_sanitized"; then
+              echo "Sanitized cargo stderr:" >&2
+              sed -n '1,200p' "$lock_stderr_sanitized" >&2
+            fi
+            fail_phase \
+              "starter_lockfile" \
+              "Cargo could not generate the starter lockfile"
+          fi
+          test -s "$project/Cargo.lock" ||
+            fail_phase \
+              "starter_lockfile" \
+              "cargo generate-lockfile succeeded without creating Cargo.lock"
+          test -f "$project/Cargo.lock" ||
+            fail_phase \
+              "starter_lockfile" \
+              "generated Cargo.lock is not a regular file"
+          project_metadata="$RUNNER_TEMP/project-metadata.json"
+          if ! cargo metadata \
+            --locked \
+            --no-deps \
+            --format-version 1 \
+            --manifest-path "$project/Cargo.toml" \
+            > "$project_metadata"
+          then
+            fail_phase \
+              "generated_project_metadata" \
+              "Cargo could not load the generated starter"
+          fi
+          if ! generated_runtime="$(
+            jq -er \
+              '.packages[] |
+               select(.name == "rustferry-android-ubuntu-acceptance") |
+               .dependencies[] |
+               select(.name == "rustferry") |
+               .path' \
+              "$project_metadata"
+          )"
+          then
+            fail_phase \
+              "generated_runtime_dependency" \
+              "generated project does not contain the expected rustferry path dependency"
+          fi
+          if test "$generated_runtime" != "$runtime"; then
+            fail_phase \
+              "generated_runtime_dependency" \
+              "generated runtime dependency is not bound to the accepted workspace package"
+          fi
+          forbidden="$(find "$project" -path "$project/target" -prune -o \
+            \( -type f \( -name 'build.gradle' -o -name 'build.gradle.*' \
+              -o -name 'settings.gradle' -o -name 'settings.gradle.*' \
+              -o -name 'gradlew' -o -name '*.kt' -o -name '*.java' \) \
+              -o -type d \( -name gradle -o -name android \) \) \
+            -print -quit)"
+          if test -n "$forbidden"; then
+            relative_forbidden="${forbidden#"$project"/}"
+            echo \
+              "::error title=Generated project is not Rust-only::unexpected path: $relative_forbidden" \
+              >&2
+            exit 1
+          fi
+          echo "project=$project" >> "$GITHUB_OUTPUT"
+          echo "cli=$cli" >> "$GITHUB_OUTPUT"
+      - name: Run Android doctor
+        if: steps.gate.outputs.run == 'true'
+        id: doctor
+        shell: bash
+        run: |
+          set -euo pipefail
+          result="$RUNNER_TEMP/android-doctor.json"
+          (cd "${{ steps.starter.outputs.project }}" && \
+            "${{ steps.starter.outputs.cli }}" doctor --json) > "$result"
+          jq -e '
+            .status == "ok" and
+            .data.ready_for_android_build == true and
+            .data.android.ready_for_build == true
+          ' "$result" > /dev/null
+          echo "result=$result" >> "$GITHUB_OUTPUT"
+      - name: Build exactly one release APK
+        if: steps.gate.outputs.run == 'true'
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          project="${{ steps.starter.outputs.project }}"
+          cli="${{ steps.starter.outputs.cli }}"
+          result="$RUNNER_TEMP/android-build.json"
+          raw_log="$RUNNER_TEMP/android-build.raw.log"
+          sanitized_log="$RUNNER_TEMP/android-build.log"
+          set +e
+          "$cli" build android --release --project-dir "$project" --json \
+            > "$result" 2> "$raw_log"
+          status=$?
+          set -e
+          python3 - "$raw_log" "$sanitized_log" <<'PY'
+          from pathlib import Path
+          import os
+          import sys
+
+          source = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+          for name, replacement in (
+              ("GITHUB_WORKSPACE", "$GITHUB_WORKSPACE"),
+              ("RUNNER_TEMP", "$RUNNER_TEMP"),
+              ("HOME", "$HOME"),
+          ):
+              value = os.environ.get(name)
+              if value:
+                  source = source.replace(value, replacement)
+          Path(sys.argv[2]).write_text(source, encoding="utf-8")
+          PY
+          if test "$status" -ne 0; then
+            cat "$result"
+            cat "$sanitized_log"
+            exit "$status"
+          fi
+          jq -e '.status == "ok" and .data.validated == true' "$result" > /dev/null
+          echo "result=$result" >> "$GITHUB_OUTPUT"
+          echo "log=$sanitized_log" >> "$GITHUB_OUTPUT"
+      - name: Inspect APK and diagnose alignment
+        if: steps.gate.outputs.run == 'true'
+        id: diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          project="${{ steps.starter.outputs.project }}"
+          result="${{ steps.build.outputs.result }}"
+          doctor_result="${{ steps.doctor.outputs.result }}"
+          apk="$(jq -er '.data.artifact' "$result")"
+          case "$apk" in
+            "$project"/target/ferry/*) ;;
+            *) echo 'Structured build result returned an unexpected artifact path.' >&2; exit 1 ;;
+          esac
+          test -f "$apk"
+          test ! -L "$apk"
+          test -s "$apk"
+          apk_sha_before="$(sha256sum "$apk" | awk '{print $1}')"
+          apk_size="$(stat -c '%s' "$apk")"
+          apk_name="$(basename "$apk")"
+          out="$RUNNER_TEMP/android-source-beta-diagnostics"
+          mkdir -p "$out/rustferry-logs"
+          cp -- "$apk" "$out/$apk_name"
+          {
+            echo "directory=$out"
+            echo "apk=$apk"
+            echo 'apk_created=true'
+            echo "apk_name=$apk_name"
+            echo "apk_size=$apk_size"
+            echo "apk_sha256=$apk_sha_before"
+          } >> "$GITHUB_OUTPUT"
+          sanitizer="$RUNNER_TEMP/sanitize-android-diagnostic.py"
+          cat > "$sanitizer" <<'PY'
+          from pathlib import Path
+          import os
+          import sys
+
+          source = Path(sys.argv[1])
+          destination = Path(sys.argv[2])
+          line_limit = int(sys.argv[3]) if len(sys.argv) > 3 else None
+          if source.is_file():
+              with source.open("rb") as handle:
+                  value = handle.read(65536)
+              text = value.decode("utf-8", errors="replace")
+          else:
+              text = "unavailable\n"
+          replacements = []
+          for name in (
+              "GITHUB_WORKSPACE",
+              "RUNNER_TEMP",
+              "HOME",
+              "ANDROID_SDK_ROOT",
+              "ANDROID_NDK",
+          ):
+              original = os.environ.get(name)
+              if original:
+                  replacements.append((original, f"${name}"))
+          replacements.sort(key=lambda item: len(item[0]), reverse=True)
+          for original, replacement in replacements:
+              text = text.replace(original, replacement)
+          if line_limit is not None:
+              text = "".join(text.splitlines(keepends=True)[:line_limit])
+          destination.write_bytes(text.encode("utf-8")[:65536])
+          PY
+          python3 "$sanitizer" \
+            "${{ steps.build.outputs.log }}" \
+            "$out/android-build.log"
+          unzip -tq "$apk" \
+            > "$RUNNER_TEMP/apk-unzip-test.raw.log" \
+            2>&1
+          entries="$RUNNER_TEMP/apk-entries.txt"
+          unzip -Z1 "$apk" > "$entries"
+          grep -Fx 'AndroidManifest.xml' "$entries"
+          grep -Fx 'classes.dex' "$entries"
+          grep -Fx 'resources.arsc' "$entries"
+          grep -E '^lib/arm64-v8a/lib.*\.so$' "$entries"
+          grep -E '^res/mipmap-.*ferry_icon\.png$' "$entries"
+          build_tools="$ANDROID_SDK_ROOT/build-tools/$BUILD_TOOLS_VERSION"
+          signature="$RUNNER_TEMP/apk-signature.txt"
+          "$build_tools/apksigner" verify --verbose --print-certs "$apk" \
+            > "$signature"
+          grep -E '^Verified using v2 scheme .*: true$' "$signature"
+          grep -E '^Verified using v3 scheme .*: true$' "$signature"
+          public_path() {
+            local value="$1"
+            value="${value//"$GITHUB_WORKSPACE"/\$GITHUB_WORKSPACE}"
+            value="${value//"$RUNNER_TEMP"/\$RUNNER_TEMP}"
+            value="${value//"$ANDROID_NDK"/\$ANDROID_NDK}"
+            value="${value//"$ANDROID_SDK_ROOT"/\$ANDROID_SDK_ROOT}"
+            value="${value//"$HOME"/\$HOME}"
+            printf '%s' "$value"
+          }
+          validation_zipalign="$build_tools/zipalign"
+          validation_zipalign_available=true
+          if ! test -x "$validation_zipalign"; then
+            validation_zipalign_available=false
+          fi
+          validation_canonical=unavailable
+          validation_binary_sha=unavailable
+          validation_build_tools=unavailable
+          validation_file=unavailable
+          if test "$validation_zipalign_available" = true; then
+            validation_canonical="$(readlink -f "$validation_zipalign")"
+            validation_binary_sha="$(sha256sum "$validation_zipalign" | awk '{print $1}')"
+            validation_build_tools="$(basename "$(dirname "$validation_canonical")")"
+            validation_file="$(file -b "$validation_zipalign")"
+          fi
+          validation_help_raw="$RUNNER_TEMP/validation-zipalign-help.raw.log"
+          set +e
+          "$validation_zipalign" -h > "$validation_help_raw" 2>&1
+          validation_help_status=$?
+          set -e
+          python3 "$sanitizer" \
+            "$validation_help_raw" \
+            "$out/acceptance-zipalign-help.sanitized.log" \
+            100
+          validator_execution_ok=true
+          if test "$validation_zipalign_available" != true || \
+             ! test -s "$validation_help_raw"
+          then
+            validator_execution_ok=false
+          fi
+
+          rustferry_zipalign="$(jq -r \
+            --arg version "$BUILD_TOOLS_VERSION" '
+              [
+                .data.android.discovery.build_tools[]? |
+                select(.version == $version and .zipalign != null) |
+                .zipalign
+              ] | last // empty
+            ' "$doctor_result")"
+          rustferry_canonical=unavailable
+          rustferry_binary_sha=unavailable
+          rustferry_build_tools=unavailable
+          rustferry_file=unavailable
+          if test -n "$rustferry_zipalign" && test -x "$rustferry_zipalign"; then
+            rustferry_canonical="$(readlink -f "$rustferry_zipalign")"
+            rustferry_binary_sha="$(sha256sum "$rustferry_zipalign" | awk '{print $1}')"
+            rustferry_build_tools="$(basename "$(dirname "$rustferry_canonical")")"
+            rustferry_file="$(file -b "$rustferry_zipalign")"
+          fi
+          binaries_match=unavailable
+          canonical_paths_match=unavailable
+          binary_hashes_match=unavailable
+          build_tools_match=unavailable
+          if test "$validation_canonical" != unavailable && \
+             test "$rustferry_canonical" != unavailable
+          then
+            canonical_paths_match=false
+            binary_hashes_match=false
+            build_tools_match=false
+            if test "$validation_canonical" = "$rustferry_canonical"; then
+              canonical_paths_match=true
+            fi
+            if test "$validation_binary_sha" = "$rustferry_binary_sha"; then
+              binary_hashes_match=true
+            fi
+            if test "$validation_build_tools" = "$rustferry_build_tools"; then
+              build_tools_match=true
+            fi
+            binaries_match=false
+            if test "$canonical_paths_match" = true && \
+               test "$binary_hashes_match" = true && \
+               test "$build_tools_match" = true
+            then
+              binaries_match=true
+            fi
+          fi
+          validation_public="$(public_path "$validation_canonical")"
+          rustferry_public="$(public_path "$rustferry_canonical")"
+          validation_identity_raw="$RUNNER_TEMP/acceptance-zipalign-identity.raw.txt"
+          rustferry_identity_raw="$RUNNER_TEMP/rustferry-zipalign-identity.raw.txt"
+          {
+            echo "canonical_path=$validation_canonical"
+            echo "sha256=$validation_binary_sha"
+            echo "build_tools=$validation_build_tools"
+            echo "file=$validation_file"
+            echo "help_exit_status=$validation_help_status"
+          } > "$validation_identity_raw"
+          {
+            echo "canonical_path=$rustferry_canonical"
+            echo "sha256=$rustferry_binary_sha"
+            echo "build_tools=$rustferry_build_tools"
+            echo "file=$rustferry_file"
+          } > "$rustferry_identity_raw"
+          python3 "$sanitizer" \
+            "$validation_identity_raw" \
+            "$out/acceptance-zipalign-identity.txt"
+          python3 "$sanitizer" \
+            "$rustferry_identity_raw" \
+            "$out/rustferry-zipalign-identity.txt"
+
+          zipalign_basic_raw="$RUNNER_TEMP/zipalign-basic.raw.log"
+          zipalign_16k_raw="$RUNNER_TEMP/zipalign-16k.raw.log"
+          set +e
+          "$validation_zipalign" \
+            -c \
+            -v \
+            4 \
+            "$apk" \
+            > "$zipalign_basic_raw" \
+            2>&1
+          zipalign_basic_status=$?
+          "$validation_zipalign" \
+            -c \
+            -P \
+            16 \
+            -v \
+            4 \
+            "$apk" \
+            > "$zipalign_16k_raw" \
+            2>&1
+          zipalign_16k_status=$?
+          set -e
+          python3 "$sanitizer" \
+            "$zipalign_basic_raw" \
+            "$out/zipalign-basic.sanitized.log"
+          python3 "$sanitizer" \
+            "$zipalign_16k_raw" \
+            "$out/zipalign-16k.sanitized.log"
+          if test "$validator_execution_ok" != true || \
+             test "$validation_help_status" -eq 126 || \
+             test "$validation_help_status" -eq 127 || \
+             test "$zipalign_basic_status" -eq 126 || \
+             test "$zipalign_basic_status" -eq 127 || \
+             test "$zipalign_16k_status" -eq 126 || \
+             test "$zipalign_16k_status" -eq 127
+          then
+            alignment_status=validator_execution_failed
+          elif test "$zipalign_basic_status" -eq 0 && \
+               test "$zipalign_16k_status" -eq 0
+          then
+            alignment_status=passed
+          elif test "$zipalign_basic_status" -ne 0; then
+            alignment_status=basic_alignment_failed
+          else
+            alignment_status=native_16k_alignment_failed
+          fi
+          {
+            echo "zipalign_basic_status=$zipalign_basic_status"
+            echo "zipalign_16k_status=$zipalign_16k_status"
+            echo "alignment_status=$alignment_status"
+            echo "validation_zipalign_path=$validation_public"
+            echo "validation_zipalign_sha256=$validation_binary_sha"
+            echo "validation_build_tools=$validation_build_tools"
+            echo "validation_help_status=$validation_help_status"
+            echo "rustferry_zipalign_path=$rustferry_public"
+            echo "rustferry_zipalign_sha256=$rustferry_binary_sha"
+            echo "rustferry_build_tools=$rustferry_build_tools"
+            echo "binaries_match=$binaries_match"
+            echo "canonical_paths_match=$canonical_paths_match"
+            echo "binary_hashes_match=$binary_hashes_match"
+            echo "build_tools_match=$build_tools_match"
+          } >> "$GITHUB_OUTPUT"
+      - name: Create APK acceptance evidence
+        if: steps.gate.outputs.run == 'true'
+        id: evidence
+        shell: bash
+        env:
+          RF_DIAG_PROJECT: ${{ steps.starter.outputs.project }}
+          RF_DIAG_BUILD_RESULT: ${{ steps.build.outputs.result }}
+          RF_DIAG_APK: ${{ steps.diagnostics.outputs.apk }}
+          RF_DIAG_APK_NAME: ${{ steps.diagnostics.outputs.apk_name }}
+          RF_DIAG_APK_SIZE: ${{ steps.diagnostics.outputs.apk_size }}
+          RF_DIAG_APK_SHA256: ${{ steps.diagnostics.outputs.apk_sha256 }}
+          RF_DIAG_DIRECTORY: ${{ steps.diagnostics.outputs.directory }}
+          RF_DIAG_ZIPALIGN_BASIC_STATUS: ${{ steps.diagnostics.outputs.zipalign_basic_status }}
+          RF_DIAG_ZIPALIGN_16K_STATUS: ${{ steps.diagnostics.outputs.zipalign_16k_status }}
+          RF_DIAG_ALIGNMENT_STATUS: ${{ steps.diagnostics.outputs.alignment_status }}
+          RF_DIAG_VALIDATION_ZIPALIGN_PATH: ${{ steps.diagnostics.outputs.validation_zipalign_path }}
+          RF_DIAG_VALIDATION_ZIPALIGN_SHA256: ${{ steps.diagnostics.outputs.validation_zipalign_sha256 }}
+          RF_DIAG_VALIDATION_BUILD_TOOLS: ${{ steps.diagnostics.outputs.validation_build_tools }}
+          RF_DIAG_VALIDATION_HELP_STATUS: ${{ steps.diagnostics.outputs.validation_help_status }}
+          RF_DIAG_RUSTFERRY_ZIPALIGN_PATH: ${{ steps.diagnostics.outputs.rustferry_zipalign_path }}
+          RF_DIAG_RUSTFERRY_ZIPALIGN_SHA256: ${{ steps.diagnostics.outputs.rustferry_zipalign_sha256 }}
+          RF_DIAG_RUSTFERRY_BUILD_TOOLS: ${{ steps.diagnostics.outputs.rustferry_build_tools }}
+          RF_DIAG_BINARIES_MATCH: ${{ steps.diagnostics.outputs.binaries_match }}
+          RF_DIAG_CANONICAL_PATHS_MATCH: ${{ steps.diagnostics.outputs.canonical_paths_match }}
+          RF_DIAG_BINARY_HASHES_MATCH: ${{ steps.diagnostics.outputs.binary_hashes_match }}
+          RF_DIAG_BUILD_TOOLS_MATCH: ${{ steps.diagnostics.outputs.build_tools_match }}
+        run: |
+          set -euo pipefail
+          fail_phase() {
+            local phase="$1"
+            local message="$2"
+            echo "::error title=Android acceptance failure::$phase: $message" >&2
+            exit 1
+          }
+          project="$RF_DIAG_PROJECT"
+          result="$RF_DIAG_BUILD_RESULT"
+          apk="$RF_DIAG_APK"
+          apk_name="$RF_DIAG_APK_NAME"
+          apk_size="$RF_DIAG_APK_SIZE"
+          apk_sha_before="$RF_DIAG_APK_SHA256"
+          out="$RF_DIAG_DIRECTORY"
+          sanitizer="$RUNNER_TEMP/sanitize-android-diagnostic.py"
+          entries="$RUNNER_TEMP/apk-entries.txt"
+          signature="$RUNNER_TEMP/apk-signature.txt"
+          build_tools="$ANDROID_SDK_ROOT/build-tools/$BUILD_TOOLS_VERSION"
+          zipalign_basic_status="$RF_DIAG_ZIPALIGN_BASIC_STATUS"
+          zipalign_16k_status="$RF_DIAG_ZIPALIGN_16K_STATUS"
+          alignment_status="$RF_DIAG_ALIGNMENT_STATUS"
+          validation_public="$RF_DIAG_VALIDATION_ZIPALIGN_PATH"
+          validation_binary_sha="$RF_DIAG_VALIDATION_ZIPALIGN_SHA256"
+          validation_build_tools="$RF_DIAG_VALIDATION_BUILD_TOOLS"
+          validation_help_status="$RF_DIAG_VALIDATION_HELP_STATUS"
+          rustferry_public="$RF_DIAG_RUSTFERRY_ZIPALIGN_PATH"
+          rustferry_binary_sha="$RF_DIAG_RUSTFERRY_ZIPALIGN_SHA256"
+          rustferry_build_tools="$RF_DIAG_RUSTFERRY_BUILD_TOOLS"
+          binaries_match="$RF_DIAG_BINARIES_MATCH"
+          canonical_paths_match="$RF_DIAG_CANONICAL_PATHS_MATCH"
+          binary_hashes_match="$RF_DIAG_BINARY_HASHES_MATCH"
+          build_tools_match="$RF_DIAG_BUILD_TOOLS_MATCH"
+          badging="$RUNNER_TEMP/apk-badging.txt"
+          "$build_tools/aapt2" dump badging "$apk" > "$badging"
+          package="$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" "$badging")"
+          version_code="$(sed -n "s/^package:.* versionCode='\([^']*\)'.*/\1/p" "$badging")"
+          version_name="$(sed -n "s/^package:.* versionName='\([^']*\)'.*/\1/p" "$badging")"
+          launcher="$(sed -n \
+            "s/^launchable-activity: name='\([^']*\)'.*/\1/p" "$badging")"
+          test "$package" = 'org.rustferry.ubuntuacceptance'
+          test "$launcher" = 'org.rustferry.bridge.FerryActivity'
+
+          apkanalyzer=''
+          if candidate="$(command -v apkanalyzer 2> /dev/null)" && \
+             test -n "$candidate"
+          then
+            apkanalyzer="$candidate"
+          elif test -x \
+            "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/apkanalyzer"
+          then
+            apkanalyzer="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/apkanalyzer"
+          else
+            apkanalyzer="$(
+              for candidate in \
+                "$ANDROID_SDK_ROOT"/cmdline-tools/*/bin/apkanalyzer
+              do
+                test -x "$candidate" || continue
+                version="$(basename "$(dirname "$(dirname "$candidate")")")"
+                if printf '%s\n' "$version" | \
+                   grep -Eq '^[0-9]+([.][0-9]+)*$'
+                then
+                  printf '%s\t%s\n' "$version" "$candidate"
+                fi
+              done | LC_ALL=C sort -V -k1,1 | tail -n 1 | cut -f 2-
+            )"
+          fi
+          if ! test -x "$apkanalyzer"; then
+            fail_phase \
+              "apkanalyzer_unavailable" \
+              "installed apkanalyzer executable was not found"
+          fi
+          if ! apkanalyzer_canonical="$(readlink -f "$apkanalyzer")"; then
+            fail_phase \
+              "apkanalyzer_unavailable" \
+              "installed apkanalyzer path could not be resolved"
+          fi
+          case "$apkanalyzer_canonical" in
+            "$ANDROID_SDK_ROOT"/cmdline-tools/*/bin/apkanalyzer) ;;
+            *)
+              fail_phase \
+                "apkanalyzer_unavailable" \
+                "installed apkanalyzer is outside Android SDK cmdline-tools"
+              ;;
+          esac
+          apkanalyzer_public="\$ANDROID_SDK_ROOT${apkanalyzer_canonical#"$ANDROID_SDK_ROOT"}"
+          apkanalyzer_sha="$(sha256sum "$apkanalyzer_canonical" | awk '{print $1}')"
+          {
+            echo "path=$apkanalyzer_public"
+            echo "sha256=$apkanalyzer_sha"
+          } > "$out/apkanalyzer-identity.txt"
+
+          apkanalyzer_min_stderr="$RUNNER_TEMP/apkanalyzer-min.stderr"
+          apkanalyzer_target_stderr="$RUNNER_TEMP/apkanalyzer-target.stderr"
+          set +e
+          min_sdk="$(
+            "$apkanalyzer" \
+              manifest \
+              min-sdk \
+              "$apk" \
+              2> "$apkanalyzer_min_stderr"
+          )"
+          min_status=$?
+          target_sdk="$(
+            "$apkanalyzer" \
+              manifest \
+              target-sdk \
+              "$apk" \
+              2> "$apkanalyzer_target_stderr"
+          )"
+          target_status=$?
+          set -e
+          python3 "$sanitizer" \
+            "$apkanalyzer_min_stderr" \
+            "$out/apkanalyzer-min.stderr"
+          python3 "$sanitizer" \
+            "$apkanalyzer_target_stderr" \
+            "$out/apkanalyzer-target.stderr"
+          if test "$min_status" -ne 0; then
+            fail_phase \
+              "apkanalyzer_min_sdk" \
+              "apkanalyzer manifest min-sdk exited with status $min_status"
+          fi
+          if test "$target_status" -ne 0; then
+            fail_phase \
+              "apkanalyzer_target_sdk" \
+              "apkanalyzer manifest target-sdk exited with status $target_status"
+          fi
+          min_sdk="$(
+            printf '%s' "$min_sdk" |
+              tr -d '\r\n[:space:]'
+          )"
+          target_sdk="$(
+            printf '%s' "$target_sdk" |
+              tr -d '\r\n[:space:]'
+          )"
+          case "$min_sdk" in
+            ''|*[!0-9]*)
+              fail_phase \
+                "manifest_sdk_levels" \
+                "apkanalyzer returned a non-decimal minimum SDK"
+              ;;
+          esac
+          case "$target_sdk" in
+            ''|*[!0-9]*)
+              fail_phase \
+                "manifest_sdk_levels" \
+                "apkanalyzer returned a non-decimal target SDK"
+              ;;
+          esac
+          test "$min_sdk" = '26' ||
+            fail_phase \
+              "manifest_sdk_levels" \
+              "unexpected minimum SDK in the final APK"
+          test "$target_sdk" = '36' ||
+            fail_phase \
+              "manifest_sdk_levels" \
+              "unexpected target SDK in the final APK"
+          compile_sdk="${ANDROID_PLATFORM#android-}"
+          test "$compile_sdk" = '35' ||
+            fail_phase \
+              "manifest_sdk_levels" \
+              "unexpected compile SDK in the acceptance environment"
+          abi="$(sed -n 's#^lib/\([^/]*\)/.*\.so$#\1#p' "$entries" \
+            | LC_ALL=C sort -u | paste -sd, -)"
+          test "$abi" = 'arm64-v8a'
+          certificate="$(sed -n \
+            's/^Signer #1 certificate SHA-256 digest: //p' "$signature")"
+          test -n "$certificate"
+          signature_result='v2=true;v3=true'
+          zip_content_status=passed
+          launcher_status=passed
+
+          shared_json="$out/shared-libraries.json"
+          shared_status_file="$RUNNER_TEMP/shared-library-status.txt"
+          extracted_manifest="$RUNNER_TEMP/extracted-shared-libraries.json"
+          extracted_root="$RUNNER_TEMP/apk-shared-libraries"
+          python3 - \
+            "$apk" \
+            "$shared_json" \
+            "$shared_status_file" \
+            "$extracted_manifest" \
+            "$extracted_root" \
+            "$zipalign_16k_status" <<'PY'
+          from pathlib import Path
+          import json
+          import re
+          import shutil
+          import sys
+          import zipfile
+
+          apk, report, status_file, manifest, root = map(Path, sys.argv[1:6])
+          extract = sys.argv[6] != "0"
+          pattern = re.compile(r"^lib/[^/]+/[^/]+\.so$")
+          records = []
+          extracted = []
+          status = "failed"
+          reason = "bounded ZIP inspection failed"
+          try:
+              with zipfile.ZipFile(apk) as archive:
+                  infos = archive.infolist()
+                  if len(infos) > 10000:
+                      raise ValueError("APK entry limit exceeded")
+                  libraries = [item for item in infos if pattern.fullmatch(item.filename)]
+                  if len(libraries) > 64:
+                      raise ValueError("shared-library entry limit exceeded")
+                  if sum(item.file_size for item in libraries) > 268435456:
+                      raise ValueError("shared-library byte limit exceeded")
+                  for index, item in enumerate(libraries):
+                      method = {
+                          zipfile.ZIP_STORED: "stored",
+                          zipfile.ZIP_DEFLATED: "deflated",
+                          zipfile.ZIP_BZIP2: "bzip2",
+                          zipfile.ZIP_LZMA: "lzma",
+                      }.get(item.compress_type, f"method-{item.compress_type}")
+                      records.append({
+                          "name": item.filename,
+                          "compression_method": method,
+                          "uncompressed_size": item.file_size,
+                          "compressed_size": item.compress_size,
+                      })
+                      if extract:
+                          root.mkdir(parents=True, exist_ok=True)
+                          destination = root / f"{index:03d}-{Path(item.filename).name}"
+                          with archive.open(item) as source, destination.open("xb") as output:
+                              shutil.copyfileobj(source, output, length=1048576)
+                          extracted.append({
+                              "name": item.filename,
+                              "path": str(destination),
+                          })
+                  expected = any(
+                      item.filename.startswith("lib/arm64-v8a/") for item in libraries
+                  )
+                  status = "passed" if expected else "failed"
+                  reason = "expected arm64-v8a shared library found" if expected else (
+                      "expected arm64-v8a shared library missing"
+                  )
+          except Exception:
+              records = []
+              extracted = []
+          report.write_text(json.dumps({
+              "status": status,
+              "reason": reason,
+              "libraries": records,
+          }, indent=2) + "\n", encoding="utf-8")
+          status_file.write_text(status + "\n", encoding="utf-8")
+          manifest.write_text(json.dumps(extracted), encoding="utf-8")
+          PY
+          shared_library_status="$(tr -d '\r\n' < "$shared_status_file")"
+          elf_json="$out/elf-load-alignments.json"
+          if test "$zipalign_16k_status" -ne 0; then
+            llvm_readelf="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+            python3 - \
+              "$llvm_readelf" \
+              "$extracted_manifest" \
+              "$elf_json" <<'PY'
+          from pathlib import Path
+          import json
+          import subprocess
+          import sys
+
+          tool = Path(sys.argv[1])
+          manifest = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+          output = []
+          for library in manifest:
+              record = {"name": library["name"], "load_alignments": []}
+              if tool.is_file():
+                  try:
+                      result = subprocess.run(
+                          [str(tool), "-lW", library["path"]],
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL,
+                          timeout=30,
+                          check=False,
+                      )
+                      text = result.stdout[:65536].decode("utf-8", errors="replace")
+                      record["load_alignments"] = [
+                          line.split()[-1]
+                          for line in text.splitlines()
+                          if line.lstrip().startswith("LOAD ") and line.split()
+                      ]
+                      record["readelf_status"] = result.returncode
+                  except (OSError, subprocess.TimeoutExpired):
+                      record["readelf_status"] = "unavailable"
+              else:
+                  record["readelf_status"] = "unavailable"
+              output.append(record)
+          Path(sys.argv[3]).write_text(
+              json.dumps(output, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          else
+            printf '[]\n' > "$elf_json"
+          fi
+
+          log_dir="$(jq -r '.data.log_dir // .data.log_directory // empty' "$result")"
+          rustferry_log_source=unavailable
+          case "$log_dir" in
+            "$project"/target/ferry/*)
+              if test -d "$log_dir" && test ! -L "$log_dir"; then
+                rustferry_log_source="$log_dir"
+              fi
+              ;;
+          esac
+          for log_name in \
+            zipalign.log \
+            zipalign-verify.log \
+            apksigner-sign.log \
+            apksigner-verify.log
+          do
+            if test "$rustferry_log_source" != unavailable && \
+               test -f "$rustferry_log_source/$log_name" && \
+               test ! -L "$rustferry_log_source/$log_name"
+            then
+              python3 "$sanitizer" \
+                "$rustferry_log_source/$log_name" \
+                "$out/rustferry-logs/$log_name"
+            else
+              printf 'unavailable\n' > "$out/rustferry-logs/$log_name"
+            fi
+          done
+
+          apk_sha_after="$(sha256sum "$apk" | awk '{print $1}')"
+          apk_sha_stable=false
+          if test "$apk_sha_after" = "$apk_sha_before"; then
+            apk_sha_stable=true
+          else
+            alignment_status=artifact_changed_during_validation
+          fi
+          evidence_json="$out/android-acceptance.json"
+          evidence_md="$out/android-acceptance.md"
+          ndk_revision="$(sed -n 's/^Pkg.Revision[[:space:]]*=[[:space:]]*//p' \
+            "$ANDROID_NDK/source.properties")"
+          rust_version="$(rustc --version)"
+          cli_version="$("${{ steps.starter.outputs.cli }}" --version)"
+          runner_image="${ImageOS:-ubuntu}-${ImageVersion:-unknown}"
+          workflow_head='${{ github.event.pull_request.head.sha }}'
+          jq -n \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg workflow_head "$workflow_head" \
+            --arg runner_os "$RUNNER_OS" \
+            --arg runner_image "$runner_image" \
+            --arg rust_version "$rust_version" \
+            --arg cargo_ferry_version "$cli_version" \
+            --arg android_sdk "$ANDROID_PLATFORM;build-tools=$BUILD_TOOLS_VERSION" \
+            --arg compile_sdk "$compile_sdk" \
+            --arg sdk_level_source 'apkanalyzer_manifest' \
+            --arg apkanalyzer_identity "$apkanalyzer_public" \
+            --arg apkanalyzer_sha256 "$apkanalyzer_sha" \
+            --arg ndk_revision "$ndk_revision" \
+            --arg rust_target 'aarch64-linux-android' \
+            --arg runtime_source_mode 'local workspace path' \
+            --arg doctor_result 'ready_for_android_build=true' \
+            --arg build_profile 'release' \
+            --arg apk_filename "$apk_name" \
+            --argjson apk_size "$apk_size" \
+            --arg apk_sha256 "$apk_sha_before" \
+            --arg package_id "$package" \
+            --arg version_code "$version_code" \
+            --arg version_name "$version_name" \
+            --arg min_sdk "$min_sdk" \
+            --arg target_sdk "$target_sdk" \
+            --arg abi "$abi" \
+            --arg launcher "$launcher" \
+            --arg launcher_result "$launcher_status" \
+            --arg signature_result "$signature_result" \
+            --arg certificate_sha256 "$certificate" \
+            --arg zip_content_result "$zip_content_status" \
+            --argjson zipalign_basic_status "$zipalign_basic_status" \
+            --argjson zipalign_16k_status "$zipalign_16k_status" \
+            --arg alignment_status "$alignment_status" \
+            --arg validation_zipalign_path "$validation_public" \
+            --arg validation_zipalign_sha256 "$validation_binary_sha" \
+            --arg validation_build_tools "$validation_build_tools" \
+            --argjson validation_help_status "$validation_help_status" \
+            --arg rustferry_zipalign_path "$rustferry_public" \
+            --arg rustferry_zipalign_sha256 "$rustferry_binary_sha" \
+            --arg rustferry_build_tools "$rustferry_build_tools" \
+            --arg binaries_match "$binaries_match" \
+            --arg canonical_paths_match "$canonical_paths_match" \
+            --arg binary_hashes_match "$binary_hashes_match" \
+            --arg build_tools_match "$build_tools_match" \
+            --argjson apk_sha_stable "$apk_sha_stable" \
+            --arg shared_library_result "$shared_library_status" \
+            --argjson gradle_absent true \
+            --slurpfile shared_libraries "$shared_json" \
+            --slurpfile elf_load_alignments "$elf_json" \
+            '{
+              source_sha:$source_sha,
+              workflow_head:$workflow_head,
+              runner_os:$runner_os,
+              runner_image:$runner_image,
+              rust_version:$rust_version,
+              cargo_ferry_version:$cargo_ferry_version,
+              android_sdk:$android_sdk,
+              compile_sdk:$compile_sdk,
+              sdk_level_source:$sdk_level_source,
+              apkanalyzer_identity:$apkanalyzer_identity,
+              apkanalyzer_sha256:$apkanalyzer_sha256,
+              ndk_revision:$ndk_revision,
+              rust_target:$rust_target,
+              runtime_source_mode:$runtime_source_mode,
+              doctor_result:$doctor_result,
+              build_profile:$build_profile,
+              apk_filename:$apk_filename,
+              apk_size:$apk_size,
+              apk_sha256:$apk_sha256,
+              package_id:$package_id,
+              version_code:$version_code,
+              version_name:$version_name,
+              min_sdk:$min_sdk,
+              target_sdk:$target_sdk,
+              abi:$abi,
+              launcher:$launcher,
+              launcher_result:$launcher_result,
+              signature_result:$signature_result,
+              certificate_sha256:$certificate_sha256,
+              zip_content_result:$zip_content_result,
+              zipalign_basic_status:$zipalign_basic_status,
+              zipalign_16k_status:$zipalign_16k_status,
+              alignment_status:$alignment_status,
+              acceptance_zipalign:{
+                path:$validation_zipalign_path,
+                sha256:$validation_zipalign_sha256,
+                build_tools:$validation_build_tools,
+                help_exit_status:$validation_help_status
+              },
+              rustferry_zipalign:{
+                path:$rustferry_zipalign_path,
+                sha256:$rustferry_zipalign_sha256,
+                build_tools:$rustferry_build_tools
+              },
+              zipalign_identity_comparison:{
+                binaries_match:$binaries_match,
+                canonical_paths_match:$canonical_paths_match,
+                binary_hashes_match:$binary_hashes_match,
+                build_tools_match:$build_tools_match
+              },
+              apk_sha_stable:$apk_sha_stable,
+              shared_library_result:$shared_library_result,
+              shared_libraries:$shared_libraries[0],
+              elf_load_alignments:$elf_load_alignments[0],
+              gradle_absent:$gradle_absent,
+              overall_acceptance:(
+                if $alignment_status == "passed" then "passed" else "failed" end
+              )
+            }' > "$evidence_json"
+          cat > "$evidence_md" <<EOF
+          # Android source beta diagnostics
+
+          - Source: \`$SOURCE_SHA\`
+          - Workflow head: \`$workflow_head\`
+          - Runner: \`$RUNNER_OS\` / \`$runner_image\`
+          - Rust: \`$rust_version\`
+          - cargo-ferry: \`$cli_version\`
+          - NDK: \`$ndk_revision\`
+          - Build Tools: \`$BUILD_TOOLS_VERSION\`
+          - Compile SDK: \`$compile_sdk\`
+          - Target / ABI: \`aarch64-linux-android\` / \`$abi\`
+          - Doctor: \`ready_for_android_build=true\`
+          - Profile: \`release\`
+          - APK: \`$apk_name\` ($apk_size bytes)
+          - SHA-256: \`$apk_sha_before\`
+          - Package: \`$package\`
+          - Version: \`$version_name\` (\`$version_code\`)
+          - Manifest SDK: min \`$min_sdk\`, target \`$target_sdk\`
+          - SDK level source: \`apkanalyzer_manifest\`
+          - APK Analyzer: \`$apkanalyzer_public\` / \`$apkanalyzer_sha\`
+          - Launcher: \`$launcher\` (\`$launcher_status\`)
+          - Signature: \`$signature_result\`; certificate SHA-256 \`$certificate\`
+          - ZIP/content: \`$zip_content_status\`
+          - Basic zipalign status: \`$zipalign_basic_status\`
+          - 16 KiB zipalign status: \`$zipalign_16k_status\`
+          - Alignment classification: \`$alignment_status\`
+          - Acceptance zipalign: \`$validation_public\` / \`$validation_binary_sha\`
+          - RustFerry zipalign: \`$rustferry_public\` / \`$rustferry_binary_sha\`
+          - Zipalign binaries match: \`$binaries_match\`
+          - APK SHA stable: \`$apk_sha_stable\`
+          - Gradle/Kotlin/user Java: absent
+          - Overall acceptance: \`$(test "$alignment_status" = passed && echo passed || echo failed)\`
+          - Install, launch, and device runtime: not validated
+          EOF
+          (
+            cd "$out"
+            sha256sum \
+              "$apk_name" \
+              android-acceptance.json \
+              android-acceptance.md \
+              android-build.log \
+              apkanalyzer-identity.txt \
+              apkanalyzer-min.stderr \
+              apkanalyzer-target.stderr \
+              acceptance-zipalign-help.sanitized.log \
+              acceptance-zipalign-identity.txt \
+              rustferry-zipalign-identity.txt \
+              zipalign-basic.sanitized.log \
+              zipalign-16k.sanitized.log \
+              shared-libraries.json \
+              elf-load-alignments.json \
+              rustferry-logs/zipalign.log \
+              rustferry-logs/zipalign-verify.log \
+              rustferry-logs/apksigner-sign.log \
+              rustferry-logs/apksigner-verify.log \
+              > checksums.txt
+          )
+          evidence_json_created=false
+          evidence_md_created=false
+          checksums_created=false
+          if test -s "$evidence_json"; then
+            evidence_json_created=true
+          fi
+          if test -s "$evidence_md"; then
+            evidence_md_created=true
+          fi
+          if test -s "$out/checksums.txt"; then
+            checksums_created=true
+          fi
+          evidence_created=false
+          if test "$evidence_json_created" = true && \
+             test "$evidence_md_created" = true && \
+             test "$checksums_created" = true
+          then
+            evidence_created=true
+          fi
+          {
+            echo "signature_result=$signature_result"
+            echo "zip_content_status=$zip_content_status"
+            echo "launcher_status=$launcher_status"
+            echo "shared_library_status=$shared_library_status"
+            echo "zipalign_basic_status=$zipalign_basic_status"
+            echo "zipalign_16k_status=$zipalign_16k_status"
+            echo "alignment_status=$alignment_status"
+            echo "binaries_match=$binaries_match"
+            echo "apk_sha_stable=$apk_sha_stable"
+            echo "min_sdk=$min_sdk"
+            echo "target_sdk=$target_sdk"
+            echo "evidence_json_created=$evidence_json_created"
+            echo "evidence_md_created=$evidence_md_created"
+            echo "checksums_created=$checksums_created"
+            echo "evidence_created=$evidence_created"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo '### Android zipalign diagnostics'
+            echo
+            echo "- Basic status: \`$zipalign_basic_status\`"
+            echo "- 16 KiB status: \`$zipalign_16k_status\`"
+            echo "- Classification: \`$alignment_status\`"
+            echo
+            echo '#### Basic check (sanitized)'
+            echo '```text'
+            sed -n '1,100p' "$out/zipalign-basic.sanitized.log"
+            echo '```'
+            echo
+            echo '#### 16 KiB check (sanitized)'
+            echo '```text'
+            sed -n '1,100p' "$out/zipalign-16k.sanitized.log"
+            echo '```'
+            echo
+            echo '#### BAD entries'
+            bad_entries="$(grep -h -E '(^|[[:space:]])BAD([[:space:]]|$)' \
+              "$out/zipalign-basic.sanitized.log" \
+              "$out/zipalign-16k.sanitized.log" || true)"
+            if test -n "$bad_entries"; then
+              printf '%s\n' "$bad_entries"
+            else
+              echo 'none'
+            fi
+            echo
+            echo '#### Verification result'
+            verification="$(grep -h -E 'Verification (successful|succesful|FAILED)' \
+              "$out/zipalign-basic.sanitized.log" \
+              "$out/zipalign-16k.sanitized.log" || true)"
+            if test -n "$verification"; then
+              printf '%s\n' "$verification"
+            else
+              echo 'unavailable'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload APK and acceptance evidence
+        id: upload
+        if: >-
+          always() &&
+          steps.gate.outputs.run == 'true' &&
+          steps.build.conclusion == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: android-source-beta-diagnostics-${{ github.run_id }}
+          path: ${{ steps.diagnostics.outputs.directory }}/*
+          if-no-files-found: error
+          retention-days: 14
+      - name: Enforce final Android acceptance
+        if: always() && steps.gate.outputs.run == 'true'
+        shell: bash
+        env:
+          BUILD_RESULT: ${{ steps.build.conclusion }}
+          DIAGNOSTICS_RESULT: ${{ steps.diagnostics.conclusion }}
+          EVIDENCE_RESULT: ${{ steps.evidence.conclusion }}
+          UPLOAD_RESULT: ${{ steps.upload.conclusion }}
+          APK_CREATED: ${{ steps.diagnostics.outputs.apk_created }}
+          APK_SHA_STABLE: ${{ steps.evidence.outputs.apk_sha_stable }}
+          SIGNATURE_RESULT: ${{ steps.evidence.outputs.signature_result }}
+          ZIP_CONTENT_STATUS: ${{ steps.evidence.outputs.zip_content_status }}
+          SHARED_LIBRARY_STATUS: ${{ steps.evidence.outputs.shared_library_status }}
+          LAUNCHER_STATUS: ${{ steps.evidence.outputs.launcher_status }}
+          ZIPALIGN_BASIC_STATUS: ${{ steps.evidence.outputs.zipalign_basic_status }}
+          ZIPALIGN_16K_STATUS: ${{ steps.evidence.outputs.zipalign_16k_status }}
+          MIN_SDK: ${{ steps.evidence.outputs.min_sdk }}
+          TARGET_SDK: ${{ steps.evidence.outputs.target_sdk }}
+          EVIDENCE_JSON_CREATED: ${{ steps.evidence.outputs.evidence_json_created }}
+          EVIDENCE_MD_CREATED: ${{ steps.evidence.outputs.evidence_md_created }}
+          CHECKSUMS_CREATED: ${{ steps.evidence.outputs.checksums_created }}
+          EVIDENCE_CREATED: ${{ steps.evidence.outputs.evidence_created }}
+        run: |
+          set -euo pipefail
+          test "$BUILD_RESULT" = success
+          test "$DIAGNOSTICS_RESULT" = success
+          test "$EVIDENCE_RESULT" = success
+          test "$APK_CREATED" = true
+          test "$APK_SHA_STABLE" = true
+          test "$SIGNATURE_RESULT" = 'v2=true;v3=true'
+          test "$ZIP_CONTENT_STATUS" = passed
+          test "$SHARED_LIBRARY_STATUS" = passed
+          test "$LAUNCHER_STATUS" = passed
+          test "$ZIPALIGN_BASIC_STATUS" = 0
+          test "$ZIPALIGN_16K_STATUS" = 0
+          test "$MIN_SDK" = 26
+          test "$TARGET_SDK" = 36
+          test "$EVIDENCE_JSON_CREATED" = true
+          test "$EVIDENCE_MD_CREATED" = true
+          test "$CHECKSUMS_CREATED" = true
+          test "$EVIDENCE_CREATED" = true
+          test "$UPLOAD_RESULT" = success

@@ -31,6 +31,8 @@ pub enum WorkerProgram {
     Plutil,
     /// Apple archive utility.
     Ditto,
+    /// Xcode tool dispatcher used for fixed inspection commands.
+    Xcrun,
 }
 
 impl WorkerProgram {
@@ -42,6 +44,7 @@ impl WorkerProgram {
             Self::Xcodebuild => "/usr/bin/xcodebuild",
             Self::Plutil => "/usr/bin/plutil",
             Self::Ditto => "/usr/bin/ditto",
+            Self::Xcrun => "/usr/bin/xcrun",
         }
     }
 }

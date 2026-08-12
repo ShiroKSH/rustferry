@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     fs,
     process::{Child, Command, ExitStatus, Stdio},
@@ -10,6 +11,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use rustferry_core::process_control::{
     BoundedOutputCapture, DEFAULT_PROCESS_OUTPUT_LIMIT, OutputCaptureStatus,
 };
+use rustferry_remote::CancellationToken;
 use serde::{Deserialize, Serialize};
 
 use crate::{AppleError, error::io_error};
@@ -18,6 +20,44 @@ use crate::{AppleError, error::io_error};
 pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_mins(30);
 const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(1);
+
+thread_local! {
+    static COMMAND_CANCELLATION: RefCell<Option<CancellationToken>> = const { RefCell::new(None) };
+}
+
+struct CommandCancellationBinding {
+    previous: Option<CancellationToken>,
+}
+
+impl Drop for CommandCancellationBinding {
+    fn drop(&mut self) {
+        COMMAND_CANCELLATION.with(|binding| {
+            binding.replace(self.previous.take());
+        });
+    }
+}
+
+/// Run a closure with cooperative cancellation enabled for Apple commands on this thread.
+///
+/// Nested bindings restore the previous token, including when the closure unwinds. Bindings on
+/// other threads are independent.
+pub fn with_command_cancellation<T>(
+    cancellation: &CancellationToken,
+    operation: impl FnOnce() -> T,
+) -> T {
+    let previous = COMMAND_CANCELLATION.with(|binding| binding.replace(Some(cancellation.clone())));
+    let _binding = CommandCancellationBinding { previous };
+    operation()
+}
+
+fn command_cancellation_requested() -> bool {
+    COMMAND_CANCELLATION.with(|binding| {
+        binding
+            .borrow()
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+    })
+}
 
 /// One safely tokenized external command.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -164,7 +204,9 @@ fn run_command_with_output_limit(
     let timeout = Duration::from_secs(spec.timeout_seconds.max(1));
     let mut status = None;
     loop {
-        if rustferry_core::process_control::interrupt_requested() {
+        if rustferry_core::process_control::interrupt_requested()
+            || command_cancellation_requested()
+        {
             terminate_process_tree(&mut child, process_group);
             drain_after_termination(&mut capture);
             return Err(AppleError::CommandInterrupted {
@@ -247,7 +289,7 @@ fn run_command_with_output_limit(
                 |code| code.to_string(),
             ),
             summary: command_summary(&output.stdout, &output.stderr),
-            log: log_path.map(Utf8Path::to_owned),
+            log: log_path.map(|path| Box::new(path.to_owned())),
         });
     }
     Ok(CommandOutput {
@@ -420,6 +462,59 @@ mod tests {
         let error = run_command(&command, Some(&root.join("command.log"))).unwrap_err();
         assert!(matches!(error, AppleError::CommandTimedOut { .. }));
         assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_stops_subprocess_group_within_a_bounded_time() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temporary.path().to_owned()).unwrap();
+        let log_path = root.join("command.log");
+        let mut command = CommandSpec::new("cancel subprocess", "/bin/sh", &root);
+        command.args = vec!["-c".into(), "sleep 10 & wait".into()];
+        command.timeout_seconds = 10;
+        let cancellation = CancellationToken::new();
+        let cancellation_request = cancellation.clone();
+        let request = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            cancellation_request.cancel();
+        });
+
+        let started = Instant::now();
+        let error =
+            with_command_cancellation(&cancellation, || run_command(&command, Some(&log_path)))
+                .unwrap_err();
+        request.join().unwrap();
+
+        assert!(matches!(error, AppleError::CommandInterrupted { .. }));
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(!log_path.exists());
+    }
+
+    #[test]
+    fn cancellation_scope_restores_nested_binding_after_unwind() {
+        let outer = CancellationToken::new();
+        outer.cancel();
+        let inner = CancellationToken::new();
+
+        assert!(!command_cancellation_requested());
+        with_command_cancellation(&outer, || {
+            assert!(command_cancellation_requested());
+            assert!(
+                !thread::spawn(command_cancellation_requested)
+                    .join()
+                    .unwrap()
+            );
+            let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_command_cancellation(&inner, || {
+                    assert!(!command_cancellation_requested());
+                    panic!("exercise cancellation binding unwind");
+                });
+            }));
+            assert!(unwind.is_err());
+            assert!(command_cancellation_requested());
+        });
+        assert!(!command_cancellation_requested());
     }
 
     #[cfg(unix)]

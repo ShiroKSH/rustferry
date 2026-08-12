@@ -417,7 +417,8 @@ fn is_safe_target_name(value: &str) -> bool {
         && value.len() <= 128
         && value
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        && !value.contains("..")
 }
 
 #[allow(clippy::needless_pass_by_value)] // Owned signature is a direct `map_err` adapter.
@@ -432,10 +433,14 @@ fn io_error(operation: &'static str, source: std::io::Error) -> ProvisioningMate
 mod tests {
     use rustferry_remote::SecretBytes;
 
-    use super::{ProfileSecretInput, ProvisioningMaterialError};
+    use super::{ProfileSecretInput, ProvisioningMaterialError, is_safe_target_name};
 
     #[test]
     fn secret_input_rejects_unsafe_target_names_and_empty_bytes() {
+        assert!(is_safe_target_name("App.Extension"));
+        for invalid in ["App..Extension", "App/Extension", "App\\Extension"] {
+            assert!(!is_safe_target_name(invalid));
+        }
         assert!(matches!(
             ProfileSecretInput::new("../App", SecretBytes::new(vec![1])),
             Err(ProvisioningMaterialError::InvalidInput {

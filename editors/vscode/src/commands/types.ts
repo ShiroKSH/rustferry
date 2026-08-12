@@ -14,9 +14,12 @@ export type CommandServices = Readonly<{
   validation: ConfigValidationCoordinator;
   output: vscode.OutputChannel;
   logs: vscode.OutputChannel;
+  jobLogs: vscode.OutputChannel;
   clientFor: (project: WorkspaceProject) => Promise<CliClient>;
   clientAt: (cwd: string, resource?: vscode.Uri) => Promise<CliClient>;
   invocationFor: (project: WorkspaceProject) => Promise<CliInvocation>;
   refreshProject: (project: WorkspaceProject) => Promise<void>;
   refreshAll: () => Promise<void>;
+  refreshJobs: () => void;
+  loadMoreJobLogs: (argument: unknown) => Promise<void>;
 }>;

@@ -19,6 +19,7 @@ camino.workspace = true
 cap-std.workspace = true
 clap.workspace = true
 fs2.workspace = true
+goblin.workspace = true
 hex.workspace = true
 plist.workspace = true
 rustferry-apple = { version = "=0.1.0", path = "../rustferry-apple" }
@@ -31,6 +32,7 @@ sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 toml.workspace = true
+unicode-normalization.workspace = true
 uuid.workspace = true
 zip.workspace = true
 

@@ -1,20 +1,23 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, Metadata, OpenOptions};
 use std::io::{self, BufRead as _, IsTerminal as _, Read as _, Write as _};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use camino::{Utf8Path, Utf8PathBuf};
-use rustferry_github::{SigningSecretNames, transport::MAX_ENVIRONMENT_SECRET_BYTES};
+use rustferry_github::{
+    MAX_SIGNING_PROFILES, SigningSecretNames, transport::MAX_ENVIRONMENT_SECRET_BYTES,
+};
 use rustferry_remote::{
     DevelopmentTeamPlan, DevicePlan, EntitlementPlan, EntitlementSet, ProfileValidationRequest,
     ProvisioningPlan, ProvisioningProfileType, SecretBytes, SecretReference, SecretReferenceKind,
     SigningIdentity, SigningMode, SigningPlan, SigningPrivateKeyReference, SigningReference,
-    SigningTargetKind, validate_profile_for_target,
+    SigningTarget, SigningTargetKind, validate_profile_for_target,
 };
 use same_file::Handle as FileIdentityHandle;
 
 use crate::cli::{
-    ManualSigningSetupArgs, RemoteProviderChoice, SigningArgs, SigningCommand, SigningSetupArgs,
-    SigningSetupMode,
+    ManualSigningSetupArgs, RemoteProviderChoice, SigningArgs, SigningCommand, SigningDoctorArgs,
+    SigningSetupArgs, SigningSetupMode,
 };
 use crate::error::CliError;
 use crate::output::Reporter;
@@ -24,11 +27,107 @@ use super::{platform_build, remote};
 
 const CREDENTIAL_SERVICE: &str = "org.rustferry.cargo-ferry.signing";
 const MAX_REMOTE_BINARY_INPUT_BYTES: u64 = ((MAX_ENVIRONMENT_SECRET_BYTES / 4) * 3) as u64;
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TargetProfilePath {
+    target: String,
+    path: Utf8PathBuf,
+}
 
 pub fn run(arguments: SigningArgs, dry_run: bool, reporter: &Reporter) -> Result<(), CliError> {
     match arguments.command {
         SigningCommand::Setup(arguments) => setup(arguments, dry_run, reporter),
+        SigningCommand::Doctor(arguments) => doctor(&arguments, reporter),
         SigningCommand::Teams(arguments) => teams(arguments.project_dir, reporter),
+    }
+}
+
+fn doctor(arguments: &SigningDoctorArgs, reporter: &Reporter) -> Result<(), CliError> {
+    let RemoteProviderChoice::Github = arguments.remote;
+    let root = find_project_root(arguments.project_dir.as_deref())
+        .map_err(|_| signing_readiness_unavailable())?;
+    let binding = remote::ProjectFilesystemBinding::capture(&root)
+        .map_err(|_| signing_readiness_unavailable())?;
+    let readiness = remote::github_signing_readiness(&binding)?;
+    if readiness.ready {
+        reporter.success(
+            "signing-doctor",
+            &readiness,
+            || render_signing_readiness(&readiness),
+            &[],
+        );
+        return Ok(());
+    }
+
+    let error = signing_not_ready();
+    let exit_code = error.exit_code();
+    reporter.failure_with_data("signing-doctor", &readiness, &error, || {
+        render_signing_readiness(&readiness)
+    });
+    Err(CliError::AlreadyReported { exit_code })
+}
+
+fn render_signing_readiness(readiness: &remote::IdeSigningReadiness) -> String {
+    let checks = std::iter::once(format!("ready={}", readiness.ready))
+        .chain(readiness.checks.iter().map(|check| {
+            format!(
+                "code={} required={} ready={} reason_code={}",
+                check.code,
+                check.required,
+                check.ready,
+                check.reason_code.unwrap_or("none")
+            )
+        }))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if missing_assets_with_ready_phase_implementation(readiness) {
+        const MISSING_ASSETS: &str = concat!(
+            "Signed Phase B implementation is ready,\n",
+            "but real Apple signing assets are not configured.\n\n",
+            "Required:\n",
+            "  Apple Development PKCS#12\n",
+            "  PKCS#12 password\n",
+            "  development provisioning profile\n",
+            "  registered device\n",
+            "  private execution repository\n",
+            "  protected Environment",
+        );
+        return format!("{MISSING_ASSETS}\n\n{checks}");
+    }
+    checks
+}
+
+fn missing_assets_with_ready_phase_implementation(readiness: &remote::IdeSigningReadiness) -> bool {
+    let check_ready = |code| {
+        readiness
+            .checks
+            .iter()
+            .any(|check| check.code == code && check.ready)
+    };
+    let assets_missing = readiness.checks.iter().any(|check| {
+        check.code == "github_actions_ios_signing.configured" && check.required && !check.ready
+    });
+    assets_missing
+        && check_ready("github.workflow.phase_a_secret_isolation")
+        && check_ready("github.workflow.phase_b_no_source_execution")
+}
+
+fn signing_readiness_unavailable() -> CliError {
+    CliError::Remote {
+        code: "signing_readiness_unavailable",
+        message: "GitHub iPhone-signing readiness could not be established safely".to_owned(),
+        help: "Verify the project and GitHub remote configuration, then retry the signing doctor."
+            .to_owned(),
+        details: Vec::new(),
+    }
+}
+
+fn signing_not_ready() -> CliError {
+    CliError::Remote {
+        code: "github_signing_not_ready",
+        message: "GitHub iPhone signing is not ready".to_owned(),
+        help: "Resolve every required readiness code before requesting a signed iPhone build."
+            .to_owned(),
+        details: Vec::new(),
     }
 }
 
@@ -77,6 +176,7 @@ fn setup(arguments: SigningSetupArgs, dry_run: bool, reporter: &Reporter) -> Res
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn manual(
     arguments: &ManualSigningSetupArgs,
     dry_run: bool,
@@ -96,7 +196,7 @@ fn manual(
     }
     let cargo_targets = platform_build::read_cargo_targets(&root)?;
     let unsigned_targets = remote::unsigned_signing_plan(&config, cargo_targets.binary())?;
-    reject_unsupported_extensions(&unsigned_targets)?;
+    let profile_paths = resolve_profile_paths(&arguments.profile, &unsigned_targets)?;
     ensure_confirmation_channel(arguments, dry_run, reporter)?;
 
     let repository_root = enclosing_repository_root(&root)?;
@@ -106,27 +206,47 @@ fn manual(
         MAX_REMOTE_BINARY_INPUT_BYTES,
         "certificate_p12",
     )?;
-    let profile = read_signing_asset(
-        &arguments.profile,
-        &repository_root,
-        MAX_REMOTE_BINARY_INPUT_BYTES,
-        "provisioning_profile",
-    )?;
     let password = acquire_password(arguments, reporter)?;
 
-    let input = rustferry_apple::ManualSigningAssetsInput::new(certificate, password, profile)
+    let identity_input = rustferry_apple::ManualSigningIdentityInput::new(certificate, password)
         .map_err(|error| signing_asset_error(&error))?;
-    reporter.progress("Validating Apple certificate and provisioning profile…");
-    let (assets, validated_input) = rustferry_apple::validate_manual_signing_assets(input)
-        .map_err(|error| signing_asset_error(&error))?;
-    let device = select_device(
-        &assets.profile.device_udid_sha256s,
-        arguments.device_sha256.as_deref(),
-    )?;
-    let plan = manual_signing_plan(unsigned_targets, &assets, device)?;
-    validate_application_profile(&assets, &plan)?;
+    let (certificate_metadata, retained_identity) =
+        rustferry_apple::validate_manual_signing_identity(identity_input)
+            .map_err(|error| signing_asset_error(&error))?;
+    let mut validated = Vec::with_capacity(profile_paths.len());
+    reporter.progress("Validating Apple certificate and target provisioning profiles…");
+    for selected in profile_paths {
+        let profile = read_signing_asset(
+            &selected.path,
+            &repository_root,
+            MAX_REMOTE_BINARY_INPUT_BYTES,
+            "provisioning_profile",
+        )?;
+        let (profile, retained) =
+            rustferry_apple::validate_manual_signing_profile(profile, &certificate_metadata)
+                .map_err(|error| signing_asset_error(&error))?;
+        validated.push((selected.target, profile, retained));
+    }
+    let common_devices = common_profile_devices(&validated)?;
+    let device = select_device(&common_devices, arguments.device_sha256.as_deref())?;
+    let plan = manual_signing_plan(unsigned_targets, &certificate_metadata, device, &config)?;
+    validate_target_profiles(&validated, &plan)?;
 
-    let session = remote::prepare_manual_github_signing(&root, plan, assets.clone(), !dry_run)?;
+    let public_assets = remote::ManualGithubSigningAssets::new(
+        certificate_metadata,
+        validated
+            .iter()
+            .map(|(target, profile, _)| (target.clone(), profile.clone()))
+            .collect(),
+    )?;
+    let session = remote::prepare_manual_github_signing(
+        &root,
+        plan,
+        public_assets.clone(),
+        &config,
+        cargo_targets.binary(),
+        !dry_run,
+    )?;
     let preview = session.preview(false, dry_run);
     if dry_run {
         reporter.success(
@@ -154,7 +274,14 @@ fn manual(
         }
     }
 
-    let values = remote::ManualGithubSecretValues::from_validated_input(&assets, validated_input)?;
+    let values = remote::ManualGithubSecretValues::from_validated_inputs(
+        &public_assets,
+        retained_identity,
+        validated
+            .into_iter()
+            .map(|(target, _, profile)| (target, profile))
+            .collect(),
+    )?;
     reporter.progress("Uploading validated signing assets to the protected GitHub Environment…");
     let installed = session.install(&values)?;
     reporter.success(
@@ -171,23 +298,144 @@ fn manual(
     Ok(())
 }
 
-fn reject_unsupported_extensions(plan: &SigningPlan) -> Result<(), CliError> {
-    let extensions = plan
+fn resolve_profile_paths(
+    values: &[String],
+    plan: &SigningPlan,
+) -> Result<Vec<TargetProfilePath>, CliError> {
+    let signable = plan
         .targets
         .iter()
-        .filter(|target| target.kind == SigningTargetKind::Extension)
-        .map(|target| format!("extension_target={}", target.name))
-        .collect::<Vec<_>>();
-    if extensions.is_empty() {
-        Ok(())
-    } else {
-        Err(manual_error_with_details(
-            "extension_profiles_required",
-            "the project contains iOS extensions that need separate provisioning profiles",
-            "Disable neither capability implicitly. Configure per-extension profiles when that setup flow is available, or use a project without Widget and Live Activity targets.",
-            extensions,
-        ))
+        .filter(|target| {
+            matches!(
+                target.kind,
+                SigningTargetKind::Application | SigningTargetKind::Extension
+            )
+        })
+        .map(|target| target.name.clone())
+        .collect::<BTreeSet<_>>();
+    if values.is_empty()
+        || values.len() > MAX_SIGNING_PROFILES
+        || signable.len() > MAX_SIGNING_PROFILES
+    {
+        return Err(manual_error_with_details(
+            "invalid_profile_count",
+            "manual GitHub signing requires one bounded profile per application and extension",
+            "Pass exactly one --profile TARGET=PATH for each generated application and extension target.",
+            vec![
+                format!("profile_count={}", values.len()),
+                format!("target_count={}", signable.len()),
+                format!("maximum={MAX_SIGNING_PROFILES}"),
+            ],
+        ));
     }
+
+    let parsed = values
+        .iter()
+        .map(|value| parse_profile_argument(value, &signable))
+        .collect::<Result<Vec<_>, _>>()?;
+    let keyed = parsed.iter().filter(|(target, _)| target.is_some()).count();
+    if keyed == 0 {
+        if parsed.len() != 1 || signable.len() != 1 {
+            return Err(manual_error(
+                "target_qualified_profiles_required",
+                "unkeyed --profile is valid only for an extension-free single-target project",
+                "Use --profile TARGET=PATH once for every generated application and extension target.",
+            ));
+        }
+        let target = signable
+            .iter()
+            .next()
+            .expect("validated signing plan has an application target")
+            .clone();
+        return Ok(vec![TargetProfilePath {
+            target,
+            path: parsed.into_iter().next().expect("one profile").1,
+        }]);
+    }
+    if keyed != parsed.len() {
+        return Err(manual_error(
+            "mixed_profile_arguments",
+            "keyed and unkeyed --profile forms cannot be mixed",
+            "Use TARGET=PATH for every profile when the project has extensions.",
+        ));
+    }
+
+    let mut selected = BTreeMap::new();
+    for (target, path) in parsed {
+        let target = target.expect("all parsed profiles are keyed");
+        if !signable.contains(&target) {
+            return Err(manual_error_with_details(
+                "unknown_profile_target",
+                "a target-qualified profile names no generated signing target",
+                "Use an exact target name from the signing preview.",
+                vec![format!("target={target}")],
+            ));
+        }
+        if selected.insert(target.clone(), path).is_some() {
+            return Err(manual_error_with_details(
+                "duplicate_profile_target",
+                "a signing target has more than one provisioning profile argument",
+                "Pass exactly one profile for each generated signing target.",
+                vec![format!("target={target}")],
+            ));
+        }
+    }
+    let actual = selected.keys().cloned().collect::<BTreeSet<_>>();
+    if actual != signable {
+        let missing = signable
+            .difference(&actual)
+            .map(|target| format!("missing_target={target}"))
+            .collect();
+        return Err(manual_error_with_details(
+            "missing_profile_target",
+            "one or more generated signing targets have no provisioning profile",
+            "Pass exactly one --profile TARGET=PATH for every application and extension.",
+            missing,
+        ));
+    }
+    Ok(selected
+        .into_iter()
+        .map(|(target, path)| TargetProfilePath { target, path })
+        .collect())
+}
+
+fn parse_profile_argument(
+    value: &str,
+    targets: &BTreeSet<String>,
+) -> Result<(Option<String>, Utf8PathBuf), CliError> {
+    if value.is_empty() {
+        return Err(manual_error(
+            "invalid_profile_argument",
+            "--profile cannot be empty",
+            "Pass PATH for one app, or TARGET=PATH for each app and extension.",
+        ));
+    }
+    if let Some((target, path)) = value.split_once('=')
+        && targets.contains(target)
+    {
+        if path.is_empty() {
+            return Err(manual_error(
+                "invalid_profile_argument",
+                "a target-qualified --profile has an empty path",
+                "Pass TARGET=PATH with a non-empty provisioning-profile path.",
+            ));
+        }
+        return Ok((Some(target.to_owned()), Utf8PathBuf::from(path)));
+    }
+    if let Some((target, _)) = value.split_once('=')
+        && !target.is_empty()
+        && target
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(manual_error_with_details(
+            "unknown_profile_target",
+            "a target-qualified profile names no generated signing target",
+            "Use an exact target name from the signing preview.",
+            vec![format!("target={target}")],
+        ));
+    }
+    Ok((None, Utf8PathBuf::from(value)))
 }
 
 fn ensure_confirmation_channel(
@@ -413,12 +661,44 @@ fn select_device(hashes: &[String], requested: Option<&str>) -> Result<DevicePla
     })
 }
 
+fn common_profile_devices(
+    validated: &[(String, rustferry_remote::ProvisioningProfile, SecretBytes)],
+) -> Result<Vec<String>, CliError> {
+    let mut common = validated
+        .first()
+        .map(|(_, profile, _)| {
+            profile
+                .device_udid_sha256s
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    for (_, profile, _) in validated.iter().skip(1) {
+        let devices = profile
+            .device_udid_sha256s
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        common.retain(|device| devices.contains(device));
+    }
+    if common.is_empty() {
+        return Err(manual_error(
+            "profiles_have_no_common_device",
+            "the target provisioning profiles do not contain one common registered device",
+            "Regenerate every development profile for the same target iPhone.",
+        ));
+    }
+    Ok(common.into_iter().collect())
+}
+
 fn manual_signing_plan(
     mut plan: SigningPlan,
-    assets: &rustferry_apple::ValidatedManualSigningAssets,
+    certificate: &rustferry_remote::SigningCertificate,
     device: DevicePlan,
+    config: &rustferry_core::FerryConfig,
 ) -> Result<SigningPlan, CliError> {
-    let application = plan
+    let _application = plan
         .targets
         .iter()
         .find(|target| target.kind == SigningTargetKind::Application)
@@ -429,17 +709,21 @@ fn manual_signing_plan(
                 "Validate the generated iPhone product graph.",
             )
         })?;
-    let application_name = application.name.clone();
-    let names = SigningSecretNames::goal3_defaults();
+    let names = SigningSecretNames::for_targets(&plan.targets).map_err(|error| {
+        manual_error_with_details(
+            "invalid_signing_target_secret_map",
+            "the generated signing targets cannot form a protected GitHub secret map",
+            "Correct duplicate or unsupported application and extension targets.",
+            vec![error.to_string()],
+        )
+    })?;
     let certificate_reference = github_secret_reference(names.certificate_p12().as_str())?;
     let password_reference = github_secret_reference(names.certificate_password().as_str())?;
-    let profile_reference = github_secret_reference(names.provisioning_profile().as_str())?;
-    let required_entitlements = EntitlementSet::default();
 
     plan.mode = SigningMode::ManualDevelopment;
     plan.signing = Some(SigningReference {
         identity: SigningIdentity {
-            certificate: assets.certificate.clone(),
+            certificate: certificate.clone(),
             private_key: SigningPrivateKeyReference {
                 reference: certificate_reference,
             },
@@ -447,18 +731,50 @@ fn manual_signing_plan(
         password: Some(password_reference),
     });
     plan.team = Some(DevelopmentTeamPlan {
-        expected: assets.certificate.team.clone(),
+        expected: certificate.team.clone(),
     });
     plan.device = Some(device);
-    plan.provisioning = vec![ProvisioningPlan {
-        target: application_name.clone(),
-        profile: profile_reference,
-        profile_type: ProvisioningProfileType::Development,
-    }];
-    plan.entitlements = vec![EntitlementPlan {
-        target: application_name,
-        required: required_entitlements,
-    }];
+    plan.provisioning = plan
+        .targets
+        .iter()
+        .filter(|target| {
+            matches!(
+                target.kind,
+                SigningTargetKind::Application | SigningTargetKind::Extension
+            )
+        })
+        .map(|target| {
+            let secret_name = names.profile_for_target(&target.name).ok_or_else(|| {
+                manual_error_with_details(
+                    "missing_target_secret_name",
+                    "a generated signing target has no protected profile-secret name",
+                    "Regenerate the GitHub provider configuration from the current target graph.",
+                    vec![format!("target={}", target.name)],
+                )
+            })?;
+            Ok(ProvisioningPlan {
+                target: target.name.clone(),
+                profile: github_secret_reference(secret_name.as_str())?,
+                profile_type: ProvisioningProfileType::Development,
+            })
+        })
+        .collect::<Result<Vec<_>, CliError>>()?;
+    plan.entitlements = plan
+        .targets
+        .iter()
+        .filter(|target| {
+            matches!(
+                target.kind,
+                SigningTargetKind::Application | SigningTargetKind::Extension
+            )
+        })
+        .map(|target| {
+            Ok(EntitlementPlan {
+                target: target.name.clone(),
+                required: required_entitlements(config, target)?,
+            })
+        })
+        .collect::<Result<Vec<_>, CliError>>()?;
     plan.allow_provisioning_updates = false;
     plan.validate().map_err(|error| {
         manual_error_with_details(
@@ -469,6 +785,38 @@ fn manual_signing_plan(
         )
     })?;
     Ok(plan)
+}
+
+fn required_entitlements(
+    config: &rustferry_core::FerryConfig,
+    target: &SigningTarget,
+) -> Result<EntitlementSet, CliError> {
+    let mut values = BTreeMap::new();
+    let widget_bundle = format!("{}.widget", config.app.identifier);
+    if config.extensions.widget.enabled
+        && (target.kind == SigningTargetKind::Application
+            || target.bundle_identifier.as_str() == widget_bundle)
+    {
+        let app_group = config.extensions.widget.app_group.as_ref().ok_or_else(|| {
+            manual_error(
+                "missing_widget_app_group",
+                "Widget signing requires an application-group entitlement",
+                "Set extensions.widget.app_group in ferry.toml before signing setup.",
+            )
+        })?;
+        values.insert(
+            "com.apple.security.application-groups".to_owned(),
+            serde_json::Value::Array(vec![serde_json::Value::String(app_group.clone())]),
+        );
+    }
+    EntitlementSet::new(values).map_err(|error| {
+        manual_error_with_details(
+            "invalid_target_entitlements",
+            "the generated target entitlements are invalid",
+            "Correct the iOS capability configuration before signing setup.",
+            vec![format!("target={}", target.name), error.to_string()],
+        )
+    })
 }
 
 fn github_secret_reference(name: &str) -> Result<SecretReference, CliError> {
@@ -482,15 +830,10 @@ fn github_secret_reference(name: &str) -> Result<SecretReference, CliError> {
     })
 }
 
-fn validate_application_profile(
-    assets: &rustferry_apple::ValidatedManualSigningAssets,
+fn validate_target_profiles(
+    validated: &[(String, rustferry_remote::ProvisioningProfile, SecretBytes)],
     plan: &SigningPlan,
 ) -> Result<(), CliError> {
-    let target = plan
-        .targets
-        .iter()
-        .find(|target| target.kind == SigningTargetKind::Application)
-        .expect("validated plan has one application target");
     let team = &plan
         .team
         .as_ref()
@@ -500,12 +843,6 @@ fn validate_application_profile(
         .device
         .as_ref()
         .expect("validated development plan has a device");
-    let entitlements = &plan
-        .entitlements
-        .iter()
-        .find(|entry| entry.target == target.name)
-        .expect("validated plan has application entitlements")
-        .required;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| {
@@ -516,30 +853,53 @@ fn validate_application_profile(
             )
         })?
         .as_secs();
-    validate_profile_for_target(
-        &assets.profile,
-        ProfileValidationRequest {
-            target,
-            team,
-            device: Some(device),
-            certificate: &assets.certificate,
-            profile_type: ProvisioningProfileType::Development,
-            required_entitlements: entitlements,
-            now_unix_seconds: now,
-        },
-    )
-    .map_err(|errors| {
-        manual_error_with_details(
-            "provisioning_profile_target_mismatch",
-            "the provisioning profile cannot authorize the generated application target",
-            "Use a non-expired iOS development profile matching the certificate, team, bundle identifier, selected device, and required entitlements.",
-            errors
-                .issues()
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
+    let profiles = validated
+        .iter()
+        .map(|(target, profile, _)| (target.as_str(), profile))
+        .collect::<BTreeMap<_, _>>();
+    for provisioning in &plan.provisioning {
+        let target = plan
+            .targets
+            .iter()
+            .find(|target| target.name == provisioning.target)
+            .expect("validated plan binds every provisioning target");
+        let entitlements = &plan
+            .entitlements
+            .iter()
+            .find(|entry| entry.target == target.name)
+            .expect("validated plan has target entitlements")
+            .required;
+        let profile = profiles
+            .get(target.name.as_str())
+            .expect("profile argument resolution covers every signable target");
+        validate_profile_for_target(
+            profile,
+            ProfileValidationRequest {
+                target,
+                team,
+                device: Some(device),
+                certificate: &plan
+                    .signing
+                    .as_ref()
+                    .expect("validated signed plan has an identity")
+                    .identity
+                    .certificate,
+                profile_type: ProvisioningProfileType::Development,
+                required_entitlements: entitlements,
+                now_unix_seconds: now,
+            },
         )
-    })?;
+        .map_err(|errors| {
+            let mut details = vec![format!("target={}", target.name)];
+            details.extend(errors.issues().iter().map(ToString::to_string));
+            manual_error_with_details(
+                "provisioning_profile_target_mismatch",
+                "a provisioning profile cannot authorize its generated signing target",
+                "Use non-expired iOS development profiles matching the certificate, team, bundle identifiers, selected device, and required entitlements.",
+                details,
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -861,13 +1221,142 @@ mod tests {
     #[cfg(unix)]
     use super::read_signing_asset;
     use super::{
-        WipingBuffer, password_environment_reference, read_password_from,
-        reject_unsupported_extensions, remote, select_device, validate_password,
+        WipingBuffer, common_profile_devices, manual_signing_plan, password_environment_reference,
+        read_password_from, remote, resolve_profile_paths, select_device, validate_password,
     };
-    use rustferry_remote::SecretBytes;
+    use rustferry_github::SigningSecretNames;
+    use rustferry_remote::{
+        DevelopmentTeam, DevicePlan, EntitlementSet, ProvisioningPlatform, ProvisioningProfile,
+        ProvisioningProfileType, SecretBytes, SigningCertificate, SigningTargetKind,
+    };
+    use std::collections::BTreeSet;
 
     const DEVICE_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const DEVICE_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn signing_doctor_render_contains_only_stable_readiness_fields() {
+        let readiness = remote::IdeSigningReadiness {
+            ready: false,
+            checks: vec![remote::IdeSigningReadinessCheck {
+                code: "github.signing_environment.reviewers".to_owned(),
+                required: true,
+                ready: false,
+                reason_code: Some("required_reviewer_gate_unproven"),
+            }],
+        };
+
+        assert_eq!(
+            super::render_signing_readiness(&readiness),
+            concat!(
+                "ready=false\n",
+                "code=github.signing_environment.reviewers required=true ready=false ",
+                "reason_code=required_reviewer_gate_unproven",
+            )
+        );
+    }
+
+    #[test]
+    fn signing_doctor_explains_missing_assets_after_phase_implementation_is_proven() {
+        let readiness = remote::IdeSigningReadiness {
+            ready: false,
+            checks: vec![
+                remote::IdeSigningReadinessCheck {
+                    code: "github_actions_ios_signing.configured".to_owned(),
+                    required: true,
+                    ready: false,
+                    reason_code: Some("signing_not_configured"),
+                },
+                remote::IdeSigningReadinessCheck {
+                    code: "github.workflow.phase_a_secret_isolation".to_owned(),
+                    required: true,
+                    ready: true,
+                    reason_code: None,
+                },
+                remote::IdeSigningReadinessCheck {
+                    code: "github.workflow.phase_b_no_source_execution".to_owned(),
+                    required: true,
+                    ready: true,
+                    reason_code: None,
+                },
+            ],
+        };
+
+        let rendered = super::render_signing_readiness(&readiness);
+        assert!(rendered.starts_with(concat!(
+            "Signed Phase B implementation is ready,\n",
+            "but real Apple signing assets are not configured.\n\n",
+            "Required:\n",
+            "  Apple Development PKCS#12\n",
+            "  PKCS#12 password\n",
+            "  development provisioning profile\n",
+            "  registered device\n",
+            "  private execution repository\n",
+            "  protected Environment\n\n",
+        )));
+        assert!(rendered.contains("code=github_actions_ios_signing.configured"));
+    }
+
+    #[test]
+    fn signing_doctor_does_not_claim_phase_b_readiness_when_a_phase_check_fails() {
+        let readiness = remote::IdeSigningReadiness {
+            ready: false,
+            checks: vec![
+                remote::IdeSigningReadinessCheck {
+                    code: "github_actions_ios_signing.configured".to_owned(),
+                    required: true,
+                    ready: false,
+                    reason_code: Some("signing_not_configured"),
+                },
+                remote::IdeSigningReadinessCheck {
+                    code: "github.workflow.phase_a_secret_isolation".to_owned(),
+                    required: true,
+                    ready: true,
+                    reason_code: None,
+                },
+                remote::IdeSigningReadinessCheck {
+                    code: "github.workflow.phase_b_no_source_execution".to_owned(),
+                    required: true,
+                    ready: false,
+                    reason_code: Some("phase_b_source_isolation_unproven"),
+                },
+            ],
+        };
+
+        let rendered = super::render_signing_readiness(&readiness);
+        assert!(!rendered.contains("Signed Phase B implementation is ready"));
+        assert!(rendered.starts_with("ready=false\n"));
+    }
+
+    #[test]
+    fn signing_doctor_failures_are_typed_and_context_free() {
+        let unavailable = super::signing_readiness_unavailable();
+        assert_eq!(unavailable.code(), "signing_readiness_unavailable");
+        assert!(unavailable.details().is_empty());
+
+        let not_ready = super::signing_not_ready();
+        assert_eq!(not_ready.code(), "github_signing_not_ready");
+        assert!(not_ready.details().is_empty());
+        assert_ne!(not_ready.exit_code(), 0);
+    }
+
+    fn tempdir_outside_current_repository() -> tempfile::TempDir {
+        let current = std::env::current_dir()
+            .expect("current directory")
+            .canonicalize()
+            .expect("canonical current directory");
+        let outer_repository = current
+            .ancestors()
+            .filter(|ancestor| ancestor.join(".git").exists())
+            .last();
+        match outer_repository.and_then(std::path::Path::parent) {
+            Some(parent) => tempfile::Builder::new()
+                .prefix("rustferry-signing-asset-")
+                .tempdir_in(parent)
+                .expect("asset tempdir outside the repository"),
+            None => tempfile::tempdir().expect("asset tempdir"),
+        }
+    }
 
     #[test]
     fn signing_asset_reader_binds_a_stable_file_outside_git() {
@@ -877,10 +1366,7 @@ mod tests {
             project.path().canonicalize().expect("canonical project"),
         )
         .expect("UTF-8 project");
-        #[cfg(unix)]
-        let outside = tempfile::tempdir_in("/tmp").expect("outside tempdir");
-        #[cfg(not(unix))]
-        let outside = tempfile::tempdir().expect("outside tempdir");
+        let outside = tempdir_outside_current_repository();
         let asset = camino::Utf8PathBuf::from_path_buf(outside.path().join("development.p12"))
             .expect("UTF-8 asset");
         std::fs::write(&asset, b"opaque-asset").expect("asset bytes");
@@ -1009,17 +1495,227 @@ mod tests {
     }
 
     #[test]
-    fn manual_setup_rejects_extensions_before_asset_processing() {
+    fn target_profile_arguments_require_an_exact_complete_extension_set() {
         let mut config = rustferry_core::FerryConfig::starter("Weather", "com.example.weather");
         config.extensions.widget.enabled = true;
         config.extensions.widget.app_group = Some("group.com.example.weather".to_owned());
         let plan = remote::unsigned_signing_plan(&config, "weather").expect("unsigned plan");
+        let keyed = resolve_profile_paths(
+            &[
+                "weather=/tmp/app.mobileprovision".to_owned(),
+                "FerryWidgetExtension=/tmp/widget.mobileprovision".to_owned(),
+            ],
+            &plan,
+        )
+        .expect("exact keyed profiles");
+        assert_eq!(keyed.len(), 2);
         assert_eq!(
-            reject_unsupported_extensions(&plan)
-                .expect_err("extension needs a separate profile")
+            resolve_profile_paths(&["/tmp/app.mobileprovision".to_owned()], &plan)
+                .expect_err("extensions require keyed profiles")
                 .code(),
-            "extension_profiles_required"
+            "target_qualified_profiles_required"
         );
+        assert_eq!(
+            resolve_profile_paths(&["weather=/tmp/app.mobileprovision".to_owned()], &plan,)
+                .expect_err("widget profile is missing")
+                .code(),
+            "missing_profile_target"
+        );
+        assert_eq!(
+            resolve_profile_paths(
+                &[
+                    "weather=/tmp/app.mobileprovision".to_owned(),
+                    "Unknown=/tmp/widget.mobileprovision".to_owned(),
+                ],
+                &plan,
+            )
+            .expect_err("unknown target")
+            .code(),
+            "unknown_profile_target"
+        );
+        assert_eq!(
+            resolve_profile_paths(
+                &[
+                    "weather=/tmp/app.mobileprovision".to_owned(),
+                    "weather=/tmp/app-2.mobileprovision".to_owned(),
+                    "FerryWidgetExtension=/tmp/widget.mobileprovision".to_owned(),
+                ],
+                &plan,
+            )
+            .expect_err("duplicate target")
+            .code(),
+            "duplicate_profile_target"
+        );
+        assert_eq!(
+            resolve_profile_paths(
+                &[
+                    "weather=/tmp/app.mobileprovision".to_owned(),
+                    "/tmp/widget.mobileprovision".to_owned(),
+                ],
+                &plan,
+            )
+            .expect_err("mixed forms")
+            .code(),
+            "mixed_profile_arguments"
+        );
+        assert_eq!(
+            resolve_profile_paths(
+                &[
+                    "weather=".to_owned(),
+                    "FerryWidgetExtension=/tmp/widget.mobileprovision".to_owned(),
+                ],
+                &plan,
+            )
+            .expect_err("empty path")
+            .code(),
+            "invalid_profile_argument"
+        );
+        assert_eq!(
+            resolve_profile_paths(
+                &[
+                    "weather=/tmp/1".to_owned(),
+                    "FerryWidgetExtension=/tmp/2".to_owned(),
+                    "weather=/tmp/3".to_owned(),
+                    "weather=/tmp/4".to_owned(),
+                ],
+                &plan,
+            )
+            .expect_err("profile count is bounded")
+            .code(),
+            "invalid_profile_count"
+        );
+    }
+
+    #[test]
+    fn unkeyed_profile_path_preserves_windows_and_equals_characters() {
+        let config = rustferry_core::FerryConfig::starter("Weather", "com.example.weather");
+        let plan = remote::unsigned_signing_plan(&config, "weather").expect("unsigned plan");
+        let resolved = resolve_profile_paths(
+            &[r"C:\\Profiles\\weather=dev.mobileprovision".to_owned()],
+            &plan,
+        )
+        .expect("Windows path remains unkeyed");
+        assert_eq!(
+            resolved[0].path,
+            camino::Utf8PathBuf::from(r"C:\\Profiles\\weather=dev.mobileprovision")
+        );
+    }
+
+    fn profile_with_devices(devices: &[&str]) -> ProvisioningProfile {
+        let team = DevelopmentTeam::new("ABCDE12345", None).expect("team");
+        ProvisioningProfile {
+            uuid: "12345678-1234-1234-1234-123456789ABC".to_owned(),
+            name: "Development".to_owned(),
+            team,
+            application_identifier: "ABCDE12345.com.example.app".to_owned(),
+            bundle_identifier_pattern: "com.example.app".to_owned(),
+            wildcard: false,
+            created_at_unix_seconds: 1,
+            expires_at_unix_seconds: 4_000_000_000,
+            device_udid_sha256s: devices.iter().map(|device| (*device).to_owned()).collect(),
+            entitlements: EntitlementSet::default(),
+            platforms: BTreeSet::from([ProvisioningPlatform::Ios]),
+            profile_type: ProvisioningProfileType::Development,
+            certificate_fingerprints: vec!["A".repeat(64)],
+        }
+    }
+
+    #[test]
+    fn profile_device_intersection_is_exact() {
+        let common = common_profile_devices(&[
+            (
+                "App".to_owned(),
+                profile_with_devices(&[DEVICE_A, DEVICE_B]),
+                SecretBytes::new(vec![1]),
+            ),
+            (
+                "Widget".to_owned(),
+                profile_with_devices(&[DEVICE_B]),
+                SecretBytes::new(vec![2]),
+            ),
+        ])
+        .expect("common device");
+        assert_eq!(common, vec![DEVICE_B]);
+        assert_eq!(
+            common_profile_devices(&[
+                (
+                    "App".to_owned(),
+                    profile_with_devices(&[DEVICE_A]),
+                    SecretBytes::new(vec![1]),
+                ),
+                (
+                    "Widget".to_owned(),
+                    profile_with_devices(&[DEVICE_B]),
+                    SecretBytes::new(vec![2]),
+                ),
+            ])
+            .expect_err("no common device")
+            .code(),
+            "profiles_have_no_common_device"
+        );
+    }
+
+    #[test]
+    fn app_widget_activity_plan_uses_canonical_secrets_and_entitlements() {
+        let mut config = rustferry_core::FerryConfig::starter("Weather", "com.example.weather");
+        config.extensions.widget.enabled = true;
+        config.extensions.widget.app_group = Some("group.com.example.weather".to_owned());
+        config.extensions.live_activity.enabled = true;
+        config.ios.min_version = "16.1".to_owned();
+        let unsigned = remote::unsigned_signing_plan(&config, "weather").expect("unsigned plan");
+        let expected_names =
+            SigningSecretNames::for_targets(&unsigned.targets).expect("target secret map");
+        let team = DevelopmentTeam::new("ABCDE12345", None).expect("team");
+        let certificate = SigningCertificate {
+            common_name: "Apple Development: Example".to_owned(),
+            sha256_fingerprint: "A".repeat(64),
+            team,
+            expires_at_unix_seconds: 4_000_000_000,
+        };
+        let plan = manual_signing_plan(
+            unsigned,
+            &certificate,
+            DevicePlan::from_sha256(DEVICE_A, None).expect("device"),
+            &config,
+        )
+        .expect("manual plan");
+        assert_eq!(plan.provisioning.len(), 3);
+        for profile in &plan.provisioning {
+            assert_eq!(
+                Some(profile.profile.name()),
+                expected_names
+                    .profile_for_target(&profile.target)
+                    .map(rustferry_github::SecretName::as_str)
+            );
+        }
+        let app_group = serde_json::json!(["group.com.example.weather"]);
+        for target in &plan.targets {
+            if !matches!(
+                target.kind,
+                SigningTargetKind::Application | SigningTargetKind::Extension
+            ) {
+                continue;
+            }
+            let required = &plan
+                .entitlements
+                .iter()
+                .find(|entry| entry.target == target.name)
+                .expect("target entitlements")
+                .required;
+            if target.kind == SigningTargetKind::Application
+                || target.bundle_identifier.as_str() == "com.example.weather.widget"
+            {
+                assert_eq!(
+                    required.get("com.apple.security.application-groups"),
+                    Some(&app_group)
+                );
+            } else {
+                assert!(
+                    required.is_empty(),
+                    "Live Activity has no app-group entitlement"
+                );
+            }
+        }
     }
 
     #[cfg(unix)]

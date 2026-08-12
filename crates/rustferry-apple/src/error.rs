@@ -95,7 +95,7 @@ pub enum AppleError {
         /// Diagnostic log containing only the retained prefixes.
         log: Option<Utf8PathBuf>,
     },
-    /// Ctrl+C interrupted an external build tool.
+    /// Cancellation interrupted an external build tool.
     #[error("`{program}` was interrupted during {stage}")]
     CommandInterrupted {
         /// Build or validation stage.
@@ -115,7 +115,7 @@ pub enum AppleError {
         /// Short stderr/stdout excerpt.
         summary: String,
         /// Redacted diagnostic log, when requested.
-        log: Option<Utf8PathBuf>,
+        log: Option<Box<Utf8PathBuf>>,
     },
     /// A filesystem operation failed.
     #[error("could not {operation} `{path}`: {source}")]
@@ -158,5 +158,27 @@ pub(crate) fn io_error(
         operation,
         path: path.into(),
         source,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_failure_stays_compact_and_preserves_its_diagnostic() {
+        assert!(std::mem::size_of::<AppleError>() < 128);
+
+        let error = AppleError::CommandFailed {
+            stage: "archive application".to_owned(),
+            program: Utf8PathBuf::from("xcodebuild"),
+            status: "65".to_owned(),
+            summary: "archive failed".to_owned(),
+            log: Some(Box::new(Utf8PathBuf::from("archive.log"))),
+        };
+        assert_eq!(
+            error.to_string(),
+            "`xcodebuild` failed during archive application with status 65; archive failed; log: Some(\"archive.log\")"
+        );
     }
 }

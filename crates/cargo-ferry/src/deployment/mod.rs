@@ -14,7 +14,7 @@ mod logs;
 mod run;
 mod signing;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use artifact::inspect_artifact;
 pub use artifact::{ArtifactKind, ValidatedArtifact};
 pub use device::{

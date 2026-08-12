@@ -5,9 +5,11 @@ use schemars::{JsonSchema, schema_for};
 use crate::{
     ArtifactDownloadRequest, ArtifactDownloadResult, ArtifactListRequest, ArtifactManifest,
     CancellationAck, CancellationRequest, CleanupConfirmation, CleanupRequest, CompileHandoff,
-    CompilePhaseEvidence, EventPage, EventRequest, HandshakeRequest, HandshakeResponse,
-    IosDeviceBuildRequest, IosDeviceBuildResult, JobHandle, ProviderDoctorReport,
-    ProviderDoctorRequest, RemoteBuildEvent, SealedUnsignedArchive,
+    CompilePhaseEvidence, EventPage, EventRequest, GitSnapshotDescriptor, HandshakeRequest,
+    HandshakeResponse, IosDeviceBuildRequest, IosDeviceBuildResult, JobHandle,
+    ProviderDoctorReport, ProviderDoctorRequest, RemoteBuildEvent, SealedUnsignedArchive,
+    SnapshotArtifactDescriptor, SnapshotArtifactReceipt, SnapshotBuildComplete, SnapshotBuildStart,
+    SnapshotJobAccepted, SnapshotSessionError, SourceBundleDescriptor,
 };
 
 /// Every standalone document exchanged or persisted by protocol v1.
@@ -30,6 +32,22 @@ pub enum RemoteProtocolV1Document {
     IosDeviceBuildRequest(IosDeviceBuildRequest),
     /// Complete public compile-to-sign handoff.
     CompileHandoff(CompileHandoff),
+    /// Initial declaration for one SSH snapshot session.
+    SnapshotBuildStart(SnapshotBuildStart),
+    /// Separately framed deterministic source descriptor.
+    SourceBundleDescriptor(SourceBundleDescriptor),
+    /// Operation-bound descriptor for one GitHub dirty-source snapshot.
+    GitSnapshotDescriptor(GitSnapshotDescriptor),
+    /// Worker acknowledgement for one snapshot job.
+    SnapshotJobAccepted(SnapshotJobAccepted),
+    /// Unsigned archive descriptor and compile evidence.
+    SnapshotArtifactDescriptor(SnapshotArtifactDescriptor),
+    /// Client proof of durable independent artifact verification.
+    SnapshotArtifactReceipt(SnapshotArtifactReceipt),
+    /// Terminal non-retaining snapshot cleanup proof.
+    SnapshotBuildComplete(SnapshotBuildComplete),
+    /// Secret-free terminal snapshot failure.
+    SnapshotSessionError(SnapshotSessionError),
     /// Public credential-free compile evidence.
     CompilePhaseEvidence(CompilePhaseEvidence),
     /// Sealed unsigned archive descriptor.

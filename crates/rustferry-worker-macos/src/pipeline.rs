@@ -25,7 +25,7 @@ use rustferry_remote::{
     IosArtifactType, IosDeviceBuildRequest, Secret, SecretBytes, SigningMode, SigningStatus,
     SigningTargetKind, SourceBundleRequest, UnsignedNestedBundleKind, UnsignedXcarchiveInspection,
     ValidationLevel, canonical_request_sha256 as remote_canonical_request_sha256,
-    verify_materialized_bundle, verify_source_manifest,
+    inspect_unsigned_xcarchive, verify_materialized_bundle, verify_source_manifest,
 };
 use same_file::Handle;
 use serde::{Deserialize, Serialize};
@@ -43,11 +43,18 @@ use crate::{
         ProfileSecretInput, ProvisioningMaterialRequest, prepare_provisioning_materials,
     },
     sealed::{
-        seal_unsigned_xcarchive, unseal_unsigned_xcarchive, validate_sealed_unsigned_archive,
+        SealedArchiveEvidence, seal_unsigned_xcarchive, unseal_unsigned_xcarchive,
+        validate_sealed_unsigned_archive,
     },
     signed_ipa::{
         SignedIpaValidationEvidence, SignedIpaValidationOptions, SignedIpaValidationRequest,
         validate_signed_development_ipa,
+    },
+    signed_products::{
+        OwnedDirectory as OwnedProductDirectory, PublishedSignedProduct, SignedProductError,
+        SignedProductOutput, SignedProductRequest, SignedProductSelection,
+        SignedProductValidationEvidence, copy_validated_tree_create_new,
+        create_requested_signed_products, validate_generated_arm64_dsym,
     },
 };
 
@@ -61,6 +68,8 @@ const MAX_REPORT_BYTES: usize = 4 * 1024 * 1024;
 const FIXED_IPA_NAME: &str = "application-development.ipa";
 const SIGNING_REPORT_NAME: &str = "signing-report.json";
 const PROVISIONING_REPORT_NAME: &str = "provisioning-report.json";
+
+type PublishedArtifacts = (Vec<ArtifactRecord>, Vec<Utf8PathBuf>, Vec<Utf8PathBuf>);
 
 /// Explicit executable locations used for fresh Apple toolchain discovery.
 ///
@@ -197,13 +206,21 @@ pub fn compile_unsigned_phase(
         .map_err(|source| io_error("bind compile source root", source))?;
     let project_root = canonical_real_directory(phase.source_selection.project_root())?;
     let toolchain = discover_device_toolchain(phase.toolchain, &project_root)?;
-    let planned = plan_ios_device_unsigned(&phase.apple_request, &toolchain)
+    let generate_debug_symbols = phase
+        .request
+        .requested_artifacts
+        .contains(&IosArtifactType::Dsym);
+    let apple_request = phase
+        .apple_request
+        .clone()
+        .with_debug_symbols(generate_debug_symbols);
+    let planned = plan_ios_device_unsigned(&apple_request, &toolchain)
         .map_err(|_| PipelineError::BuildPlanRejected)?;
     validate_device_plan(phase, &planned, &toolchain, &project_root)?;
     let rust_version = probe_rust_version(&toolchain, &project_root)?;
     let worker_os = probe_worker_os(&project_root)?;
 
-    let outcome = build_ios_device_unsigned(&phase.apple_request, &toolchain)
+    let outcome = build_ios_device_unsigned(&apple_request, &toolchain)
         .map_err(|_| PipelineError::UnsignedBuildFailed)?;
     if outcome.plan != planned
         || outcome.archive.is_none()
@@ -221,19 +238,17 @@ pub fn compile_unsigned_phase(
         .archive
         .as_deref()
         .ok_or(PipelineError::BuildEvidenceMismatch)?;
-    let sealed = seal_unsigned_xcarchive(
+    let archive_inspection = outcome
+        .archive_inspection
+        .ok_or(PipelineError::BuildEvidenceMismatch)?;
+    let sealed = seal_compiled_archive(
+        generate_debug_symbols,
         archive_path,
+        &planned,
+        &toolchain,
         phase.sealed_archive_path,
-        planned.archive_expectation.clone(),
-    )
-    .map_err(|_| PipelineError::ArchiveSealFailed)?;
-    if sealed.inspection
-        != outcome
-            .archive_inspection
-            .ok_or(PipelineError::BuildEvidenceMismatch)?
-    {
-        return Err(PipelineError::BuildEvidenceMismatch);
-    }
+        archive_inspection,
+    )?;
     ensure_same_directory(&source_root, &source_identity)?;
 
     let request_sha256 = remote_canonical_request_sha256(phase.request)
@@ -274,6 +289,251 @@ pub fn compile_unsigned_phase(
         sealed_archive_path: phase.sealed_archive_path.to_owned(),
         evidence,
     })
+}
+
+fn seal_compiled_archive(
+    generate_debug_symbols: bool,
+    archive_path: &Utf8Path,
+    plan: &IosDeviceArchivePlan,
+    toolchain: &IosDeviceToolchain,
+    sealed_archive_path: &Utf8Path,
+    mut archive_inspection: UnsignedXcarchiveInspection,
+) -> Result<SealedArchiveEvidence, PipelineError> {
+    let mut generated_dsym = None;
+    if generate_debug_symbols {
+        generated_dsym = Some(generate_main_application_dsym(
+            archive_path,
+            plan,
+            toolchain,
+        )?);
+        archive_inspection =
+            match inspect_unsigned_xcarchive(archive_path, &plan.archive_expectation) {
+                Ok(inspection) => inspection,
+                Err(_) => {
+                    return Err(cleanup_pending_dsym(
+                        &mut generated_dsym,
+                        PipelineError::DsymGenerationFailed,
+                    ));
+                }
+            };
+    }
+    let Ok(sealed) = seal_unsigned_xcarchive(
+        archive_path,
+        sealed_archive_path,
+        plan.archive_expectation.clone(),
+    ) else {
+        return Err(cleanup_pending_dsym(
+            &mut generated_dsym,
+            PipelineError::ArchiveSealFailed,
+        ));
+    };
+    if sealed.inspection != archive_inspection {
+        return Err(cleanup_pending_dsym(
+            &mut generated_dsym,
+            PipelineError::BuildEvidenceMismatch,
+        ));
+    }
+    if generated_dsym
+        .as_mut()
+        .is_some_and(|dsym| dsym.keep().is_err())
+    {
+        return Err(cleanup_pending_dsym(
+            &mut generated_dsym,
+            PipelineError::CleanupIncomplete,
+        ));
+    }
+    Ok(sealed)
+}
+
+fn generate_main_application_dsym(
+    archive_path: &Utf8Path,
+    plan: &IosDeviceArchivePlan,
+    toolchain: &IosDeviceToolchain,
+) -> Result<OwnedProductDirectory, PipelineError> {
+    let archive_identity = Handle::from_path(archive_path)
+        .map_err(|source| io_error("bind archive for dSYM generation", source))?;
+    if archive_path != plan.archive_path
+        || !plan.generate_debug_symbols
+        || !plan
+            .macho_validation
+            .executable_path
+            .starts_with(archive_path)
+    {
+        return Err(PipelineError::DsymGenerationFailed);
+    }
+    let dsym_parent = archive_path.join("dSYMs");
+    match fs::symlink_metadata(&dsym_parent) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(PipelineError::DsymGenerationFailed);
+        }
+        Ok(_) => {}
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&dsym_parent)
+                .map_err(|source| io_error("create archive dSYM directory", source))?;
+        }
+        Err(source) => return Err(io_error("inspect archive dSYM directory", source)),
+    }
+    let dsym_parent = canonical_real_directory(&dsym_parent)?;
+    let dsym_parent_identity = Handle::from_path(&dsym_parent)
+        .map_err(|source| io_error("bind archive dSYM directory", source))?;
+    let dsym_name = format!("{}.dSYM", plan.archive_expectation.app_directory_name);
+    let dsym_path = dsym_parent.join(&dsym_name);
+    match fs::symlink_metadata(&dsym_path) {
+        Ok(_) => return Err(PipelineError::DsymGenerationFailed),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => return Err(io_error("inspect application dSYM destination", source)),
+    }
+
+    let mut staging = OwnedProductDirectory::create_unique(&dsym_parent, ".rustferry-dsym-staging")
+        .map_err(map_dsym_product_error)?;
+    let staged_dsym_path = staging.path().join(&dsym_name);
+    let command = dsymutil_command(archive_path, &staged_dsym_path, plan, toolchain);
+    if run_command(&command, None).is_err() {
+        return Err(cleanup_owned_dsym_directory(
+            &mut staging,
+            PipelineError::DsymGenerationFailed,
+        ));
+    }
+    if staging.verify_binding().is_err() {
+        return Err(cleanup_owned_dsym_directory(
+            &mut staging,
+            PipelineError::CleanupIncomplete,
+        ));
+    }
+    if let Err(error) = validate_main_application_dsym(&staged_dsym_path, plan, toolchain) {
+        return Err(cleanup_owned_dsym_directory(&mut staging, error));
+    }
+
+    let mut generated = match copy_validated_tree_create_new(&staged_dsym_path, &dsym_path) {
+        Ok(generated) => generated,
+        Err(error) => {
+            let error = map_dsym_product_error(error);
+            return Err(cleanup_owned_dsym_directory(&mut staging, error));
+        }
+    };
+    let validation = (|| {
+        generated
+            .verify_binding()
+            .map_err(|_| PipelineError::CleanupIncomplete)?;
+        validate_main_application_dsym(&dsym_path, plan, toolchain)?;
+        if Handle::from_path(archive_path)
+            .map_err(|source| io_error("rebind archive after dSYM generation", source))?
+            != archive_identity
+            || Handle::from_path(&dsym_parent)
+                .map_err(|source| io_error("rebind archive dSYM directory", source))?
+                != dsym_parent_identity
+        {
+            return Err(PipelineError::DsymGenerationFailed);
+        }
+        Ok(())
+    })();
+    if let Err(error) = validation {
+        let generated_cleanup = generated.cleanup();
+        let staging_cleanup = staging.cleanup();
+        return if generated_cleanup.is_err() || staging_cleanup.is_err() {
+            Err(PipelineError::CleanupIncomplete)
+        } else {
+            Err(error)
+        };
+    }
+    if staging.cleanup().is_err() {
+        return Err(cleanup_owned_dsym_directory(
+            &mut generated,
+            PipelineError::CleanupIncomplete,
+        ));
+    }
+    Ok(generated)
+}
+
+fn validate_main_application_dsym(
+    dsym_path: &Utf8Path,
+    plan: &IosDeviceArchivePlan,
+    toolchain: &IosDeviceToolchain,
+) -> Result<(), PipelineError> {
+    let metadata = fs::symlink_metadata(dsym_path)
+        .map_err(|source| io_error("inspect generated application dSYM", source))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(PipelineError::DsymGenerationFailed);
+    }
+    let dwarf_path = dsym_path
+        .join("Contents/Resources/DWARF")
+        .join(&plan.archive_expectation.executable);
+    let source_request = SourceBundleRequest::new(dsym_path, dsym_path)
+        .with_limits(crate::sealed::sealed_limits().source);
+    let source_plan = rustferry_remote::plan_source_bundle(&source_request)
+        .map_err(|_| PipelineError::DsymGenerationFailed)?;
+    if !source_plan.excluded_sensitive_paths().is_empty()
+        || source_plan.manifest().entries.is_empty()
+    {
+        return Err(PipelineError::DsymGenerationFailed);
+    }
+    verify_source_manifest(&source_request, source_plan.manifest())
+        .map_err(|_| PipelineError::DsymGenerationFailed)?;
+    validate_generated_arm64_dsym(
+        &plan.macho_validation.executable_path,
+        &dwarf_path,
+        &toolchain.developer_dir,
+        Duration::from_mins(5),
+    )
+    .map_err(|_| PipelineError::DsymGenerationFailed)?;
+    Ok(())
+}
+
+fn dsymutil_command(
+    archive_path: &Utf8Path,
+    dsym_path: &Utf8Path,
+    plan: &IosDeviceArchivePlan,
+    toolchain: &IosDeviceToolchain,
+) -> CommandSpec {
+    let mut command = CommandSpec::new("generate application dSYM", &toolchain.xcrun, archive_path);
+    command.args = vec![
+        "dsymutil".to_owned(),
+        plan.macho_validation.executable_path.to_string(),
+        "-o".to_owned(),
+        dsym_path.to_string(),
+    ];
+    command.environment.insert(
+        "DEVELOPER_DIR".to_owned(),
+        toolchain.developer_dir.to_string(),
+    );
+    command
+        .environment
+        .insert("LC_ALL".to_owned(), "C".to_owned());
+    command.timeout_seconds = Duration::from_mins(5).as_secs();
+    command
+}
+
+fn map_dsym_product_error(error: SignedProductError) -> PipelineError {
+    if error == SignedProductError::CleanupIncomplete {
+        PipelineError::CleanupIncomplete
+    } else {
+        PipelineError::DsymGenerationFailed
+    }
+}
+
+fn cleanup_owned_dsym_directory(
+    directory: &mut OwnedProductDirectory,
+    error: PipelineError,
+) -> PipelineError {
+    if directory.cleanup().is_err() {
+        PipelineError::CleanupIncomplete
+    } else {
+        error
+    }
+}
+
+fn cleanup_pending_dsym(
+    directory: &mut Option<OwnedProductDirectory>,
+    error: PipelineError,
+) -> PipelineError {
+    if directory
+        .as_mut()
+        .is_some_and(|directory| directory.cleanup().is_err())
+    {
+        PipelineError::CleanupIncomplete
+    } else {
+        error
+    }
 }
 
 /// Exact phase-B protected-signing inputs.
@@ -346,6 +606,8 @@ pub struct ProtectedSigningReport {
     pub sealed_archive_sha256: String,
     /// Independent signed IPA validation.
     pub signed_ipa: SignedIpaValidationEvidence,
+    /// Optional app, signed `XCArchive`, and dSYM validation evidence.
+    pub signed_products: SignedProductValidationEvidence,
     /// Mandatory cleanup proof.
     pub cleanup: ProtectedCleanupEvidence,
 }
@@ -368,6 +630,8 @@ pub struct ProtectedSignPhaseOutput {
     pub ipa_path: Utf8PathBuf,
     /// Requested public report files, sorted by filename.
     pub report_paths: Vec<Utf8PathBuf>,
+    /// Requested optional product transports, sorted by filename.
+    pub product_paths: Vec<Utf8PathBuf>,
     /// Redacted public evidence.
     pub evidence: ProtectedSignPhaseEvidence,
 }
@@ -420,6 +684,7 @@ pub fn sign_protected_phase(
             workspace.create_child_directory("profiles")?,
             workspace.create_child_directory("temporary")?,
             workspace.create_child_directory("validation")?,
+            workspace.create_child_directory("products")?,
             workspace.path().join("isolated-home"),
         ))
     })();
@@ -429,6 +694,7 @@ pub fn sign_protected_phase(
         profile_scratch,
         temporary_directory,
         validation_workspace,
+        product_workspace,
         isolated_home,
     ) = match setup {
         Ok(setup) => setup,
@@ -547,9 +813,37 @@ pub fn sign_protected_phase(
         if !validation.cleanup_confirmed {
             return Err(PipelineError::CleanupIncomplete);
         }
+        let signed_products = create_requested_signed_products(&SignedProductRequest {
+            ipa_path: &ipa_path,
+            unsigned_archive_path: &unsealed_archive,
+            artifact_directory: phase.artifact_directory,
+            workspace_root: &product_workspace,
+            developer_directory: &toolchain.developer_dir,
+            app_directory_name: &phase.request.product.app_directory_name,
+            executable: &phase.request.product.executable,
+            ipa_expectation: &ipa_expectation,
+            validation: &validation,
+            selection: SignedProductSelection {
+                app: phase
+                    .request
+                    .requested_artifacts
+                    .contains(&IosArtifactType::AppBundle),
+                archive: phase
+                    .request
+                    .requested_artifacts
+                    .contains(&IosArtifactType::Xcarchive),
+                dsym: phase
+                    .request
+                    .requested_artifacts
+                    .contains(&IosArtifactType::Dsym),
+            },
+            command_timeout: phase.command_timeout,
+        })
+        .map_err(|_| PipelineError::SignedArtifactRejected)?;
         Ok(ProtectedOperationOutput {
             ipa_path,
             validation,
+            signed_products,
             isolated_home_removed: exported.cleanup.isolated_home_removed,
             export_options_removed: exported.cleanup.export_options_removed,
         })
@@ -595,6 +889,7 @@ pub fn sign_protected_phase(
         request_sha256: phase.compile.request_sha256.clone(),
         sealed_archive_sha256: phase.compile.sealed_archive.transport.sha256.clone(),
         signed_ipa: operation.validation.clone(),
+        signed_products: operation.signed_products.evidence.clone(),
         cleanup,
     };
     let Ok(report_bytes) = serde_json::to_vec_pretty(&report) else {
@@ -605,12 +900,13 @@ pub fn sign_protected_phase(
         cleanup_artifact_directory(phase.job_root, phase.artifact_directory)?;
         return Err(PipelineError::ReportEncodingFailed);
     }
-    let (records, report_paths) = match publish_requested_artifacts(
+    let (records, report_paths, product_paths) = match publish_requested_artifacts(
         phase.request,
         phase.artifact_directory,
         &operation.ipa_path,
         &operation.validation,
         &report_bytes,
+        operation.signed_products.products,
     ) {
         Ok(published) => published,
         Err(error) => {
@@ -628,6 +924,7 @@ pub fn sign_protected_phase(
     Ok(ProtectedSignPhaseOutput {
         ipa_path: operation.ipa_path,
         report_paths,
+        product_paths,
         evidence: ProtectedSignPhaseEvidence {
             artifact_manifest: manifest,
             report,
@@ -638,6 +935,7 @@ pub fn sign_protected_phase(
 struct ProtectedOperationOutput {
     ipa_path: Utf8PathBuf,
     validation: SignedIpaValidationEvidence,
+    signed_products: SignedProductOutput,
     isolated_home_removed: bool,
     export_options_removed: bool,
 }
@@ -669,6 +967,8 @@ pub enum PipelineError {
     BuildEvidenceMismatch,
     /// Unsigned archive sealing failed.
     ArchiveSealFailed,
+    /// Requested application dSYM generation or validation failed.
+    DsymGenerationFailed,
     /// Compile evidence was malformed or did not bind the request.
     CompileEvidenceRejected,
     /// Sealed archive verification/extraction failed.
@@ -723,6 +1023,7 @@ impl fmt::Display for PipelineError {
             Self::UnsignedBuildFailed => "unsigned physical-iPhone build failed",
             Self::BuildEvidenceMismatch => "unsigned build evidence is inconsistent",
             Self::ArchiveSealFailed => "unsigned archive sealing failed",
+            Self::DsymGenerationFailed => "application dSYM generation failed",
             Self::CompileEvidenceRejected => "compile evidence is invalid",
             Self::ArchiveUnsealFailed => "sealed archive verification failed",
             Self::ArchiveHandoffMismatch => "sealed archive handoff evidence differs",
@@ -828,12 +1129,6 @@ fn validate_manual_development_request(
         || request.signing.team.is_none()
         || request.signing.device.is_none()
         || !request.requested_artifacts.contains(&IosArtifactType::Ipa)
-        || request.requested_artifacts.iter().any(|artifact| {
-            matches!(
-                artifact,
-                IosArtifactType::Xcarchive | IosArtifactType::AppBundle
-            )
-        })
     {
         return Err(PipelineError::SigningPlanRejected);
     }
@@ -918,6 +1213,11 @@ fn validate_device_plan(
         || plan.destination != "generic/platform=iOS"
         || plan.disposition != IosDeviceArtifactDisposition::UnsignedCompileOnly
         || plan.profile != expected_apple_profile(phase.request.profile)
+        || plan.generate_debug_symbols
+            != phase
+                .request
+                .requested_artifacts
+                .contains(&IosArtifactType::Dsym)
         || plan.commands.len() != 3
         || !plan.generated_root.starts_with(&device_root)
         || !plan.cargo_target_dir.starts_with(&device_root)
@@ -1212,7 +1512,8 @@ fn publish_requested_artifacts(
     ipa_path: &Utf8Path,
     validation: &SignedIpaValidationEvidence,
     report_bytes: &[u8],
-) -> Result<(Vec<ArtifactRecord>, Vec<Utf8PathBuf>), PipelineError> {
+    products: Vec<PublishedSignedProduct>,
+) -> Result<PublishedArtifacts, PipelineError> {
     let mut records = vec![ArtifactRecord {
         artifact_id: "iphone-ipa".to_owned(),
         kind: ArtifactKind::Ipa,
@@ -1222,6 +1523,41 @@ fn publish_requested_artifacts(
         media_type: Some("application/octet-stream".to_owned()),
     }];
     verify_record(ipa_path, &records[0])?;
+    let expected_product_kinds = request
+        .requested_artifacts
+        .iter()
+        .filter(|artifact| {
+            matches!(
+                artifact,
+                IosArtifactType::AppBundle | IosArtifactType::Xcarchive | IosArtifactType::Dsym
+            )
+        })
+        .map(|artifact| artifact.artifact_kind())
+        .collect::<BTreeSet<_>>();
+    let actual_product_kinds = products
+        .iter()
+        .map(|product| product.record.kind)
+        .collect::<BTreeSet<_>>();
+    if actual_product_kinds != expected_product_kinds
+        || products.len() != actual_product_kinds.len()
+    {
+        return Err(PipelineError::ArtifactPublicationFailed);
+    }
+    let mut product_paths = Vec::new();
+    for product in products {
+        if product.path != artifact_directory.join(&product.record.file_name)
+            || records.iter().any(|record| {
+                record.artifact_id == product.record.artifact_id
+                    || record.kind == product.record.kind
+                    || record.file_name == product.record.file_name
+            })
+        {
+            return Err(PipelineError::ArtifactPublicationFailed);
+        }
+        verify_record(&product.path, &product.record)?;
+        product_paths.push(product.path);
+        records.push(product.record);
+    }
     let mut report_paths = Vec::new();
     for (requested, artifact_id, kind, file_name) in [
         (
@@ -1257,7 +1593,8 @@ fn publish_requested_artifacts(
     }
     records.sort_by(|left, right| left.artifact_id.cmp(&right.artifact_id));
     report_paths.sort();
-    Ok((records, report_paths))
+    product_paths.sort();
+    Ok((records, report_paths, product_paths))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1318,7 +1655,10 @@ fn build_artifact_manifest(
     manifest
         .source_revision
         .clone_from(&phase.request.source_revision);
-    manifest.source_snapshot = phase.request.source_mode == rustferry_remote::SourceMode::Snapshot;
+    manifest.source_snapshot = matches!(
+        phase.request.source_mode,
+        rustferry_remote::SourceMode::Snapshot | rustferry_remote::SourceMode::GitSnapshot
+    );
     manifest
         .source_sha256
         .clone_from(&phase.request.source.sha256);
@@ -1853,6 +2193,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn manual_signing_accepts_every_supported_optional_product() {
+        let mut request = manual_request();
+        request.requested_artifacts = BTreeSet::from([
+            IosArtifactType::Ipa,
+            IosArtifactType::SigningReport,
+            IosArtifactType::AppBundle,
+            IosArtifactType::Xcarchive,
+            IosArtifactType::Dsym,
+        ]);
+
+        assert_eq!(validate_compile_signing_request(&request), Ok(()));
+        request.requested_artifacts.remove(&IosArtifactType::Ipa);
+        assert_eq!(
+            validate_compile_signing_request(&request),
+            Err(PipelineError::SigningPlanRejected)
+        );
+    }
+
     fn source_entry(path: &str, digest: char) -> rustferry_remote::SourceManifestEntry {
         rustferry_remote::SourceManifestEntry {
             path: path.to_owned(),
@@ -1935,7 +2294,10 @@ mod tests {
                 sha256: hex::encode(source_digest.finalize()),
             },
             signing,
-            requested_artifacts: BTreeSet::from([IosArtifactType::Ipa]),
+            requested_artifacts: BTreeSet::from([
+                IosArtifactType::Ipa,
+                IosArtifactType::SigningReport,
+            ]),
         }
     }
 

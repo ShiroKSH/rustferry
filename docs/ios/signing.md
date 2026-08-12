@@ -33,15 +33,20 @@ Configure the unsigned remote provider first, then validate the signing assets w
 ```console
 cargo ferry signing setup manual \
   --certificate /private/signing/development.p12 \
-  --profile /private/signing/application.mobileprovision \
+  --profile weather=/private/signing/application.mobileprovision \
+  --profile FerryWidgetExtension=/private/signing/widget.mobileprovision \
+  --profile FerryLiveActivityExtension=/private/signing/live-activity.mobileprovision \
   --remote github \
   --device-sha256 <lowercase-sha256> \
   --dry-run
 ```
 
-The files must remain outside every Git repository. The command accepts one application profile and
-currently rejects projects with Widget or Live Activity extensions. Omit `--device-sha256` only for
-a profile containing one device.
+The files must remain outside every Git repository. Manual setup accepts at most three application
+and extension profiles. Projects with extensions require one exact, case-sensitive
+`--profile TARGET=PATH` for every generated target; use the preview's target names. The legacy
+unkeyed `--profile PATH` form remains valid only for an extension-free single application, and the
+two forms cannot be mixed. All profiles must contain one common selected device. Omit
+`--device-sha256` only when every profile contains the same single device.
 
 The example uses the interactive no-echo prompt. Other password sources are `--password-stdin`,
 `--password-env <NAME>`, or `--password-credential <ENTRY>`. Select one. No password value is accepted
@@ -50,13 +55,16 @@ the command asks for confirmation after printing public certificate, profile, te
 target metadata.
 
 The protected Environment must contain no secrets before initial setup. RustFerry revalidates the
-retained asset bytes immediately before upload, then sends the PKCS#12 and profile as canonical
-padded base64 and the password as raw UTF-8, with a 48 KiB limit per final value. It verifies the
-exact required secret names remotely before persisting the private local signing config. See
+retained asset bytes immediately before upload, then sends the PKCS#12 and profiles as canonical
+padded base64 and the password as raw UTF-8, with a 48 KiB limit per final value. The application
+keeps the legacy profile secret name; each extension receives a deterministic static secret derived
+from its target name and bundle identifier. RustFerry verifies the exact planned three-to-five-name
+set remotely before persisting the private local signing config. Multi-profile jobs use the bounded
+`RFSIGNV2` stdin frame; the legacy frame remains single-application-only. See
 [GitHub macOS provider security](../remote/github-security.md) for the full preflight, failure, and
 cleanup contract.
 
-The remote signing engine and setup flow have synthetic cryptographic and policy validation. A real
+The multi-profile setup and transport pass the affected-package integration suite locally. A real
 Apple Development certificate/profile upload and signed IPA acceptance run remain pending. No
 signing identity, private key, password, profile contents, or account token is stored in
 `ferry.toml`, public workflow files, or generated logs. See [Physical iPhone development](physical-device.md)

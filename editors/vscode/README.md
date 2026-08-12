@@ -10,7 +10,7 @@
   <a href="https://marketplace.visualstudio.com/items?itemName=ShiroKSH.rustferry-vscode">Install from the Visual Studio Marketplace</a>
 </p>
 
-RustFerry for VS Code is the native editor surface for RustFerry projects. It discovers `ferry.toml`, negotiates IDE protocol v1 with `cargo-ferry`, and exposes project, device, diagnostic, task, and artifact workflows without duplicating build logic.
+RustFerry for VS Code is the native editor surface for RustFerry projects. It discovers `ferry.toml`, negotiates IDE protocol v1 with `cargo-ferry`, and exposes project, device, diagnostic, task, artifact, and remote-job workflows without duplicating build logic.
 
 Configuration diagnostics track the current editor buffer, including unsaved changes. Dirty manifest text travels only through a bounded stdin protocol request; stale results and disk-backed quick fixes are rejected.
 
@@ -33,6 +33,12 @@ Set `rustferry.cliPath` when the CLI is not discoverable. The setting must point
 6. Reveal or copy the artifact path from the Artifacts view.
 
 The extension provides generated `rustferry` tasks without requiring `.vscode/tasks.json`. Rust language intelligence remains the responsibility of rust-analyzer.
+
+## Remote jobs
+
+The Jobs view is the fourth native tree in the existing RustFerry Activity Bar container. A compatible CLI can expose workspace-bound job summaries, state, bounded pages of sanitized lifecycle and worker events, artifact evidence receipts, explicit remote-snapshot previews, and signing readiness. Load-more, cancellable follow, and mutation actions appear only when the current CLI handshake advertises their exact additive IDE commands.
+
+Every CLI job read and action sends the selected project root as `--workspace`; cargo-ferry remains responsible for revalidating canonical-root, filesystem-identity, job ownership, state, and managed-artifact boundaries. The extension keeps no durable job cache. Tree items are session-only display data and never authorize cancellation, retry, verification, reveal, or removal.
 
 ## Trust, remote, and virtual workspaces
 

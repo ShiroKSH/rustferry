@@ -464,6 +464,7 @@ impl<E: CommandExecutor> SigningService<E> {
                 source,
             }
         })?;
+        #[cfg(unix)]
         make_executable(&plan.staged_binary)?;
 
         let xcode_output = self.executor.execute(&plan.xcodebuild_command)?;
@@ -2210,11 +2211,6 @@ fn make_executable(path: &Utf8Path) -> DeploymentResult<()> {
         path: path.to_owned(),
         source,
     })
-}
-
-#[cfg(not(unix))]
-fn make_executable(_path: &Utf8Path) -> DeploymentResult<()> {
-    Ok(())
 }
 
 #[cfg(test)]

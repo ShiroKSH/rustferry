@@ -38,6 +38,9 @@ url.workspace = true
 uuid.workspace = true
 zip.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+rustferry-core = { version = "=0.1.0", path = "../rustferry-core" }
+
 [dev-dependencies]
 tempfile.workspace = true
 

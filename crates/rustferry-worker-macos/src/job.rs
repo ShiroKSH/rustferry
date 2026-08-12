@@ -2937,13 +2937,7 @@ fn validate_manifest_extensions(extensions: &[String]) -> bool {
 }
 
 const fn artifact_kind(artifact_type: IosArtifactType) -> ArtifactKind {
-    match artifact_type {
-        IosArtifactType::Ipa => ArtifactKind::Ipa,
-        IosArtifactType::Xcarchive => ArtifactKind::Xcarchive,
-        IosArtifactType::AppBundle => ArtifactKind::App,
-        IosArtifactType::SigningReport => ArtifactKind::SigningReport,
-        IosArtifactType::ProvisioningReport => ArtifactKind::ValidationReport,
-    }
+    artifact_type.artifact_kind()
 }
 
 #[cfg(test)]

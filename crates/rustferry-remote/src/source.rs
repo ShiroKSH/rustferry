@@ -13,15 +13,22 @@
 //! path and its descendants. Negation, glob syntax, escaping, absolute paths,
 //! whitespace at line edges, and non-portable names are rejected. Ignore rules
 //! can never re-include built-in sensitive paths.
+//! Caller exclusions use the same portable workspace-relative path model and
+//! take precedence over selected roots and ignore rules. The workspace root
+//! itself (`.`) cannot be excluded. Sensitive paths take precedence over all
+//! caller policy and are reported without traversing their contents.
 //!
 //! Source ZIPs contain manifest files only: no embedded manifest, directory
 //! entries, links, or platform metadata beyond one normalized executable bit.
 //! ZIP metadata is fixed and entries follow manifest order, producing identical
 //! bytes for identical inputs. The separately transported manifest remains the
 //! worker's source of truth.
-//! Unix hard links are refused. Windows does not expose link counts through a
-//! stable standard API, so Windows snapshots flatten links to bytes and bind
-//! them through repeated size, timestamp, and content-digest verification.
+//! Hard-linked source files are refused on Unix and Windows. Windows link
+//! counts are queried from retained file handles so path replacement cannot
+//! substitute the object whose link state is inspected.
+//! Callers may supply portable executable-mode metadata for selected files;
+//! this carries executable intent from filesystems which do not expose Unix
+//! mode bits. A live Unix executable bit is never cleared by portable metadata.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -33,7 +40,7 @@ use std::{
 };
 
 #[cfg(windows)]
-use std::fs::OpenOptions;
+use std::{fs::OpenOptions, os::windows::io::AsHandle as _};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use cap_std::{
@@ -48,16 +55,49 @@ use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
+#[cfg(windows)]
+use rustferry_core::{RegularFileStreamErrorKind, verify_regular_file_has_no_named_streams};
+
+#[cfg(windows)]
+use rustferry_core::windows_private_directory::{
+    regular_file_link_count, remove_private_directory_tree_handle, verify_private_directory_handle,
+};
+
 const MANIFEST_SCHEMA_VERSION: u32 = 1;
 const MANIFEST_DOMAIN: &[u8] = b"rustferry-source-manifest-v1\0";
+/// Current source-bundle descriptor schema.
+pub const SOURCE_BUNDLE_DESCRIPTOR_SCHEMA_VERSION: u32 = 1;
+/// Maximum canonical source-bundle descriptor size, including its final newline.
+pub const MAX_SOURCE_BUNDLE_DESCRIPTOR_BYTES: u64 = 128 * 1024 * 1024;
+/// Maximum complete payload of one GitHub dirty-source snapshot orphan commit.
+pub const MAX_GIT_SNAPSHOT_BYTES: u64 = 90 * 1024 * 1024;
+/// Maximum canonical Git snapshot descriptor size, including its final newline.
+pub const MAX_GIT_SNAPSHOT_DESCRIPTOR_BYTES: u64 = 8 * 1024 * 1024;
+/// Current Git snapshot descriptor schema.
+pub const GIT_SNAPSHOT_DESCRIPTOR_SCHEMA_VERSION: u32 = 1;
+/// Fixed source archive path in a Git snapshot orphan commit.
+pub const GIT_SNAPSHOT_ARCHIVE_PATH: &str = ".rustferry/goal3/source.zip";
+/// Fixed source descriptor path in a Git snapshot orphan commit.
+pub const GIT_SNAPSHOT_DESCRIPTOR_PATH: &str = ".rustferry/goal3/source.json";
+/// Exact sorted regular-file tree required in a Git snapshot orphan commit.
+pub const GIT_SNAPSHOT_TREE_PATHS: [&str; 2] =
+    [GIT_SNAPSHOT_DESCRIPTOR_PATH, GIT_SNAPSHOT_ARCHIVE_PATH];
+/// Private custom namespace for operation-scoped source snapshot commits.
+pub const GIT_SNAPSHOT_REF_PREFIX: &str = "refs/rustferry/goal3/snapshots";
 const MAX_PORTABLE_PATH_BYTES: usize = 4_096;
 const MAX_PORTABLE_SEGMENT_BYTES: usize = 255;
 const MAX_IGNORE_PATTERN_BYTES: usize = 1_024;
 const MAX_SUPPORTED_DEPTH: usize = 256;
+/// Defensive ceiling for selected directory entries and manifest path nodes.
+pub const MAX_SOURCE_TRAVERSAL_ENTRIES: usize = 100_000;
 const SOURCE_ARCHIVE_TEMP_ATTEMPTS: u64 = 128;
 const SOURCE_ARCHIVE_BUFFER_SIZE: usize = 64 * 1024;
 #[cfg(windows)]
 const WINDOWS_FILE_SHARE_READ: u32 = 0x0000_0001;
+#[cfg(windows)]
+const WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+#[cfg(windows)]
+const WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
 const WORKSPACE_BUILD_INPUTS: &[&str] = &[
     "Cargo.toml",
@@ -69,16 +109,22 @@ const WORKSPACE_BUILD_INPUTS: &[&str] = &[
 ];
 
 const SENSITIVE_DIRECTORIES: &[&str] = &[
+    ".aws",
+    ".azure",
     ".git",
+    ".gnupg",
     ".hg",
+    ".kube",
     ".svn",
     ".goal2",
     ".goal3",
     ".cache",
+    ".ssh",
     ".tmp",
     ".venv",
     "__pycache__",
     "build",
+    "credentials",
     "deriveddata",
     "device-pairing",
     "dist",
@@ -92,20 +138,29 @@ const SENSITIVE_DIRECTORIES: &[&str] = &[
 ];
 
 const SENSITIVE_FILE_NAMES: &[&str] = &[
+    ".envrc",
+    ".git-credentials",
     ".netrc",
     ".npmrc",
     ".pypirc",
+    "application_default_credentials.json",
     "credentials",
+    "credentials.json",
     "credentials.toml",
+    "credentials.yaml",
+    "credentials.yml",
     "id_dsa",
     "id_ecdsa",
     "id_ed25519",
     "id_rsa",
     "keystore.properties",
+    "service-account.json",
+    "service_account.json",
 ];
 
 const SENSITIVE_EXTENSIONS: &[&str] = &[
     "cer",
+    "crd",
     "crt",
     "der",
     "ipa",
@@ -116,6 +171,7 @@ const SENSITIVE_EXTENSIONS: &[&str] = &[
     "p12",
     "p8",
     "pem",
+    "ppk",
     "provisionprofile",
     "xcarchive",
 ];
@@ -128,6 +184,8 @@ const SENSITIVE_EXTENSIONS: &[&str] = &[
 pub enum SourceMode {
     /// The worker checks out a pinned Git revision.
     Git,
+    /// The worker checks out an operation-scoped orphan commit containing a verified source ZIP.
+    GitSnapshot,
     /// The client sends a verified content snapshot.
     Snapshot,
 }
@@ -193,6 +251,9 @@ pub struct SourceBundleRequest {
     workspace_root: Utf8PathBuf,
     project_root: Utf8PathBuf,
     workspace_inputs: Vec<Utf8PathBuf>,
+    workspace_exclusions: Vec<Utf8PathBuf>,
+    executable_modes: Vec<(Utf8PathBuf, bool)>,
+    max_traversal_entries: usize,
     limits: SourceLimits,
 }
 
@@ -206,6 +267,9 @@ impl SourceBundleRequest {
             workspace_root: workspace_root.into(),
             project_root: project_root.into(),
             workspace_inputs: Vec::new(),
+            workspace_exclusions: Vec::new(),
+            executable_modes: Vec::new(),
+            max_traversal_entries: MAX_SOURCE_TRAVERSAL_ENTRIES,
             limits: SourceLimits::default(),
         }
     }
@@ -213,6 +277,39 @@ impl SourceBundleRequest {
     /// Add an allowlisted workspace-relative file or directory.
     pub fn include_workspace_path(mut self, path: impl Into<Utf8PathBuf>) -> Self {
         self.workspace_inputs.push(path.into());
+        self
+    }
+
+    /// Exclude one portable workspace-relative path and all descendants.
+    ///
+    /// Exclusions take precedence over the project root, built-in workspace
+    /// inputs, explicit includes, and `.ferryignore`. The workspace root (`.`)
+    /// is not a valid exclusion. Built-in sensitive exclusions remain
+    /// non-overridable and are audited separately.
+    pub fn exclude_workspace_path(mut self, path: impl Into<Utf8PathBuf>) -> Self {
+        self.workspace_exclusions.push(path.into());
+        self
+    }
+
+    /// Supply portable executable-mode metadata for one workspace-relative file.
+    ///
+    /// The path must be selected into the final manifest. On non-Unix hosts the
+    /// supplied value is authoritative because filesystem mode bits are not
+    /// available. On Unix, a true value adds executable intent while a live
+    /// filesystem executable bit remains authoritative and is never cleared.
+    pub fn with_executable_mode(mut self, path: impl Into<Utf8PathBuf>, executable: bool) -> Self {
+        self.executable_modes.push((path.into(), executable));
+        self
+    }
+
+    /// Apply a stricter combined traversal-entry limit than the defensive default.
+    ///
+    /// Values above [`MAX_SOURCE_TRAVERSAL_ENTRIES`] are rejected during
+    /// planning rather than weakening the global defensive ceiling. The one
+    /// budget counts components in explicit request paths, filesystem directory
+    /// entries read during selection, and components in final manifest paths.
+    pub fn with_max_traversal_entries(mut self, maximum: usize) -> Self {
+        self.max_traversal_entries = maximum;
         self
     }
 
@@ -237,6 +334,24 @@ impl SourceBundleRequest {
         &self.workspace_inputs
     }
 
+    /// Return caller-selected workspace-relative exclusions.
+    pub fn workspace_exclusions(&self) -> &[Utf8PathBuf] {
+        &self.workspace_exclusions
+    }
+
+    /// Return caller-supplied portable executable-mode metadata.
+    pub fn executable_modes(&self) -> &[(Utf8PathBuf, bool)] {
+        &self.executable_modes
+    }
+
+    /// Return the configured combined traversal-entry limit.
+    ///
+    /// The budget covers request path components, filesystem directory entries,
+    /// and every component of every final manifest path.
+    pub fn max_traversal_entries(&self) -> usize {
+        self.max_traversal_entries
+    }
+
     /// Return the configured resource limits.
     pub fn limits(&self) -> SourceLimits {
         self.limits
@@ -253,7 +368,7 @@ pub struct SourceManifestEntry {
     pub size: u64,
     /// Lowercase hexadecimal SHA-256 digest of the file contents.
     pub sha256: String,
-    /// Whether any executable bit was present on Unix; false on Windows.
+    /// Whether extraction must restore an executable bit, from Unix mode or portable metadata.
     pub executable: bool,
 }
 
@@ -281,6 +396,282 @@ pub struct SourceArchive {
     pub size: u64,
     /// Lowercase hexadecimal SHA-256 digest of the complete ZIP.
     pub sha256: String,
+}
+
+/// Versioned binding between one deterministic source ZIP and its manifest.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceBundleDescriptor {
+    /// Source-bundle descriptor schema version.
+    pub schema_version: u32,
+    /// Exact ZIP size and SHA-256 digest.
+    pub archive: SourceArchive,
+    /// Exact paths, sizes, modes, and digests represented by the ZIP.
+    pub manifest: SourceManifest,
+}
+
+/// Strict binding for one operation-scoped GitHub dirty-source snapshot.
+///
+/// The orphan commit containing this descriptor has exactly the two paths in
+/// [`GIT_SNAPSHOT_TREE_PATHS`]. The full request hash cannot be embedded because
+/// its `source_revision` is the SHA of that commit; `request_template_sha256`
+/// therefore covers the canonical request with only `source_revision` omitted.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitSnapshotDescriptor {
+    /// Git snapshot descriptor schema version.
+    pub schema_version: u32,
+    /// Exact operation identifier used to derive `snapshot_ref`.
+    pub operation_id: String,
+    /// Exact normalized credential-free HTTPS GitHub source repository.
+    pub source_repository: String,
+    /// Exact operation-derived heads ref carrying the orphan commit.
+    pub snapshot_ref: String,
+    /// Canonical request SHA-256 with only `source_revision` omitted.
+    pub request_template_sha256: String,
+    /// Deterministic ZIP transport and exact source manifest.
+    pub bundle: SourceBundleDescriptor,
+}
+
+impl GitSnapshotDescriptor {
+    /// Construct a descriptor from a pre-publication or final Git snapshot request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when request fields, manifest binding, repository, ref, digest, or source
+    /// size violates the Git snapshot contract.
+    pub fn from_request(
+        request: &crate::protocol::IosDeviceBuildRequest,
+        bundle: SourceBundleDescriptor,
+    ) -> Result<Self, SourceError> {
+        if request.source_mode != SourceMode::GitSnapshot {
+            return Err(invalid_git_snapshot(
+                "descriptor requires Git snapshot source mode",
+            ));
+        }
+        if bundle.manifest != request.source {
+            return Err(invalid_git_snapshot(
+                "descriptor manifest does not match request source",
+            ));
+        }
+        let source_repository = request
+            .source_repository
+            .clone()
+            .ok_or_else(|| invalid_git_snapshot("request has no source repository"))?;
+        let snapshot_ref = git_snapshot_ref(&request.operation_id)?;
+        let request_template_sha256 =
+            crate::protocol::canonical_git_snapshot_request_template_sha256(request)
+                .map_err(|_| invalid_git_snapshot("request template is invalid"))?;
+        let descriptor = Self {
+            schema_version: GIT_SNAPSHOT_DESCRIPTOR_SCHEMA_VERSION,
+            operation_id: request.operation_id.clone(),
+            source_repository,
+            snapshot_ref,
+            request_template_sha256,
+            bundle,
+        };
+        descriptor.validate(git_snapshot_archive_limits())?;
+        Ok(descriptor)
+    }
+
+    /// Validate a standalone descriptor against strict Git snapshot bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for any unsupported, ambiguous, non-canonical, or oversized field.
+    pub fn validate(&self, limits: SourceArchiveLimits) -> Result<(), SourceError> {
+        if self.schema_version != GIT_SNAPSHOT_DESCRIPTOR_SCHEMA_VERSION {
+            return Err(invalid_git_snapshot(
+                "unsupported Git snapshot descriptor schema version",
+            ));
+        }
+        let expected_ref = git_snapshot_ref(&self.operation_id)?;
+        if self.snapshot_ref != expected_ref {
+            return Err(invalid_git_snapshot(
+                "snapshot ref is not derived from the operation identifier",
+            ));
+        }
+        crate::protocol::validate_github_repository(&self.source_repository)
+            .map_err(|_| invalid_git_snapshot("source repository is not canonical"))?;
+        validate_sha256(&self.request_template_sha256)
+            .map_err(|_| invalid_git_snapshot("request template SHA-256 is invalid"))?;
+        self.bundle.validate(limits)?;
+        if self.bundle.archive.size > MAX_GIT_SNAPSHOT_BYTES
+            || self.bundle.manifest.total_size > MAX_GIT_SNAPSHOT_BYTES
+        {
+            return Err(limit_error(
+                SourceLimitKind::GitSnapshotSize,
+                None,
+                MAX_GIT_SNAPSHOT_BYTES,
+                self.bundle
+                    .archive
+                    .size
+                    .max(self.bundle.manifest.total_size),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Require exact binding to the final published request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for request drift in operation, repository, template, mode, or manifest.
+    pub fn validate_for_request(
+        &self,
+        request: &crate::protocol::IosDeviceBuildRequest,
+        limits: SourceArchiveLimits,
+    ) -> Result<(), SourceError> {
+        request
+            .validate()
+            .map_err(|_| invalid_git_snapshot("final request is invalid"))?;
+        self.validate(limits)?;
+        if request.source_mode != SourceMode::GitSnapshot
+            || request.operation_id != self.operation_id
+            || request.source_repository.as_deref() != Some(self.source_repository.as_str())
+            || request.source != self.bundle.manifest
+        {
+            return Err(invalid_git_snapshot(
+                "descriptor does not match the final request",
+            ));
+        }
+        let template_sha256 =
+            crate::protocol::canonical_git_snapshot_request_template_sha256(request)
+                .map_err(|_| invalid_git_snapshot("final request template is invalid"))?;
+        if template_sha256 != self.request_template_sha256 {
+            return Err(invalid_git_snapshot(
+                "request template SHA-256 does not match the descriptor",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Return strict source and ZIP limits for GitHub dirty-source snapshots.
+pub fn git_snapshot_archive_limits() -> SourceArchiveLimits {
+    let mut limits = SourceArchiveLimits::default();
+    limits.source.max_total_size = MAX_GIT_SNAPSHOT_BYTES;
+    limits.max_archive_size = MAX_GIT_SNAPSHOT_BYTES;
+    limits
+}
+
+/// Derive the only allowed Git snapshot ref for an operation.
+///
+/// # Errors
+///
+/// Returns an error when the operation is not one safe Git-ref path segment.
+pub fn git_snapshot_ref(operation_id: &str) -> Result<String, SourceError> {
+    if operation_id.is_empty()
+        || operation_id.len() > 128
+        || operation_id.starts_with('.')
+        || operation_id.ends_with('.')
+        || operation_id
+            .get(operation_id.len().saturating_sub(5)..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".lock"))
+        || operation_id.contains("..")
+        || !operation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(invalid_git_snapshot(
+            "operation identifier is not one safe Git-ref segment",
+        ));
+    }
+    Ok(format!("{GIT_SNAPSHOT_REF_PREFIX}/{operation_id}"))
+}
+
+/// Encode a validated Git snapshot descriptor in its one canonical byte representation.
+///
+/// # Errors
+///
+/// Returns an error for invalid fields, serialization failure, descriptor overflow, or a combined
+/// two-file orphan payload above the fixed 90 MiB ceiling.
+pub fn canonical_git_snapshot_descriptor_bytes(
+    descriptor: &GitSnapshotDescriptor,
+) -> Result<Vec<u8>, SourceError> {
+    descriptor.validate(git_snapshot_archive_limits())?;
+    let mut bytes =
+        serde_json::to_vec_pretty(descriptor).map_err(|error| SourceError::InvalidGitSnapshot {
+            reason: format!("descriptor JSON serialization failed: {error}"),
+        })?;
+    bytes.push(b'\n');
+    let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if size > MAX_GIT_SNAPSHOT_DESCRIPTOR_BYTES {
+        return Err(limit_error(
+            SourceLimitKind::DescriptorSize,
+            Some(GIT_SNAPSHOT_DESCRIPTOR_PATH.to_owned()),
+            MAX_GIT_SNAPSHOT_DESCRIPTOR_BYTES,
+            size,
+        ));
+    }
+    let combined = descriptor
+        .bundle
+        .archive
+        .size
+        .checked_add(size)
+        .ok_or_else(|| {
+            limit_error(
+                SourceLimitKind::GitSnapshotSize,
+                None,
+                MAX_GIT_SNAPSHOT_BYTES,
+                u64::MAX,
+            )
+        })?;
+    if combined > MAX_GIT_SNAPSHOT_BYTES {
+        return Err(limit_error(
+            SourceLimitKind::GitSnapshotSize,
+            None,
+            MAX_GIT_SNAPSHOT_BYTES,
+            combined,
+        ));
+    }
+    Ok(bytes)
+}
+
+impl SourceBundleDescriptor {
+    /// Bind an archive descriptor to its canonical manifest.
+    pub fn new(archive: SourceArchive, manifest: SourceManifest) -> Self {
+        Self {
+            schema_version: SOURCE_BUNDLE_DESCRIPTOR_SCHEMA_VERSION,
+            archive,
+            manifest,
+        }
+    }
+
+    /// Validate the complete descriptor without reading archive bytes.
+    ///
+    /// Byte-level integrity and ZIP-to-manifest correspondence are enforced by
+    /// [`verify_and_extract_source_bundle`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unsupported descriptor version, malformed or
+    /// oversized archive descriptor, invalid limits, or non-canonical manifest.
+    pub fn validate(&self, limits: SourceArchiveLimits) -> Result<(), SourceError> {
+        if self.schema_version != SOURCE_BUNDLE_DESCRIPTOR_SCHEMA_VERSION {
+            return Err(SourceError::InvalidArchive {
+                reason: "unsupported source-bundle descriptor schema version".to_owned(),
+            });
+        }
+        validate_archive_limits(limits)?;
+        if self.archive.size == 0 {
+            return Err(SourceError::InvalidArchive {
+                reason: "source archive size must be positive".to_owned(),
+            });
+        }
+        validate_sha256(&self.archive.sha256).map_err(|_| SourceError::InvalidArchive {
+            reason: "source archive SHA-256 is not 64 lowercase hexadecimal characters".to_owned(),
+        })?;
+        if self.archive.size > limits.max_archive_size {
+            return Err(limit_error(
+                SourceLimitKind::ArchiveSize,
+                None,
+                limits.max_archive_size,
+                self.archive.size,
+            ));
+        }
+        validate_source_manifest(&self.manifest, limits.source)
+    }
 }
 
 /// One local file selected by a bundle plan.
@@ -311,6 +702,8 @@ pub struct SourceBundlePlan {
     request: SourceBundleRequest,
     manifest: SourceManifest,
     files: Vec<PlannedSourceFile>,
+    executable_modes: BTreeMap<String, bool>,
+    excluded_sensitive_paths: Vec<String>,
 }
 
 impl SourceBundlePlan {
@@ -322,6 +715,14 @@ impl SourceBundlePlan {
     /// Return local files in the same order as manifest entries.
     pub fn files(&self) -> &[PlannedSourceFile] {
         &self.files
+    }
+
+    /// Return sensitive roots and files skipped during source selection.
+    ///
+    /// Paths are portable, sorted, unique, and name-only. Contents below a
+    /// skipped sensitive directory are never traversed for this audit.
+    pub fn excluded_sensitive_paths(&self) -> &[String] {
+        &self.excluded_sensitive_paths
     }
 }
 
@@ -346,6 +747,8 @@ pub enum PortablePathReason {
     InvalidCharacter,
     /// A component ended in a dot or space.
     TrailingDotOrSpace,
+    /// A component was not in Unicode NFC form.
+    NonNfc,
     /// A Windows-reserved device name was present.
     ReservedName,
     /// The complete path was too long.
@@ -369,8 +772,14 @@ pub enum SourceLimitKind {
     IgnoreFileSize,
     /// Total ignore rules.
     IgnoreRuleCount,
+    /// Directory entries and portable manifest path nodes traversed.
+    TraversalEntryCount,
     /// ZIP transport size.
     ArchiveSize,
+    /// Serialized source-bundle descriptor size.
+    DescriptorSize,
+    /// Complete Git snapshot orphan payload size.
+    GitSnapshotSize,
     /// ZIP entry compression ratio.
     CompressionRatio,
 }
@@ -416,6 +825,26 @@ pub enum SourceError {
     /// A built-in sensitive path was explicitly selected or found in a bundle.
     SensitivePath {
         /// Portable path; secret contents are never included.
+        path: String,
+    },
+    /// A selected regular file contained a conservative credential signature.
+    SensitiveContent {
+        /// Portable source path; credential contents are never included.
+        path: String,
+    },
+    /// A Windows reparse point or junction was found in selected source.
+    ReparsePoint {
+        /// Portable workspace-relative path or root role.
+        path: String,
+    },
+    /// A selected Windows regular file has a named alternate data stream.
+    AlternateDataStream {
+        /// Portable workspace-relative path; stream names are never retained.
+        path: String,
+    },
+    /// A selected Windows regular file's streams could not be inspected safely.
+    StreamInspectionUnavailable {
+        /// Portable workspace-relative path.
         path: String,
     },
     /// A selected path did not exist.
@@ -470,6 +899,23 @@ pub enum SourceError {
         /// Defensive maximum.
         maximum: usize,
     },
+    /// The requested traversal-entry limit exceeds the defensive ceiling.
+    UnsupportedTraversalLimit {
+        /// Requested traversal entries.
+        requested: usize,
+        /// Defensive maximum.
+        maximum: usize,
+    },
+    /// Portable executable metadata repeated the same path.
+    DuplicateExecutableMode {
+        /// Duplicated workspace-relative path.
+        path: String,
+    },
+    /// Portable executable metadata named a file outside the final selection.
+    ExecutableModePathNotSelected {
+        /// Workspace-relative path absent from the manifest.
+        path: String,
+    },
     /// A .ferryignore line was outside the documented safe subset.
     InvalidIgnoreRule {
         /// Portable ignore-file path.
@@ -511,6 +957,11 @@ pub enum SourceError {
         /// Stable or safely quoted rejection reason.
         reason: String,
     },
+    /// Git snapshot fields or cross-document bindings were invalid.
+    InvalidGitSnapshot {
+        /// Stable rejection reason without request or source contents.
+        reason: String,
+    },
     /// ZIP bytes did not match their transport descriptor.
     ArchiveIntegrityMismatch {
         /// Stable validation reason.
@@ -544,6 +995,7 @@ pub enum SourceError {
 }
 
 impl fmt::Display for SourceError {
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidRoot { root, reason } => write!(formatter, "invalid {root}: {reason}"),
@@ -556,6 +1008,24 @@ impl fmt::Display for SourceError {
             }
             Self::SensitivePath { path } => {
                 write!(formatter, "sensitive source path is excluded: {path}")
+            }
+            Self::SensitiveContent { path } => {
+                write!(
+                    formatter,
+                    "credential-like source contents are excluded: {path}"
+                )
+            }
+            Self::ReparsePoint { path } => {
+                write!(formatter, "Windows reparse points are not allowed: {path}")
+            }
+            Self::AlternateDataStream { path } => {
+                write!(formatter, "alternate data streams are not allowed: {path}")
+            }
+            Self::StreamInspectionUnavailable { path } => {
+                write!(
+                    formatter,
+                    "cannot inspect data streams for source file: {path}"
+                )
             }
             Self::MissingInput { path } => write!(formatter, "source input does not exist: {path}"),
             Self::Symlink { path } => write!(formatter, "symbolic links are not allowed: {path}"),
@@ -595,6 +1065,19 @@ impl fmt::Display for SourceError {
                 formatter,
                 "source depth limit {requested} exceeds supported maximum {maximum}"
             ),
+            Self::UnsupportedTraversalLimit { requested, maximum } => write!(
+                formatter,
+                "source traversal-entry limit {requested} exceeds supported maximum {maximum}"
+            ),
+            Self::DuplicateExecutableMode { path } => {
+                write!(formatter, "duplicate executable-mode metadata for {path}")
+            }
+            Self::ExecutableModePathNotSelected { path } => {
+                write!(
+                    formatter,
+                    "executable-mode metadata path is not selected: {path}"
+                )
+            }
             Self::InvalidIgnoreRule { file, line, reason } => {
                 write!(formatter, "invalid {file} rule on line {line}: {reason:?}")
             }
@@ -619,6 +1102,9 @@ impl fmt::Display for SourceError {
             }
             Self::InvalidArchive { reason } => {
                 write!(formatter, "invalid source archive: {reason}")
+            }
+            Self::InvalidGitSnapshot { reason } => {
+                write!(formatter, "invalid Git source snapshot: {reason}")
             }
             Self::ArchiveIntegrityMismatch { reason } => {
                 write!(formatter, "source archive integrity mismatch: {reason}")
@@ -660,17 +1146,26 @@ impl Error for SourceError {
 /// ignore rules, filesystem races, or exceeded resource limits.
 pub fn plan_source_bundle(request: &SourceBundleRequest) -> Result<SourceBundlePlan, SourceError> {
     check_supported_depth(request.limits)?;
+    let mut traversal = TraversalBudget::new(request.max_traversal_entries)?;
     let roots = ResolvedRoots::resolve(request)?;
     let project_path = display_relative_path(&roots.project_relative);
-    let ignore_rules = load_ignore_rules(&roots, request.limits)?;
-    let include_roots = collect_include_roots(request, &roots)?;
-    let scan = scan_paths(
+    let executable_modes = validate_executable_modes(request, &mut traversal)?;
+    let workspace_exclusions = validate_workspace_exclusions(request, &mut traversal)?;
+    let ignore_rules = load_ignore_rules(&roots, &workspace_exclusions, request.limits)?;
+    let include_roots =
+        collect_include_roots(request, &roots, &workspace_exclusions, &mut traversal)?;
+    let mut scan = scan_paths(
         &roots.workspace,
         include_roots,
+        &workspace_exclusions,
         &ignore_rules,
         request.limits,
+        &mut traversal,
     )?;
+    apply_executable_modes(&mut scan.entries, &executable_modes)?;
+    consume_planned_manifest_traversal(&mut traversal, &scan.entries)?;
     let manifest = build_manifest(project_path, scan.entries);
+    validate_source_manifest(&manifest, request.limits)?;
     let files = manifest
         .entries
         .iter()
@@ -684,6 +1179,8 @@ pub fn plan_source_bundle(request: &SourceBundleRequest) -> Result<SourceBundleP
         request: request.clone(),
         manifest,
         files,
+        executable_modes,
+        excluded_sensitive_paths: scan.excluded_sensitive_paths,
     })
 }
 
@@ -769,7 +1266,8 @@ fn verify_materialized_capability(
     expected: &SourceManifest,
     limits: SourceLimits,
 ) -> Result<(), SourceError> {
-    let scan = scan_capability_paths(directory, limits)?;
+    let mut scan = scan_capability_paths(directory, limits)?;
+    normalize_unobservable_executable_modes(&mut scan.entries, &expected.entries);
     let unexpected_directory = has_unexpected_directory(&scan.directories, expected);
     let actual = build_manifest(expected.project_path.clone(), scan.entries);
     if actual == *expected && !unexpected_directory {
@@ -816,6 +1314,7 @@ pub fn validate_source_manifest(
     let mut collisions = BTreeMap::new();
     let mut file_paths = BTreeSet::new();
     let mut total_size = 0_u64;
+    let mut traversal_entries = 0_u64;
     for entry in &manifest.entries {
         validate_portable_path_str(&entry.path, false).map_err(|reason| {
             SourceError::NonPortablePath {
@@ -825,6 +1324,7 @@ pub fn validate_source_manifest(
         })?;
         reject_sensitive(&entry.path)?;
         check_depth(&entry.path, limits.max_depth)?;
+        consume_manifest_traversal(&mut traversal_entries, &entry.path)?;
         register_path_components(&entry.path, &mut collisions)?;
         if entry.path == manifest.project_path {
             return Err(SourceError::InvalidManifest {
@@ -885,6 +1385,122 @@ pub fn validate_source_manifest(
     Ok(())
 }
 
+/// Validate and atomically publish a source-bundle descriptor as canonical JSON.
+///
+/// The output is pretty JSON followed by one newline. Publication is create-only:
+/// an existing output is never replaced. The temporary file, destination parent,
+/// and published link are bound to captured filesystem identities so cleanup
+/// cannot remove an attacker-substituted path.
+///
+/// # Errors
+///
+/// Returns an error for an invalid descriptor, an existing output, descriptor
+/// size overflow, unsafe destination changes, or filesystem failures. Any file
+/// created by this operation is removed on failure when it still has the
+/// operation-owned identity.
+pub fn write_source_bundle_descriptor_file(
+    descriptor: &SourceBundleDescriptor,
+    output: &Utf8Path,
+    limits: SourceArchiveLimits,
+) -> Result<(), SourceError> {
+    descriptor.validate(limits)?;
+    let temporary = create_archive_temporary(output)?;
+    let operation_parent = match temporary.parent.try_clone() {
+        Ok(parent) => parent,
+        Err(source) => {
+            let original = SourceError::Io {
+                operation: "clone descriptor output parent handle",
+                path: output.as_str().to_owned(),
+                source,
+            };
+            drop(temporary.file);
+            return match remove_owned_capability_file(
+                &temporary.parent,
+                &temporary.temporary_name,
+                &temporary.identity,
+            ) {
+                Ok(()) => Err(original),
+                Err(source) => Err(SourceError::CleanupFailed {
+                    path: temporary.temporary_path.as_str().to_owned(),
+                    original: original.to_string(),
+                    source,
+                }),
+            };
+        }
+    };
+    let mut cleanup = PartialFileCleanup::new(
+        temporary.temporary_path.clone(),
+        temporary.parent,
+        temporary.temporary_name.clone(),
+        temporary.identity,
+    );
+    let publication = (|| {
+        let mut writer =
+            DescriptorSizeLimitedWriter::new(temporary.file, MAX_SOURCE_BUNDLE_DESCRIPTOR_BYTES);
+        if let Err(error) = serde_json::to_writer_pretty(&mut writer, descriptor) {
+            return Err(descriptor_json_error(writer.exceeded(), output, &error));
+        }
+        if let Err(source) = writer.write_all(b"\n") {
+            return Err(descriptor_write_error(
+                writer.exceeded(),
+                output,
+                "write source bundle descriptor",
+                source,
+            ));
+        }
+        let file = writer.into_inner();
+        file.sync_all().map_err(|source| SourceError::Io {
+            operation: "synchronize source bundle descriptor",
+            path: output.as_str().to_owned(),
+            source,
+        })?;
+        drop(file);
+
+        ensure_capability_directory_path(
+            &operation_parent,
+            &temporary.parent_path,
+            &temporary.parent_identity,
+        )
+        .map_err(|source| SourceError::Io {
+            operation: "bind descriptor output parent handle to path",
+            path: output.as_str().to_owned(),
+            source,
+        })?;
+        publish_archive_no_clobber(
+            &operation_parent,
+            &temporary.temporary_name,
+            &temporary.output_name,
+            &cleanup.identity,
+            output,
+        )?;
+        cleanup.mark_published(&temporary.output_name);
+        cleanup.remove_temporary_link_after_publish()?;
+        ensure_capability_directory_path(
+            &operation_parent,
+            &temporary.parent_path,
+            &temporary.parent_identity,
+        )
+        .map_err(|source| SourceError::Io {
+            operation: "rebind descriptor output parent handle to path",
+            path: output.as_str().to_owned(),
+            source,
+        })?;
+        ensure_named_capability_file(&operation_parent, &temporary.output_name, &cleanup.identity)
+            .map_err(|source| SourceError::Io {
+                operation: "bind published descriptor handle to output path",
+                path: output.as_str().to_owned(),
+                source,
+            })?;
+        cleanup.keep_published();
+        Ok(())
+    })();
+
+    match publication {
+        Ok(()) => Ok(()),
+        Err(error) => cleanup.fail(error),
+    }
+}
+
 /// Create and atomically publish a deterministic source ZIP.
 ///
 /// Existing output is never replaced. Planned files are reopened and streamed
@@ -899,6 +1515,16 @@ pub fn create_source_bundle_archive(
     output: &Utf8Path,
     limits: SourceArchiveLimits,
 ) -> Result<SourceArchive, SourceError> {
+    create_source_bundle_archive_with_temporary_hook(plan, output, limits, || {})
+}
+
+#[allow(clippy::too_many_lines)]
+fn create_source_bundle_archive_with_temporary_hook(
+    plan: &SourceBundlePlan,
+    output: &Utf8Path,
+    limits: SourceArchiveLimits,
+    temporary_created: impl FnOnce(),
+) -> Result<SourceArchive, SourceError> {
     validate_archive_limits(limits)?;
     validate_source_manifest(&plan.manifest, limits.source)?;
     if plan.manifest.entries.len() != plan.files.len() {
@@ -907,16 +1533,33 @@ pub fn create_source_bundle_archive(
     verify_source_bundle_plan(plan)?;
 
     let temporary = create_archive_temporary(output)?;
-    let mut cleanup = PartialFileCleanup::new(
-        temporary.temporary_path.clone(),
-        temporary
-            .parent
-            .try_clone()
-            .map_err(|source| SourceError::Io {
+    temporary_created();
+    let cleanup_parent = match temporary.parent.try_clone() {
+        Ok(parent) => parent,
+        Err(source) => {
+            let original = SourceError::Io {
                 operation: "clone archive output parent handle",
                 path: output.as_str().to_owned(),
                 source,
-            })?,
+            };
+            drop(temporary.file);
+            return match remove_owned_capability_file(
+                &temporary.parent,
+                &temporary.temporary_name,
+                &temporary.identity,
+            ) {
+                Ok(()) => Err(original),
+                Err(source) => Err(SourceError::CleanupFailed {
+                    path: temporary.temporary_path.as_str().to_owned(),
+                    original: original.to_string(),
+                    source,
+                }),
+            };
+        }
+    };
+    let mut cleanup = PartialFileCleanup::new(
+        temporary.temporary_path.clone(),
+        cleanup_parent,
         temporary.temporary_name.clone(),
         temporary.identity,
     );
@@ -929,7 +1572,12 @@ pub fn create_source_bundle_archive(
             if planned.bundle_path.as_str() != expected.path {
                 return Err(SourceError::ManifestMismatch);
             }
-            write_verified_zip_entry(&mut writer, planned, expected)?;
+            write_verified_zip_entry(
+                &mut writer,
+                planned,
+                expected,
+                plan.executable_modes.get(&expected.path).copied(),
+            )?;
         }
         let mut file = writer
             .finish()
@@ -1006,6 +1654,54 @@ pub fn verify_and_extract_source_bundle(
     destination: &Utf8Path,
     limits: SourceArchiveLimits,
 ) -> Result<SourceArchive, SourceError> {
+    verify_and_extract_source_bundle_inner(
+        archive_path,
+        expected_archive,
+        expected_manifest,
+        destination,
+        None,
+        limits,
+    )
+}
+
+/// Verify and extract an untrusted source ZIP using an already retained exact destination-parent
+/// handle instead of reopening that parent by pathname.
+///
+/// Callers should pass a cloned handle and retain their original capability for the complete
+/// operation. The supplied handle is rebound to `destination.parent()` before any destination is
+/// created and is consumed by this call.
+///
+/// # Errors
+///
+/// Returns the same strict extraction failures as [`verify_and_extract_source_bundle`], plus an
+/// error when the supplied parent handle is not bound to the destination parent or, on Windows,
+/// does not satisfy the strict private-directory policy.
+pub fn verify_and_extract_source_bundle_with_parent_handle(
+    archive_path: &Utf8Path,
+    expected_archive: &SourceArchive,
+    expected_manifest: &SourceManifest,
+    destination: &Utf8Path,
+    destination_parent: File,
+    limits: SourceArchiveLimits,
+) -> Result<SourceArchive, SourceError> {
+    verify_and_extract_source_bundle_inner(
+        archive_path,
+        expected_archive,
+        expected_manifest,
+        destination,
+        Some(destination_parent),
+        limits,
+    )
+}
+
+fn verify_and_extract_source_bundle_inner(
+    archive_path: &Utf8Path,
+    expected_archive: &SourceArchive,
+    expected_manifest: &SourceManifest,
+    destination: &Utf8Path,
+    destination_parent: Option<File>,
+    limits: SourceArchiveLimits,
+) -> Result<SourceArchive, SourceError> {
     validate_archive_limits(limits)?;
     validate_source_manifest(expected_manifest, limits.source)?;
     validate_sha256(&expected_archive.sha256)?;
@@ -1030,7 +1726,7 @@ pub fn verify_and_extract_source_bundle(
         name: destination_name,
         directory: destination_directory,
         identity,
-    } = create_fresh_destination(destination)?;
+    } = create_fresh_destination(destination, destination_parent)?;
     let mut cleanup = PartialDirectoryCleanup::new(
         actual_destination,
         destination_parent,
@@ -1079,6 +1775,7 @@ struct PartialDirectoryCleanup {
     parent: CapabilityDir,
     parent_path: Utf8PathBuf,
     parent_identity: FileIdentityHandle,
+    #[cfg(not(windows))]
     name: String,
     directory: Option<CapabilityDir>,
     identity: Option<FileIdentityHandle>,
@@ -1182,11 +1879,14 @@ impl PartialDirectoryCleanup {
         directory: CapabilityDir,
         identity: FileIdentityHandle,
     ) -> Self {
+        #[cfg(windows)]
+        drop(name);
         Self {
             path,
             parent,
             parent_path,
             parent_identity,
+            #[cfg(not(windows))]
             name,
             directory: Some(directory),
             identity: Some(identity),
@@ -1209,19 +1909,39 @@ impl PartialDirectoryCleanup {
                 path: self.path.as_str().to_owned(),
                 source,
             })?;
-        let identity = self
-            .identity
-            .as_ref()
-            .ok_or(SourceError::InvalidDestination {
-                reason: "extraction destination identity is unavailable",
-            })?;
-        ensure_named_capability_directory(&self.parent, &self.name, identity).map_err(
-            |source| SourceError::Io {
-                operation: "bind extracted destination handle to final path",
-                path: self.path.as_str().to_owned(),
-                source,
-            },
-        )?;
+        #[cfg(windows)]
+        verify_private_directory_handle(
+            self.directory()?
+                .try_clone()
+                .map_err(|source| SourceError::Io {
+                    operation: "clone extraction destination handle",
+                    path: self.path.as_str().to_owned(),
+                    source,
+                })?
+                .into_std_file()
+                .as_handle(),
+        )
+        .map_err(|source| SourceError::Io {
+            operation: "verify extraction destination handle",
+            path: self.path.as_str().to_owned(),
+            source: io::Error::other(source),
+        })?;
+        #[cfg(not(windows))]
+        {
+            let identity = self
+                .identity
+                .as_ref()
+                .ok_or(SourceError::InvalidDestination {
+                    reason: "extraction destination identity is unavailable",
+                })?;
+            ensure_named_capability_directory(&self.parent, &self.name, identity).map_err(
+                |source| SourceError::Io {
+                    operation: "bind extracted destination handle to final path",
+                    path: self.path.as_str().to_owned(),
+                    source,
+                },
+            )?;
+        }
         drop(self.identity.take());
         drop(self.directory.take());
         self.active = false;
@@ -1236,7 +1956,7 @@ impl PartialDirectoryCleanup {
             return Err(error);
         };
         drop(self.identity.take());
-        match directory.remove_open_dir_all() {
+        match remove_created_directory_tree(directory) {
             Ok(()) => {
                 self.active = false;
                 Err(error)
@@ -1259,7 +1979,7 @@ impl Drop for PartialDirectoryCleanup {
         if self.active {
             drop(self.identity.take());
             if let Some(directory) = self.directory.take() {
-                let _ = directory.remove_open_dir_all();
+                let _ = remove_created_directory_tree(directory);
             }
         }
     }
@@ -1350,6 +2070,100 @@ impl Write for ArchiveSizeLimitedWriter {
 
     fn flush(&mut self) -> io::Result<()> {
         self.file.flush()
+    }
+}
+
+#[derive(Debug)]
+struct DescriptorSizeLimitedWriter {
+    file: File,
+    maximum: u64,
+    written: u64,
+    exceeded: Option<u64>,
+}
+
+impl DescriptorSizeLimitedWriter {
+    const fn new(file: File, maximum: u64) -> Self {
+        Self {
+            file,
+            maximum,
+            written: 0,
+            exceeded: None,
+        }
+    }
+
+    const fn exceeded(&self) -> Option<u64> {
+        self.exceeded
+    }
+
+    fn into_inner(self) -> File {
+        self.file
+    }
+}
+
+impl Write for DescriptorSizeLimitedWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let actual = self.written.saturating_add(buffer.len() as u64);
+        if actual > self.maximum {
+            self.exceeded = Some(actual);
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "source bundle descriptor exceeds its fixed size limit",
+            ));
+        }
+        let written = self.file.write(buffer)?;
+        self.written = self.written.saturating_add(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+fn descriptor_json_error(
+    exceeded: Option<u64>,
+    output: &Utf8Path,
+    error: &serde_json::Error,
+) -> SourceError {
+    if let Some(actual) = exceeded {
+        return limit_error(
+            SourceLimitKind::DescriptorSize,
+            None,
+            MAX_SOURCE_BUNDLE_DESCRIPTOR_BYTES,
+            actual,
+        );
+    }
+    if let Some(kind) = error.io_error_kind() {
+        return SourceError::Io {
+            operation: "serialize source bundle descriptor",
+            path: output.as_str().to_owned(),
+            source: io::Error::new(kind, error.to_string()),
+        };
+    }
+    SourceError::InvalidArchive {
+        reason: "source bundle descriptor could not be serialized".to_owned(),
+    }
+}
+
+fn descriptor_write_error(
+    exceeded: Option<u64>,
+    output: &Utf8Path,
+    operation: &'static str,
+    source: io::Error,
+) -> SourceError {
+    if let Some(actual) = exceeded {
+        limit_error(
+            SourceLimitKind::DescriptorSize,
+            None,
+            MAX_SOURCE_BUNDLE_DESCRIPTOR_BYTES,
+            actual,
+        )
+    } else {
+        SourceError::Io {
+            operation,
+            path: output.as_str().to_owned(),
+            source,
+        }
     }
 }
 
@@ -1540,6 +2354,7 @@ fn open_read_stable(path: &Utf8Path) -> io::Result<File> {
     OpenOptions::new()
         .read(true)
         .share_mode(WINDOWS_FILE_SHARE_READ)
+        .custom_flags(WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
 }
 
@@ -1600,6 +2415,7 @@ fn write_verified_zip_entry(
     writer: &mut ZipWriter<ArchiveSizeLimitedWriter>,
     planned: &PlannedSourceFile,
     expected: &SourceManifestEntry,
+    portable_executable: Option<bool>,
 ) -> Result<(), SourceError> {
     let path = planned.source_path();
     let path_display = expected.path.clone();
@@ -1614,8 +2430,12 @@ fn write_verified_zip_entry(
     if !initial.is_file() {
         return Err(SourceError::UnsupportedFileType { path: path_display });
     }
+    #[cfg(not(windows))]
     reject_hard_link(&initial, &expected.path)?;
-    if initial.len() != expected.size || executable_bit(&initial) != expected.executable {
+    if initial.len() != expected.size
+        || resolved_executable_mode(executable_bit(&initial), portable_executable)
+            != expected.executable
+    {
         return Err(SourceError::ManifestMismatch);
     }
 
@@ -1629,11 +2449,14 @@ fn write_verified_zip_entry(
         path: expected.path.clone(),
         source,
     })?;
-    reject_hard_link(&opened, &expected.path)?;
+    reject_open_hard_link(&source_file, &expected.path)?;
+    #[cfg(windows)]
+    reject_named_streams(&source_file, &expected.path)?;
     if !opened.is_file()
         || !same_file_identity(&initial, &opened)
         || opened.len() != expected.size
-        || executable_bit(&opened) != expected.executable
+        || resolved_executable_mode(executable_bit(&opened), portable_executable)
+            != expected.executable
     {
         return Err(SourceError::ChangedDuringRead {
             path: expected.path.clone(),
@@ -1689,12 +2512,18 @@ fn write_verified_zip_entry(
         path: expected.path.clone(),
         source,
     })?;
+    reject_open_hard_link(&source_file, &expected.path)?;
+    #[cfg(windows)]
+    reject_named_streams(&source_file, &expected.path)?;
+    #[cfg(not(windows))]
+    reject_hard_link(&path_final, &expected.path)?;
     ensure_source_metadata_stable(
         expected,
         &opened,
         &open_final,
         &path_final,
         initial_modified,
+        portable_executable,
     )?;
     if count != expected.size || hex_digest(digest.finalize()) != expected.sha256 {
         return Err(SourceError::ManifestMismatch);
@@ -1708,6 +2537,7 @@ fn ensure_source_metadata_stable(
     open_final: &Metadata,
     path_final: &Metadata,
     initial_modified: Option<std::time::SystemTime>,
+    portable_executable: Option<bool>,
 ) -> Result<(), SourceError> {
     let stable = !path_final.file_type().is_symlink()
         && open_final.is_file()
@@ -1718,8 +2548,10 @@ fn ensure_source_metadata_stable(
         && path_final.len() == expected.size
         && open_final.modified().ok() == initial_modified
         && path_final.modified().ok() == initial_modified
-        && executable_bit(open_final) == expected.executable
-        && executable_bit(path_final) == expected.executable;
+        && resolved_executable_mode(executable_bit(open_final), portable_executable)
+            == expected.executable
+        && resolved_executable_mode(executable_bit(path_final), portable_executable)
+            == expected.executable;
     if stable {
         Ok(())
     } else {
@@ -2036,7 +2868,10 @@ fn preflight_archive(
 }
 
 #[allow(clippy::too_many_lines)]
-fn create_fresh_destination(destination: &Utf8Path) -> Result<FreshDestination, SourceError> {
+fn create_fresh_destination(
+    destination: &Utf8Path,
+    retained_parent: Option<File>,
+) -> Result<FreshDestination, SourceError> {
     let name = destination
         .file_name()
         .filter(|name| !name.is_empty())
@@ -2049,13 +2884,17 @@ fn create_fresh_destination(destination: &Utf8Path) -> Result<FreshDestination, 
         .unwrap_or_else(|| Utf8Path::new("."));
     let canonical_parent = canonical_directory(parent, "extraction destination parent")?;
     let actual = canonical_parent.join(name);
-    let parent_directory =
+    let retained_parent_supplied = retained_parent.is_some();
+    let parent_directory = if let Some(parent) = retained_parent {
+        CapabilityDir::from_std_file(parent)
+    } else {
         CapabilityDir::open_ambient_dir(canonical_parent.as_std_path(), ambient_authority())
             .map_err(|source| SourceError::Io {
                 operation: "open extraction destination parent",
                 path: parent.as_str().to_owned(),
                 source,
-            })?;
+            })?
+    };
     let parent_identity =
         capability_directory_identity(&parent_directory).map_err(|source| SourceError::Io {
             operation: "capture extraction destination parent identity",
@@ -2068,6 +2907,25 @@ fn create_fresh_destination(destination: &Utf8Path) -> Result<FreshDestination, 
             path: parent.as_str().to_owned(),
             source,
         })?;
+    #[cfg(windows)]
+    if retained_parent_supplied {
+        let parent_handle = parent_directory
+            .try_clone()
+            .map_err(|source| SourceError::Io {
+                operation: "clone retained extraction destination parent",
+                path: parent.as_str().to_owned(),
+                source,
+            })?;
+        verify_private_directory_handle(parent_handle.into_std_file().as_handle()).map_err(
+            |source| SourceError::Io {
+                operation: "verify retained extraction destination parent",
+                path: parent.as_str().to_owned(),
+                source: io::Error::other(source),
+            },
+        )?;
+    }
+    #[cfg(not(windows))]
+    let _ = retained_parent_supplied;
     match parent_directory.symlink_metadata(name) {
         Ok(_) => {
             return Err(SourceError::DestinationExists {
@@ -2083,6 +2941,25 @@ fn create_fresh_destination(destination: &Utf8Path) -> Result<FreshDestination, 
             });
         }
     }
+    #[cfg(windows)]
+    let private_directory =
+        rustferry_core::windows_private_directory::create_private_directory(actual.as_std_path())
+            .map_err(|error| {
+            if error.kind()
+            == rustferry_core::windows_private_directory::PrivateDirectoryErrorKind::AlreadyExists
+        {
+            SourceError::DestinationExists {
+                path: destination.as_str().to_owned(),
+            }
+        } else {
+            SourceError::Io {
+                operation: "create private extraction destination",
+                path: destination.as_str().to_owned(),
+                source: io::Error::other(error),
+            }
+        }
+        })?;
+    #[cfg(not(windows))]
     create_private_capability_directory(&parent_directory, name).map_err(|source| {
         if source.kind() == io::ErrorKind::AlreadyExists {
             SourceError::DestinationExists {
@@ -2096,6 +2973,9 @@ fn create_fresh_destination(destination: &Utf8Path) -> Result<FreshDestination, 
             }
         }
     })?;
+    #[cfg(windows)]
+    let directory = CapabilityDir::from_std_file(private_directory);
+    #[cfg(not(windows))]
     let directory = match parent_directory.open_dir(name) {
         Ok(directory) => directory,
         Err(source) => {
@@ -2128,25 +3008,7 @@ fn create_fresh_destination(destination: &Utf8Path) -> Result<FreshDestination, 
             );
         }
     };
-    let named_metadata = match parent_directory.symlink_metadata(name) {
-        Ok(metadata) => metadata,
-        Err(source) => {
-            return cleanup_created_directory(
-                directory,
-                &actual,
-                SourceError::Io {
-                    operation: "reinspect created extraction destination",
-                    path: destination.as_str().to_owned(),
-                    source,
-                },
-            );
-        }
-    };
-    if opened_metadata.is_symlink()
-        || !opened_metadata.is_dir()
-        || named_metadata.is_symlink()
-        || !named_metadata.is_dir()
-    {
+    if opened_metadata.is_symlink() || !opened_metadata.is_dir() {
         return cleanup_created_directory(
             directory,
             &actual,
@@ -2154,6 +3016,32 @@ fn create_fresh_destination(destination: &Utf8Path) -> Result<FreshDestination, 
                 reason: "created extraction destination is not a directory",
             },
         );
+    }
+    #[cfg(not(windows))]
+    {
+        let named_metadata = match parent_directory.symlink_metadata(name) {
+            Ok(metadata) => metadata,
+            Err(source) => {
+                return cleanup_created_directory(
+                    directory,
+                    &actual,
+                    SourceError::Io {
+                        operation: "reinspect created extraction destination",
+                        path: destination.as_str().to_owned(),
+                        source,
+                    },
+                );
+            }
+        };
+        if named_metadata.is_symlink() || !named_metadata.is_dir() {
+            return cleanup_created_directory(
+                directory,
+                &actual,
+                SourceError::InvalidDestination {
+                    reason: "created extraction destination is not a directory",
+                },
+            );
+        }
     }
     let identity = match capability_directory_identity(&directory) {
         Ok(identity) => identity,
@@ -2170,8 +3058,15 @@ fn create_fresh_destination(destination: &Utf8Path) -> Result<FreshDestination, 
         }
     };
     let binding =
-        ensure_capability_directory_path(&parent_directory, &canonical_parent, &parent_identity)
-            .and_then(|()| ensure_named_capability_directory(&parent_directory, name, &identity));
+        ensure_capability_directory_path(&parent_directory, &canonical_parent, &parent_identity);
+    #[cfg(windows)]
+    let binding = binding.and_then(|()| {
+        verify_private_directory_handle(directory.try_clone()?.into_std_file().as_handle())
+            .map_err(io::Error::other)
+    });
+    #[cfg(not(windows))]
+    let binding = binding
+        .and_then(|()| ensure_named_capability_directory(&parent_directory, name, &identity));
     if let Err(source) = binding {
         drop(identity);
         return cleanup_created_directory(
@@ -2200,7 +3095,7 @@ fn cleanup_created_directory<T>(
     path: &Utf8Path,
     original: SourceError,
 ) -> Result<T, SourceError> {
-    match directory.remove_open_dir_all() {
+    match remove_created_directory_tree(directory) {
         Ok(()) => Err(original),
         Err(source) => Err(SourceError::CleanupFailed {
             path: path.as_str().to_owned(),
@@ -2208,6 +3103,16 @@ fn cleanup_created_directory<T>(
             source,
         }),
     }
+}
+
+#[cfg(windows)]
+fn remove_created_directory_tree(directory: CapabilityDir) -> io::Result<()> {
+    remove_private_directory_tree_handle(directory.into_std_file()).map_err(io::Error::other)
+}
+
+#[cfg(not(windows))]
+fn remove_created_directory_tree(directory: CapabilityDir) -> io::Result<()> {
+    directory.remove_open_dir_all()
 }
 
 fn capability_directory_identity(directory: &CapabilityDir) -> io::Result<FileIdentityHandle> {
@@ -2230,6 +3135,7 @@ fn ensure_capability_directory_path(
     }
 }
 
+#[cfg(not(windows))]
 fn ensure_named_capability_directory(
     parent: &CapabilityDir,
     name: &str,
@@ -2344,6 +3250,7 @@ fn extract_verified_entry(
         source,
     })?;
     drop(entry);
+    #[cfg(unix)]
     set_extracted_permissions(&output, expected.executable).map_err(|source| SourceError::Io {
         operation: "set extracted source permissions",
         path: expected.path.clone(),
@@ -2422,11 +3329,6 @@ fn set_extracted_permissions(file: &cap_std::fs::File, executable: bool) -> io::
     file.set_permissions(cap_std::fs::Permissions::from_mode(mode))
 }
 
-#[cfg(not(unix))]
-fn set_extracted_permissions(_file: &cap_std::fs::File, _executable: bool) -> io::Result<()> {
-    Ok(())
-}
-
 fn open_new_private_capability_file(
     parent: &CapabilityDir,
     name: &str,
@@ -2456,6 +3358,7 @@ fn scan_capability_paths(
     let mut entries = BTreeMap::new();
     let mut collisions = BTreeMap::new();
     let mut total_size = 0_u64;
+    let mut traversal = TraversalBudget::new(MAX_SOURCE_TRAVERSAL_ENTRIES)?;
 
     while let Some((directory, relative)) = stack.pop() {
         let display = display_relative_path(&relative);
@@ -2466,6 +3369,7 @@ fn scan_capability_paths(
         })?;
         let mut children = Vec::new();
         for child in iterator {
+            traversal.consume(1, Some(&display))?;
             let child = child.map_err(|source| SourceError::Io {
                 operation: "read verified bundle entry",
                 path: display.clone(),
@@ -2525,6 +3429,7 @@ fn scan_capability_paths(
                     path: child_display,
                 });
             }
+            #[cfg(not(windows))]
             reject_capability_hard_link(&metadata, &child_display)?;
             if entries.len() >= limits.max_file_count {
                 return Err(limit_error(
@@ -2565,6 +3470,7 @@ fn scan_capability_paths(
                 limits.max_file_size,
                 &metadata,
             )?;
+            reject_sensitive_contents(&child_display, &contents)?;
             let executable = capability_executable_bit(&metadata);
             total_size = next_total;
             entries.insert(
@@ -2582,6 +3488,7 @@ fn scan_capability_paths(
     Ok(ScanResult {
         entries: entries.into_values().collect(),
         directories: directories.into_iter().collect(),
+        excluded_sensitive_paths: Vec::new(),
     })
 }
 
@@ -2602,7 +3509,7 @@ fn read_bounded_capability_file(
         path: display.to_owned(),
         source,
     })?;
-    reject_capability_hard_link(&opened, display)?;
+    reject_open_capability_hard_link(&file, display)?;
     if !opened.is_file() || !same_capability_file_identity(initial, &opened) {
         return Err(SourceError::ChangedDuringRead {
             path: display.to_owned(),
@@ -2642,6 +3549,9 @@ fn read_bounded_capability_file(
             path: display.to_owned(),
             source,
         })?;
+    reject_open_capability_hard_link(reader.get_ref(), display)?;
+    #[cfg(not(windows))]
+    reject_capability_hard_link(&path_final, display)?;
     if path_final.is_symlink()
         || !path_final.is_file()
         || !same_capability_file_identity(&opened, &opened_final)
@@ -2661,6 +3571,45 @@ fn read_bounded_capability_file(
     Ok(contents)
 }
 
+fn reject_link_count(links: u64, path: &str) -> Result<(), SourceError> {
+    match links {
+        1 => Ok(()),
+        2.. => Err(SourceError::HardLink {
+            path: path.to_owned(),
+            links,
+        }),
+        _ => Err(SourceError::HardLinkInspectionUnavailable {
+            path: path.to_owned(),
+        }),
+    }
+}
+
+#[cfg(windows)]
+fn reject_open_capability_hard_link(
+    file: &cap_std::fs::File,
+    path: &str,
+) -> Result<(), SourceError> {
+    let links = regular_file_link_count(file.as_handle()).map_err(|_| {
+        SourceError::HardLinkInspectionUnavailable {
+            path: path.to_owned(),
+        }
+    })?;
+    reject_link_count(u64::from(links), path)
+}
+
+#[cfg(not(windows))]
+fn reject_open_capability_hard_link(
+    file: &cap_std::fs::File,
+    path: &str,
+) -> Result<(), SourceError> {
+    let metadata = file.metadata().map_err(|source| SourceError::Io {
+        operation: "inspect open file hard-link count",
+        path: path.to_owned(),
+        source,
+    })?;
+    reject_capability_hard_link(&metadata, path)
+}
+
 #[cfg(unix)]
 fn reject_capability_hard_link(
     metadata: &cap_std::fs::Metadata,
@@ -2668,23 +3617,7 @@ fn reject_capability_hard_link(
 ) -> Result<(), SourceError> {
     use cap_std::fs::MetadataExt as _;
 
-    let links = metadata.nlink();
-    if links > 1 {
-        Err(SourceError::HardLink {
-            path: path.to_owned(),
-            links,
-        })
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(windows)]
-fn reject_capability_hard_link(
-    _metadata: &cap_std::fs::Metadata,
-    _path: &str,
-) -> Result<(), SourceError> {
-    Ok(())
+    reject_link_count(metadata.nlink(), path)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -2740,6 +3673,25 @@ fn capability_executable_bit(_metadata: &cap_std::fs::Metadata) -> bool {
     false
 }
 
+#[cfg(unix)]
+fn normalize_unobservable_executable_modes(
+    _actual: &mut [SourceManifestEntry],
+    _expected: &[SourceManifestEntry],
+) {
+}
+
+#[cfg(not(unix))]
+fn normalize_unobservable_executable_modes(
+    actual: &mut [SourceManifestEntry],
+    expected: &[SourceManifestEntry],
+) {
+    for entry in actual {
+        if let Ok(index) = expected.binary_search_by(|candidate| candidate.path.cmp(&entry.path)) {
+            entry.executable = expected[index].executable;
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ResolvedRoots {
     workspace: Utf8PathBuf,
@@ -2783,12 +3735,154 @@ impl ResolvedRoots {
 struct ScanResult {
     entries: Vec<SourceManifestEntry>,
     directories: Vec<String>,
+    excluded_sensitive_paths: Vec<String>,
+}
+
+#[derive(Debug)]
+struct TraversalBudget {
+    maximum: usize,
+    visited: usize,
+}
+
+impl TraversalBudget {
+    fn new(maximum: usize) -> Result<Self, SourceError> {
+        if maximum > MAX_SOURCE_TRAVERSAL_ENTRIES {
+            return Err(SourceError::UnsupportedTraversalLimit {
+                requested: maximum,
+                maximum: MAX_SOURCE_TRAVERSAL_ENTRIES,
+            });
+        }
+        Ok(Self {
+            maximum,
+            visited: 0,
+        })
+    }
+
+    fn consume(&mut self, count: usize, path: Option<&str>) -> Result<(), SourceError> {
+        let actual = self.visited.saturating_add(count);
+        if actual > self.maximum {
+            return Err(limit_error(
+                SourceLimitKind::TraversalEntryCount,
+                path.map(str::to_owned),
+                self.maximum as u64,
+                actual as u64,
+            ));
+        }
+        self.visited = actual;
+        Ok(())
+    }
+}
+
+fn consume_manifest_traversal(total: &mut u64, path: &str) -> Result<(), SourceError> {
+    *total = total.saturating_add(path.split('/').count() as u64);
+    if *total > MAX_SOURCE_TRAVERSAL_ENTRIES as u64 {
+        Err(limit_error(
+            SourceLimitKind::TraversalEntryCount,
+            Some(path.to_owned()),
+            MAX_SOURCE_TRAVERSAL_ENTRIES as u64,
+            *total,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn consume_planned_manifest_traversal(
+    traversal: &mut TraversalBudget,
+    entries: &[SourceManifestEntry],
+) -> Result<(), SourceError> {
+    for entry in entries {
+        traversal.consume(entry.path.split('/').count(), Some(&entry.path))?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
 struct IgnoreRule {
     base: String,
     path: String,
+}
+
+fn validate_executable_modes(
+    request: &SourceBundleRequest,
+    traversal: &mut TraversalBudget,
+) -> Result<BTreeMap<String, bool>, SourceError> {
+    let mut modes = BTreeMap::new();
+    let mut collisions = BTreeMap::new();
+    for (path, executable) in request.executable_modes() {
+        let display = path.as_str().to_owned();
+        traversal.consume(path.components().count(), Some(&display))?;
+        validate_portable_path_str(&display, false).map_err(|reason| {
+            SourceError::NonPortablePath {
+                path: display.clone(),
+                reason,
+            }
+        })?;
+        reject_sensitive(&display)?;
+        check_depth(&display, request.limits.max_depth)?;
+        register_path_components(&display, &mut collisions)?;
+        if modes.insert(display.clone(), *executable).is_some() {
+            return Err(SourceError::DuplicateExecutableMode { path: display });
+        }
+    }
+    Ok(modes)
+}
+
+fn validate_workspace_exclusions(
+    request: &SourceBundleRequest,
+    traversal: &mut TraversalBudget,
+) -> Result<Vec<String>, SourceError> {
+    let mut requested = BTreeSet::new();
+    let mut collisions = BTreeMap::new();
+    for path in request.workspace_exclusions() {
+        let display = path.as_str().to_owned();
+        validate_portable_path_str(&display, false).map_err(|reason| {
+            SourceError::NonPortablePath {
+                path: display.clone(),
+                reason,
+            }
+        })?;
+        check_depth(&display, request.limits.max_depth)?;
+        register_path_components(&display, &mut collisions)?;
+        traversal.consume(display.split('/').count(), Some(&display))?;
+        requested.insert(display);
+    }
+
+    let mut exclusions: Vec<String> = Vec::new();
+    for display in requested {
+        if exclusions
+            .iter()
+            .any(|ancestor| path_is_within(&display, ancestor))
+        {
+            continue;
+        }
+        exclusions.push(display);
+    }
+    Ok(exclusions)
+}
+
+fn apply_executable_modes(
+    entries: &mut [SourceManifestEntry],
+    modes: &BTreeMap<String, bool>,
+) -> Result<(), SourceError> {
+    for (path, portable) in modes {
+        let index = entries
+            .binary_search_by(|entry| entry.path.as_str().cmp(path))
+            .map_err(|_| SourceError::ExecutableModePathNotSelected { path: path.clone() })?;
+        entries[index].executable =
+            resolved_executable_mode(entries[index].executable, Some(*portable));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn resolved_executable_mode(filesystem: bool, portable: Option<bool>) -> bool {
+    filesystem || portable.unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn resolved_executable_mode(_filesystem: bool, portable: Option<bool>) -> bool {
+    portable.unwrap_or(false)
 }
 
 fn check_supported_depth(limits: SourceLimits) -> Result<(), SourceError> {
@@ -2829,7 +3923,7 @@ fn reject_root_symlink(path: &Utf8Path, root: &'static str) -> Result<(), Source
             root,
             reason: "root is a symbolic link",
         }),
-        Ok(_) => Ok(()),
+        Ok(metadata) => reject_reparse_point(&metadata, root),
         Err(source) => Err(SourceError::Io {
             operation: "inspect",
             path: root.to_owned(),
@@ -2841,6 +3935,8 @@ fn reject_root_symlink(path: &Utf8Path, root: &'static str) -> Result<(), Source
 fn collect_include_roots(
     request: &SourceBundleRequest,
     roots: &ResolvedRoots,
+    workspace_exclusions: &[String],
+    traversal: &mut TraversalBudget,
 ) -> Result<Vec<Utf8PathBuf>, SourceError> {
     let mut include_roots = BTreeSet::new();
     include_roots.insert(roots.project_relative.clone());
@@ -2863,6 +3959,7 @@ fn collect_include_roots(
 
     for input in &request.workspace_inputs {
         let display = input.as_str().to_owned();
+        traversal.consume(input.components().count(), Some(&display))?;
         validate_portable_path_str(&display, false).map_err(|reason| {
             SourceError::NonPortablePath {
                 path: display.clone(),
@@ -2870,6 +3967,9 @@ fn collect_include_roots(
             }
         })?;
         reject_sensitive(&display)?;
+        if is_workspace_excluded(&display, workspace_exclusions) {
+            continue;
+        }
         ensure_no_symlink_components(&roots.workspace, input)?;
         if !roots
             .workspace
@@ -2901,7 +4001,7 @@ fn ensure_no_symlink_components(root: &Utf8Path, relative: &Utf8Path) -> Result<
                     path: display.as_str().to_owned(),
                 });
             }
-            Ok(_) => {}
+            Ok(metadata) => reject_reparse_point(&metadata, display.as_str())?,
             Err(source) if source.kind() == io::ErrorKind::NotFound => {
                 return Err(SourceError::MissingInput {
                     path: relative.as_str().to_owned(),
@@ -2921,6 +4021,7 @@ fn ensure_no_symlink_components(root: &Utf8Path, relative: &Utf8Path) -> Result<
 
 fn load_ignore_rules(
     roots: &ResolvedRoots,
+    workspace_exclusions: &[String],
     limits: SourceLimits,
 ) -> Result<Vec<IgnoreRule>, SourceError> {
     let mut locations = vec![(Utf8PathBuf::from("."), roots.workspace.join(".ferryignore"))];
@@ -2934,6 +4035,9 @@ fn load_ignore_rules(
     let mut rules = Vec::new();
     for (base, source_path) in locations {
         let display = relative_ignore_path(&base);
+        if is_workspace_excluded(&display, workspace_exclusions) {
+            continue;
+        }
         let metadata = match fs::symlink_metadata(source_path.as_std_path()) {
             Ok(metadata) => metadata,
             Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
@@ -2948,9 +4052,11 @@ fn load_ignore_rules(
         if metadata.file_type().is_symlink() {
             return Err(SourceError::Symlink { path: display });
         }
+        reject_reparse_point(&metadata, &display)?;
         if !metadata.is_file() {
             return Err(SourceError::UnsupportedFileType { path: display });
         }
+        #[cfg(not(windows))]
         reject_hard_link(&metadata, &display)?;
         if metadata.len() > limits.max_ignore_file_size {
             return Err(limit_error(
@@ -3033,14 +4139,17 @@ fn parse_ignore_file(
 fn scan_paths(
     root: &Utf8Path,
     include_roots: Vec<Utf8PathBuf>,
+    workspace_exclusions: &[String],
     ignore_rules: &[IgnoreRule],
     limits: SourceLimits,
+    traversal: &mut TraversalBudget,
 ) -> Result<ScanResult, SourceError> {
     let mut stack: Vec<_> = include_roots.into_iter().rev().collect();
     let mut visited_directories = BTreeSet::new();
     let mut directories = BTreeSet::new();
     let mut entries = BTreeMap::new();
     let mut collisions = BTreeMap::new();
+    let mut excluded_sensitive_paths = BTreeSet::new();
     let mut total_size = 0_u64;
 
     while let Some(relative) = stack.pop() {
@@ -3054,6 +4163,10 @@ fn scan_paths(
             })?;
             check_depth(&display, limits.max_depth)?;
             if is_sensitive_path(&display) {
+                excluded_sensitive_paths.insert(display);
+                continue;
+            }
+            if is_workspace_excluded(&display, workspace_exclusions) {
                 continue;
             }
             if is_ignored(&display, ignore_rules) {
@@ -3078,6 +4191,7 @@ fn scan_paths(
         if metadata.file_type().is_symlink() {
             return Err(SourceError::Symlink { path: display });
         }
+        reject_reparse_point(&metadata, &display)?;
 
         if metadata.is_dir() {
             if display != "." {
@@ -3087,7 +4201,7 @@ fn scan_paths(
             if !visited_directories.insert(display.clone()) {
                 continue;
             }
-            let mut children = read_directory_children(&source_path, &display)?;
+            let mut children = read_directory_children(&source_path, &display, traversal)?;
             children.sort();
             for child in children.into_iter().rev() {
                 let child_relative = if relative.as_str() == "." {
@@ -3102,6 +4216,7 @@ fn scan_paths(
         if !metadata.is_file() {
             return Err(SourceError::UnsupportedFileType { path: display });
         }
+        #[cfg(not(windows))]
         reject_hard_link(&metadata, &display)?;
         register_collision_key(&display, &mut collisions)?;
         if entries.contains_key(&display) {
@@ -3146,6 +4261,7 @@ fn scan_paths(
             &metadata,
             SourceLimitKind::FileSize,
         )?;
+        reject_sensitive_contents(&display, &contents)?;
         let digest = hex_digest(Sha256::digest(&contents));
         let executable = executable_bit(&metadata);
         total_size = next_total;
@@ -3163,12 +4279,14 @@ fn scan_paths(
     Ok(ScanResult {
         entries: entries.into_values().collect(),
         directories: directories.into_iter().collect(),
+        excluded_sensitive_paths: excluded_sensitive_paths.into_iter().collect(),
     })
 }
 
 fn read_directory_children(
     directory: &Utf8Path,
     display: &str,
+    traversal: &mut TraversalBudget,
 ) -> Result<Vec<String>, SourceError> {
     let iterator = fs::read_dir(directory.as_std_path()).map_err(|source| SourceError::Io {
         operation: "read directory",
@@ -3177,6 +4295,7 @@ fn read_directory_children(
     })?;
     let mut children = Vec::new();
     for entry in iterator {
+        traversal.consume(1, Some(display))?;
         let entry = entry.map_err(|source| SourceError::Io {
             operation: "read directory entry",
             path: display.to_owned(),
@@ -3198,6 +4317,7 @@ fn read_bounded_file(
     initial_metadata: &Metadata,
     limit_kind: SourceLimitKind,
 ) -> Result<Vec<u8>, SourceError> {
+    reject_reparse_point(initial_metadata, display)?;
     let file = open_read_stable(path).map_err(|source| SourceError::Io {
         operation: "open",
         path: display.to_owned(),
@@ -3208,7 +4328,9 @@ fn read_bounded_file(
         path: display.to_owned(),
         source,
     })?;
-    reject_hard_link(&opened_metadata, display)?;
+    reject_open_hard_link(&file, display)?;
+    #[cfg(windows)]
+    reject_named_streams(&file, display)?;
     if !opened_metadata.is_file() || !same_file_identity(initial_metadata, &opened_metadata) {
         return Err(SourceError::ChangedDuringRead {
             path: display.to_owned(),
@@ -3256,8 +4378,16 @@ fn read_bounded_file(
             path: display.to_owned(),
         });
     }
-    reject_hard_link(&open_final_metadata, display)?;
-    reject_hard_link(&path_final_metadata, display)?;
+    reject_reparse_point(&open_final_metadata, display)?;
+    reject_reparse_point(&path_final_metadata, display)?;
+    reject_open_hard_link(reader.get_ref(), display)?;
+    #[cfg(windows)]
+    reject_named_streams(reader.get_ref(), display)?;
+    #[cfg(not(windows))]
+    {
+        reject_hard_link(&open_final_metadata, display)?;
+        reject_hard_link(&path_final_metadata, display)?;
+    }
     let stable = open_final_metadata.is_file()
         && path_final_metadata.is_file()
         && same_file_identity(&opened_metadata, &open_final_metadata)
@@ -3277,24 +4407,43 @@ fn read_bounded_file(
     Ok(contents)
 }
 
+#[cfg(windows)]
+fn reject_open_hard_link(file: &File, path: &str) -> Result<(), SourceError> {
+    let links = regular_file_link_count(file.as_handle()).map_err(|_| {
+        SourceError::HardLinkInspectionUnavailable {
+            path: path.to_owned(),
+        }
+    })?;
+    reject_link_count(u64::from(links), path)
+}
+
+#[cfg(windows)]
+fn reject_named_streams(file: &File, path: &str) -> Result<(), SourceError> {
+    verify_regular_file_has_no_named_streams(file).map_err(|error| match error.kind() {
+        RegularFileStreamErrorKind::NamedStream => SourceError::AlternateDataStream {
+            path: path.to_owned(),
+        },
+        _ => SourceError::StreamInspectionUnavailable {
+            path: path.to_owned(),
+        },
+    })
+}
+
+#[cfg(not(windows))]
+fn reject_open_hard_link(file: &File, path: &str) -> Result<(), SourceError> {
+    let metadata = file.metadata().map_err(|source| SourceError::Io {
+        operation: "inspect open file hard-link count",
+        path: path.to_owned(),
+        source,
+    })?;
+    reject_hard_link(&metadata, path)
+}
+
 #[cfg(unix)]
 fn reject_hard_link(metadata: &Metadata, path: &str) -> Result<(), SourceError> {
     use std::os::unix::fs::MetadataExt;
 
-    let links = metadata.nlink();
-    if links > 1 {
-        Err(SourceError::HardLink {
-            path: path.to_owned(),
-            links,
-        })
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(windows)]
-fn reject_hard_link(_metadata: &Metadata, _path: &str) -> Result<(), SourceError> {
-    Ok(())
+    reject_link_count(metadata.nlink(), path)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -3432,6 +4581,9 @@ fn validate_portable_path_str(path: &str, allow_dot: bool) -> Result<(), Portabl
         if segment.ends_with(['.', ' ']) {
             return Err(PortablePathReason::TrailingDotOrSpace);
         }
+        if !segment.nfc().eq(segment.chars()) {
+            return Err(PortablePathReason::NonNfc);
+        }
         if segment.chars().any(|character| {
             character.is_control()
                 || matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*')
@@ -3449,19 +4601,20 @@ fn validate_portable_path_str(path: &str, allow_dot: bool) -> Result<(), Portabl
 
 fn is_windows_reserved_name(stem: &str) -> bool {
     let upper = stem.to_ascii_uppercase();
-    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || upper.strip_prefix("COM").is_some_and(|suffix| {
-            matches!(
-                suffix,
-                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
-            )
-        })
-        || upper.strip_prefix("LPT").is_some_and(|suffix| {
-            matches!(
-                suffix,
-                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
-            )
-        })
+    matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$" | "CONIN$" | "CONOUT$"
+    ) || upper.strip_prefix("COM").is_some_and(|suffix| {
+        matches!(
+            suffix,
+            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+        )
+    }) || upper.strip_prefix("LPT").is_some_and(|suffix| {
+        matches!(
+            suffix,
+            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+        )
+    })
 }
 
 fn reject_sensitive(path: &str) -> Result<(), SourceError> {
@@ -3472,6 +4625,200 @@ fn reject_sensitive(path: &str) -> Result<(), SourceError> {
     } else {
         Ok(())
     }
+}
+
+fn reject_sensitive_contents(path: &str, contents: &[u8]) -> Result<(), SourceError> {
+    if contains_private_key(contents) || contains_access_token(contents) {
+        Err(SourceError::SensitiveContent {
+            path: path.to_owned(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn contains_private_key(contents: &[u8]) -> bool {
+    if contains_putty_private_key(contents) {
+        return true;
+    }
+
+    let begin = b"-----BEGIN ";
+    let key_suffix = b"PRIVATE KEY-----";
+    let end = b"-----END ";
+    let mut offset = 0;
+    while let Some(relative_begin) = find_bytes(&contents[offset..], begin) {
+        let header_start = offset + relative_begin + begin.len();
+        let header_window_end = header_start.saturating_add(64).min(contents.len());
+        let Some(relative_suffix) =
+            find_bytes(&contents[header_start..header_window_end], key_suffix)
+        else {
+            offset = header_start;
+            continue;
+        };
+        let body_start = header_start + relative_suffix + key_suffix.len();
+        let Some(relative_end) = find_bytes(&contents[body_start..], end) else {
+            offset = body_start;
+            continue;
+        };
+        let body = &contents[body_start..body_start + relative_end];
+        if body
+            .iter()
+            .filter(|byte| byte.is_ascii_alphanumeric())
+            .count()
+            >= 128
+        {
+            return true;
+        }
+        offset = body_start;
+    }
+    false
+}
+
+fn contains_putty_private_key(contents: &[u8]) -> bool {
+    let mut lines = contents
+        .split(|byte| matches!(*byte, b'\r' | b'\n'))
+        .filter(|line| !line.is_empty());
+    let mut saw_header = false;
+
+    while let Some(line) = lines.next() {
+        if is_putty_private_key_header(line) {
+            saw_header = true;
+            continue;
+        }
+        if !saw_header {
+            continue;
+        }
+        let Some(private_line_count) = putty_private_line_count(line) else {
+            continue;
+        };
+
+        let mut encoded_bytes = 0_usize;
+        let mut complete = private_line_count > 0;
+        let mut next_header = false;
+        for _ in 0..private_line_count {
+            let Some(line) = lines.next() else {
+                complete = false;
+                break;
+            };
+            if is_putty_private_key_header(line) {
+                complete = false;
+                next_header = true;
+                break;
+            }
+            if line.is_empty() || !line.iter().all(|byte| is_base64_byte(*byte)) {
+                complete = false;
+                break;
+            }
+            encoded_bytes = encoded_bytes
+                .saturating_add(line.iter().filter(|byte| !matches!(**byte, b'=')).count());
+        }
+        if complete && encoded_bytes >= 32 {
+            return true;
+        }
+        saw_header = next_header;
+    }
+    false
+}
+
+fn is_putty_private_key_header(line: &[u8]) -> bool {
+    const PREFIX: &[u8] = b"PuTTY-User-Key-File-";
+    let Some(rest) = line.strip_prefix(PREFIX) else {
+        return false;
+    };
+    rest.len() > 3
+        && matches!(rest[0], b'1' | b'2' | b'3')
+        && &rest[1..3] == b": "
+        && rest[3..].iter().all(u8::is_ascii_graphic)
+}
+
+fn putty_private_line_count(line: &[u8]) -> Option<usize> {
+    let digits = line.strip_prefix(b"Private-Lines: ")?;
+    if digits.is_empty() {
+        return None;
+    }
+    digits.iter().try_fold(0_usize, |count, byte| {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        count
+            .checked_mul(10)?
+            .checked_add(usize::from(*byte - b'0'))
+    })
+}
+
+const fn is_base64_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')
+}
+
+fn contains_access_token(contents: &[u8]) -> bool {
+    const TOKEN_SIGNATURES: &[(&[u8], usize, usize)] = &[
+        (b"\x67hp_", 36, 64),
+        (b"\x67ithub_pat_", 40, 128),
+        (b"\x67ho_", 36, 128),
+        (b"\x67hu_", 36, 128),
+        (b"\x67hs_", 36, 128),
+        (b"\x67hr_", 36, 128),
+        (b"\x6epm_", 36, 64),
+        (b"\x73k_live_", 24, 96),
+        (b"\x78oxb-", 20, 160),
+        (b"\x78oxp-", 20, 160),
+        (b"\x79a29.", 20, 160),
+        (b"\x41KIA", 16, 16),
+        (b"\x41SIA", 16, 16),
+    ];
+
+    TOKEN_SIGNATURES.iter().any(|(prefix, minimum, maximum)| {
+        let mut offset = 0;
+        while let Some(relative) = find_bytes(&contents[offset..], prefix) {
+            let start = offset + relative;
+            let before_ok = start == 0 || !is_token_byte(contents[start - 1]);
+            let tail_start = start + prefix.len();
+            let tail_length = contents[tail_start..]
+                .iter()
+                .take_while(|byte| is_token_byte(**byte))
+                .count();
+            let after = tail_start.saturating_add(tail_length);
+            let after_ok = after == contents.len() || !is_token_byte(contents[after]);
+            if before_ok && after_ok && (*minimum..=*maximum).contains(&tail_length) {
+                return true;
+            }
+            offset = tail_start;
+        }
+        false
+    })
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+const fn is_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
+}
+
+#[cfg_attr(
+    not(windows),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "Windows reparse validation has no non-Windows equivalent"
+    )
+)]
+fn reject_reparse_point(metadata: &Metadata, path: &str) -> Result<(), SourceError> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        if metadata.file_attributes() & WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(SourceError::ReparsePoint {
+                path: path.to_owned(),
+            });
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (metadata, path);
+    Ok(())
 }
 
 fn is_sensitive_path(path: &str) -> bool {
@@ -3515,6 +4862,19 @@ fn is_ignored(path: &str, rules: &[IgnoreRule]) -> bool {
                     .is_some_and(|rest| rest.starts_with('/'))
         })
     })
+}
+
+fn is_workspace_excluded(path: &str, exclusions: &[String]) -> bool {
+    exclusions
+        .iter()
+        .any(|excluded| path_is_within(path, excluded))
+}
+
+fn path_is_within(path: &str, root: &str) -> bool {
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 fn register_collision_key(
@@ -3610,6 +4970,12 @@ fn limit_error(
     }
 }
 
+fn invalid_git_snapshot(reason: impl Into<String>) -> SourceError {
+    SourceError::InvalidGitSnapshot {
+        reason: reason.into(),
+    }
+}
+
 fn display_relative_path(path: &Utf8Path) -> String {
     if path.as_str().is_empty() || path.as_str() == "." {
         return ".".to_owned();
@@ -3640,10 +5006,69 @@ fn has_unexpected_directory(directories: &[String], expected: &SourceManifest) -
     })
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn archive_parent_swap_never_publishes_into_replacement_directory() {
+        use std::{sync::mpsc, thread};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = Utf8PathBuf::from_path_buf(temporary.path().join("workspace")).unwrap();
+        let project = workspace.join("app");
+        fs::create_dir_all(project.join("src")).unwrap();
+        fs::write(workspace.join("Cargo.toml"), b"[workspace]\n").unwrap();
+        fs::write(workspace.join("Cargo.lock"), b"").unwrap();
+        fs::write(project.join("Cargo.toml"), b"[package]\nname = \"app\"\n").unwrap();
+        fs::write(project.join("src/lib.rs"), b"pub fn value() -> u8 { 1 }\n").unwrap();
+        let request = SourceBundleRequest::new(workspace.clone(), project);
+        let plan = plan_source_bundle(&request).unwrap();
+        let root = workspace.parent().unwrap();
+        let output_parent = root.join("publish-parent");
+        let moved_parent = root.join("publish-parent-owned");
+        fs::create_dir(&output_parent).unwrap();
+        let output = output_parent.join("source.zip");
+
+        let output_for_creator = output.clone();
+        let (created_sender, created_receiver) = mpsc::sync_channel(0);
+        let (continue_sender, continue_receiver) = mpsc::sync_channel(0);
+        let creator = thread::spawn(move || {
+            create_source_bundle_archive_with_temporary_hook(
+                &plan,
+                &output_for_creator,
+                SourceArchiveLimits::default(),
+                || {
+                    created_sender.send(()).unwrap();
+                    continue_receiver.recv().unwrap();
+                },
+            )
+        });
+
+        created_receiver.recv().unwrap();
+        fs::rename(&output_parent, &moved_parent).unwrap();
+        fs::create_dir(&output_parent).unwrap();
+        fs::write(output_parent.join("sentinel"), b"unchanged").unwrap();
+        continue_sender.send(()).unwrap();
+        let result = creator.join().unwrap();
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(output_parent.join("sentinel")).unwrap(),
+            b"unchanged"
+        );
+        assert!(!output.exists());
+        assert!(fs::read_dir(&moved_parent).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".source.zip.rustferry-partial-")
+        }));
+    }
+
+    #[cfg(unix)]
     #[test]
     fn capability_root_binding_rejects_named_replacement() {
         let temporary = tempfile::tempdir().unwrap();
@@ -3661,5 +5086,96 @@ mod tests {
         fs::create_dir(&root).unwrap();
 
         assert!(ensure_capability_directory_path(&directory, &canonical_root, &identity).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bounded_read_rejects_a_hard_link_outside_the_selected_tree() {
+        let temporary = tempfile::tempdir().unwrap();
+        let selected = temporary.path().join("selected");
+        fs::create_dir(&selected).unwrap();
+        let source = selected.join("source.rs");
+        let outside_link = temporary.path().join("outside-link.rs");
+        fs::write(&source, b"fn main() {}").unwrap();
+        fs::hard_link(&source, &outside_link).unwrap();
+
+        let source = Utf8PathBuf::from_path_buf(source).unwrap();
+        let metadata = fs::symlink_metadata(&source).unwrap();
+        let error = read_bounded_file(
+            &source,
+            "selected/source.rs",
+            1024,
+            &metadata,
+            SourceLimitKind::FileSize,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, SourceError::HardLink { links: 2, .. }));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn capability_read_rejects_a_hard_link_outside_the_bundle() {
+        let temporary = tempfile::tempdir().unwrap();
+        let bundle = temporary.path().join("bundle");
+        fs::create_dir(&bundle).unwrap();
+        let source = bundle.join("source.rs");
+        let outside_link = temporary.path().join("outside-link.rs");
+        fs::write(&source, b"fn main() {}").unwrap();
+        fs::hard_link(&source, &outside_link).unwrap();
+
+        let directory = CapabilityDir::open_ambient_dir(&bundle, ambient_authority()).unwrap();
+        let metadata = directory.symlink_metadata("source.rs").unwrap();
+        let error =
+            read_bounded_capability_file(&directory, "source.rs", "source.rs", 1024, &metadata)
+                .unwrap_err();
+
+        assert!(matches!(error, SourceError::HardLink { links: 2, .. }));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn partial_destination_failure_cleans_exact_root_and_preserves_replacement() {
+        let temporary = tempfile::tempdir().unwrap();
+        let destination = Utf8PathBuf::from_path_buf(temporary.path().join("destination")).unwrap();
+        let moved = temporary.path().join("moved");
+        let replacement = temporary.path().join("replacement");
+        let replacement_marker = replacement.join("preserve.txt");
+        fs::create_dir(&replacement).unwrap();
+        fs::write(&replacement_marker, b"preserve").unwrap();
+
+        let FreshDestination {
+            path,
+            parent,
+            parent_path,
+            parent_identity,
+            name,
+            directory,
+            identity,
+        } = create_fresh_destination(&destination, None).unwrap();
+        directory.create_dir_all("app/src").unwrap();
+        directory
+            .write("app/src/partial.rs", b"partial extraction")
+            .unwrap();
+        let mut cleanup = PartialDirectoryCleanup::new(
+            path,
+            parent,
+            parent_path,
+            parent_identity,
+            name,
+            directory,
+            identity,
+        );
+
+        assert!(fs::rename(&destination, &moved).is_err());
+        assert!(fs::rename(&replacement, &destination).is_err());
+        let result: Result<(), SourceError> = cleanup.fail(SourceError::InvalidArchive {
+            reason: "injected partial extraction failure".to_owned(),
+        });
+
+        assert!(matches!(result, Err(SourceError::InvalidArchive { .. })));
+        assert!(!destination.exists());
+        assert!(!moved.exists());
+        assert_eq!(fs::read(&replacement_marker).unwrap(), b"preserve");
     }
 }

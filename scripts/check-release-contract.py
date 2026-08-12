@@ -29,6 +29,7 @@ EXPECTED_PUBLISHABLE_PACKAGES = frozenset(
         "rustferry-core",
         "rustferry-github",
         "rustferry-remote",
+        "rustferry-ssh",
     }
 )
 EXPECTED_NON_PUBLISHABLE_PACKAGES = frozenset({"rustferry-worker-macos"})

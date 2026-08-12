@@ -52,6 +52,15 @@ iOS builds require macOS, full Xcode with an iPhone Simulator SDK, and `aarch64-
 
 Follow [iOS setup](ios/setup.md). Physical-device builds have separate signing/provisioning requirements and a separate validation level.
 
+## Remote physical-iPhone artifacts
+
+Linux and Windows clients do not install Xcode or an Apple SDK. They can use the configured GitHub
+provider for an exact-revision build, or explicitly select a named SSH Mac for deterministic
+unsigned snapshot session v1. The macOS worker still needs full Xcode, iPhoneOS, Rust/Cargo/rustup,
+and `aarch64-apple-ios`. The accepted GitHub evidence is an unsigned XCArchive; the SSH path has no
+live artifact evidence, and neither path has validated a real development-signed IPA or device
+runtime. See [physical iPhone development](ios/physical-device.md).
+
 ## Shell completions
 
 Generate definitions to a file appropriate for your shell:

@@ -206,6 +206,7 @@ impl StorageBackend for FileStorage {
                 .map_err(|error| io_error("sync temporary record", &temporary, &error))?;
             fs::rename(&temporary, &path)
                 .map_err(|error| io_error("replace record", &path, &error))?;
+            #[cfg(unix)]
             sync_directory(&self.root)?;
             Ok(())
         })();
@@ -223,10 +224,13 @@ impl StorageBackend for FileStorage {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = self.path_for_key(key)?;
         match fs::remove_file(&path) {
-            Ok(()) => sync_directory(&self.root),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(io_error("remove", &path, &error)),
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(io_error("remove", &path, &error)),
         }
+        #[cfg(unix)]
+        sync_directory(&self.root)?;
+        Ok(())
     }
 
     fn contains(&self, key: &str) -> Result<bool> {
@@ -255,7 +259,9 @@ impl StorageBackend for FileStorage {
                 fs::remove_file(&path).map_err(|error| io_error("remove", &path, &error))?;
             }
         }
-        sync_directory(&self.root)
+        #[cfg(unix)]
+        sync_directory(&self.root)?;
+        Ok(())
     }
 }
 
@@ -264,11 +270,6 @@ fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| io_error("sync directory", path, &error))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_: &Path) -> Result<()> {
     Ok(())
 }
 

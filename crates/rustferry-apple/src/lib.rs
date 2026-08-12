@@ -24,7 +24,9 @@ pub use build::{
     AppleBuildProfile, ExtensionKind, IosBuildOutcome, IosBuildPlan, IosSimulatorBuildRequest,
     PlannedCopy, build_ios_simulator, plan_ios_simulator,
 };
-pub use command::{CommandOutput, CommandSpec, DEFAULT_COMMAND_TIMEOUT, run_command};
+pub use command::{
+    CommandOutput, CommandSpec, DEFAULT_COMMAND_TIMEOUT, run_command, with_command_cancellation,
+};
 pub use device::{
     IosDeviceArchiveOutcome, IosDeviceArchivePlan, IosDeviceArchiveRequest,
     IosDeviceArtifactDisposition, IosDeviceMachOValidation, IosDeviceMachOValidationPlan,
@@ -46,8 +48,9 @@ pub use signing_assets::{
     APPLE_ROOT_CA_G2_SHA256, APPLE_ROOT_CA_G3_SHA256, APPLE_ROOT_CA_SHA256,
     MAX_MANUAL_SIGNING_PASSWORD_BYTES, MAX_MANUAL_SIGNING_PKCS12_BYTES,
     MAX_MANUAL_SIGNING_PROFILE_BYTES, ManualSigningAssetError, ManualSigningAssetField,
-    ManualSigningAssetInputError, ManualSigningAssetsInput, ValidatedManualSigningAssets,
-    validate_manual_signing_assets,
+    ManualSigningAssetInputError, ManualSigningAssetsInput, ManualSigningIdentityInput,
+    ValidatedManualSigningAssets, validate_manual_signing_assets, validate_manual_signing_identity,
+    validate_manual_signing_profile,
 };
 
 /// Rust target used for physical iPhone artifacts.

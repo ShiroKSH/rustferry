@@ -1,30 +1,51 @@
 //! Bounded ingestion of the final GitHub Actions iPhone artifact.
 //!
-//! The GitHub artifact ZIP is untrusted input. This module accepts exactly the
-//! four public files emitted by the protected signing job, validates their
-//! cross-file integrity, independently inspects the IPA, and publishes regular
-//! files without replacing an existing destination.
+//! The GitHub artifact ZIP is untrusted input. This module accepts the exact
+//! request-derived public file set emitted by the protected signing job,
+//! validates its cross-file integrity, independently inspects the signed
+//! products, and publishes regular files without replacing a destination.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt, fs,
-    fs::{File, OpenOptions},
+    fs::File,
     io::{self, Read, Write},
 };
 
+#[cfg(windows)]
+use std::cell::Cell;
+#[cfg(not(windows))]
+use std::fs::OpenOptions;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt as _;
+#[cfg(windows)]
+use std::os::windows::io::AsHandle as _;
 
 use camino::{Utf8Path, Utf8PathBuf};
+use goblin::mach::{Mach, SingleArch, load_command::CommandVariant};
+#[cfg(windows)]
+use rustferry_core::windows_private_directory::{
+    PrivateDirectoryCleanupStatus, PrivateDirectoryError, PrivateDirectoryErrorKind,
+    PrivateFileLinkState, create_private_file as create_windows_private_file,
+    open_private_directory as open_windows_private_directory,
+    open_private_file as open_windows_private_file,
+    open_private_file_for_removal as open_windows_private_file_for_removal,
+    open_private_file_for_removal_in_state as open_windows_private_file_for_removal_in_state,
+    remove_private_file_handle as remove_windows_private_file_handle,
+    remove_private_file_handle_in_state as remove_windows_private_file_handle_in_state,
+    verify_private_file_handle as verify_windows_private_file_handle,
+    verify_private_file_handle_in_state as verify_windows_private_file_handle_in_state,
+};
 use rustferry_remote::{
     ARTIFACT_MANIFEST_SCHEMA_VERSION, ArtifactKind, ArtifactManifest, ArtifactRecord, BuildProfile,
     COMPILE_PHASE_EVIDENCE_SCHEMA_VERSION, CleanupStatus, CompilePhaseEvidence,
     IOS_DEVICE_RUST_TARGET, IOS_DEVICE_SDK, IosDeviceBuildRequest, IpaExpectation, IpaInspection,
-    SEALED_UNSIGNED_ARCHIVE_SCHEMA_VERSION, SigningMode, SigningStatus, SigningTargetKind,
-    SourceMode, UnsignedNestedBundleKind, ValidationLevel, canonical_request_sha256, inspect_ipa,
-    verify_downloaded_file,
+    PROTECTED_SIGNING_SANITIZED_LOG_V1, SEALED_UNSIGNED_ARCHIVE_SCHEMA_VERSION, SigningMode,
+    SigningStatus, SigningTargetKind, SourceMode, UnsignedNestedBundleKind, ValidationLevel,
+    canonical_request_sha256, inspect_ipa, verify_downloaded_file,
 };
+use same_file::Handle as FileIdentityHandle;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
@@ -40,14 +61,39 @@ pub const ARTIFACT_MANIFEST_NAME: &str = "artifact-manifest.json";
 pub const SIGNING_REPORT_NAME: &str = "signing-report.json";
 /// Exact independent-validation report filename published by the protected job.
 pub const VALIDATION_REPORT_NAME: &str = "validation-report.json";
+/// Exact sanitized signing-log filename published by the protected job.
+pub const SANITIZED_BUILD_LOG_NAME: &str = "sanitized-build-log.txt";
+/// Exact signed application-bundle transport filename published by the protected job.
+pub const APP_BUNDLE_ARCHIVE_NAME: &str = "application.app.zip";
+/// Exact signed Xcode-archive transport filename published by the protected job.
+pub const SIGNED_XCARCHIVE_NAME: &str = "application.xcarchive.zip";
+/// Exact dSYM transport filename published by the protected job.
+pub const DSYM_ARCHIVE_NAME: &str = "application.dSYM.zip";
 
-const REQUIRED_ENTRY_COUNT: usize = 4;
-const MAX_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024 + 32 * 1024 * 1024;
+const BASE_ENTRY_COUNT: usize = 5;
 const MAX_IPA_BYTES: u64 = 2 * 1024 * 1024 * 1024 + 16 * 1024 * 1024;
+const MAX_APP_BUNDLE_ARCHIVE_BYTES: u64 = MAX_IPA_BYTES;
+const MAX_XCARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024 + 32 * 1024 * 1024;
+const MAX_DSYM_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024 + 32 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_REPORT_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_TOTAL_EXPANDED_BYTES: u64 = MAX_IPA_BYTES + MAX_MANIFEST_BYTES + 2 * MAX_REPORT_BYTES;
+const MAX_SANITIZED_LOG_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_TOTAL_EXPANDED_BYTES: u64 = MAX_IPA_BYTES
+    + MAX_APP_BUNDLE_ARCHIVE_BYTES
+    + MAX_XCARCHIVE_BYTES
+    + MAX_DSYM_ARCHIVE_BYTES
+    + MAX_MANIFEST_BYTES
+    + 2 * MAX_REPORT_BYTES
+    + MAX_SANITIZED_LOG_BYTES;
+const MAX_ARCHIVE_BYTES: u64 = MAX_TOTAL_EXPANDED_BYTES + 64 * 1024 * 1024;
 const MAX_COMPRESSION_RATIO: u64 = 200;
+const MAX_INNER_ENTRY_COUNT: usize = 100_001;
+const MAX_INNER_PATH_BYTES: usize = 4_096;
+const MAX_INNER_TREE_DEPTH: usize = 128;
+const MAX_INNER_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_INNER_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_CAPTURED_MACHO_BYTES: u64 = 256 * 1024 * 1024;
+const SIGNED_TREE_SHA256_DOMAIN: &[u8] = b"rustferry-signed-tree-v1\0";
 const MAX_PUBLIC_TEXT_BYTES: usize = 255;
 const MAX_SIGNED_BUNDLES: usize = 512;
 const MAX_CODE_OBJECTS: usize = 512;
@@ -193,7 +239,7 @@ pub struct GithubArtifactIngestion<'a> {
     pub archive_path: &'a Utf8Path,
     /// Existing, empty, caller-owned directory used only for this ingestion.
     pub temporary_directory: &'a Utf8Path,
-    /// Existing caller-owned directory receiving the four validated files.
+    /// Existing caller-owned directory receiving the exact requested validated files.
     pub output_directory: &'a Utf8Path,
     /// Exact run identity and compile-handoff digests.
     pub expected: &'a GithubArtifactExpectation,
@@ -212,6 +258,14 @@ pub struct PublishedGithubArtifact {
     pub signing_report_path: Utf8PathBuf,
     /// Atomically published independent-validation report.
     pub validation_report_path: Utf8PathBuf,
+    /// Atomically published sanitized signing and export log.
+    pub sanitized_log_path: Utf8PathBuf,
+    /// Atomically published signed application-bundle transport, when requested.
+    pub app_bundle_archive_path: Option<Utf8PathBuf>,
+    /// Atomically published signed Xcode-archive transport, when requested.
+    pub signed_xcarchive_path: Option<Utf8PathBuf>,
+    /// Atomically published dSYM transport, when requested.
+    pub dsym_archive_path: Option<Utf8PathBuf>,
     /// Strictly decoded worker manifest.
     pub manifest: ArtifactManifest,
     /// Cross-platform inspection of the exact published IPA bytes.
@@ -235,13 +289,22 @@ pub enum RequiredArtifactFile {
     SigningReport,
     /// Independent validation report.
     ValidationReport,
+    /// Sanitized protected-signing log.
+    SanitizedLog,
+    /// Signed application bundle encoded as a bounded ZIP transport.
+    AppBundleArchive,
+    /// Signed Xcode archive encoded as a bounded ZIP transport.
+    SignedXcarchive,
+    /// Debug-symbol bundle encoded as a bounded ZIP transport.
+    DsymArchive,
 }
 
 impl RequiredArtifactFile {
-    const ALL: [Self; REQUIRED_ENTRY_COUNT] = [
+    const BASE: [Self; BASE_ENTRY_COUNT] = [
         Self::Manifest,
         Self::SigningReport,
         Self::ValidationReport,
+        Self::SanitizedLog,
         Self::Ipa,
     ];
 
@@ -251,6 +314,10 @@ impl RequiredArtifactFile {
             Self::Manifest => ARTIFACT_MANIFEST_NAME,
             Self::SigningReport => SIGNING_REPORT_NAME,
             Self::ValidationReport => VALIDATION_REPORT_NAME,
+            Self::SanitizedLog => SANITIZED_BUILD_LOG_NAME,
+            Self::AppBundleArchive => APP_BUNDLE_ARCHIVE_NAME,
+            Self::SignedXcarchive => SIGNED_XCARCHIVE_NAME,
+            Self::DsymArchive => DSYM_ARCHIVE_NAME,
         }
     }
 
@@ -259,6 +326,35 @@ impl RequiredArtifactFile {
             Self::Ipa => MAX_IPA_BYTES,
             Self::Manifest => MAX_MANIFEST_BYTES,
             Self::SigningReport | Self::ValidationReport => MAX_REPORT_BYTES,
+            Self::SanitizedLog => MAX_SANITIZED_LOG_BYTES,
+            Self::AppBundleArchive => MAX_APP_BUNDLE_ARCHIVE_BYTES,
+            Self::SignedXcarchive => MAX_XCARCHIVE_BYTES,
+            Self::DsymArchive => MAX_DSYM_ARCHIVE_BYTES,
+        }
+    }
+
+    const fn artifact_kind(self) -> Option<ArtifactKind> {
+        match self {
+            Self::Ipa => Some(ArtifactKind::Ipa),
+            Self::Manifest => None,
+            Self::SigningReport => Some(ArtifactKind::SigningReport),
+            Self::ValidationReport => Some(ArtifactKind::ValidationReport),
+            Self::SanitizedLog => Some(ArtifactKind::SanitizedLog),
+            Self::AppBundleArchive => Some(ArtifactKind::App),
+            Self::SignedXcarchive => Some(ArtifactKind::Xcarchive),
+            Self::DsymArchive => Some(ArtifactKind::Dsym),
+        }
+    }
+
+    const fn media_type(self) -> Option<&'static str> {
+        match self {
+            Self::Ipa => Some("application/octet-stream"),
+            Self::Manifest => None,
+            Self::SigningReport | Self::ValidationReport => Some("application/json"),
+            Self::SanitizedLog => Some("text/plain; charset=utf-8"),
+            Self::AppBundleArchive | Self::SignedXcarchive | Self::DsymArchive => {
+                Some("application/zip")
+            }
         }
     }
 
@@ -268,9 +364,30 @@ impl RequiredArtifactFile {
             ARTIFACT_MANIFEST_NAME => Some(Self::Manifest),
             SIGNING_REPORT_NAME => Some(Self::SigningReport),
             VALIDATION_REPORT_NAME => Some(Self::ValidationReport),
+            SANITIZED_BUILD_LOG_NAME => Some(Self::SanitizedLog),
+            APP_BUNDLE_ARCHIVE_NAME => Some(Self::AppBundleArchive),
+            SIGNED_XCARCHIVE_NAME => Some(Self::SignedXcarchive),
+            DSYM_ARCHIVE_NAME => Some(Self::DsymArchive),
             _ => None,
         }
     }
+}
+
+fn required_artifact_files(expected: &GithubArtifactExpectation) -> BTreeSet<RequiredArtifactFile> {
+    let mut files = RequiredArtifactFile::BASE
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let requested = &expected.request().requested_artifacts;
+    if requested.contains(&rustferry_remote::IosArtifactType::AppBundle) {
+        files.insert(RequiredArtifactFile::AppBundleArchive);
+    }
+    if requested.contains(&rustferry_remote::IosArtifactType::Xcarchive) {
+        files.insert(RequiredArtifactFile::SignedXcarchive);
+    }
+    if requested.contains(&rustferry_remote::IosArtifactType::Dsym) {
+        files.insert(RequiredArtifactFile::DsymArchive);
+    }
+    files
 }
 
 impl fmt::Display for RequiredArtifactFile {
@@ -292,13 +409,13 @@ pub enum GithubArtifactError {
     ArchiveTooLarge,
     /// The downloaded bytes are not a valid supported ZIP.
     InvalidArchive,
-    /// The ZIP does not contain exactly four central-directory entries.
+    /// The ZIP does not contain the exact request-derived central-directory entry count.
     InvalidEntryCount,
     /// An entry name is non-UTF-8, absolute, traversing, or otherwise unsafe.
     UnsafeEntryName,
     /// An entry uses a nested directory or wrapper root.
     NestedArchiveRoot,
-    /// An entry is not one of the four exact public outputs.
+    /// An entry is not one of the exact request-derived public outputs.
     UnexpectedEntry,
     /// An exact ZIP entry occurs more than once.
     DuplicateEntry,
@@ -332,6 +449,10 @@ pub enum GithubArtifactError {
     ArtifactIntegrityFailed(RequiredArtifactFile),
     /// Cross-platform IPA inspection rejected the exact downloaded bytes.
     IpaInspectionFailed,
+    /// An optional signed-product ZIP is malformed or violates its exact layout.
+    InvalidProductArchive(RequiredArtifactFile),
+    /// Optional signed-product contents differ from the validated IPA or public evidence.
+    ProductEvidenceMismatch(RequiredArtifactFile),
     /// An exact destination filename already exists.
     OutputAlreadyExists(RequiredArtifactFile),
     /// This filesystem cannot provide no-replace atomic publication.
@@ -398,6 +519,15 @@ impl fmt::Display for GithubArtifactError {
             Self::IpaInspectionFailed => {
                 formatter.write_str("downloaded IPA failed physical-iPhone inspection")
             }
+            Self::InvalidProductArchive(file) => {
+                write!(formatter, "{file} has an invalid signed-product layout")
+            }
+            Self::ProductEvidenceMismatch(file) => {
+                write!(
+                    formatter,
+                    "{file} does not match the validated signed product"
+                )
+            }
             Self::OutputAlreadyExists(file) => {
                 write!(formatter, "refusing to overwrite existing {file}")
             }
@@ -425,7 +555,39 @@ struct PublishedEvidenceReport {
     request_sha256: String,
     sealed_archive_sha256: String,
     signed_ipa: PublishedSignedIpaEvidence,
+    signed_products: PublishedSignedProductsEvidence,
     cleanup: PublishedCleanupEvidence,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct PublishedSignedProductsEvidence {
+    app_tree: Option<PublishedSignedTreeEvidence>,
+    archive: Option<PublishedSignedArchiveEvidence>,
+    dsym: Option<PublishedSignedDsymEvidence>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct PublishedSignedTreeEvidence {
+    entry_count: u32,
+    total_size: u64,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct PublishedSignedArchiveEvidence {
+    app_tree: PublishedSignedTreeEvidence,
+    root_deep_signature_verified: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct PublishedSignedDsymEvidence {
+    architecture: String,
+    signed_executable_uuid: String,
+    dsym_uuid: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -504,12 +666,15 @@ pub fn ingest_github_actions_artifact(
     request: GithubArtifactIngestion<'_>,
 ) -> Result<PublishedGithubArtifact, GithubArtifactError> {
     validate_ipa_expectation(request.ipa_expectation)?;
-    let temporary_directory = bind_empty_directory(request.temporary_directory, true)?;
-    let output_directory = bind_empty_directory(request.output_directory, false)?;
+    let required_files = required_artifact_files(request.expected);
+    let (temporary_directory, _temporary_directory_guard) =
+        bind_empty_directory(request.temporary_directory, true)?;
+    let (output_directory, _output_directory_guard) =
+        bind_empty_directory(request.output_directory, false)?;
     if temporary_directory == output_directory {
         return Err(GithubArtifactError::InvalidPath);
     }
-    for file in RequiredArtifactFile::ALL {
+    for file in required_files.iter().copied() {
         ensure_output_absent(&output_directory.join(file.file_name()), file)?;
     }
 
@@ -520,7 +685,7 @@ pub fn ingest_github_actions_artifact(
     }
     let mut archive =
         ZipArchive::new(archive_file).map_err(|_| GithubArtifactError::InvalidArchive)?;
-    let entries = scan_archive(&mut archive, archive_size)?;
+    let entries = scan_archive(&mut archive, archive_size, &required_files)?;
 
     let manifest_bytes = read_bounded_entry(
         &mut archive,
@@ -537,6 +702,7 @@ pub fn ingest_github_actions_artifact(
         request.expected,
         request.ipa_expectation,
         &entries,
+        &required_files,
     )?;
 
     let signing_report_bytes = read_bounded_entry(
@@ -549,6 +715,12 @@ pub fn ingest_github_actions_artifact(
         entries[&RequiredArtifactFile::ValidationReport],
         RequiredArtifactFile::ValidationReport,
     )?;
+    let sanitized_log_bytes = read_bounded_entry(
+        &mut archive,
+        entries[&RequiredArtifactFile::SanitizedLog],
+        RequiredArtifactFile::SanitizedLog,
+    )?;
+    validate_sanitized_log(&sanitized_log_bytes)?;
     let signing_report =
         parse_public_report(&signing_report_bytes, RequiredArtifactFile::SigningReport)?;
     let validation_report = parse_public_report(
@@ -563,10 +735,12 @@ pub fn ingest_github_actions_artifact(
         &manifest,
         records[&RequiredArtifactFile::Ipa],
         request.expected,
+        &required_files,
     )?;
 
-    let staged_paths = RequiredArtifactFile::ALL
-        .into_iter()
+    let staged_paths = required_files
+        .iter()
+        .copied()
         .map(|file| (file, temporary_directory.join(file.file_name())))
         .collect::<BTreeMap<_, _>>();
     let staging_result = (|| {
@@ -582,12 +756,21 @@ pub fn ingest_github_actions_artifact(
             &staged_paths[&RequiredArtifactFile::ValidationReport],
             &validation_report_bytes,
         )?;
-        extract_entry_to_new_file(
-            &mut archive,
-            entries[&RequiredArtifactFile::Ipa],
-            RequiredArtifactFile::Ipa,
-            &staged_paths[&RequiredArtifactFile::Ipa],
+        write_new_file(
+            &staged_paths[&RequiredArtifactFile::SanitizedLog],
+            &sanitized_log_bytes,
         )?;
+        for file in required_files.iter().copied().filter(|file| {
+            !matches!(
+                file,
+                RequiredArtifactFile::Manifest
+                    | RequiredArtifactFile::SigningReport
+                    | RequiredArtifactFile::ValidationReport
+                    | RequiredArtifactFile::SanitizedLog
+            )
+        }) {
+            extract_entry_to_new_file(&mut archive, entries[&file], file, &staged_paths[&file])?;
+        }
         Ok(())
     })();
     if let Err(error) = staging_result {
@@ -601,6 +784,8 @@ pub fn ingest_github_actions_artifact(
         &records,
         request.ipa_expectation,
         &manifest,
+        &required_files,
+        &validation_report,
     );
     let ipa_inspection = match validation_result {
         Ok(inspection) => inspection,
@@ -610,18 +795,31 @@ pub fn ingest_github_actions_artifact(
         }
     };
 
-    let published_paths = match publish_no_replace(&staged_paths, &output_directory) {
-        Ok(paths) => paths,
-        Err(error) => {
-            cleanup_paths(staged_paths.values())?;
-            return Err(error);
-        }
-    };
-    if cleanup_paths(staged_paths.values()).is_err() {
-        cleanup_paths(published_paths.values())?;
-        cleanup_paths(staged_paths.values())?;
+    let published_links =
+        match publish_no_replace(&staged_paths, &output_directory, &required_files) {
+            Ok(links) => links,
+            Err(error) => {
+                cleanup_paths(staged_paths.values())?;
+                return Err(error);
+            }
+        };
+    if finalize_published_links(published_links.values(), staged_paths.values()).is_err() {
+        let _ = cleanup_published_links(published_links.values());
+        #[cfg(not(windows))]
+        let _ = cleanup_paths(staged_paths.values());
         return Err(GithubArtifactError::CleanupFailed);
     }
+    if published_links
+        .values()
+        .any(|link| published_link_matches(link) != Ok(true))
+    {
+        let _ = cleanup_published_links(published_links.values());
+        return Err(GithubArtifactError::CleanupFailed);
+    }
+    let published_paths = published_links
+        .iter()
+        .map(|(file, link)| (*file, link.path.clone()))
+        .collect::<BTreeMap<_, _>>();
 
     let mut validation_levels = manifest.validation_levels.clone();
     validation_levels.insert(ValidationLevel::DownloadedToClient);
@@ -630,6 +828,16 @@ pub fn ingest_github_actions_artifact(
         manifest_path: published_paths[&RequiredArtifactFile::Manifest].clone(),
         signing_report_path: published_paths[&RequiredArtifactFile::SigningReport].clone(),
         validation_report_path: published_paths[&RequiredArtifactFile::ValidationReport].clone(),
+        sanitized_log_path: published_paths[&RequiredArtifactFile::SanitizedLog].clone(),
+        app_bundle_archive_path: published_paths
+            .get(&RequiredArtifactFile::AppBundleArchive)
+            .cloned(),
+        signed_xcarchive_path: published_paths
+            .get(&RequiredArtifactFile::SignedXcarchive)
+            .cloned(),
+        dsym_archive_path: published_paths
+            .get(&RequiredArtifactFile::DsymArchive)
+            .cloned(),
         manifest,
         ipa_inspection,
         manifest_sha256: sha256_bytes(&manifest_bytes),
@@ -638,10 +846,16 @@ pub fn ingest_github_actions_artifact(
     })
 }
 
+#[derive(Debug)]
+struct PrivateDirectoryGuard {
+    #[cfg(windows)]
+    _handle: File,
+}
+
 fn bind_empty_directory(
     path: &Utf8Path,
     require_empty: bool,
-) -> Result<Utf8PathBuf, GithubArtifactError> {
+) -> Result<(Utf8PathBuf, PrivateDirectoryGuard), GithubArtifactError> {
     if !path.is_absolute() {
         return Err(GithubArtifactError::InvalidPath);
     }
@@ -656,9 +870,24 @@ fn bind_empty_directory(
             return Err(GithubArtifactError::TemporaryDirectoryNotEmpty);
         }
     }
-    Ok(canonical)
+    #[cfg(windows)]
+    let guard = open_windows_private_directory(canonical.as_std_path())
+        .map(|handle| PrivateDirectoryGuard { _handle: handle })
+        .map_err(map_windows_private_path_error)?;
+    #[cfg(not(windows))]
+    let guard = PrivateDirectoryGuard {};
+    Ok((canonical, guard))
 }
 
+#[cfg(windows)]
+fn open_regular_archive(path: &Utf8Path) -> Result<File, GithubArtifactError> {
+    if !path.is_absolute() {
+        return Err(GithubArtifactError::InvalidPath);
+    }
+    open_windows_private_file(path.as_std_path()).map_err(map_windows_private_path_error)
+}
+
+#[cfg(not(windows))]
 fn open_regular_archive(path: &Utf8Path) -> Result<File, GithubArtifactError> {
     if !path.is_absolute() {
         return Err(GithubArtifactError::InvalidPath);
@@ -677,14 +906,15 @@ fn open_regular_archive(path: &Utf8Path) -> Result<File, GithubArtifactError> {
 fn scan_archive(
     archive: &mut ZipArchive<File>,
     archive_size: u64,
+    required_files: &BTreeSet<RequiredArtifactFile>,
 ) -> Result<BTreeMap<RequiredArtifactFile, EntryMetadata>, GithubArtifactError> {
-    if archive.len() != REQUIRED_ENTRY_COUNT {
+    if archive.len() != required_files.len() {
         return Err(GithubArtifactError::InvalidEntryCount);
     }
     let mut exact_names = BTreeSet::new();
     let mut portable_names = BTreeMap::<String, String>::new();
     let mut header_starts = BTreeSet::new();
-    let mut compressed_ranges = Vec::with_capacity(REQUIRED_ENTRY_COUNT);
+    let mut compressed_ranges = Vec::with_capacity(archive.len());
     let mut entries = BTreeMap::new();
     let mut expanded_size = 0_u64;
 
@@ -702,6 +932,9 @@ fn scan_archive(
         }
         let file = RequiredArtifactFile::from_file_name(name)
             .ok_or(GithubArtifactError::UnexpectedEntry)?;
+        if !required_files.contains(&file) {
+            return Err(GithubArtifactError::UnexpectedEntry);
+        }
         validate_entry_metadata(&entry, file)?;
         if !header_starts.insert(entry.header_start()) {
             return Err(GithubArtifactError::LinkedOrSpecialEntry);
@@ -733,19 +966,28 @@ fn scan_archive(
             return Err(GithubArtifactError::DuplicateEntry);
         }
     }
-    compressed_ranges.sort_unstable();
-    if compressed_ranges
-        .windows(2)
-        .any(|pair| pair[1].0 < pair[0].1)
-    {
+    if zip_layout_has_aliases(&header_starts, &mut compressed_ranges) {
         return Err(GithubArtifactError::LinkedOrSpecialEntry);
     }
-    for file in RequiredArtifactFile::ALL {
+    for file in required_files.iter().copied() {
         if !entries.contains_key(&file) {
             return Err(GithubArtifactError::MissingEntry(file));
         }
     }
     Ok(entries)
+}
+
+fn zip_layout_has_aliases(
+    header_starts: &BTreeSet<u64>,
+    compressed_ranges: &mut [(u64, u64)],
+) -> bool {
+    compressed_ranges.sort_unstable();
+    compressed_ranges
+        .windows(2)
+        .any(|pair| pair[1].0 < pair[0].1)
+        || compressed_ranges
+            .iter()
+            .any(|&(start, end)| start < end && header_starts.range(start..end).next().is_some())
 }
 
 fn validate_entry_name(raw_name: &[u8]) -> Result<&str, GithubArtifactError> {
@@ -831,21 +1073,31 @@ fn read_bounded_entry(
     Ok(bytes)
 }
 
+fn validate_sanitized_log(bytes: &[u8]) -> Result<(), GithubArtifactError> {
+    if bytes != PROTECTED_SIGNING_SANITIZED_LOG_V1 {
+        return Err(GithubArtifactError::InvalidPublicReport(
+            RequiredArtifactFile::SanitizedLog,
+        ));
+    }
+    Ok(())
+}
+
 fn validate_manifest<'a>(
     manifest: &'a ArtifactManifest,
     expected: &GithubArtifactExpectation,
     ipa_expectation: &IpaExpectation,
     entries: &BTreeMap<RequiredArtifactFile, EntryMetadata>,
+    required_files: &BTreeSet<RequiredArtifactFile>,
 ) -> Result<BTreeMap<RequiredArtifactFile, &'a ArtifactRecord>, GithubArtifactError> {
     if !manifest_identity_matches(manifest, expected)
         || !manifest_build_matches(manifest, expected, ipa_expectation)
         || !manifest_signing_matches(manifest, expected)
-        || manifest.artifacts.len() != 3
+        || manifest.artifacts.len() != required_files.len().saturating_sub(1)
         || !validate_manifest_public_fields(manifest)
     {
         return Err(GithubArtifactError::InvalidManifest);
     }
-    validate_manifest_records(manifest, entries)
+    validate_manifest_records(manifest, entries, required_files)
 }
 
 fn manifest_identity_matches(
@@ -945,27 +1197,21 @@ fn manifest_signing_matches(
 fn validate_manifest_records<'a>(
     manifest: &'a ArtifactManifest,
     entries: &BTreeMap<RequiredArtifactFile, EntryMetadata>,
+    required_files: &BTreeSet<RequiredArtifactFile>,
 ) -> Result<BTreeMap<RequiredArtifactFile, &'a ArtifactRecord>, GithubArtifactError> {
-    let expected_records = [
-        (
-            RequiredArtifactFile::Ipa,
-            ArtifactKind::Ipa,
-            "application/octet-stream",
-        ),
-        (
-            RequiredArtifactFile::SigningReport,
-            ArtifactKind::SigningReport,
-            "application/json",
-        ),
-        (
-            RequiredArtifactFile::ValidationReport,
-            ArtifactKind::ValidationReport,
-            "application/json",
-        ),
-    ];
     let mut records = BTreeMap::new();
     let mut artifact_ids = BTreeSet::new();
-    for (file, kind, media_type) in expected_records {
+    for file in required_files
+        .iter()
+        .copied()
+        .filter(|file| *file != RequiredArtifactFile::Manifest)
+    {
+        let kind = file
+            .artifact_kind()
+            .ok_or(GithubArtifactError::InvalidArtifactRecord(file))?;
+        let media_type = file
+            .media_type()
+            .ok_or(GithubArtifactError::InvalidArtifactRecord(file))?;
         let record = manifest
             .one_artifact(kind)
             .map_err(|_| GithubArtifactError::InvalidArtifactRecord(file))?;
@@ -1062,6 +1308,7 @@ fn validate_public_report(
     manifest: &ArtifactManifest,
     ipa_record: &ArtifactRecord,
     expected: &GithubArtifactExpectation,
+    required_files: &BTreeSet<RequiredArtifactFile>,
 ) -> Result<(), GithubArtifactError> {
     let evidence = &report.signed_ipa;
     let signing = &manifest.signing;
@@ -1183,7 +1430,64 @@ fn validate_public_report(
     {
         return Err(GithubArtifactError::EvidenceMismatch);
     }
+    validate_signed_products_report(&report.signed_products, required_files)?;
     Ok(())
+}
+
+fn validate_signed_products_report(
+    products: &PublishedSignedProductsEvidence,
+    required_files: &BTreeSet<RequiredArtifactFile>,
+) -> Result<(), GithubArtifactError> {
+    let app_requested = required_files.contains(&RequiredArtifactFile::AppBundleArchive);
+    let archive_requested = required_files.contains(&RequiredArtifactFile::SignedXcarchive);
+    let dsym_requested = required_files.contains(&RequiredArtifactFile::DsymArchive);
+    let product_materialized = app_requested || archive_requested || dsym_requested;
+    if products.app_tree.is_some() != product_materialized
+        || products.archive.is_some() != archive_requested
+        || products.dsym.is_some() != dsym_requested
+    {
+        return Err(GithubArtifactError::EvidenceMismatch);
+    }
+    if let Some(app_tree) = &products.app_tree {
+        validate_signed_tree_evidence(app_tree)?;
+    }
+    if let Some(archive) = &products.archive {
+        validate_signed_tree_evidence(&archive.app_tree)?;
+        if !archive.root_deep_signature_verified
+            || Some(&archive.app_tree) != products.app_tree.as_ref()
+        {
+            return Err(GithubArtifactError::EvidenceMismatch);
+        }
+    }
+    if let Some(dsym) = &products.dsym
+        && (dsym.architecture != "arm64"
+            || dsym.signed_executable_uuid != dsym.dsym_uuid
+            || !is_canonical_macho_uuid(&dsym.signed_executable_uuid))
+    {
+        return Err(GithubArtifactError::EvidenceMismatch);
+    }
+    Ok(())
+}
+
+fn validate_signed_tree_evidence(
+    evidence: &PublishedSignedTreeEvidence,
+) -> Result<(), GithubArtifactError> {
+    if evidence.entry_count == 0 || evidence.total_size == 0 || !is_lower_sha256(&evidence.sha256) {
+        return Err(GithubArtifactError::EvidenceMismatch);
+    }
+    Ok(())
+}
+
+fn is_canonical_macho_uuid(value: &str) -> bool {
+    value != "00000000-0000-0000-0000-000000000000"
+        && value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || matches!(byte, b'A'..=b'F')
+            }
+        })
 }
 
 fn validate_staged_files(
@@ -1192,6 +1496,8 @@ fn validate_staged_files(
     records: &BTreeMap<RequiredArtifactFile, &ArtifactRecord>,
     expectation: &IpaExpectation,
     manifest: &ArtifactManifest,
+    required_files: &BTreeSet<RequiredArtifactFile>,
+    report: &PublishedEvidenceReport,
 ) -> Result<IpaInspection, GithubArtifactError> {
     let manifest_record = ArtifactRecord {
         artifact_id: "artifact-manifest".to_owned(),
@@ -1207,11 +1513,11 @@ fn validate_staged_files(
         &manifest_record,
     )
     .map_err(|_| GithubArtifactError::ArtifactIntegrityFailed(RequiredArtifactFile::Manifest))?;
-    for file in [
-        RequiredArtifactFile::SigningReport,
-        RequiredArtifactFile::ValidationReport,
-        RequiredArtifactFile::Ipa,
-    ] {
+    for file in required_files
+        .iter()
+        .copied()
+        .filter(|file| *file != RequiredArtifactFile::Manifest)
+    {
         verify_downloaded_file(&staged_paths[&file], records[&file])
             .map_err(|_| GithubArtifactError::ArtifactIntegrityFailed(file))?;
     }
@@ -1225,7 +1531,581 @@ fn validate_staged_files(
     {
         return Err(GithubArtifactError::EvidenceMismatch);
     }
+    validate_signed_product_archives(staged_paths, expectation, required_files, report)?;
     Ok(inspection)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SignedTreeInspection {
+    directories: BTreeSet<String>,
+    files: BTreeMap<String, SignedTreeFile>,
+    total_size: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SignedTreeFile {
+    size: u64,
+    sha256: String,
+    executable: bool,
+}
+
+impl SignedTreeInspection {
+    fn evidence(&self) -> Result<PublishedSignedTreeEvidence, GithubArtifactError> {
+        let mut digest = Sha256::new();
+        digest.update(SIGNED_TREE_SHA256_DOMAIN);
+        digest.update(
+            u64::try_from(self.directories.len())
+                .map_err(|_| GithubArtifactError::EvidenceMismatch)?
+                .to_be_bytes(),
+        );
+        for path in &self.directories {
+            update_signed_tree_path(&mut digest, path)?;
+        }
+        digest.update(
+            u64::try_from(self.files.len())
+                .map_err(|_| GithubArtifactError::EvidenceMismatch)?
+                .to_be_bytes(),
+        );
+        for (path, file) in &self.files {
+            update_signed_tree_path(&mut digest, path)?;
+            digest.update(file.size.to_be_bytes());
+            let sha256 =
+                hex::decode(&file.sha256).map_err(|_| GithubArtifactError::EvidenceMismatch)?;
+            if sha256.len() != 32 {
+                return Err(GithubArtifactError::EvidenceMismatch);
+            }
+            digest.update(sha256);
+            digest.update([u8::from(file.executable)]);
+        }
+        Ok(PublishedSignedTreeEvidence {
+            entry_count: u32::try_from(self.files.len())
+                .map_err(|_| GithubArtifactError::EvidenceMismatch)?,
+            total_size: self.total_size,
+            sha256: hex::encode(digest.finalize()),
+        })
+    }
+}
+
+fn update_signed_tree_path(digest: &mut Sha256, path: &str) -> Result<(), GithubArtifactError> {
+    digest.update(
+        u32::try_from(path.len())
+            .map_err(|_| GithubArtifactError::EvidenceMismatch)?
+            .to_be_bytes(),
+    );
+    digest.update(path.as_bytes());
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_signed_product_archives(
+    staged_paths: &BTreeMap<RequiredArtifactFile, Utf8PathBuf>,
+    expectation: &IpaExpectation,
+    required_files: &BTreeSet<RequiredArtifactFile>,
+    report: &PublishedEvidenceReport,
+) -> Result<(), GithubArtifactError> {
+    let app_requested = required_files.contains(&RequiredArtifactFile::AppBundleArchive);
+    let archive_requested = required_files.contains(&RequiredArtifactFile::SignedXcarchive);
+    let dsym_requested = required_files.contains(&RequiredArtifactFile::DsymArchive);
+    if !app_requested && !archive_requested && !dsym_requested {
+        return Ok(());
+    }
+    let ipa_root = format!("Payload/{}", expectation.app_directory_name);
+    let ipa = inspect_signed_tree_zip(
+        &staged_paths[&RequiredArtifactFile::Ipa],
+        &ipa_root,
+        None,
+        RequiredArtifactFile::Ipa,
+        Some(&expectation.executable),
+    )?;
+    let app_evidence = ipa.tree.evidence()?;
+    if report.signed_products.app_tree.as_ref() != Some(&app_evidence) {
+        return Err(GithubArtifactError::ProductEvidenceMismatch(
+            RequiredArtifactFile::Ipa,
+        ));
+    }
+    if app_requested {
+        let app = inspect_signed_tree_zip(
+            &staged_paths[&RequiredArtifactFile::AppBundleArchive],
+            &expectation.app_directory_name,
+            Some(&expectation.app_directory_name),
+            RequiredArtifactFile::AppBundleArchive,
+            None,
+        )?;
+        if app.tree != ipa.tree {
+            return Err(GithubArtifactError::ProductEvidenceMismatch(
+                RequiredArtifactFile::AppBundleArchive,
+            ));
+        }
+    }
+    if archive_requested {
+        let stem = expectation
+            .app_directory_name
+            .strip_suffix(".app")
+            .ok_or(GithubArtifactError::InvalidExpectation)?;
+        let archive_root = format!("{stem}.xcarchive");
+        let archive_app_root = format!(
+            "{archive_root}/Products/Applications/{}",
+            expectation.app_directory_name
+        );
+        let archive = inspect_signed_tree_zip(
+            &staged_paths[&RequiredArtifactFile::SignedXcarchive],
+            &archive_app_root,
+            Some(&archive_root),
+            RequiredArtifactFile::SignedXcarchive,
+            None,
+        )?;
+        if archive.tree != ipa.tree
+            || report
+                .signed_products
+                .archive
+                .as_ref()
+                .map(|evidence| &evidence.app_tree)
+                != Some(&app_evidence)
+        {
+            return Err(GithubArtifactError::ProductEvidenceMismatch(
+                RequiredArtifactFile::SignedXcarchive,
+            ));
+        }
+    }
+    if dsym_requested {
+        let dsym_root = format!("{}.dSYM", expectation.app_directory_name);
+        let dwarf_relative = format!("Contents/Resources/DWARF/{}", expectation.executable);
+        let dsym = inspect_signed_tree_zip(
+            &staged_paths[&RequiredArtifactFile::DsymArchive],
+            &dsym_root,
+            Some(&dsym_root),
+            RequiredArtifactFile::DsymArchive,
+            Some(&dwarf_relative),
+        )?;
+        let dwarf_entries = dsym
+            .tree
+            .files
+            .keys()
+            .filter(|path| path.starts_with("Contents/Resources/DWARF/"))
+            .collect::<Vec<_>>();
+        if dwarf_entries.as_slice() != [&dwarf_relative]
+            || !dsym.tree.files.contains_key("Contents/Info.plist")
+        {
+            return Err(GithubArtifactError::InvalidProductArchive(
+                RequiredArtifactFile::DsymArchive,
+            ));
+        }
+        let main_bytes = ipa
+            .captured
+            .ok_or(GithubArtifactError::InvalidProductArchive(
+                RequiredArtifactFile::Ipa,
+            ))?;
+        let dsym_bytes = dsym
+            .captured
+            .ok_or(GithubArtifactError::InvalidProductArchive(
+                RequiredArtifactFile::DsymArchive,
+            ))?;
+        let main_uuid = arm64_macho_uuid(&main_bytes, goblin::mach::header::MH_EXECUTE)
+            .map_err(|()| GithubArtifactError::InvalidProductArchive(RequiredArtifactFile::Ipa))?;
+        let dsym_uuid =
+            arm64_macho_uuid(&dsym_bytes, goblin::mach::header::MH_DSYM).map_err(|()| {
+                GithubArtifactError::InvalidProductArchive(RequiredArtifactFile::DsymArchive)
+            })?;
+        let evidence = report
+            .signed_products
+            .dsym
+            .as_ref()
+            .ok_or(GithubArtifactError::EvidenceMismatch)?;
+        if main_uuid != dsym_uuid
+            || main_uuid != evidence.signed_executable_uuid
+            || dsym_uuid != evidence.dsym_uuid
+        {
+            return Err(GithubArtifactError::ProductEvidenceMismatch(
+                RequiredArtifactFile::DsymArchive,
+            ));
+        }
+    }
+    Ok(())
+}
+
+struct InspectedSignedTreeZip {
+    tree: SignedTreeInspection,
+    captured: Option<Vec<u8>>,
+}
+
+#[allow(clippy::too_many_lines)]
+fn inspect_signed_tree_zip(
+    path: &Utf8Path,
+    tree_root: &str,
+    wrapper_root: Option<&str>,
+    artifact: RequiredArtifactFile,
+    capture_relative: Option<&str>,
+) -> Result<InspectedSignedTreeZip, GithubArtifactError> {
+    let file = open_regular_archive(path)
+        .map_err(|_| GithubArtifactError::InvalidProductArchive(artifact))?;
+    let archive_size = file
+        .metadata()
+        .map_err(|_| GithubArtifactError::InvalidProductArchive(artifact))?
+        .len();
+    if archive_size == 0 || archive_size > artifact.maximum_size() {
+        return Err(GithubArtifactError::InvalidProductArchive(artifact));
+    }
+    let mut archive =
+        ZipArchive::new(file).map_err(|_| GithubArtifactError::InvalidProductArchive(artifact))?;
+    if archive.is_empty() || archive.len() > MAX_INNER_ENTRY_COUNT {
+        return Err(GithubArtifactError::InvalidProductArchive(artifact));
+    }
+    let root_prefix = format!("{tree_root}/");
+    let wrapper_prefix = wrapper_root.map(|root| format!("{root}/"));
+    let wrapper_info_path = wrapper_root.map(|root| format!("{root}/Info.plist"));
+    let mut exact_names = BTreeSet::new();
+    let mut portable_names = BTreeMap::<String, String>::new();
+    let mut header_starts = BTreeSet::new();
+    let mut compressed_ranges = Vec::with_capacity(archive.len());
+    let mut archive_directories = BTreeSet::new();
+    let mut archive_files = BTreeSet::new();
+    let mut directories = BTreeSet::new();
+    let mut files = BTreeMap::new();
+    let mut total_size = 0_u64;
+    let mut expanded_size = 0_u64;
+    let mut captured = None;
+    let mut wrapper_root_directory = wrapper_root.is_none();
+    let mut wrapper_info_plist = false;
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|_| GithubArtifactError::InvalidProductArchive(artifact))?;
+        let (name, is_directory) = validate_inner_entry_name(entry.name_raw())
+            .map_err(|()| GithubArtifactError::InvalidProductArchive(artifact))?;
+        let name = name.to_owned();
+        if !exact_names.insert(name.clone())
+            || portable_names
+                .insert(portable_name_key(&name), name.clone())
+                .is_some()
+        {
+            return Err(GithubArtifactError::InvalidProductArchive(artifact));
+        }
+        if !header_starts.insert(entry.header_start()) {
+            return Err(GithubArtifactError::InvalidProductArchive(artifact));
+        }
+        let data_end = entry
+            .data_start()
+            .checked_add(entry.compressed_size())
+            .ok_or(GithubArtifactError::InvalidProductArchive(artifact))?;
+        if data_end > archive_size {
+            return Err(GithubArtifactError::InvalidProductArchive(artifact));
+        }
+        compressed_ranges.push((entry.data_start(), data_end));
+        if let (Some(wrapper_root), Some(wrapper_prefix)) =
+            (wrapper_root, wrapper_prefix.as_deref())
+        {
+            if name != wrapper_root && !name.starts_with(wrapper_prefix) {
+                return Err(GithubArtifactError::InvalidProductArchive(artifact));
+            }
+            if name == wrapper_root && is_directory {
+                wrapper_root_directory = true;
+            }
+        }
+        validate_inner_entry_metadata(&entry, is_directory, artifact)?;
+        if is_sensitive_inner_path(&name) {
+            return Err(GithubArtifactError::InvalidProductArchive(artifact));
+        }
+        insert_parent_directories(&name, &mut archive_directories);
+        if is_directory {
+            archive_directories.insert(name.clone());
+        } else {
+            archive_files.insert(name.clone());
+        }
+        if !is_directory && wrapper_info_path.as_deref() == Some(name.as_str()) {
+            wrapper_info_plist = true;
+        }
+        expanded_size = expanded_size
+            .checked_add(entry.size())
+            .ok_or(GithubArtifactError::InvalidProductArchive(artifact))?;
+        if expanded_size > MAX_INNER_TOTAL_BYTES {
+            return Err(GithubArtifactError::InvalidProductArchive(artifact));
+        }
+        let relative = if name == tree_root {
+            if !is_directory {
+                return Err(GithubArtifactError::InvalidProductArchive(artifact));
+            }
+            None
+        } else {
+            name.strip_prefix(&root_prefix)
+        };
+        if relative.is_some_and(str::is_empty) {
+            return Err(GithubArtifactError::InvalidProductArchive(artifact));
+        }
+        if let Some(relative) = relative {
+            insert_parent_directories(relative, &mut directories);
+        }
+        if is_directory {
+            if let Some(relative) = relative {
+                if files.contains_key(relative) {
+                    return Err(GithubArtifactError::InvalidProductArchive(artifact));
+                }
+                directories.insert(relative.to_owned());
+            }
+            continue;
+        }
+        if relative
+            .is_some_and(|relative| directories.contains(relative) || files.contains_key(relative))
+        {
+            return Err(GithubArtifactError::InvalidProductArchive(artifact));
+        }
+        let executable = entry.unix_mode().is_some_and(|mode| mode & 0o111 != 0);
+        let capture = relative.is_some_and(|relative| capture_relative == Some(relative));
+        if capture && (entry.size() == 0 || entry.size() > MAX_CAPTURED_MACHO_BYTES) {
+            return Err(GithubArtifactError::InvalidProductArchive(artifact));
+        }
+        let mut hasher = Sha256::new();
+        let mut bytes = capture.then(Vec::new);
+        let mut read = 0_u64;
+        loop {
+            let count = entry
+                .read(&mut buffer)
+                .map_err(|_| GithubArtifactError::InvalidProductArchive(artifact))?;
+            if count == 0 {
+                break;
+            }
+            read = read
+                .checked_add(
+                    u64::try_from(count)
+                        .map_err(|_| GithubArtifactError::InvalidProductArchive(artifact))?,
+                )
+                .ok_or(GithubArtifactError::InvalidProductArchive(artifact))?;
+            if read > entry.size() {
+                return Err(GithubArtifactError::InvalidProductArchive(artifact));
+            }
+            hasher.update(&buffer[..count]);
+            if let Some(bytes) = &mut bytes {
+                bytes.extend_from_slice(&buffer[..count]);
+            }
+        }
+        if read != entry.size() {
+            return Err(GithubArtifactError::InvalidProductArchive(artifact));
+        }
+        if let Some(relative) = relative {
+            total_size = total_size
+                .checked_add(read)
+                .ok_or(GithubArtifactError::InvalidProductArchive(artifact))?;
+            files.insert(
+                relative.to_owned(),
+                SignedTreeFile {
+                    size: read,
+                    sha256: hex::encode(hasher.finalize()),
+                    executable,
+                },
+            );
+        }
+        if capture && captured.replace(bytes.unwrap_or_default()).is_some() {
+            return Err(GithubArtifactError::InvalidProductArchive(artifact));
+        }
+    }
+    if zip_layout_has_aliases(&header_starts, &mut compressed_ranges) {
+        return Err(GithubArtifactError::InvalidProductArchive(artifact));
+    }
+    let mut tree_portable_paths = BTreeMap::<String, &str>::new();
+    let tree_paths_are_portable = directories
+        .iter()
+        .map(String::as_str)
+        .chain(files.keys().map(String::as_str))
+        .all(|path| {
+            tree_portable_paths
+                .insert(portable_name_key(path), path)
+                .is_none()
+        });
+    if files.is_empty()
+        || (!files.contains_key("Info.plist") && !files.contains_key("Contents/Info.plist"))
+        || directories.iter().any(|path| files.contains_key(path))
+        || archive_directories
+            .iter()
+            .any(|path| archive_files.contains(path))
+        || !tree_paths_are_portable
+        || !wrapper_root_directory
+        || (artifact == RequiredArtifactFile::SignedXcarchive && !wrapper_info_plist)
+    {
+        return Err(GithubArtifactError::InvalidProductArchive(artifact));
+    }
+    Ok(InspectedSignedTreeZip {
+        tree: SignedTreeInspection {
+            directories,
+            files,
+            total_size,
+        },
+        captured,
+    })
+}
+
+fn validate_inner_entry_name(raw: &[u8]) -> Result<(&str, bool), ()> {
+    let raw = std::str::from_utf8(raw).map_err(|_| ())?;
+    let is_directory = raw.ends_with('/');
+    let name = raw.strip_suffix('/').unwrap_or(raw);
+    if name.is_empty()
+        || name.len() > MAX_INNER_PATH_BYTES
+        || name.starts_with('/')
+        || name.starts_with('\\')
+        || name.contains('\\')
+        || name.contains('\0')
+        || name.chars().any(char::is_control)
+        || (name.len() >= 2 && name.as_bytes()[1] == b':')
+        || name.split('/').count() > MAX_INNER_TREE_DEPTH
+        || name
+            .split('/')
+            .any(|component| !is_portable_inner_component(component))
+    {
+        return Err(());
+    }
+    Ok((name, is_directory))
+}
+
+fn is_sensitive_inner_path(name: &str) -> bool {
+    name.split('/').any(|component| {
+        let lower = component.to_ascii_lowercase();
+        let extension = lower.rsplit_once('.').map(|(_, extension)| extension);
+        matches!(
+            extension,
+            Some("p12" | "p8" | "key" | "pem" | "swift" | "m" | "mm")
+        ) || lower == "project.pbxproj"
+            || matches!(lower.as_str(), "keychains" | "credentials" | "secrets")
+    })
+}
+
+fn is_portable_inner_component(component: &str) -> bool {
+    let basename = component
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let reserved = matches!(basename.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || basename
+            .strip_prefix("COM")
+            .or_else(|| basename.strip_prefix("LPT"))
+            .is_some_and(|suffix| {
+                matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+            });
+    !component.is_empty()
+        && component.len() <= 255
+        && !matches!(component, "." | "..")
+        && !component.ends_with(['.', ' '])
+        && !component.contains([':', '*', '?', '"', '<', '>', '|'])
+        && !reserved
+}
+
+fn validate_inner_entry_metadata(
+    entry: &ZipFile<'_, File>,
+    is_directory: bool,
+    artifact: RequiredArtifactFile,
+) -> Result<(), GithubArtifactError> {
+    if entry.encrypted()
+        || !matches!(
+            entry.compression(),
+            CompressionMethod::Stored | CompressionMethod::Deflated
+        )
+        || entry.is_symlink()
+        || entry.is_dir() != is_directory
+    {
+        return Err(GithubArtifactError::InvalidProductArchive(artifact));
+    }
+    if let Some(mode) = entry.unix_mode() {
+        let kind = mode & 0o170_000;
+        let expected = if is_directory { 0o040_000 } else { 0o100_000 };
+        if kind != 0 && kind != expected {
+            return Err(GithubArtifactError::InvalidProductArchive(artifact));
+        }
+    }
+    if (is_directory && (entry.size() != 0 || entry.compressed_size() != 0))
+        || (!is_directory
+            && (entry.size() > MAX_INNER_ENTRY_BYTES
+                || (entry.size() != 0
+                    && (entry.compressed_size() == 0
+                        || entry.size()
+                            > entry
+                                .compressed_size()
+                                .saturating_mul(MAX_COMPRESSION_RATIO)))))
+    {
+        return Err(GithubArtifactError::InvalidProductArchive(artifact));
+    }
+    Ok(())
+}
+
+fn insert_parent_directories(path: &str, directories: &mut BTreeSet<String>) {
+    let mut parent = String::new();
+    let mut components = path.split('/').peekable();
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            break;
+        }
+        if !parent.is_empty() {
+            parent.push('/');
+        }
+        parent.push_str(component);
+        directories.insert(parent.clone());
+    }
+}
+
+fn arm64_macho_uuid(bytes: &[u8], expected_file_type: u32) -> Result<String, ()> {
+    let parsed = Mach::parse(bytes).map_err(|_| ())?;
+    let mut uuids = Vec::new();
+    match parsed {
+        Mach::Binary(binary) => {
+            if binary.header.cputype != goblin::mach::constants::cputype::CPU_TYPE_ARM64 {
+                return Err(());
+            }
+            uuids.push(macho_uuid(&binary, expected_file_type)?);
+        }
+        Mach::Fat(container) => {
+            for entry in &container {
+                let SingleArch::MachO(binary) = entry.map_err(|_| ())? else {
+                    return Err(());
+                };
+                if binary.header.cputype != goblin::mach::constants::cputype::CPU_TYPE_ARM64 {
+                    return Err(());
+                }
+                uuids.push(macho_uuid(&binary, expected_file_type)?);
+            }
+        }
+    }
+    if uuids.len() != 1 {
+        return Err(());
+    }
+    uuids.pop().ok_or(())
+}
+
+fn macho_uuid(binary: &goblin::mach::MachO<'_>, expected_file_type: u32) -> Result<String, ()> {
+    if binary.header.filetype != expected_file_type {
+        return Err(());
+    }
+    let uuids = binary
+        .load_commands
+        .iter()
+        .filter_map(|command| match &command.command {
+            CommandVariant::Uuid(command) => Some(command.uuid),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if uuids.len() != 1 {
+        return Err(());
+    }
+    let bytes = uuids[0];
+    if bytes.iter().all(|byte| *byte == 0) {
+        return Err(());
+    }
+    Ok(format!(
+        "{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    ))
 }
 
 fn extract_entry_to_new_file(
@@ -1237,55 +2117,314 @@ fn extract_entry_to_new_file(
     let mut entry = archive
         .by_index(metadata.index)
         .map_err(|_| GithubArtifactError::InvalidArchive)?;
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut output = options.open(path).map_err(io_error)?;
-    let copied = io::copy(
-        &mut entry.by_ref().take(metadata.size.saturating_add(1)),
-        &mut output,
-    )
-    .map_err(|_| GithubArtifactError::EntryIntegrityFailed(artifact))?;
-    if copied != metadata.size {
-        return Err(GithubArtifactError::EntryIntegrityFailed(artifact));
+    let mut output = create_new_artifact_file(path)?;
+    let result = (|| {
+        let copied = io::copy(
+            &mut entry.by_ref().take(metadata.size.saturating_add(1)),
+            &mut output,
+        )
+        .map_err(|_| GithubArtifactError::EntryIntegrityFailed(artifact))?;
+        if copied != metadata.size {
+            return Err(GithubArtifactError::EntryIntegrityFailed(artifact));
+        }
+        output.flush().map_err(io_error)?;
+        output.sync_all().map_err(io_error)
+    })();
+    if let Err(error) = result {
+        cleanup_created_file(path, output)?;
+        return Err(error);
     }
-    output.flush().map_err(io_error)?;
-    output.sync_all().map_err(io_error)?;
     Ok(())
 }
 
 fn write_new_file(path: &Utf8Path, bytes: &[u8]) -> Result<(), GithubArtifactError> {
+    let mut output = create_new_artifact_file(path)?;
+    let result = output
+        .write_all(bytes)
+        .and_then(|()| output.flush())
+        .and_then(|()| output.sync_all())
+        .map_err(io_error);
+    if let Err(error) = result {
+        cleanup_created_file(path, output)?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn create_new_artifact_file(path: &Utf8Path) -> Result<File, GithubArtifactError> {
+    create_windows_private_file(path.as_std_path()).map_err(map_windows_private_file_error)
+}
+
+#[cfg(not(windows))]
+fn create_new_artifact_file(path: &Utf8Path) -> Result<File, GithubArtifactError> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
-    let mut output = options.open(path).map_err(io_error)?;
-    output.write_all(bytes).map_err(io_error)?;
-    output.flush().map_err(io_error)?;
-    output.sync_all().map_err(io_error)?;
-    Ok(())
+    options.open(path).map_err(io_error)
 }
 
+#[cfg(windows)]
+fn cleanup_created_file(_path: &Utf8Path, file: File) -> Result<(), GithubArtifactError> {
+    remove_windows_private_file_handle(file).map_err(|_| GithubArtifactError::CleanupFailed)
+}
+
+#[cfg(not(windows))]
+fn cleanup_created_file(path: &Utf8Path, file: File) -> Result<(), GithubArtifactError> {
+    drop(file);
+    fs::remove_file(path).map_err(|_| GithubArtifactError::CleanupFailed)
+}
+
+struct PublishedLink {
+    path: Utf8PathBuf,
+    linked_file: File,
+    #[cfg(windows)]
+    staging_path: Utf8PathBuf,
+    #[cfg(windows)]
+    staging_file: File,
+    #[cfg(windows)]
+    staging_removed: Cell<bool>,
+}
+
+#[cfg(windows)]
 fn publish_no_replace(
     staged: &BTreeMap<RequiredArtifactFile, Utf8PathBuf>,
     output_directory: &Utf8Path,
-) -> Result<BTreeMap<RequiredArtifactFile, Utf8PathBuf>, GithubArtifactError> {
-    for file in RequiredArtifactFile::ALL {
+    required_files: &BTreeSet<RequiredArtifactFile>,
+) -> Result<BTreeMap<RequiredArtifactFile, PublishedLink>, GithubArtifactError> {
+    for file in required_files.iter().copied() {
         ensure_output_absent(&output_directory.join(file.file_name()), file)?;
     }
     let mut published = BTreeMap::new();
-    for file in RequiredArtifactFile::ALL {
+    let publication_order = required_files
+        .iter()
+        .copied()
+        .filter(|file| *file != RequiredArtifactFile::Ipa)
+        .chain(std::iter::once(RequiredArtifactFile::Ipa));
+    for file in publication_order {
+        let staging_path = staged[&file].clone();
+        let Ok(staging_file) = open_windows_private_file_for_removal(staging_path.as_std_path())
+        else {
+            cleanup_published_links(published.values())?;
+            return Err(GithubArtifactError::AtomicPublicationFailed);
+        };
         let destination = output_directory.join(file.file_name());
+        if let Err(error) = fs::hard_link(&staging_path, &destination) {
+            cleanup_published_links(published.values())?;
+            return Err(if error.kind() == io::ErrorKind::AlreadyExists {
+                GithubArtifactError::OutputAlreadyExists(file)
+            } else {
+                GithubArtifactError::AtomicPublicationFailed
+            });
+        }
+        if verify_windows_private_file_handle_in_state(
+            staging_file.as_handle(),
+            PrivateFileLinkState::PublicationPair,
+        )
+        .is_err()
+        {
+            let _ = cleanup_published_links(published.values());
+            return Err(GithubArtifactError::CleanupFailed);
+        }
+        let Ok(linked_file) = open_windows_private_file_for_removal_in_state(
+            destination.as_std_path(),
+            PrivateFileLinkState::PublicationPair,
+        ) else {
+            let _ = remove_windows_private_file_handle_in_state(
+                staging_file,
+                PrivateFileLinkState::PublicationPair,
+            );
+            let _ = cleanup_published_links(published.values());
+            return Err(GithubArtifactError::CleanupFailed);
+        };
+        let link = PublishedLink {
+            path: destination,
+            linked_file,
+            staging_path,
+            staging_file,
+            staging_removed: Cell::new(false),
+        };
+        if published_link_matches(&link) != Ok(true) {
+            let _ = cleanup_published_links([&link]);
+            let _ = cleanup_published_links(published.values());
+            return Err(GithubArtifactError::CleanupFailed);
+        }
+        published.insert(file, link);
+    }
+    Ok(published)
+}
+
+#[cfg(windows)]
+fn published_link_matches(link: &PublishedLink) -> Result<bool, GithubArtifactError> {
+    let metadata = fs::symlink_metadata(&link.path).map_err(io_error)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Ok(false);
+    }
+    let expected_state = if link.staging_removed.get() {
+        PrivateFileLinkState::Single
+    } else {
+        PrivateFileLinkState::PublicationPair
+    };
+    if verify_windows_private_file_handle_in_state(link.linked_file.as_handle(), expected_state)
+        .is_err()
+        || (!link.staging_removed.get()
+            && verify_windows_private_file_handle_in_state(
+                link.staging_file.as_handle(),
+                PrivateFileLinkState::PublicationPair,
+            )
+            .is_err())
+        || !open_files_match(&link.linked_file, &link.staging_file)?
+        || !path_matches_file(&link.path, &link.linked_file)?
+        || (!link.staging_removed.get()
+            && !path_matches_file(&link.staging_path, &link.staging_file)?)
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn finalize_published_links<'a>(
+    links: impl IntoIterator<Item = &'a PublishedLink>,
+    _staged_paths: impl IntoIterator<Item = &'a Utf8PathBuf>,
+) -> Result<(), GithubArtifactError> {
+    for link in links {
+        if link.staging_removed.get() || published_link_matches(link) != Ok(true) {
+            return Err(GithubArtifactError::CleanupFailed);
+        }
+        remove_windows_private_file_handle_in_state(
+            link.staging_file.try_clone().map_err(io_error)?,
+            PrivateFileLinkState::PublicationPair,
+        )
+        .map_err(|_| GithubArtifactError::CleanupFailed)?;
+        link.staging_removed.set(true);
+        verify_windows_private_file_handle(link.linked_file.as_handle())
+            .map_err(|_| GithubArtifactError::CleanupFailed)?;
+        if published_link_matches(link) != Ok(true) {
+            return Err(GithubArtifactError::CleanupFailed);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn cleanup_published_links<'a>(
+    links: impl IntoIterator<Item = &'a PublishedLink>,
+) -> Result<(), GithubArtifactError> {
+    let mut failed = false;
+    for link in links {
+        let result = if link.staging_removed.get() {
+            remove_windows_private_file_handle(link.linked_file.try_clone().map_err(io_error)?)
+        } else {
+            let destination_cleanup = remove_windows_private_file_handle_in_state(
+                link.linked_file.try_clone().map_err(io_error)?,
+                PrivateFileLinkState::PublicationPair,
+            );
+            if destination_cleanup.is_err() {
+                failed = true;
+                continue;
+            }
+            link.staging_removed.set(true);
+            remove_windows_private_file_handle(link.staging_file.try_clone().map_err(io_error)?)
+        };
+        if result.is_err() {
+            failed = true;
+        }
+    }
+    if failed {
+        Err(GithubArtifactError::CleanupFailed)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn cleanup_paths<'a>(
+    paths: impl IntoIterator<Item = &'a Utf8PathBuf>,
+) -> Result<(), GithubArtifactError> {
+    let mut failed = false;
+    for path in paths {
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                failed = true;
+                continue;
+            }
+            Ok(_) => {}
+        }
+        match open_windows_private_file_for_removal(path.as_std_path()) {
+            Ok(file) => {
+                if remove_windows_private_file_handle(file).is_err() {
+                    failed = true;
+                }
+            }
+            Err(_) => failed = true,
+        }
+    }
+    if failed {
+        Err(GithubArtifactError::CleanupFailed)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn open_files_match(left: &File, right: &File) -> Result<bool, GithubArtifactError> {
+    let left =
+        FileIdentityHandle::from_file(left.try_clone().map_err(io_error)?).map_err(io_error)?;
+    let right =
+        FileIdentityHandle::from_file(right.try_clone().map_err(io_error)?).map_err(io_error)?;
+    Ok(left == right)
+}
+
+#[cfg(windows)]
+fn path_matches_file(path: &Utf8Path, file: &File) -> Result<bool, GithubArtifactError> {
+    let open =
+        FileIdentityHandle::from_file(file.try_clone().map_err(io_error)?).map_err(io_error)?;
+    let path = FileIdentityHandle::from_path(path).map_err(io_error)?;
+    Ok(open == path)
+}
+
+#[cfg(not(windows))]
+fn publish_no_replace(
+    staged: &BTreeMap<RequiredArtifactFile, Utf8PathBuf>,
+    output_directory: &Utf8Path,
+    required_files: &BTreeSet<RequiredArtifactFile>,
+) -> Result<BTreeMap<RequiredArtifactFile, PublishedLink>, GithubArtifactError> {
+    for file in required_files.iter().copied() {
+        ensure_output_absent(&output_directory.join(file.file_name()), file)?;
+    }
+    let mut published = BTreeMap::new();
+    let publication_order = required_files
+        .iter()
+        .copied()
+        .filter(|file| *file != RequiredArtifactFile::Ipa)
+        .chain(std::iter::once(RequiredArtifactFile::Ipa));
+    for file in publication_order {
+        let destination = output_directory.join(file.file_name());
+        let linked_file = match File::open(&staged[&file]) {
+            Ok(file) if file.metadata().is_ok_and(|metadata| metadata.is_file()) => file,
+            Ok(_) | Err(_) => {
+                cleanup_published_links(published.values())?;
+                return Err(GithubArtifactError::AtomicPublicationFailed);
+            }
+        };
         match fs::hard_link(&staged[&file], &destination) {
             Ok(()) => {
-                published.insert(file, destination);
+                let link = PublishedLink {
+                    path: destination,
+                    linked_file,
+                };
+                if published_link_matches(&link) != Ok(true) {
+                    published.insert(file, link);
+                    cleanup_published_links(published.values())?;
+                    return Err(GithubArtifactError::AtomicPublicationFailed);
+                }
+                published.insert(file, link);
             }
             Err(error) => {
-                let cleanup = cleanup_paths(published.values());
-                if cleanup.is_err() {
-                    return Err(GithubArtifactError::CleanupFailed);
-                }
+                cleanup_published_links(published.values())?;
                 if error.kind() == io::ErrorKind::AlreadyExists {
                     return Err(GithubArtifactError::OutputAlreadyExists(file));
                 }
@@ -1294,6 +2433,65 @@ fn publish_no_replace(
         }
     }
     Ok(published)
+}
+
+#[cfg(not(windows))]
+fn published_link_matches(link: &PublishedLink) -> Result<bool, GithubArtifactError> {
+    let metadata = fs::symlink_metadata(&link.path).map_err(io_error)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Ok(false);
+    }
+    let open_identity =
+        FileIdentityHandle::from_file(link.linked_file.try_clone().map_err(io_error)?)
+            .map_err(io_error)?;
+    let path_identity = FileIdentityHandle::from_path(&link.path).map_err(io_error)?;
+    if open_identity != path_identity {
+        return Ok(false);
+    }
+    let final_metadata = fs::symlink_metadata(&link.path).map_err(io_error)?;
+    if final_metadata.file_type().is_symlink() || !final_metadata.is_file() {
+        return Ok(false);
+    }
+    let final_identity = FileIdentityHandle::from_path(&link.path).map_err(io_error)?;
+    Ok(open_identity == final_identity)
+}
+
+#[cfg(not(windows))]
+fn cleanup_published_links<'a>(
+    links: impl IntoIterator<Item = &'a PublishedLink>,
+) -> Result<(), GithubArtifactError> {
+    let mut failed = false;
+    for link in links {
+        let metadata = match fs::symlink_metadata(&link.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                failed = true;
+                continue;
+            }
+        };
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || published_link_matches(link) != Ok(true)
+        {
+            failed = true;
+            continue;
+        }
+        if published_link_matches(link) != Ok(true) {
+            failed = true;
+            continue;
+        }
+        match fs::remove_file(&link.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => failed = true,
+        }
+    }
+    if failed {
+        Err(GithubArtifactError::CleanupFailed)
+    } else {
+        Ok(())
+    }
 }
 
 fn ensure_output_absent(
@@ -1307,6 +2505,7 @@ fn ensure_output_absent(
     }
 }
 
+#[cfg(not(windows))]
 fn cleanup_paths<'a>(
     paths: impl IntoIterator<Item = &'a Utf8PathBuf>,
 ) -> Result<(), GithubArtifactError> {
@@ -1323,6 +2522,14 @@ fn cleanup_paths<'a>(
     } else {
         Ok(())
     }
+}
+
+#[cfg(not(windows))]
+fn finalize_published_links<'a>(
+    _links: impl IntoIterator<Item = &'a PublishedLink>,
+    staged_paths: impl IntoIterator<Item = &'a Utf8PathBuf>,
+) -> Result<(), GithubArtifactError> {
+    cleanup_paths(staged_paths)
 }
 
 fn validate_ipa_expectation(expectation: &IpaExpectation) -> Result<(), GithubArtifactError> {
@@ -1555,6 +2762,36 @@ fn io_error(error: io::Error) -> GithubArtifactError {
     GithubArtifactError::Io(error.kind())
 }
 
+#[cfg(windows)]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "used directly as a path-free Result::map_err adapter"
+)]
+fn map_windows_private_path_error(error: PrivateDirectoryError) -> GithubArtifactError {
+    if error.cleanup_status() == PrivateDirectoryCleanupStatus::Uncertain {
+        GithubArtifactError::CleanupFailed
+    } else if matches!(error.os_code(), Some(2 | 3)) {
+        GithubArtifactError::Io(io::ErrorKind::NotFound)
+    } else {
+        GithubArtifactError::InvalidPath
+    }
+}
+
+#[cfg(windows)]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "used directly as a path-free Result::map_err adapter"
+)]
+fn map_windows_private_file_error(error: PrivateDirectoryError) -> GithubArtifactError {
+    if error.cleanup_status() == PrivateDirectoryCleanupStatus::Uncertain {
+        GithubArtifactError::CleanupFailed
+    } else if error.kind() == PrivateDirectoryErrorKind::AlreadyExists {
+        GithubArtifactError::Io(io::ErrorKind::AlreadyExists)
+    } else {
+        GithubArtifactError::InvalidPath
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1585,7 +2822,6 @@ mod tests {
     const PROFILE_UUID: &str = "12345678-1234-1234-1234-123456789ABC";
     const ENTITLEMENTS_SHA256: &str =
         "3333333333333333333333333333333333333333333333333333333333333333";
-
     #[test]
     fn entry_names_reject_escape_and_nested_roots() {
         for name in [
@@ -1612,6 +2848,164 @@ mod tests {
     }
 
     #[test]
+    fn signed_product_paths_reject_private_material_and_source() {
+        for name in [
+            "App.app/certificate.p12",
+            "App.app/certificate.pem/value",
+            "App.xcarchive/credentials/value",
+            "App.app/Source/main.swift",
+            "App.xcarchive/project.pbxproj",
+        ] {
+            assert!(is_sensitive_inner_path(name), "accepted {name}");
+        }
+        for name in [
+            "App.app/embedded.mobileprovision",
+            "App.app/_CodeSignature/CodeResources",
+            "App.app/Frameworks/Example.swiftmodule/arm64-apple-ios.swiftinterface",
+        ] {
+            assert!(!is_sensitive_inner_path(name), "rejected {name}");
+        }
+    }
+
+    #[test]
+    fn signed_product_archive_requires_an_explicit_wrapper_directory() {
+        let root = TempDir::new().unwrap();
+        let path = Utf8PathBuf::from_path_buf(root.path().join("missing-root.zip")).unwrap();
+        let file = create_new_artifact_file(&path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        let options = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Stored)
+            .unix_permissions(0o644);
+        for (name, bytes) in [
+            ("App.app/Info.plist", b"plist".as_slice()),
+            ("App.app/App", b"binary".as_slice()),
+        ] {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap();
+        assert_eq!(
+            inspect_signed_tree_zip(
+                &path,
+                "App.app",
+                Some("App.app"),
+                RequiredArtifactFile::AppBundleArchive,
+                None,
+            )
+            .map(|_| ()),
+            Err(GithubArtifactError::InvalidProductArchive(
+                RequiredArtifactFile::AppBundleArchive
+            ))
+        );
+    }
+
+    #[test]
+    fn signed_app_and_xcarchive_trees_bind_to_the_exact_ipa_app() {
+        let root = TempDir::new().unwrap();
+        let root = Utf8PathBuf::from_path_buf(root.path().to_owned()).unwrap();
+        let ipa_path = root.join(DEVELOPMENT_IPA_NAME);
+        let app_path = root.join(APP_BUNDLE_ARCHIVE_NAME);
+        let archive_path = root.join(SIGNED_XCARCHIVE_NAME);
+        let tampered_path = root.join("tampered.app.zip");
+        write_new_file(&ipa_path, &test_ipa()).unwrap();
+        write_rewrapped_app_zip(&app_path, "", false);
+        write_rewrapped_app_zip(&archive_path, "App.xcarchive/Products/Applications/", false);
+        write_rewrapped_app_zip(&tampered_path, "", true);
+
+        let ipa = inspect_signed_tree_zip(
+            &ipa_path,
+            "Payload/App.app",
+            None,
+            RequiredArtifactFile::Ipa,
+            None,
+        )
+        .unwrap();
+        let app = inspect_signed_tree_zip(
+            &app_path,
+            "App.app",
+            Some("App.app"),
+            RequiredArtifactFile::AppBundleArchive,
+            None,
+        )
+        .unwrap();
+        let archive = inspect_signed_tree_zip(
+            &archive_path,
+            "App.xcarchive/Products/Applications/App.app",
+            Some("App.xcarchive"),
+            RequiredArtifactFile::SignedXcarchive,
+            None,
+        )
+        .unwrap();
+        let tampered = inspect_signed_tree_zip(
+            &tampered_path,
+            "App.app",
+            Some("App.app"),
+            RequiredArtifactFile::AppBundleArchive,
+            None,
+        )
+        .unwrap();
+        assert_eq!(app.tree, ipa.tree);
+        assert_eq!(archive.tree, ipa.tree);
+        assert_eq!(app.tree.evidence().unwrap(), ipa.tree.evidence().unwrap());
+        assert_ne!(tampered.tree, ipa.tree);
+    }
+
+    #[test]
+    fn arm64_dsym_uuid_must_match_the_signed_executable() {
+        let uuid = [
+            0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+            0x77, 0x88,
+        ];
+        let executable = macho_with_uuid(goblin::mach::header::MH_EXECUTE, uuid);
+        let dsym = macho_with_uuid(goblin::mach::header::MH_DSYM, uuid);
+        let expected = "12345678-9ABC-DEF0-1122-334455667788";
+        assert_eq!(
+            arm64_macho_uuid(&executable, goblin::mach::header::MH_EXECUTE).unwrap(),
+            expected
+        );
+        assert_eq!(
+            arm64_macho_uuid(&dsym, goblin::mach::header::MH_DSYM).unwrap(),
+            expected
+        );
+        assert!(arm64_macho_uuid(&dsym, goblin::mach::header::MH_EXECUTE).is_err());
+        assert!(
+            arm64_macho_uuid(
+                &macho_with_uuid(goblin::mach::header::MH_EXECUTE, [0; 16]),
+                goblin::mach::header::MH_EXECUTE
+            )
+            .is_err()
+        );
+        let mut other = uuid;
+        other[15] ^= 1;
+        assert_ne!(
+            arm64_macho_uuid(
+                &macho_with_uuid(goblin::mach::header::MH_DSYM, other),
+                goblin::mach::header::MH_DSYM
+            )
+            .unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn sanitized_log_requires_the_exact_secret_free_protocol_payload() {
+        assert!(validate_sanitized_log(PROTECTED_SIGNING_SANITIZED_LOG_V1).is_ok());
+        for rejected in [
+            b"".as_slice(),
+            b"printable secret-like payload\n",
+            b"secret\0value",
+            &[0xff],
+        ] {
+            assert_eq!(
+                validate_sanitized_log(rejected),
+                Err(GithubArtifactError::InvalidPublicReport(
+                    RequiredArtifactFile::SanitizedLog
+                ))
+            );
+        }
+    }
+
+    #[test]
     fn valid_fixture_is_inspected_and_published_without_staging_residue() {
         let fixture = Fixture::new();
         let published = fixture.ingest().expect("ingest fixture");
@@ -1619,6 +3013,14 @@ mod tests {
         assert!(published.manifest_path.is_file());
         assert!(published.signing_report_path.is_file());
         assert!(published.validation_report_path.is_file());
+        assert!(published.sanitized_log_path.is_file());
+        assert!(published.app_bundle_archive_path.is_none());
+        assert!(published.signed_xcarchive_path.is_none());
+        assert!(published.dsym_archive_path.is_none());
+        assert_eq!(
+            fs::read(&published.sanitized_log_path).unwrap(),
+            PROTECTED_SIGNING_SANITIZED_LOG_V1
+        );
         assert_eq!(published.manifest.operation_id, OPERATION_ID);
         assert_eq!(
             published.manifest_size,
@@ -1654,6 +3056,64 @@ mod tests {
         assert_eq!(fs::read_dir(&fixture.staging).unwrap().count(), 0);
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn publication_cleanup_preserves_a_replaced_destination() {
+        let root = TempDir::new().unwrap();
+        let source = Utf8PathBuf::from_path_buf(root.path().join("source")).unwrap();
+        let destination = Utf8PathBuf::from_path_buf(root.path().join("destination")).unwrap();
+        fs::write(&source, b"published").unwrap();
+        let linked_file = File::open(&source).unwrap();
+        fs::hard_link(&source, &destination).unwrap();
+        let link = PublishedLink {
+            path: destination.clone(),
+            linked_file,
+        };
+        fs::remove_file(&destination).unwrap();
+        fs::write(&destination, b"foreign").unwrap();
+
+        assert_eq!(
+            cleanup_published_links([&link]),
+            Err(GithubArtifactError::CleanupFailed)
+        );
+        assert_eq!(fs::read(destination).unwrap(), b"foreign");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn publication_cleanup_removes_exact_original_and_preserves_replacement() {
+        let root = TempDir::new().unwrap();
+        let source = Utf8PathBuf::from_path_buf(root.path().join("source")).unwrap();
+        let destination = Utf8PathBuf::from_path_buf(root.path().join("destination")).unwrap();
+        let displaced = Utf8PathBuf::from_path_buf(root.path().join("displaced")).unwrap();
+        let mut output = create_new_artifact_file(&source).unwrap();
+        output.write_all(b"published").unwrap();
+        output.sync_all().unwrap();
+        drop(output);
+        let staging_file = open_windows_private_file_for_removal(source.as_std_path()).unwrap();
+        fs::hard_link(&source, &destination).unwrap();
+        let linked_file = open_windows_private_file_for_removal_in_state(
+            destination.as_std_path(),
+            PrivateFileLinkState::PublicationPair,
+        )
+        .unwrap();
+        let link = PublishedLink {
+            path: destination.clone(),
+            linked_file,
+            staging_path: source.clone(),
+            staging_file,
+            staging_removed: Cell::new(false),
+        };
+        fs::rename(&destination, &displaced).unwrap();
+        fs::write(&destination, b"foreign").unwrap();
+
+        cleanup_published_links([&link]).unwrap();
+        drop(link);
+        assert_eq!(fs::read(destination).unwrap(), b"foreign");
+        assert!(!source.exists());
+        assert!(!displaced.exists());
+    }
+
     #[test]
     fn report_with_different_run_digest_is_rejected() {
         let mut fixture = Fixture::new();
@@ -1673,6 +3133,24 @@ mod tests {
     }
 
     #[test]
+    fn optional_artifact_files_are_derived_only_from_the_signed_request() {
+        let (mut request, _) = test_request_and_compile();
+        request.requested_artifacts.extend([
+            IosArtifactType::AppBundle,
+            IosArtifactType::Xcarchive,
+            IosArtifactType::Dsym,
+        ]);
+        let source = request.source.clone();
+        let compile = test_compile_evidence(&request, source);
+        let expected = GithubArtifactExpectation::new(JOB_ID, PROVIDER, request, compile).unwrap();
+        let files = required_artifact_files(&expected);
+        assert_eq!(files.len(), BASE_ENTRY_COUNT + 3);
+        assert!(files.contains(&RequiredArtifactFile::AppBundleArchive));
+        assert!(files.contains(&RequiredArtifactFile::SignedXcarchive));
+        assert!(files.contains(&RequiredArtifactFile::DsymArchive));
+    }
+
+    #[test]
     fn unexpected_archive_entry_is_rejected() {
         let root = TempDir::new().unwrap();
         let path = Utf8PathBuf::from_path_buf(root.path().join("unexpected.zip")).unwrap();
@@ -1683,6 +3161,7 @@ mod tests {
             DEVELOPMENT_IPA_NAME,
             ARTIFACT_MANIFEST_NAME,
             SIGNING_REPORT_NAME,
+            VALIDATION_REPORT_NAME,
             "secret.pem",
         ] {
             writer.start_file(name, options).unwrap();
@@ -1691,8 +3170,9 @@ mod tests {
         writer.finish().unwrap();
         let archive_size = path.metadata().unwrap().len();
         let mut archive = ZipArchive::new(File::open(path).unwrap()).unwrap();
+        let required = RequiredArtifactFile::BASE.into_iter().collect();
         assert_eq!(
-            scan_archive(&mut archive, archive_size),
+            scan_archive(&mut archive, archive_size, &required),
             Err(GithubArtifactError::UnexpectedEntry)
         );
     }
@@ -1711,6 +3191,7 @@ mod tests {
             ARTIFACT_MANIFEST_NAME,
             SIGNING_REPORT_NAME,
             VALIDATION_REPORT_NAME,
+            SANITIZED_BUILD_LOG_NAME,
         ] {
             writer.start_file(name, options).unwrap();
             writer.write_all(b"x").unwrap();
@@ -1718,8 +3199,9 @@ mod tests {
         writer.finish().unwrap();
         let archive_size = path.metadata().unwrap().len();
         let mut archive = ZipArchive::new(File::open(path).unwrap()).unwrap();
+        let required = RequiredArtifactFile::BASE.into_iter().collect();
         assert_eq!(
-            scan_archive(&mut archive, archive_size),
+            scan_archive(&mut archive, archive_size, &required),
             Err(GithubArtifactError::LinkedOrSpecialEntry)
         );
     }
@@ -1740,15 +3222,22 @@ mod tests {
             let archive = root_path.join("github-artifact.zip");
             let staging = root_path.join("staging");
             let output = root_path.join("output");
-            fs::create_dir(&staging).unwrap();
-            fs::create_dir(&output).unwrap();
+            create_test_private_directory(&staging);
+            create_test_private_directory(&output);
 
             let (request, compile) = test_request_and_compile();
             let ipa_bytes = test_ipa();
             let ipa_sha256 = sha256_bytes(&ipa_bytes);
             let ipa_size = u64::try_from(ipa_bytes.len()).unwrap();
             let report_bytes = test_report(&compile.request_sha256, &ipa_sha256, ipa_size);
-            let manifest = test_manifest(&request, &compile, &ipa_sha256, ipa_size, &report_bytes);
+            let manifest = test_manifest(
+                &request,
+                &compile,
+                &ipa_sha256,
+                ipa_size,
+                &report_bytes,
+                PROTECTED_SIGNING_SANITIZED_LOG_V1,
+            );
             let manifest_bytes = serde_json::to_vec_pretty(&manifest).unwrap();
             write_artifact_zip(
                 &archive,
@@ -1756,6 +3245,7 @@ mod tests {
                 &manifest_bytes,
                 &report_bytes,
                 &report_bytes,
+                PROTECTED_SIGNING_SANITIZED_LOG_V1,
             );
             Self {
                 _root: root,
@@ -2022,6 +3512,26 @@ mod tests {
         bytes
     }
 
+    fn macho_with_uuid(file_type: u32, uuid: [u8; 16]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for value in [
+            0xfeed_facfu32,
+            goblin::mach::constants::cputype::CPU_TYPE_ARM64,
+            0,
+            file_type,
+            1,
+            24,
+            0,
+            0,
+            goblin::mach::load_command::LC_UUID,
+            24,
+        ] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.extend_from_slice(&uuid);
+        bytes
+    }
+
     fn test_report(request_sha256: &str, ipa_sha256: &str, ipa_size: u64) -> Vec<u8> {
         serde_json::to_vec_pretty(&json!({
             "schema_version": PUBLIC_REPORT_SCHEMA_VERSION,
@@ -2051,6 +3561,11 @@ mod tests {
                 "root_deep_signature_verified": true,
                 "cleanup_confirmed": true
             },
+            "signed_products": {
+                "app_tree": null,
+                "archive": null,
+                "dsym": null
+            },
             "cleanup": {
                 "keychain_search_list_restored": true,
                 "keychain_removed": true,
@@ -2071,6 +3586,7 @@ mod tests {
         ipa_sha256: &str,
         ipa_size: u64,
         report_bytes: &[u8],
+        sanitized_log: &[u8],
     ) -> ArtifactManifest {
         let report_sha256 = sha256_bytes(report_bytes);
         let report_size = u64::try_from(report_bytes.len()).unwrap();
@@ -2132,6 +3648,14 @@ mod tests {
                 sha256: report_sha256,
                 media_type: Some("application/json".to_owned()),
             },
+            ArtifactRecord {
+                artifact_id: "sanitized-build-log".to_owned(),
+                kind: ArtifactKind::SanitizedLog,
+                file_name: SANITIZED_BUILD_LOG_NAME.to_owned(),
+                size: u64::try_from(sanitized_log.len()).unwrap(),
+                sha256: sha256_bytes(sanitized_log),
+                media_type: Some("text/plain; charset=utf-8".to_owned()),
+            },
         ];
         manifest.validation_levels = BTreeSet::from([
             ValidationLevel::SourceValidated,
@@ -2159,8 +3683,9 @@ mod tests {
         manifest: &[u8],
         signing_report: &[u8],
         validation_report: &[u8],
+        sanitized_log: &[u8],
     ) {
-        let file = File::create(path).unwrap();
+        let file = create_new_artifact_file(path).unwrap();
         let mut writer = ZipWriter::new(file);
         let options = SimpleFileOptions::default()
             .compression_method(CompressionMethod::Stored)
@@ -2170,10 +3695,64 @@ mod tests {
             (ARTIFACT_MANIFEST_NAME, manifest),
             (SIGNING_REPORT_NAME, signing_report),
             (VALIDATION_REPORT_NAME, validation_report),
+            (SANITIZED_BUILD_LOG_NAME, sanitized_log),
         ] {
             writer.start_file(name, options).unwrap();
             writer.write_all(bytes).unwrap();
         }
         writer.finish().unwrap();
+    }
+
+    fn write_rewrapped_app_zip(path: &Utf8Path, prefix: &str, tamper_executable: bool) {
+        let mut source = ZipArchive::new(Cursor::new(test_ipa())).unwrap();
+        let file = create_new_artifact_file(path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        let directory_options = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Stored)
+            .unix_permissions(0o755);
+        if let Some(archive_root) = prefix.strip_suffix("Products/Applications/") {
+            writer
+                .add_directory(archive_root, directory_options)
+                .unwrap();
+            let options = SimpleFileOptions::default()
+                .compression_method(CompressionMethod::Stored)
+                .unix_permissions(0o644);
+            writer
+                .start_file(format!("{archive_root}Info.plist"), options)
+                .unwrap();
+            writer.write_all(b"public archive fixture").unwrap();
+        } else {
+            writer.add_directory("App.app/", directory_options).unwrap();
+        }
+        for index in 0..source.len() {
+            let mut entry = source.by_index(index).unwrap();
+            let relative = entry.name().strip_prefix("Payload/").unwrap().to_owned();
+            let options = SimpleFileOptions::default()
+                .compression_method(CompressionMethod::Stored)
+                .unix_permissions(entry.unix_mode().unwrap_or(0o644) & 0o777);
+            writer
+                .start_file(format!("{prefix}{relative}"), options)
+                .unwrap();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            if tamper_executable && relative == "App.app/App" {
+                bytes.push(0);
+            }
+            writer.write_all(&bytes).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    #[cfg(windows)]
+    fn create_test_private_directory(path: &Utf8Path) {
+        drop(
+            rustferry_core::windows_private_directory::create_private_directory(path.as_std_path())
+                .unwrap(),
+        );
+    }
+
+    #[cfg(not(windows))]
+    fn create_test_private_directory(path: &Utf8Path) {
+        fs::create_dir(path).unwrap();
     }
 }

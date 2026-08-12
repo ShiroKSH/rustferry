@@ -16,12 +16,17 @@ use std::{
 
 use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
 use clap::{Args, Parser, Subcommand, ValueEnum, error::ErrorKind};
-use rustferry_apple::{AppleBuildProfile, IosDeviceArchiveRequest};
+use rustferry_apple::{AppleBuildProfile, IosDeviceArchiveRequest, with_command_cancellation};
 use rustferry_core::{FerryConfig, TargetPlatform};
 use rustferry_remote::{
-    ArtifactKind, ArtifactRecord, CompileHandoff, IosArtifactType, IosDeviceBuildRequest,
+    ArtifactKind, ArtifactRecord, CompileHandoff, GIT_SNAPSHOT_ARCHIVE_PATH,
+    GIT_SNAPSHOT_DESCRIPTOR_PATH, GIT_SNAPSHOT_TREE_PATHS, GitSnapshotDescriptor, IosArtifactType,
+    IosDeviceBuildRequest, MAX_GIT_SNAPSHOT_DESCRIPTOR_BYTES, PROTECTED_SIGNING_SANITIZED_LOG_V1,
     SealedUnsignedArchive, SecretBytes, SecretReference, SecretReferenceKind, SigningMode,
-    SourceBundleRequest, SourceManifest, SourceMode, verify_source_manifest,
+    SourceBundleRequest, SourceManifest, SourceMode, WorkerStdioCodecError,
+    WorkerStdioRequestEnvelope, canonical_git_snapshot_descriptor_bytes, canonical_request_sha256,
+    canonical_signing_target_graph_sha256, decode_worker_stdio_request,
+    git_snapshot_archive_limits, verify_and_extract_source_bundle, verify_source_manifest,
 };
 #[cfg(target_os = "macos")]
 use rustferry_worker_macos::keychain::{KeychainOptions, garbage_collect_stale_keychains};
@@ -31,6 +36,16 @@ use rustferry_worker_macos::{
     pipeline::{
         CompilePhaseRequest, PipelineError, PipelinePublicMetadata, PipelineToolchainSelection,
         ProtectedSignPhaseRequest, compile_unsigned_phase, sign_protected_phase,
+    },
+    session_output::{
+        BoundedSessionOutput, SNAPSHOT_OUTPUT_INACTIVITY_DEADLINE, SNAPSHOT_OUTPUT_TOTAL_DEADLINE,
+    },
+    snapshot_session::{
+        SnapshotCompileContext, SnapshotCompileFailure, SnapshotCompileOutput, SnapshotCompiler,
+        serve_snapshot_session,
+    },
+    stdio::{
+        WORKER_STDIO_REQUEST_DEADLINE, serve_one_stdio_request, write_request_timeout_response,
     },
 };
 use same_file::Handle;
@@ -47,11 +62,18 @@ const MAX_PUBLIC_REPORT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CARGO_MANIFEST_BYTES: usize = 2 * 1024 * 1024;
 const MAX_GITHUB_OUTPUT_BYTES: u64 = 1024 * 1024;
 const MAX_GIT_OUTPUT_BYTES: usize = 64 * 1024;
-const MAX_ENCODED_SECRET_BYTES: usize = 24 * 1024 * 1024;
-const MAX_DECODED_SIGNING_BLOB_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ENCODED_SECRET_BYTES: usize = 48 * 1024;
+const MAX_DECODED_SIGNING_BLOB_BYTES: usize = (MAX_ENCODED_SECRET_BYTES / 4) * 3;
 const MAX_SIGNING_PASSWORD_BYTES: usize = 4 * 1024;
-const MAX_SIGNING_STDIN_BYTES: usize =
-    MAX_ENCODED_SECRET_BYTES * 2 + MAX_SIGNING_PASSWORD_BYTES + 2;
+// One app plus the currently generated Widget and Live Activity extensions.
+const MAX_SIGNING_PROFILES: usize = 3;
+const MAX_SIGNING_SECRET_RECORDS: usize = 2 + MAX_SIGNING_PROFILES;
+const MAX_SIGNING_REFERENCE_NAME_BYTES: usize = 128;
+const SIGNING_SECRET_FRAME_V2_MAGIC: &[u8; 8] = b"RFSIGNV2";
+const MAX_SIGNING_STDIN_BYTES: usize = SIGNING_SECRET_FRAME_V2_MAGIC.len()
+    + 4
+    + MAX_SIGNING_SECRET_RECORDS
+        * (2 + 4 + MAX_SIGNING_REFERENCE_NAME_BYTES + MAX_ENCODED_SECRET_BYTES);
 const GIT_TIMEOUT: Duration = Duration::from_secs(20);
 const JOB_MARKER_NAME: &str = ".rustferry-worker-job-v1.json";
 const COMPILE_REPORT_NAME: &str = "compile-report.json";
@@ -61,6 +83,7 @@ const IPA_NAME: &str = "application-development.ipa";
 const ARTIFACT_MANIFEST_NAME: &str = "artifact-manifest.json";
 const SIGNING_REPORT_NAME: &str = "signing-report.json";
 const VALIDATION_REPORT_NAME: &str = "validation-report.json";
+const SANITIZED_BUILD_LOG_NAME: &str = "sanitized-build-log.txt";
 const GITHUB_DISPATCH_MANIFEST_SCHEMA_VERSION: u32 = 2;
 const GITHUB_DISPATCH_PROVIDER: &str = "github-actions";
 
@@ -89,8 +112,8 @@ enum WorkerCommand {
     RunJob(RunJobArgs),
     /// Remove one marker-bound worker job root.
     Cleanup(CleanupArgs),
-    /// Start the persistent worker protocol server (not enabled in this release).
-    Serve,
+    /// Handle one read-only worker control-plane request over stdin/stdout.
+    Serve(ServeArgs),
 }
 
 #[derive(Debug, Args)]
@@ -105,6 +128,65 @@ struct HostArgs {
     /// Worker-owned root to inspect; it is never created by this command.
     #[arg(long)]
     worker_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct ServeArgs {
+    /// Read one strict JSON request from stdin and write one strict JSON response.
+    #[arg(
+        long,
+        action = clap::ArgAction::SetTrue,
+        conflicts_with = "stdio_session_v1",
+        required_unless_present = "stdio_session_v1"
+    )]
+    stdio: bool,
+    /// Run one framed snapshot-build session over stdin/stdout.
+    #[arg(long, action = clap::ArgAction::SetTrue, conflicts_with = "stdio")]
+    stdio_session_v1: bool,
+    /// Worker-owned root to inspect for a provider-doctor request.
+    #[arg(long)]
+    worker_root: Option<PathBuf>,
+}
+
+type DecodedStdioRequest = Result<WorkerStdioRequestEnvelope, WorkerStdioCodecError>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StdioRequestWaitError {
+    DeadlineExceeded,
+    ReaderStopped,
+}
+
+struct StdioRequestTask {
+    receiver: mpsc::Receiver<DecodedStdioRequest>,
+    worker: thread::JoinHandle<()>,
+}
+
+impl StdioRequestTask {
+    fn spawn(
+        read_request: impl FnOnce() -> DecodedStdioRequest + Send + 'static,
+    ) -> io::Result<Self> {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("rustferry-stdio-request".to_owned())
+            .spawn(move || {
+                let _ = sender.send(read_request());
+            })?;
+        Ok(Self { receiver, worker })
+    }
+
+    fn wait(&self, deadline: Duration) -> Result<DecodedStdioRequest, StdioRequestWaitError> {
+        match self.receiver.recv_timeout(deadline) {
+            Ok(request) => Ok(request),
+            Err(RecvTimeoutError::Timeout) => Err(StdioRequestWaitError::DeadlineExceeded),
+            Err(RecvTimeoutError::Disconnected) => Err(StdioRequestWaitError::ReaderStopped),
+        }
+    }
+
+    fn join(self) -> Result<(), StdioRequestWaitError> {
+        self.worker
+            .join()
+            .map_err(|_| StdioRequestWaitError::ReaderStopped)
+    }
 }
 
 #[derive(Debug, Args)]
@@ -130,6 +212,9 @@ struct GithubRequestArgs {
     output_manifest: PathBuf,
     #[arg(long)]
     github_output: PathBuf,
+    /// Static workflow-bound digest of the complete signing target graph.
+    #[arg(long)]
+    expected_signing_target_graph_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -200,7 +285,7 @@ struct RunJobArgs {
     #[arg(long)]
     certificate_password_reference: Option<String>,
     #[arg(long)]
-    provisioning_profile_reference: Option<String>,
+    provisioning_profile_reference: Vec<String>,
     #[arg(
         long,
         default_value_t = 120,
@@ -307,10 +392,7 @@ fn dispatch(command: WorkerCommand) -> Result<(), CliFailure> {
             JobPhase::Sign => run_sign(arguments),
         },
         WorkerCommand::Cleanup(arguments) => run_cleanup(arguments),
-        WorkerCommand::Serve => Err(CliFailure::execution(
-            "unsupported_capability",
-            "persistent worker serving is not enabled in this release",
-        )),
+        WorkerCommand::Serve(arguments) => run_stdio(arguments),
     }
 }
 
@@ -334,16 +416,7 @@ fn run_version(arguments: &VersionArgs) -> Result<(), CliFailure> {
 }
 
 fn run_doctor(arguments: HostArgs, capabilities_only: bool) -> Result<(), CliFailure> {
-    let worker_root = match arguments.worker_root {
-        Some(path) => path_to_utf8(path)?,
-        None => path_to_utf8(env::temp_dir().join("rustferry-worker"))?,
-    };
-    if !worker_root.is_absolute() {
-        return Err(CliFailure::input(
-            "invalid_worker_root",
-            "worker root must be absolute",
-        ));
-    }
+    let worker_root = command_worker_root(arguments.worker_root)?;
     let options = WorkerHostOptions::from_environment(worker_root);
     let report = doctor_worker_host(&options);
     let capabilities = worker_host_capabilities(&report);
@@ -365,6 +438,120 @@ fn run_doctor(arguments: HostArgs, capabilities_only: bool) -> Result<(), CliFai
             "report": report,
         }))
     }
+}
+
+fn run_stdio(arguments: ServeArgs) -> Result<(), CliFailure> {
+    if arguments.stdio_session_v1 {
+        if arguments.worker_root.is_some() {
+            return Err(CliFailure::input(
+                "invalid_worker_root_source",
+                "snapshot sessions require the configured trusted worker root",
+            ));
+        }
+        return run_snapshot_stdio();
+    }
+    if !arguments.stdio {
+        return Err(CliFailure::input(
+            "invalid_transport",
+            "worker serve transport must be stdio",
+        ));
+    }
+    let worker_root = command_worker_root(arguments.worker_root)?;
+    let options = WorkerHostOptions::from_environment(worker_root);
+    let Ok(request_task) =
+        StdioRequestTask::spawn(|| decode_worker_stdio_request(&mut io::stdin().lock()))
+    else {
+        return serve_one_stdio_request(
+            Err(WorkerStdioCodecError::Io),
+            &mut io::stdout().lock(),
+            &options,
+        )
+        .map_err(map_stdio_failure);
+    };
+    let request = match request_task.wait(WORKER_STDIO_REQUEST_DEADLINE) {
+        Ok(request) => {
+            if request_task.join().is_ok() {
+                request
+            } else {
+                Err(WorkerStdioCodecError::Io)
+            }
+        }
+        Err(StdioRequestWaitError::DeadlineExceeded) => terminate_after_stdio_request_deadline(),
+        Err(StdioRequestWaitError::ReaderStopped) => {
+            let _ = request_task.join();
+            Err(WorkerStdioCodecError::Io)
+        }
+    };
+    serve_one_stdio_request(request, &mut io::stdout().lock(), &options).map_err(map_stdio_failure)
+}
+
+struct ProductionSnapshotCompiler;
+
+impl SnapshotCompiler for ProductionSnapshotCompiler {
+    fn compile(
+        &mut self,
+        context: SnapshotCompileContext<'_>,
+    ) -> Result<SnapshotCompileOutput, SnapshotCompileFailure> {
+        let result = with_command_cancellation(context.cancellation(), || {
+            compile_materialized_source(
+                context.request().clone(),
+                context.source_root(),
+                context.output_directory(),
+                context.job_id(),
+                rustferry_worker_macos::stdio::SSH_STDIO_PROVIDER_ID,
+                env!("CARGO_PKG_VERSION"),
+            )
+        });
+        let handoff = result.map_err(|_| {
+            SnapshotCompileFailure::new(
+                "snapshot_compile_failed",
+                "unsigned physical-iPhone compilation failed",
+                false,
+            )
+        })?;
+        Ok(SnapshotCompileOutput {
+            handoff,
+            artifact_path: context.output_directory().join(SEALED_ARCHIVE_NAME),
+        })
+    }
+}
+
+fn run_snapshot_stdio() -> Result<(), CliFailure> {
+    let worker_root = trusted_worker_root()?;
+    let mut compiler = ProductionSnapshotCompiler;
+    let mut output = BoundedSessionOutput::spawn(
+        io::stdout(),
+        SNAPSHOT_OUTPUT_TOTAL_DEADLINE,
+        SNAPSHOT_OUTPUT_INACTIVITY_DEADLINE,
+    )
+    .map_err(|_| {
+        CliFailure::execution(
+            "snapshot_output_failed",
+            "snapshot session output could not be initialized",
+        )
+    })?;
+    serve_snapshot_session(io::stdin(), &mut output, &worker_root, &mut compiler).map_err(|_| {
+        CliFailure::execution(
+            "snapshot_session_failed",
+            "snapshot session response could not be completed",
+        )
+    })
+}
+
+fn terminate_after_stdio_request_deadline() -> ! {
+    if write_request_timeout_response(&mut io::stdout().lock()).is_ok() {
+        std::process::exit(0);
+    }
+    let failure = map_stdio_failure(WorkerStdioCodecError::Io);
+    write_error(&failure);
+    std::process::exit(i32::from(failure.exit_code));
+}
+
+const fn map_stdio_failure(_error: WorkerStdioCodecError) -> CliFailure {
+    CliFailure::execution(
+        "stdio_failed",
+        "worker stdio response could not be completed",
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -422,12 +609,17 @@ fn run_github_request(arguments: GithubRequestArgs) -> Result<(), CliFailure> {
     let manifest = decode_github_dispatch_manifest(&manifest_bytes)?;
     let request = &manifest.request;
     validate_github_artifact_contract(request)?;
+    validate_expected_signing_target_graph(
+        arguments.expected_signing_target_graph_sha256.as_deref(),
+        request,
+    )?;
 
     let event_bytes = read_bounded_file(&event_path, MAX_EVENT_BYTES)?;
     let event = decode_unique_value(&event_bytes)?;
     let event_object = event
         .as_object()
         .ok_or_else(|| CliFailure::input("invalid_event", "GitHub event payload is invalid"))?;
+    let event_kind = github_event_kind(exact_environment_string("GITHUB_EVENT_NAME")?.as_deref())?;
     let event_ref = required_object_string(event_object, "ref", "invalid_event")?;
     let expected_ref = format!(
         "{}/{}",
@@ -451,22 +643,15 @@ fn run_github_request(arguments: GithubRequestArgs) -> Result<(), CliFailure> {
     let dispatch_head = git_head(&dispatch_root)?;
     cross_check_exact_environment_value("GITHUB_SHA", &dispatch_head)?;
 
-    let is_workflow_dispatch = event_object.get("inputs").is_some_and(Value::is_object);
-    if is_workflow_dispatch {
-        validate_workflow_dispatch_event(
+    match event_kind {
+        GithubEventKind::WorkflowDispatch => validate_workflow_dispatch_event(
             event_object,
             request,
             source_revision,
+            &dispatch_head,
             &arguments.workflow_path,
-        )?;
-    } else {
-        let after = required_object_string(event_object, "after", "invalid_push_event")?;
-        if after != dispatch_head {
-            return Err(CliFailure::input(
-                "dispatch_revision_mismatch",
-                "push event revision differs from the dispatch checkout",
-            ));
-        }
+        )?,
+        GithubEventKind::Push => validate_push_event(event_object, &dispatch_head)?,
     }
 
     let execution_repository = event_object
@@ -509,7 +694,9 @@ fn run_github_request(arguments: GithubRequestArgs) -> Result<(), CliFailure> {
         "trusted_source_repository_mismatch",
         "trusted source checkout does not match the public source repository",
     )?;
-    ensure_revision_is_trusted(&trusted_root, source_revision)?;
+    if request.source_mode == SourceMode::Git {
+        ensure_revision_is_trusted(&trusted_root, source_revision)?;
+    }
 
     let normalized = serde_json::to_vec_pretty(request).map_err(|_| {
         CliFailure::execution(
@@ -530,7 +717,7 @@ fn run_github_request(arguments: GithubRequestArgs) -> Result<(), CliFailure> {
     write_json_stdout(&serde_json::json!({
         "schema_version": CLI_SCHEMA_VERSION,
         "status": "validated",
-        "event": if is_workflow_dispatch { "workflow_dispatch" } else { "push" },
+        "event": event_kind.as_str(),
     }))
 }
 
@@ -595,21 +782,193 @@ fn run_compile(arguments: RunJobArgs) -> Result<(), CliFailure> {
         "trusted_source_repository_mismatch",
         "trusted source checkout does not match the public source repository",
     )?;
-    ensure_revision_is_trusted(&trusted_root, source_revision)?;
+    if request.source_mode == SourceMode::Git {
+        ensure_revision_is_trusted(&trusted_root, source_revision)?;
+    }
 
-    let checkout_selection = source_selection(&source_root, &request.source)?;
-    verify_source_manifest(&checkout_selection, &request.source).map_err(|_| {
+    let materialized_root = materialize_github_source(&source_root, &job_root, &request)?;
+    let metadata_job_id = request.operation_id.clone();
+    let handoff = compile_materialized_source(
+        request,
+        &materialized_root,
+        &output_directory,
+        &metadata_job_id,
+        "github-actions",
+        env!("CARGO_PKG_VERSION"),
+    )?;
+    output_guard.keep();
+    write_json_stdout(&serde_json::json!({
+        "schema_version": CLI_SCHEMA_VERSION,
+        "status": "succeeded",
+        "phase": "compile",
+        "request_sha256": handoff.compile.request_sha256,
+        "sealed_sha256": handoff.compile.sealed_archive.transport.sha256,
+    }))
+}
+
+fn materialize_github_source(
+    source_root: &Utf8Path,
+    job_root: &Utf8Path,
+    request: &IosDeviceBuildRequest,
+) -> Result<Utf8PathBuf, CliFailure> {
+    let materialized_root = job_root.join("source");
+    match request.source_mode {
+        SourceMode::Git => {
+            let checkout_selection = source_selection(source_root, &request.source)?;
+            verify_source_manifest(&checkout_selection, &request.source).map_err(|_| {
+                CliFailure::input(
+                    "source_manifest_mismatch",
+                    "source checkout does not match the request manifest",
+                )
+            })?;
+            create_private_directory(&materialized_root)?;
+            materialize_manifest(source_root, &materialized_root, &request.source)?;
+        }
+        SourceMode::GitSnapshot => {
+            validate_git_snapshot_tree(source_root)?;
+            let descriptor_path =
+                resolve_regular_under(source_root, Utf8Path::new(GIT_SNAPSHOT_DESCRIPTOR_PATH))?;
+            let descriptor_bytes = read_bounded_file(
+                &descriptor_path,
+                usize::try_from(MAX_GIT_SNAPSHOT_DESCRIPTOR_BYTES).unwrap_or(usize::MAX),
+            )?;
+            let descriptor: GitSnapshotDescriptor = decode_strict_json(&descriptor_bytes)?;
+            descriptor
+                .validate_for_request(request, git_snapshot_archive_limits())
+                .map_err(|_| {
+                    CliFailure::input(
+                        "snapshot_descriptor_mismatch",
+                        "Git snapshot descriptor does not match the final request",
+                    )
+                })?;
+            if canonical_git_snapshot_descriptor_bytes(&descriptor).map_err(|_| {
+                CliFailure::input(
+                    "snapshot_descriptor_invalid",
+                    "Git snapshot descriptor is invalid",
+                )
+            })? != descriptor_bytes
+            {
+                return Err(CliFailure::input(
+                    "snapshot_descriptor_noncanonical",
+                    "Git snapshot descriptor bytes are not canonical",
+                ));
+            }
+            let archive_path =
+                resolve_regular_under(source_root, Utf8Path::new(GIT_SNAPSHOT_ARCHIVE_PATH))?;
+            verify_and_extract_source_bundle(
+                &archive_path,
+                &descriptor.bundle.archive,
+                &descriptor.bundle.manifest,
+                &materialized_root,
+                git_snapshot_archive_limits(),
+            )
+            .map_err(|_| {
+                CliFailure::input(
+                    "snapshot_archive_invalid",
+                    "Git snapshot archive failed strict verification",
+                )
+            })?;
+        }
+        SourceMode::Snapshot => {
+            return Err(CliFailure::input(
+                "unsupported_source_mode",
+                "GitHub worker does not accept interactive snapshot source mode",
+            ));
+        }
+    }
+    Ok(materialized_root)
+}
+
+fn validate_git_snapshot_tree(root: &Utf8Path) -> Result<(), CliFailure> {
+    let commit = run_git(root, &["cat-file", "-p", "HEAD^{commit}"])?;
+    if !commit.success || !is_orphan_git_snapshot_commit(&commit.stdout) {
+        return Err(CliFailure::input(
+            "invalid_snapshot_commit",
+            "Git snapshot revision is not one parentless orphan commit",
+        ));
+    }
+    let tree = run_git(root, &["ls-tree", "-r", "-z", "--full-tree", "HEAD"])?;
+    let objects = if tree.success {
+        exact_git_snapshot_tree_objects(&tree.stdout)
+    } else {
+        None
+    }
+    .ok_or_else(|| {
         CliFailure::input(
-            "source_manifest_mismatch",
-            "source checkout does not match the request manifest",
+            "invalid_snapshot_tree",
+            "Git snapshot commit does not contain the exact two-file source contract",
         )
     })?;
-    let materialized_root = job_root.join("source");
-    create_private_directory(&materialized_root)?;
-    materialize_manifest(&source_root, &materialized_root, &request.source)?;
-    let materialized_selection = source_selection(&materialized_root, &request.source)?;
+    for (path, object) in GIT_SNAPSHOT_TREE_PATHS.into_iter().zip(objects) {
+        let actual = run_git(root, &["hash-object", "--no-filters", "--", path])?;
+        if !actual.success || one_git_sha1_line(&actual.stdout) != Some(object.as_str()) {
+            return Err(CliFailure::input(
+                "snapshot_worktree_mismatch",
+                "Git snapshot checkout bytes do not match the immutable commit tree",
+            ));
+        }
+    }
+    Ok(())
+}
 
-    let project_root = project_root_for(&materialized_root, &request.source.project_path)?;
+fn one_git_sha1_line(output: &[u8]) -> Option<&str> {
+    let revision = std::str::from_utf8(output).ok()?.strip_suffix('\n')?;
+    if revision.contains(['\r', '\n']) || validate_sha1(revision).is_err() {
+        return None;
+    }
+    Some(revision)
+}
+
+fn is_orphan_git_snapshot_commit(output: &[u8]) -> bool {
+    let Some(header_end) = output.windows(2).position(|window| window == b"\n\n") else {
+        return false;
+    };
+    let mut headers = output[..header_end].split(|byte| *byte == b'\n');
+    let Some(tree) = headers.next().and_then(|line| line.strip_prefix(b"tree ")) else {
+        return false;
+    };
+    validate_sha1(std::str::from_utf8(tree).unwrap_or_default()).is_ok()
+        && !headers.any(|line| line.starts_with(b"parent "))
+}
+
+fn exact_git_snapshot_tree_objects(output: &[u8]) -> Option<Vec<String>> {
+    if output.last() != Some(&0) {
+        return None;
+    }
+    let records = output[..output.len().saturating_sub(1)]
+        .split(|byte| *byte == 0)
+        .collect::<Vec<_>>();
+    if records.len() != GIT_SNAPSHOT_TREE_PATHS.len() {
+        return None;
+    }
+    let mut objects = Vec::with_capacity(records.len());
+    for (record, expected_path) in records.iter().zip(GIT_SNAPSHOT_TREE_PATHS) {
+        let tab = record.iter().position(|byte| *byte == b'\t')?;
+        let header = std::str::from_utf8(&record[..tab]).ok()?;
+        let object = header.strip_prefix("100644 blob ")?;
+        if validate_sha1(object).is_err() || &record[tab + 1..] != expected_path.as_bytes() {
+            return None;
+        }
+        objects.push(object.to_owned());
+    }
+    Some(objects)
+}
+
+#[cfg(test)]
+fn is_exact_git_snapshot_tree(output: &[u8]) -> bool {
+    exact_git_snapshot_tree_objects(output).is_some()
+}
+
+fn compile_materialized_source(
+    request: IosDeviceBuildRequest,
+    materialized_root: &Utf8Path,
+    output_directory: &Utf8Path,
+    metadata_job_id: &str,
+    provider: &str,
+    rustferry_version: &str,
+) -> Result<CompileHandoff, CliFailure> {
+    let materialized_selection = source_selection(materialized_root, &request.source)?;
+    let project_root = project_root_for(materialized_root, &request.source.project_path)?;
     let config = FerryConfig::load(&project_root.join("ferry.toml"))
         .map_err(|_| CliFailure::input("invalid_ferry_config", "ferry configuration is invalid"))?;
     if !config.platforms.contains(&TargetPlatform::Ios) {
@@ -626,12 +985,8 @@ fn run_compile(arguments: RunJobArgs) -> Result<(), CliFailure> {
         rustferry_remote::BuildProfile::Release => AppleBuildProfile::Release,
     };
     let toolchain = toolchain_selection()?;
-    let metadata = PipelinePublicMetadata::new(
-        request.operation_id.clone(),
-        "github-actions",
-        env!("CARGO_PKG_VERSION"),
-    )
-    .map_err(map_pipeline_error)?;
+    let metadata = PipelinePublicMetadata::new(metadata_job_id, provider, rustferry_version)
+        .map_err(map_pipeline_error)?;
     let sealed_archive_path = output_directory.join(SEALED_ARCHIVE_NAME);
     let phase = CompilePhaseRequest {
         request: &request,
@@ -667,15 +1022,8 @@ fn run_compile(arguments: RunJobArgs) -> Result<(), CliFailure> {
         &output_directory.join("sanitized-compile-log.txt"),
         b"RustFerry unsigned physical-iPhone compilation and sealing completed.\n",
     )?;
-    sync_directory(&output_directory)?;
-    output_guard.keep();
-    write_json_stdout(&serde_json::json!({
-        "schema_version": CLI_SCHEMA_VERSION,
-        "status": "succeeded",
-        "phase": "compile",
-        "request_sha256": handoff.compile.request_sha256,
-        "sealed_sha256": handoff.compile.sealed_archive.transport.sha256,
-    }))
+    sync_directory(output_directory)?;
+    Ok(handoff)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -705,21 +1053,24 @@ fn run_sign(arguments: RunJobArgs) -> Result<(), CliFailure> {
         arguments.certificate_password_reference,
         "certificate_password_reference",
     )?;
-    let profile_reference = required_string(
-        arguments.provisioning_profile_reference,
-        "provisioning_profile_reference",
-    )?;
-    for name in [
-        &certificate_reference,
-        &password_reference,
-        &profile_reference,
-    ] {
+    let profile_references = arguments.provisioning_profile_reference.clone();
+    if profile_references.is_empty() || profile_references.len() > MAX_SIGNING_PROFILES {
+        return Err(CliFailure::input(
+            "invalid_profile_reference_count",
+            "protected signing requires one bounded profile reference per app and extension",
+        ));
+    }
+    for name in std::iter::once(&certificate_reference)
+        .chain(std::iter::once(&password_reference))
+        .chain(profile_references.iter())
+    {
         validate_public_secret_reference_name(name)?;
     }
-    if certificate_reference == password_reference
-        || certificate_reference == profile_reference
-        || password_reference == profile_reference
-    {
+    let all_argument_references = std::iter::once(certificate_reference.as_str())
+        .chain(std::iter::once(password_reference.as_str()))
+        .chain(profile_references.iter().map(String::as_str))
+        .collect::<BTreeSet<_>>();
+    if all_argument_references.len() != profile_references.len() + 2 {
         return Err(CliFailure::input(
             "duplicate_secret_reference",
             "protected signing references must be distinct",
@@ -765,7 +1116,7 @@ fn run_sign(arguments: RunJobArgs) -> Result<(), CliFailure> {
         &handoff.request,
         &certificate_reference,
         &password_reference,
-        &profile_reference,
+        &profile_references,
     )?;
 
     let worker_root = trusted_worker_root()?;
@@ -788,8 +1139,7 @@ fn run_sign(arguments: RunJobArgs) -> Result<(), CliFailure> {
     let internal_artifacts = job_root.join("artifacts");
     let toolchain = toolchain_selection()?;
     let references = signing_secret_references(&handoff.request)?;
-    let input = read_signing_secret_stdin(&mut io::stdin().lock())?;
-    let mut resolver = StdinSecretResolver::new(references, input)?;
+    let mut resolver = read_signing_secret_stdin(&mut io::stdin().lock(), &references)?;
     let phase = ProtectedSignPhaseRequest {
         request: &handoff.request,
         compile: &handoff.compile,
@@ -823,6 +1173,12 @@ fn run_sign(arguments: RunJobArgs) -> Result<(), CliFailure> {
         SIGNING_REPORT_NAME,
     )?
     .clone();
+    let product_outputs = bind_requested_product_outputs(
+        &handoff.request,
+        &manifest.artifacts,
+        &output.product_paths,
+        &internal_artifacts,
+    )?;
     if output.ipa_path != internal_artifacts.join(IPA_NAME)
         || sha256_file(&output.ipa_path)? != ipa_record.sha256
     {
@@ -860,17 +1216,31 @@ fn run_sign(arguments: RunJobArgs) -> Result<(), CliFailure> {
         sha256: sha256_bytes(&validation_bytes),
         media_type: Some("application/json".to_owned()),
     };
-    if manifest
-        .artifacts
-        .iter()
-        .any(|record| record.artifact_id == validation_record.artifact_id)
-    {
-        return Err(CliFailure::execution(
-            "ambiguous_validation_report",
-            "validation report artifact is ambiguous",
-        ));
-    }
-    manifest.artifacts.push(validation_record.clone());
+    let sanitized_log_record = ArtifactRecord {
+        artifact_id: "sanitized-build-log".to_owned(),
+        kind: ArtifactKind::SanitizedLog,
+        file_name: SANITIZED_BUILD_LOG_NAME.to_owned(),
+        size: u64::try_from(PROTECTED_SIGNING_SANITIZED_LOG_V1.len()).map_err(|_| {
+            CliFailure::execution(
+                "sanitized_build_log_too_large",
+                "sanitized build log exceeded its bound",
+            )
+        })?,
+        sha256: sha256_bytes(PROTECTED_SIGNING_SANITIZED_LOG_V1),
+        media_type: Some("text/plain; charset=utf-8".to_owned()),
+    };
+    append_generated_artifact_record(
+        &mut manifest,
+        validation_record.clone(),
+        "ambiguous_validation_report",
+        "validation report artifact is ambiguous",
+    )?;
+    append_generated_artifact_record(
+        &mut manifest,
+        sanitized_log_record.clone(),
+        "ambiguous_sanitized_build_log",
+        "sanitized build log artifact is ambiguous",
+    )?;
     manifest
         .artifacts
         .sort_by(|left, right| left.artifact_id.cmp(&right.artifact_id));
@@ -889,22 +1259,27 @@ fn run_sign(arguments: RunJobArgs) -> Result<(), CliFailure> {
         &output_directory.join(IPA_NAME),
         ipa_record.size,
     )?;
+    for (record, source) in &product_outputs {
+        atomic_copy_new(
+            source,
+            &output_directory.join(&record.file_name),
+            record.size,
+        )?;
+    }
     atomic_write_new(&output_directory.join(SIGNING_REPORT_NAME), &signing_bytes)?;
     atomic_write_new(
         &output_directory.join(VALIDATION_REPORT_NAME),
         &validation_bytes,
     )?;
     atomic_write_new(
+        &output_directory.join(SANITIZED_BUILD_LOG_NAME),
+        PROTECTED_SIGNING_SANITIZED_LOG_V1,
+    )?;
+    atomic_write_new(
         &output_directory.join(ARTIFACT_MANIFEST_NAME),
         &manifest_bytes,
     )?;
-    verify_published_signing_output(
-        &output_directory,
-        &ipa_record,
-        &signing_record,
-        &validation_record,
-        &manifest,
-    )?;
+    verify_published_signing_output(&output_directory, &manifest)?;
     sync_directory(&output_directory)?;
     output_guard.keep();
     write_json_stdout(&serde_json::json!({
@@ -971,10 +1346,57 @@ fn remove_owned_job_root(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GithubEventKind {
+    Push,
+    WorkflowDispatch,
+}
+
+impl GithubEventKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Push => "push",
+            Self::WorkflowDispatch => "workflow_dispatch",
+        }
+    }
+}
+
+fn github_event_kind(value: Option<&str>) -> Result<GithubEventKind, CliFailure> {
+    match value {
+        Some("push") => Ok(GithubEventKind::Push),
+        Some("workflow_dispatch") => Ok(GithubEventKind::WorkflowDispatch),
+        _ => Err(CliFailure::input(
+            "invalid_event_name",
+            "required GitHub event name is missing or unsupported",
+        )),
+    }
+}
+
+fn validate_push_event(
+    event: &serde_json::Map<String, Value>,
+    dispatch_revision: &str,
+) -> Result<(), CliFailure> {
+    if event.contains_key("inputs") {
+        return Err(CliFailure::input(
+            "invalid_push_event",
+            "push event contains workflow dispatch inputs",
+        ));
+    }
+    let after = required_object_string(event, "after", "invalid_push_event")?;
+    if after != dispatch_revision {
+        return Err(CliFailure::input(
+            "dispatch_revision_mismatch",
+            "push event revision differs from the dispatch checkout",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_workflow_dispatch_event(
     event: &serde_json::Map<String, Value>,
     request: &IosDeviceBuildRequest,
     source_revision: &str,
+    dispatch_revision: &str,
     workflow_path: &str,
 ) -> Result<(), CliFailure> {
     let inputs = event
@@ -987,9 +1409,9 @@ fn validate_workflow_dispatch_event(
             )
         })?;
     let expected_keys = BTreeSet::from([
-        "device_udid_sha256",
+        "dispatch_revision",
         "operation_id",
-        "project_path",
+        "request_sha256",
         "source_revision",
     ]);
     if inputs.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected_keys {
@@ -998,35 +1420,27 @@ fn validate_workflow_dispatch_event(
             "workflow dispatch input set is invalid",
         ));
     }
-    let device_udid_sha256 = request
-        .signing
-        .device
-        .as_ref()
-        .map(rustferry_remote::DevicePlan::udid_sha256)
-        .ok_or_else(|| {
-            CliFailure::input(
-                "missing_device",
-                "manual-development request has no physical device",
-            )
-        })?;
+    let request_sha256 = canonical_request_sha256(request).map_err(|_| {
+        CliFailure::input(
+            "invalid_workflow_dispatch",
+            "workflow dispatch request is invalid",
+        )
+    })?;
     for (name, expected) in [
         ("source_revision", source_revision),
         ("operation_id", request.operation_id.as_str()),
-        ("project_path", request.source.project_path.as_str()),
-        ("device_udid_sha256", device_udid_sha256),
+        ("request_sha256", request_sha256.as_str()),
+        ("dispatch_revision", dispatch_revision),
     ] {
         if inputs.get(name).and_then(Value::as_str) != Some(expected) {
             return Err(CliFailure::input(
                 "workflow_dispatch_mismatch",
-                "workflow dispatch input differs from the signed request",
+                "workflow dispatch input differs from the validated request",
             ));
         }
     }
-    if event
-        .get("workflow")
-        .and_then(Value::as_str)
-        .is_some_and(|workflow| workflow != workflow_path)
-    {
+    let workflow = required_object_string(event, "workflow", "invalid_workflow_dispatch")?;
+    if workflow != workflow_path {
         return Err(CliFailure::input(
             "workflow_path_mismatch",
             "workflow dispatch path differs from the trusted workflow",
@@ -1042,16 +1456,30 @@ fn validate_github_artifact_contract(request: &IosDeviceBuildRequest) -> Result<
             "physical-iPhone build request is invalid",
         )
     })?;
-    if request.source_mode != SourceMode::Git {
+    if !matches!(
+        request.source_mode,
+        SourceMode::Git | SourceMode::GitSnapshot
+    ) {
         return Err(CliFailure::input(
             "unsupported_source_mode",
-            "GitHub worker requires immutable Git source mode",
+            "GitHub worker requires immutable Git or Git snapshot source mode",
         ));
     }
-    let expected = match request.signing.mode {
-        SigningMode::UnsignedCompileOnly => BTreeSet::from([IosArtifactType::Xcarchive]),
+    let valid = match request.signing.mode {
+        SigningMode::UnsignedCompileOnly => {
+            request.requested_artifacts == BTreeSet::from([IosArtifactType::Xcarchive])
+        }
         SigningMode::ManualDevelopment => {
-            BTreeSet::from([IosArtifactType::Ipa, IosArtifactType::SigningReport])
+            let required = BTreeSet::from([IosArtifactType::Ipa, IosArtifactType::SigningReport]);
+            let supported = BTreeSet::from([
+                IosArtifactType::Ipa,
+                IosArtifactType::SigningReport,
+                IosArtifactType::AppBundle,
+                IosArtifactType::Xcarchive,
+                IosArtifactType::Dsym,
+            ]);
+            required.is_subset(&request.requested_artifacts)
+                && request.requested_artifacts.is_subset(&supported)
         }
         SigningMode::Development
         | SigningMode::PersonalTeam
@@ -1063,10 +1491,28 @@ fn validate_github_artifact_contract(request: &IosDeviceBuildRequest) -> Result<
             ));
         }
     };
-    if request.requested_artifacts != expected {
+    if !valid {
         return Err(CliFailure::input(
             "invalid_artifact_contract",
-            "GitHub signing requires exactly IPA and signing-report artifacts",
+            "GitHub signing artifact selection is unsupported",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_expected_signing_target_graph(
+    expected_sha256: Option<&str>,
+    request: &IosDeviceBuildRequest,
+) -> Result<(), CliFailure> {
+    let Some(expected_sha256) = expected_sha256 else {
+        return Ok(());
+    };
+    validate_sha256(expected_sha256)?;
+    let actual_sha256 = canonical_signing_target_graph_sha256(&request.signing.targets);
+    if actual_sha256 != expected_sha256 {
+        return Err(CliFailure::input(
+            "signing_target_graph_mismatch",
+            "request signing targets differ from the static workflow target graph",
         ));
     }
     Ok(())
@@ -1090,21 +1536,22 @@ fn validate_secret_role_bindings(
     request: &IosDeviceBuildRequest,
     certificate_reference: &str,
     password_reference: &str,
-    profile_reference: &str,
+    profile_references: &[String],
 ) -> Result<(), CliFailure> {
-    let signing = request.signing.signing.as_ref().ok_or_else(|| {
-        CliFailure::input("missing_signing_plan", "manual signing plan is incomplete")
-    })?;
-    let password = signing.password.as_ref().ok_or_else(|| {
-        CliFailure::input(
-            "missing_signing_password",
-            "manual signing password reference is missing",
-        )
-    })?;
-    if signing.identity.private_key.reference.name() != certificate_reference
-        || password.name() != password_reference
-        || request.signing.provisioning.len() != 1
-        || request.signing.provisioning[0].profile.name() != profile_reference
+    let expected = signing_secret_references(request)?;
+    let expected_profiles = expected
+        .profiles
+        .iter()
+        .map(SecretReference::name)
+        .collect::<BTreeSet<_>>();
+    let actual_profiles = profile_references
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if expected.certificate.name() != certificate_reference
+        || expected.password.name() != password_reference
+        || actual_profiles.len() != profile_references.len()
+        || actual_profiles != expected_profiles
     {
         return Err(CliFailure::input(
             "secret_role_mismatch",
@@ -1114,9 +1561,38 @@ fn validate_secret_role_bindings(
     Ok(())
 }
 
+#[derive(Clone, Debug)]
+struct SigningSecretReferences {
+    certificate: SecretReference,
+    password: SecretReference,
+    profiles: Vec<SecretReference>,
+}
+
+impl SigningSecretReferences {
+    fn ordered(&self) -> Vec<&SecretReference> {
+        std::iter::once(&self.certificate)
+            .chain(std::iter::once(&self.password))
+            .chain(self.profiles.iter())
+            .collect()
+    }
+
+    fn expected_names(&self) -> BTreeSet<&str> {
+        self.ordered()
+            .into_iter()
+            .map(SecretReference::name)
+            .collect()
+    }
+
+    fn reference_named(&self, name: &str) -> Option<&SecretReference> {
+        self.ordered()
+            .into_iter()
+            .find(|reference| reference.name() == name)
+    }
+}
+
 fn signing_secret_references(
     request: &IosDeviceBuildRequest,
-) -> Result<[SecretReference; 3], CliFailure> {
+) -> Result<SigningSecretReferences, CliFailure> {
     let signing = request.signing.signing.as_ref().ok_or_else(|| {
         CliFailure::input("missing_signing_plan", "manual signing plan is incomplete")
     })?;
@@ -1126,26 +1602,29 @@ fn signing_secret_references(
             "manual signing password reference is missing",
         )
     })?;
-    let profile = request
-        .signing
-        .provisioning
-        .first()
-        .filter(|_| request.signing.provisioning.len() == 1)
-        .ok_or_else(|| {
-            CliFailure::input(
-                "invalid_profile_reference",
-                "manual signing requires exactly one provisioning profile reference",
-            )
-        })?;
-    let references = [
-        signing.identity.private_key.reference.clone(),
-        password.clone(),
-        profile.profile.clone(),
-    ];
+    if request.signing.provisioning.is_empty()
+        || request.signing.provisioning.len() > MAX_SIGNING_PROFILES
+    {
+        return Err(CliFailure::input(
+            "invalid_profile_reference_count",
+            "manual signing profile reference count is unsupported",
+        ));
+    }
+    let references = SigningSecretReferences {
+        certificate: signing.identity.private_key.reference.clone(),
+        password: password.clone(),
+        profiles: request
+            .signing
+            .provisioning
+            .iter()
+            .map(|profile| profile.profile.clone())
+            .collect(),
+    };
     if references
-        .iter()
+        .ordered()
+        .into_iter()
         .any(|reference| reference.kind() != SecretReferenceKind::GithubActions)
-        || references.iter().collect::<BTreeSet<_>>().len() != references.len()
+        || references.expected_names().len() != references.ordered().len()
     {
         return Err(CliFailure::input(
             "invalid_secret_reference",
@@ -1155,40 +1634,13 @@ fn signing_secret_references(
     Ok(references)
 }
 
-struct SigningSecretInput {
-    certificate_p12: SecretBytes,
-    certificate_password: SecretBytes,
-    provisioning_profile: SecretBytes,
-}
-
 struct StdinSecretResolver {
     secrets: BTreeMap<SecretReference, SecretBytes>,
 }
 
 impl StdinSecretResolver {
-    fn new(
-        references: [SecretReference; 3],
-        input: SigningSecretInput,
-    ) -> Result<Self, CliFailure> {
-        let SigningSecretInput {
-            certificate_p12,
-            certificate_password,
-            provisioning_profile,
-        } = input;
-        let mut secrets = BTreeMap::new();
-        for (reference, value) in references.into_iter().zip([
-            certificate_p12,
-            certificate_password,
-            provisioning_profile,
-        ]) {
-            if secrets.insert(reference, value).is_some() {
-                return Err(CliFailure::input(
-                    "duplicate_secret_reference",
-                    "protected signing references must be distinct",
-                ));
-            }
-        }
-        Ok(Self { secrets })
+    fn new(secrets: BTreeMap<SecretReference, SecretBytes>) -> Self {
+        Self { secrets }
     }
 
     fn is_empty(&self) -> bool {
@@ -1209,68 +1661,237 @@ impl WorkerSecretResolver for StdinSecretResolver {
     }
 }
 
-fn read_signing_secret_stdin(reader: &mut impl Read) -> Result<SigningSecretInput, CliFailure> {
-    let mut frame = Vec::new();
-    let read = reader
-        .take(u64::try_from(MAX_SIGNING_STDIN_BYTES + 1).unwrap_or(u64::MAX))
-        .read_to_end(&mut frame);
-    if read.is_err() || frame.len() > MAX_SIGNING_STDIN_BYTES {
-        frame.fill(0);
-        return Err(invalid_signing_stdin());
-    }
-    parse_signing_secret_frame(
-        frame,
+fn read_signing_secret_stdin(
+    reader: &mut impl Read,
+    references: &SigningSecretReferences,
+) -> Result<StdinSecretResolver, CliFailure> {
+    let mut frame = read_bounded_signing_secret_stdin(reader)?;
+    parse_signing_secret_frame_in_place(
+        &mut frame,
+        references,
         MAX_ENCODED_SECRET_BYTES,
         MAX_SIGNING_PASSWORD_BYTES,
         MAX_DECODED_SIGNING_BLOB_BYTES,
     )
 }
 
-fn parse_signing_secret_frame(
-    mut frame: Vec<u8>,
+fn read_bounded_signing_secret_stdin(reader: &mut impl Read) -> Result<Vec<u8>, CliFailure> {
+    // Fixed initialized length: reads cannot grow the allocation and strand secret copies.
+    // The final byte is an oversize probe, so an exactly-maximal valid frame still reaches EOF.
+    let mut frame = vec![0; MAX_SIGNING_STDIN_BYTES + 1];
+    let mut length = 0;
+    loop {
+        if length == frame.len() {
+            frame.fill(0);
+            return Err(invalid_signing_stdin());
+        }
+        match reader.read(&mut frame[length..]) {
+            Ok(0) => break,
+            Ok(read) if read <= frame.len() - length => length += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Ok(_) | Err(_) => {
+                frame.fill(0);
+                return Err(invalid_signing_stdin());
+            }
+        }
+    }
+    frame.truncate(length);
+    Ok(frame)
+}
+
+fn parse_signing_secret_frame_in_place(
+    frame: &mut [u8],
+    references: &SigningSecretReferences,
     maximum_encoded_blob_bytes: usize,
     maximum_password_bytes: usize,
     maximum_decoded_blob_bytes: usize,
-) -> Result<SigningSecretInput, CliFailure> {
-    let result = (|| {
-        let separators = frame
-            .iter()
-            .enumerate()
-            .filter_map(|(index, byte)| (*byte == 0).then_some(index))
-            .take(3)
-            .collect::<Vec<_>>();
-        let [certificate_end, password_end] = separators.as_slice() else {
-            return Err(invalid_signing_stdin());
-        };
-        let certificate = &frame[..*certificate_end];
-        let password = &frame[*certificate_end + 1..*password_end];
-        let profile = &frame[*password_end + 1..];
-        if certificate.len() > maximum_encoded_blob_bytes
-            || password.len() > maximum_password_bytes
-            || profile.len() > maximum_encoded_blob_bytes
+) -> Result<StdinSecretResolver, CliFailure> {
+    let result = if frame.starts_with(b"RFSIGN") {
+        parse_signing_secret_frame_v2(
+            frame,
+            references,
+            maximum_encoded_blob_bytes,
+            maximum_password_bytes,
+            maximum_decoded_blob_bytes,
+        )
+    } else if references.profiles.len() == 1 {
+        parse_legacy_signing_secret_frame(
+            frame,
+            references,
+            maximum_encoded_blob_bytes,
+            maximum_password_bytes,
+            maximum_decoded_blob_bytes,
+        )
+    } else {
+        Err(CliFailure::input(
+            "legacy_signing_frame_requires_single_profile",
+            "legacy protected signing stdin is valid only for a single-profile plan",
+        ))
+    };
+    frame.fill(0);
+    result
+}
+
+fn parse_legacy_signing_secret_frame(
+    frame: &[u8],
+    references: &SigningSecretReferences,
+    maximum_encoded_blob_bytes: usize,
+    maximum_password_bytes: usize,
+    maximum_decoded_blob_bytes: usize,
+) -> Result<StdinSecretResolver, CliFailure> {
+    let separators = frame
+        .iter()
+        .enumerate()
+        .filter_map(|(index, byte)| (*byte == 0).then_some(index))
+        .take(3)
+        .collect::<Vec<_>>();
+    let [certificate_end, password_end] = separators.as_slice() else {
+        return Err(invalid_signing_stdin());
+    };
+    let certificate = &frame[..*certificate_end];
+    let password = &frame[*certificate_end + 1..*password_end];
+    let profile = &frame[*password_end + 1..];
+    if certificate.len() > maximum_encoded_blob_bytes
+        || password.len() > maximum_password_bytes
+        || profile.len() > maximum_encoded_blob_bytes
+    {
+        return Err(invalid_signing_stdin());
+    }
+    let certificate_p12 = decode_base64(certificate, maximum_decoded_blob_bytes)
+        .map(SecretBytes::new)
+        .ok_or_else(invalid_signing_stdin)?;
+    let provisioning_profile = decode_base64(profile, maximum_decoded_blob_bytes)
+        .map(SecretBytes::new)
+        .ok_or_else(invalid_signing_stdin)?;
+    validate_signing_password(password, maximum_password_bytes)?;
+    let mut secrets = BTreeMap::new();
+    secrets.insert(references.certificate.clone(), certificate_p12);
+    secrets.insert(
+        references.password.clone(),
+        SecretBytes::new(password.to_vec()),
+    );
+    secrets.insert(references.profiles[0].clone(), provisioning_profile);
+    Ok(StdinSecretResolver::new(secrets))
+}
+
+fn parse_signing_secret_frame_v2(
+    frame: &[u8],
+    references: &SigningSecretReferences,
+    maximum_encoded_blob_bytes: usize,
+    maximum_password_bytes: usize,
+    maximum_decoded_blob_bytes: usize,
+) -> Result<StdinSecretResolver, CliFailure> {
+    if !frame.starts_with(SIGNING_SECRET_FRAME_V2_MAGIC) {
+        return Err(CliFailure::input(
+            "unsupported_signing_secret_frame_version",
+            "protected signing stdin frame version is unsupported",
+        ));
+    }
+    let mut offset = SIGNING_SECRET_FRAME_V2_MAGIC.len();
+    let count = read_frame_u32(frame, &mut offset).ok_or_else(invalid_signing_stdin)?;
+    let expected_count = references.ordered().len();
+    if count != expected_count || count > MAX_SIGNING_SECRET_RECORDS {
+        return Err(CliFailure::input(
+            "signing_secret_count_mismatch",
+            "protected signing stdin has an unexpected record count",
+        ));
+    }
+
+    let expected_names = references.expected_names();
+    let mut seen = BTreeSet::new();
+    let mut secrets = BTreeMap::new();
+    for _ in 0..count {
+        let name_length = read_frame_u16(frame, &mut offset).ok_or_else(invalid_signing_stdin)?;
+        let value_length = read_frame_u32(frame, &mut offset).ok_or_else(invalid_signing_stdin)?;
+        if name_length == 0
+            || name_length > MAX_SIGNING_REFERENCE_NAME_BYTES
+            || value_length > maximum_encoded_blob_bytes.max(maximum_password_bytes)
         {
             return Err(invalid_signing_stdin());
         }
-        let certificate_p12 = decode_base64(certificate, maximum_decoded_blob_bytes)
-            .map(SecretBytes::new)
-            .ok_or_else(invalid_signing_stdin)?;
-        let provisioning_profile = decode_base64(profile, maximum_decoded_blob_bytes)
-            .map(SecretBytes::new)
-            .ok_or_else(invalid_signing_stdin)?;
-        Ok(SigningSecretInput {
-            certificate_p12,
-            certificate_password: SecretBytes::new(password.to_vec()),
-            provisioning_profile,
-        })
-    })();
-    frame.fill(0);
-    result
+        let name_bytes =
+            take_frame_bytes(frame, &mut offset, name_length).ok_or_else(invalid_signing_stdin)?;
+        let name = std::str::from_utf8(name_bytes).map_err(|_| invalid_signing_stdin())?;
+        validate_public_secret_reference_name(name)?;
+        if !expected_names.contains(name) {
+            return Err(CliFailure::input(
+                "unknown_signing_secret_record",
+                "protected signing stdin contains an unknown secret reference",
+            ));
+        }
+        if !seen.insert(name) {
+            return Err(CliFailure::input(
+                "duplicate_signing_secret_record",
+                "protected signing stdin repeats a secret reference",
+            ));
+        }
+        let value =
+            take_frame_bytes(frame, &mut offset, value_length).ok_or_else(invalid_signing_stdin)?;
+        let reference = references
+            .reference_named(name)
+            .expect("expected reference name was checked");
+        let decoded = if reference == &references.password {
+            validate_signing_password(value, maximum_password_bytes)?;
+            SecretBytes::new(value.to_vec())
+        } else {
+            if value.len() > maximum_encoded_blob_bytes {
+                return Err(invalid_signing_stdin());
+            }
+            decode_base64(value, maximum_decoded_blob_bytes)
+                .map(SecretBytes::new)
+                .ok_or_else(invalid_signing_stdin)?
+        };
+        secrets.insert(reference.clone(), decoded);
+    }
+    if offset != frame.len() {
+        return Err(CliFailure::input(
+            "trailing_signing_secret_frame_bytes",
+            "protected signing stdin contains trailing bytes",
+        ));
+    }
+    if seen != expected_names {
+        return Err(CliFailure::input(
+            "missing_signing_secret_record",
+            "protected signing stdin omits a required secret reference",
+        ));
+    }
+    Ok(StdinSecretResolver::new(secrets))
+}
+
+fn read_frame_u16(frame: &[u8], offset: &mut usize) -> Option<usize> {
+    let bytes = take_frame_bytes(frame, offset, 2)?;
+    Some(usize::from(u16::from_be_bytes([bytes[0], bytes[1]])))
+}
+
+fn read_frame_u32(frame: &[u8], offset: &mut usize) -> Option<usize> {
+    let bytes = take_frame_bytes(frame, offset, 4)?;
+    usize::try_from(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])).ok()
+}
+
+fn take_frame_bytes<'a>(frame: &'a [u8], offset: &mut usize, length: usize) -> Option<&'a [u8]> {
+    let end = offset.checked_add(length)?;
+    let bytes = frame.get(*offset..end)?;
+    *offset = end;
+    Some(bytes)
+}
+
+fn validate_signing_password(value: &[u8], maximum: usize) -> Result<(), CliFailure> {
+    if value.len() > maximum
+        || std::str::from_utf8(value).is_err()
+        || value.iter().any(|byte| matches!(byte, 0 | b'\r' | b'\n'))
+    {
+        return Err(CliFailure::input(
+            "invalid_signing_password",
+            "protected signing password is not bounded safe UTF-8",
+        ));
+    }
+    Ok(())
 }
 
 const fn invalid_signing_stdin() -> CliFailure {
     CliFailure::input(
         "invalid_signing_stdin",
-        "protected signing stdin must contain exactly three bounded canonical fields",
+        "protected signing stdin is malformed, truncated, oversized, or noncanonical",
     )
 }
 
@@ -1368,6 +1989,7 @@ fn materialize_manifest(
                 "source changed during materialization",
             ));
         }
+        #[cfg(unix)]
         set_executable(&destination, entry.executable)?;
         File::open(&destination)
             .and_then(|file| file.sync_all())
@@ -1576,11 +2198,106 @@ fn verify_bytes_record(bytes: &[u8], record: &ArtifactRecord) -> Result<(), CliF
     Ok(())
 }
 
+fn bind_requested_product_outputs(
+    request: &IosDeviceBuildRequest,
+    records: &[ArtifactRecord],
+    paths: &[Utf8PathBuf],
+    directory: &Utf8Path,
+) -> Result<Vec<(ArtifactRecord, Utf8PathBuf)>, CliFailure> {
+    let requested = request
+        .requested_artifacts
+        .iter()
+        .filter(|artifact| {
+            matches!(
+                artifact,
+                IosArtifactType::AppBundle | IosArtifactType::Xcarchive | IosArtifactType::Dsym
+            )
+        })
+        .map(|artifact| artifact.artifact_kind())
+        .collect::<BTreeSet<_>>();
+    let product_records = records
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.kind,
+                ArtifactKind::App | ArtifactKind::Xcarchive | ArtifactKind::Dsym
+            )
+        })
+        .collect::<Vec<_>>();
+    let actual = product_records
+        .iter()
+        .map(|record| record.kind)
+        .collect::<BTreeSet<_>>();
+    if actual != requested || product_records.len() != actual.len() || paths.len() != actual.len() {
+        return Err(CliFailure::execution(
+            "signed_product_set_mismatch",
+            "signed optional-product outputs do not match the request",
+        ));
+    }
+
+    let mut sources = BTreeMap::new();
+    for path in paths {
+        let file_name = path.file_name().ok_or_else(|| {
+            CliFailure::execution(
+                "signed_product_path_invalid",
+                "signed optional-product path is invalid",
+            )
+        })?;
+        let rebound = resolve_regular_under(directory, Utf8Path::new(file_name))?;
+        if &rebound != path || sources.insert(file_name.to_owned(), path.clone()).is_some() {
+            return Err(CliFailure::execution(
+                "signed_product_path_invalid",
+                "signed optional-product path is invalid",
+            ));
+        }
+    }
+
+    let mut outputs = Vec::new();
+    let mut artifact_ids = BTreeSet::new();
+    let mut file_names = BTreeSet::new();
+    for record in product_records {
+        validate_sha256(&record.sha256)?;
+        let source = sources.get(&record.file_name).ok_or_else(|| {
+            CliFailure::execution(
+                "signed_product_record_missing",
+                "signed optional-product record has no exact output",
+            )
+        })?;
+        if !artifact_ids.insert(record.artifact_id.as_str())
+            || !file_names.insert(record.file_name.as_str())
+            || fs::metadata(source).map(|metadata| metadata.len()).ok() != Some(record.size)
+            || sha256_file(source)? != record.sha256
+        {
+            return Err(CliFailure::execution(
+                "signed_product_binding_failed",
+                "signed optional-product output does not match its record",
+            ));
+        }
+        outputs.push((record.clone(), source.clone()));
+    }
+    outputs.sort_by(|left, right| left.0.artifact_id.cmp(&right.0.artifact_id));
+    Ok(outputs)
+}
+
+fn append_generated_artifact_record(
+    manifest: &mut rustferry_remote::ArtifactManifest,
+    record: ArtifactRecord,
+    error_code: &'static str,
+    error_message: &'static str,
+) -> Result<(), CliFailure> {
+    if manifest.artifacts.iter().any(|existing| {
+        existing.artifact_id == record.artifact_id
+            || existing.kind == record.kind
+            || existing.file_name == record.file_name
+    }) {
+        return Err(CliFailure::execution(error_code, error_message));
+    }
+    manifest.artifacts.push(record);
+    Ok(())
+}
+
 fn verify_published_signing_output(
     directory: &Utf8Path,
-    ipa: &ArtifactRecord,
-    signing: &ArtifactRecord,
-    validation: &ArtifactRecord,
     expected_manifest: &rustferry_remote::ArtifactManifest,
 ) -> Result<(), CliFailure> {
     let names = fs::read_dir(directory)
@@ -1599,19 +2316,27 @@ fn verify_published_signing_output(
         .ok_or_else(|| {
             CliFailure::execution("artifact_verification_failed", "artifact output is invalid")
         })?;
-    let expected = BTreeSet::from([
-        IPA_NAME.to_owned(),
-        ARTIFACT_MANIFEST_NAME.to_owned(),
-        SIGNING_REPORT_NAME.to_owned(),
-        VALIDATION_REPORT_NAME.to_owned(),
-    ]);
+    let mut expected = expected_manifest
+        .artifacts
+        .iter()
+        .map(|record| record.file_name.clone())
+        .collect::<BTreeSet<_>>();
+    if expected.len() != expected_manifest.artifacts.len()
+        || !expected.insert(ARTIFACT_MANIFEST_NAME.to_owned())
+    {
+        return Err(CliFailure::execution(
+            "artifact_output_mismatch",
+            "signed artifact output set is ambiguous",
+        ));
+    }
     if names != expected {
         return Err(CliFailure::execution(
             "artifact_output_mismatch",
             "signed artifact output set is incomplete",
         ));
     }
-    for record in [ipa, signing, validation] {
+    for record in &expected_manifest.artifacts {
+        validate_sha256(&record.sha256)?;
         let path = resolve_regular_under(directory, Utf8Path::new(&record.file_name))?;
         if fs::metadata(&path).map(|metadata| metadata.len()).ok() != Some(record.size)
             || sha256_file(&path)? != record.sha256
@@ -1641,7 +2366,7 @@ fn reject_sign_arguments_for_compile(arguments: &RunJobArgs) -> Result<(), CliFa
         || arguments.operation_id.is_some()
         || arguments.certificate_p12_reference.is_some()
         || arguments.certificate_password_reference.is_some()
-        || arguments.provisioning_profile_reference.is_some()
+        || !arguments.provisioning_profile_reference.is_empty()
     {
         return Err(CliFailure::input(
             "phase_argument_mismatch",
@@ -2389,24 +3114,24 @@ fn sync_directory(path: &Utf8Path) -> Result<(), CliFailure> {
 }
 
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "directory sync is a durability operation with no Windows equivalent"
+)]
 const fn sync_directory(_path: &Utf8Path) -> Result<(), CliFailure> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn set_executable(path: &Utf8Path, executable: bool) -> Result<(), CliFailure> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let mode = if executable { 0o755 } else { 0o644 };
-        fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|_| {
-            CliFailure::execution(
-                "source_permissions_failed",
-                "source permissions could not be set",
-            )
-        })?;
-    }
-    #[cfg(not(unix))]
-    let _ = executable;
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = if executable { 0o755 } else { 0o644 };
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|_| {
+        CliFailure::execution(
+            "source_permissions_failed",
+            "source permissions could not be set",
+        )
+    })?;
     Ok(())
 }
 
@@ -2415,6 +3140,32 @@ fn trusted_worker_root() -> Result<Utf8PathBuf, CliFailure> {
         exact_environment_path("RUNNER_TEMP")?,
         exact_environment_path("RUSTFERRY_WORKER_ROOT")?,
     )
+}
+
+fn command_worker_root(explicit: Option<PathBuf>) -> Result<Utf8PathBuf, CliFailure> {
+    let explicit = explicit.map(path_to_utf8).transpose()?;
+    select_command_worker_root(
+        explicit,
+        exact_environment_path("RUNNER_TEMP")?,
+        exact_environment_path("RUSTFERRY_WORKER_ROOT")?,
+    )
+}
+
+fn select_command_worker_root(
+    explicit: Option<Utf8PathBuf>,
+    runner_temp: Option<Utf8PathBuf>,
+    persistent_root: Option<Utf8PathBuf>,
+) -> Result<Utf8PathBuf, CliFailure> {
+    if let Some(root) = explicit {
+        if !root.is_absolute() {
+            return Err(CliFailure::input(
+                "invalid_worker_root",
+                "worker root must be absolute",
+            ));
+        }
+        return Ok(root);
+    }
+    select_trusted_worker_root(runner_temp, persistent_root)
 }
 
 fn select_trusted_worker_root(
@@ -2511,6 +3262,9 @@ fn validate_private_owned_directory(
     worker_root: &Utf8Path,
     directory: &Utf8Path,
 ) -> Result<(), CliFailure> {
+    #[cfg(not(unix))]
+    let _ = worker_root;
+    #[cfg(unix)]
     let root_metadata = fs::symlink_metadata(worker_root).map_err(|_| {
         CliFailure::input(
             "invalid_worker_root",
@@ -2576,6 +3330,9 @@ fn validate_owned_job_root(
 }
 
 fn validate_private_marker(job_root: &Utf8Path, marker: &Utf8Path) -> Result<(), CliFailure> {
+    #[cfg(not(unix))]
+    let _ = job_root;
+    #[cfg(unix)]
     let job_metadata = fs::symlink_metadata(job_root).map_err(|_| {
         CliFailure::cleanup("cleanup_marker_invalid", "worker cleanup marker is invalid")
     })?;
@@ -2888,6 +3645,7 @@ fn run_git(root: &Utf8Path, arguments: &[&str]) -> Result<GitResult, CliFailure>
         .env("LC_ALL", "C")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -3243,6 +4001,10 @@ fn map_pipeline_error(error: PipelineError) -> CliFailure {
                 "unsigned physical-iPhone build failed",
             )
         }
+        PipelineError::DsymGenerationFailed => CliFailure::execution(
+            "dsym_generation_failed",
+            "application dSYM generation or validation failed",
+        ),
         PipelineError::ArchiveSealFailed
         | PipelineError::ArchiveUnsealFailed
         | PipelineError::ArchiveHandoffMismatch => CliFailure::execution(
@@ -3281,8 +4043,11 @@ fn map_pipeline_error(error: PipelineError) -> CliFailure {
 #[cfg(test)]
 mod tests {
     use rustferry_remote::{
-        BuildProfile, BundleIdentifier, CURRENT_PROTOCOL_VERSION, DevicePlan, SigningPlan,
-        SigningTarget, SigningTargetKind,
+        BuildProfile, BundleIdentifier, CURRENT_PROTOCOL_VERSION, DevelopmentTeam,
+        DevelopmentTeamPlan, DevicePlan, EntitlementPlan, EntitlementSet, ProvisioningPlan,
+        ProvisioningProfileType, SigningCertificate, SigningIdentity, SigningPlan,
+        SigningPrivateKeyReference, SigningReference, SigningTarget, SigningTargetKind,
+        SourceArchive, SourceBundleDescriptor,
     };
     use sha2::Digest as _;
 
@@ -3359,6 +4124,61 @@ mod tests {
         }
     }
 
+    fn valid_signed_github_request(raw_udid: &str) -> IosDeviceBuildRequest {
+        let mut request = valid_github_request();
+        let team = DevelopmentTeam::new("ABCDE12345", None).expect("team");
+        let secret =
+            |name| SecretReference::new(SecretReferenceKind::GithubActions, name).expect("secret");
+        request.signing = SigningPlan {
+            mode: SigningMode::ManualDevelopment,
+            signing: Some(SigningReference {
+                identity: SigningIdentity {
+                    certificate: SigningCertificate {
+                        common_name: "Apple Development".to_owned(),
+                        sha256_fingerprint: "a".repeat(64),
+                        team: team.clone(),
+                        expires_at_unix_seconds: u64::MAX,
+                    },
+                    private_key: SigningPrivateKeyReference {
+                        reference: secret("RUSTFERRY_GOAL3_IOS_CERTIFICATE_P12"),
+                    },
+                },
+                password: Some(secret("RUSTFERRY_GOAL3_IOS_CERTIFICATE_PASSWORD")),
+            }),
+            team: Some(DevelopmentTeamPlan {
+                expected: team.clone(),
+            }),
+            device: Some(DevicePlan::new(raw_udid, None).expect("device")),
+            targets: request.signing.targets.clone(),
+            provisioning: vec![ProvisioningPlan {
+                target: "App".to_owned(),
+                profile: secret("RUSTFERRY_GOAL3_IOS_PROVISIONING_PROFILE"),
+                profile_type: ProvisioningProfileType::Development,
+            }],
+            entitlements: vec![EntitlementPlan {
+                target: "App".to_owned(),
+                required: EntitlementSet::new(BTreeMap::new()).expect("entitlements"),
+            }],
+            allow_provisioning_updates: false,
+        };
+        request
+            .requested_artifacts
+            .extend([IosArtifactType::Ipa, IosArtifactType::SigningReport]);
+        request
+    }
+
+    fn workflow_dispatch_event(request: &IosDeviceBuildRequest, dispatch_revision: &str) -> Value {
+        serde_json::json!({
+            "inputs": {
+                "operation_id": request.operation_id,
+                "request_sha256": canonical_request_sha256(request).expect("request digest"),
+                "source_revision": request.source_revision.as_deref().expect("source revision"),
+                "dispatch_revision": dispatch_revision
+            },
+            "workflow": TEST_WORKFLOW_PATH
+        })
+    }
+
     fn valid_dispatch_manifest() -> GithubDispatchManifest {
         GithubDispatchManifest {
             schema_version: GITHUB_DISPATCH_MANIFEST_SCHEMA_VERSION,
@@ -3390,6 +4210,84 @@ mod tests {
         assert!(decode_unique_value(br#"{"a":1,"a":2}"#).is_err());
         assert!(decode_unique_value(br#"{"a":1} null"#).is_err());
         assert!(decode_unique_value(br#"{"a":[true,null]}"#).is_ok());
+    }
+
+    #[test]
+    fn serve_requires_the_explicit_stdio_transport() {
+        assert!(Cli::try_parse_from(["ferry-worker-macos", "serve"]).is_err());
+        let cli = Cli::try_parse_from(["ferry-worker-macos", "serve", "--stdio"])
+            .expect("explicit stdio transport");
+        assert!(matches!(
+            cli.command,
+            WorkerCommand::Serve(ServeArgs { stdio: true, .. })
+        ));
+        let cli = Cli::try_parse_from(["ferry-worker-macos", "serve", "--stdio-session-v1"])
+            .expect("explicit snapshot session transport");
+        assert!(matches!(
+            cli.command,
+            WorkerCommand::Serve(ServeArgs {
+                stdio_session_v1: true,
+                ..
+            })
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "ferry-worker-macos",
+                "serve",
+                "--stdio",
+                "--stdio-session-v1",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn partial_open_stdio_request_hits_injected_deadline_and_reader_can_finish() {
+        struct PartialOpenReader {
+            prefix: io::Cursor<Vec<u8>>,
+            release: mpsc::Receiver<()>,
+            released: bool,
+        }
+
+        impl Read for PartialOpenReader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let read = self.prefix.read(buffer)?;
+                if read > 0 {
+                    return Ok(read);
+                }
+                if !self.released {
+                    self.release.recv().map_err(|_| {
+                        io::Error::new(io::ErrorKind::BrokenPipe, "test reader release closed")
+                    })?;
+                    self.released = true;
+                }
+                Ok(0)
+            }
+        }
+
+        let (release, wait_for_release) = mpsc::sync_channel(1);
+        let request_task = StdioRequestTask::spawn(move || {
+            let mut reader = PartialOpenReader {
+                prefix: io::Cursor::new(br#"{"schema_version":1,"request":{"#.to_vec()),
+                release: wait_for_release,
+                released: false,
+            };
+            decode_worker_stdio_request(&mut reader)
+        })
+        .expect("stdio reader task");
+
+        assert_eq!(
+            request_task.wait(Duration::ZERO),
+            Err(StdioRequestWaitError::DeadlineExceeded)
+        );
+        release.send(()).expect("release partial reader");
+        assert_eq!(
+            request_task
+                .wait(Duration::from_secs(1))
+                .expect("reader result after release"),
+            Err(WorkerStdioCodecError::TruncatedJson)
+        );
+        request_task.join().expect("reader task joined");
     }
 
     #[test]
@@ -3461,6 +4359,64 @@ unsafe_code = "deny"
         validate_github_dispatch_bindings(&decoded, valid_dispatch_bindings(&workflow_sha256))
             .expect("valid bindings");
         assert_eq!(decoded.request, manifest.request);
+    }
+
+    #[test]
+    fn static_target_graph_digest_rejects_every_crafted_graph_drift() {
+        let mut request = valid_github_request();
+        request
+            .product
+            .nested_bundles
+            .push(rustferry_remote::UnsignedNestedBundleExpectation {
+                relative_path: "Frameworks/RuntimeBridge.framework".to_owned(),
+                bundle_identifier: "com.example.app.runtime-bridge".to_owned(),
+                executable: "RuntimeBridge".to_owned(),
+                kind: rustferry_remote::UnsignedNestedBundleKind::Framework,
+            });
+        request.signing.targets.push(SigningTarget {
+            name: "RuntimeBridge".to_owned(),
+            bundle_identifier: BundleIdentifier::new("com.example.app.runtime-bridge")
+                .expect("framework bundle"),
+            kind: SigningTargetKind::Framework,
+        });
+        request.validate().expect("valid app and framework graph");
+        let expected = canonical_signing_target_graph_sha256(&request.signing.targets);
+        validate_expected_signing_target_graph(Some(&expected), &request)
+            .expect("exact static graph");
+        validate_expected_signing_target_graph(None, &request)
+            .expect("legacy workflow omits the graph digest");
+        assert_eq!(
+            validate_expected_signing_target_graph(Some(&expected.to_uppercase()), &request)
+                .expect_err("uppercase digest must fail")
+                .code,
+            "invalid_sha256"
+        );
+
+        let mut app_bundle_drift = request.clone();
+        app_bundle_drift.signing.targets[0].bundle_identifier =
+            BundleIdentifier::new("com.example.other").expect("forged app bundle");
+        let mut framework_bundle_drift = request.clone();
+        framework_bundle_drift.signing.targets[1].bundle_identifier =
+            BundleIdentifier::new("com.example.app.other-framework")
+                .expect("forged framework bundle");
+        let mut name_drift = request.clone();
+        name_drift.signing.targets[1].name = "OtherFramework".to_owned();
+        let mut omitted_target = request.clone();
+        omitted_target.signing.targets.pop();
+
+        for drifted in [
+            app_bundle_drift,
+            framework_bundle_drift,
+            name_drift,
+            omitted_target,
+        ] {
+            assert_eq!(
+                validate_expected_signing_target_graph(Some(&expected), &drifted)
+                    .expect_err("crafted target graph must fail")
+                    .code,
+                "signing_target_graph_mismatch"
+            );
+        }
     }
 
     #[test]
@@ -3558,55 +4514,176 @@ unsafe_code = "deny"
     }
 
     #[test]
-    fn workflow_dispatch_binds_only_the_device_udid_sha256() {
+    fn workflow_dispatch_binds_unsigned_signed_and_git_snapshot_requests() {
         const RAW_UDID: &str = "00008110-001234567890801E";
-        const UDID_SHA256: &str =
-            "4a5f50907ec074080957ea89dd35b48051f861d4e0db99a4ab391acd90fefc6d";
+        const DISPATCH_REVISION: &str = "fedcba9876543210fedcba9876543210fedcba98";
 
-        let mut request = valid_github_request();
-        request.signing.device =
-            Some(DevicePlan::new(RAW_UDID, None).expect("valid device identifier"));
-        let source_revision = request.source_revision.as_deref().expect("Git revision");
-        let event = serde_json::json!({
-            "inputs": {
-                "device_udid_sha256": UDID_SHA256,
-                "operation_id": request.operation_id.as_str(),
-                "project_path": request.source.project_path.as_str(),
-                "source_revision": source_revision
-            },
-            "workflow": TEST_WORKFLOW_PATH
-        });
-        validate_workflow_dispatch_event(
-            event.as_object().expect("event object"),
-            &request,
-            source_revision,
-            TEST_WORKFLOW_PATH,
-        )
-        .expect("hash-only workflow inputs should bind");
-        assert!(
-            !serde_json::to_string(&request)
-                .expect("request should serialize")
-                .contains(RAW_UDID)
+        let unsigned = valid_github_request();
+        let signed = valid_signed_github_request(RAW_UDID);
+        let mut git_snapshot = valid_github_request();
+        git_snapshot.source_mode = SourceMode::GitSnapshot;
+
+        for request in [&unsigned, &signed, &git_snapshot] {
+            let source_revision = request.source_revision.as_deref().expect("Git revision");
+            let event = workflow_dispatch_event(request, DISPATCH_REVISION);
+            validate_workflow_dispatch_event(
+                event.as_object().expect("event object"),
+                request,
+                source_revision,
+                DISPATCH_REVISION,
+                TEST_WORKFLOW_PATH,
+            )
+            .expect("exact public dispatch inputs bind the complete request");
+        }
+
+        let signed_event = workflow_dispatch_event(&signed, DISPATCH_REVISION);
+        let serialized_event = serde_json::to_string(&signed_event).expect("event serialization");
+        assert!(!serialized_event.contains(RAW_UDID));
+        assert_eq!(
+            signed_event["inputs"]
+                .as_object()
+                .expect("inputs")
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "dispatch_revision",
+                "operation_id",
+                "request_sha256",
+                "source_revision",
+            ])
         );
 
-        let raw_event = serde_json::json!({
-            "inputs": {
-                "device_udid": RAW_UDID,
-                "operation_id": request.operation_id.as_str(),
-                "project_path": request.source.project_path.as_str(),
-                "source_revision": source_revision
-            },
-            "workflow": TEST_WORKFLOW_PATH
-        });
+        let mut changed_device = signed.clone();
+        changed_device.signing.device =
+            Some(DevicePlan::from_sha256("b".repeat(64), None).expect("changed device"));
         let error = validate_workflow_dispatch_event(
-            raw_event.as_object().expect("event object"),
-            &request,
-            source_revision,
+            signed_event.as_object().expect("event object"),
+            &changed_device,
+            changed_device
+                .source_revision
+                .as_deref()
+                .expect("source revision"),
+            DISPATCH_REVISION,
             TEST_WORKFLOW_PATH,
         )
-        .expect_err("raw device input must be rejected");
-        assert!(!error.code.contains(RAW_UDID));
+        .expect_err("device binding inside the request hash must be immutable");
+        assert_eq!(error.code, "workflow_dispatch_mismatch");
         assert!(!error.message.contains(RAW_UDID));
+    }
+
+    #[test]
+    fn workflow_dispatch_rejects_missing_extra_and_mismatched_inputs() {
+        const DISPATCH_REVISION: &str = "fedcba9876543210fedcba9876543210fedcba98";
+        const RAW_DEVICE_INPUT: &str = "00008110-001234567890801E";
+        let request = valid_github_request();
+        let source_revision = request.source_revision.as_deref().expect("source revision");
+        let event = workflow_dispatch_event(&request, DISPATCH_REVISION);
+
+        let mut missing = event.clone();
+        missing["inputs"]
+            .as_object_mut()
+            .expect("inputs")
+            .remove("request_sha256");
+        let mut extra = event.clone();
+        extra["inputs"].as_object_mut().expect("inputs").insert(
+            "device_udid".to_owned(),
+            Value::String(RAW_DEVICE_INPUT.to_owned()),
+        );
+        for invalid in [&missing, &extra] {
+            let error = validate_workflow_dispatch_event(
+                invalid.as_object().expect("event object"),
+                &request,
+                source_revision,
+                DISPATCH_REVISION,
+                TEST_WORKFLOW_PATH,
+            )
+            .expect_err("non-exact input set must fail");
+            assert_eq!(error.code, "invalid_workflow_dispatch");
+            assert!(!error.message.contains(RAW_DEVICE_INPUT));
+        }
+
+        for name in [
+            "operation_id",
+            "request_sha256",
+            "source_revision",
+            "dispatch_revision",
+        ] {
+            let mut mismatch = event.clone();
+            mismatch["inputs"]
+                .as_object_mut()
+                .expect("inputs")
+                .insert(name.to_owned(), Value::String("mismatch".to_owned()));
+            let error = validate_workflow_dispatch_event(
+                mismatch.as_object().expect("event object"),
+                &request,
+                source_revision,
+                DISPATCH_REVISION,
+                TEST_WORKFLOW_PATH,
+            )
+            .expect_err("mismatched input must fail");
+            assert_eq!(error.code, "workflow_dispatch_mismatch");
+        }
+
+        let mut missing_workflow = event.clone();
+        missing_workflow
+            .as_object_mut()
+            .expect("event object")
+            .remove("workflow");
+        let error = validate_workflow_dispatch_event(
+            missing_workflow.as_object().expect("event object"),
+            &request,
+            source_revision,
+            DISPATCH_REVISION,
+            TEST_WORKFLOW_PATH,
+        )
+        .expect_err("workflow identity is required");
+        assert_eq!(error.code, "invalid_workflow_dispatch");
+
+        let mut wrong_workflow = event;
+        wrong_workflow["workflow"] = Value::String(".github/workflows/other.yml".to_owned());
+        let error = validate_workflow_dispatch_event(
+            wrong_workflow.as_object().expect("event object"),
+            &request,
+            source_revision,
+            DISPATCH_REVISION,
+            TEST_WORKFLOW_PATH,
+        )
+        .expect_err("workflow identity must be exact");
+        assert_eq!(error.code, "workflow_path_mismatch");
+    }
+
+    #[test]
+    fn github_event_name_classifies_exactly_and_push_rejects_dispatch_inputs() {
+        const DISPATCH_REVISION: &str = "fedcba9876543210fedcba9876543210fedcba98";
+
+        assert_eq!(
+            github_event_kind(Some("push")).expect("push event"),
+            GithubEventKind::Push
+        );
+        assert_eq!(
+            github_event_kind(Some("workflow_dispatch")).expect("dispatch event"),
+            GithubEventKind::WorkflowDispatch
+        );
+        for value in [None, Some(""), Some("schedule"), Some("Workflow_Dispatch")] {
+            let error = github_event_kind(value).expect_err("event name must be exact");
+            assert_eq!(error.code, "invalid_event_name");
+        }
+
+        let push = serde_json::json!({ "after": DISPATCH_REVISION });
+        validate_push_event(push.as_object().expect("push object"), DISPATCH_REVISION)
+            .expect("exact push event");
+
+        let push_with_inputs = serde_json::json!({
+            "after": DISPATCH_REVISION,
+            "inputs": {}
+        });
+        let error = validate_push_event(
+            push_with_inputs.as_object().expect("push object"),
+            DISPATCH_REVISION,
+        )
+        .expect_err("push event must not carry dispatch inputs");
+        assert_eq!(error.code, "invalid_push_event");
     }
 
     #[test]
@@ -3703,6 +4780,81 @@ unsafe_code = "deny"
     }
 
     #[test]
+    fn github_git_snapshot_descriptor_binds_every_request_field_except_commit_sha() {
+        let mut request = valid_github_request();
+        request.source_mode = SourceMode::GitSnapshot;
+        let descriptor = GitSnapshotDescriptor::from_request(
+            &request,
+            SourceBundleDescriptor::new(
+                SourceArchive {
+                    size: 1,
+                    sha256: "a".repeat(64),
+                },
+                request.source.clone(),
+            ),
+        )
+        .expect("snapshot descriptor");
+        descriptor
+            .validate_for_request(&request, git_snapshot_archive_limits())
+            .expect("final request binding");
+        validate_github_artifact_contract(&request).expect("Git snapshot source mode");
+
+        let mut another_revision = request.clone();
+        another_revision.source_revision = Some("f".repeat(40));
+        descriptor
+            .validate_for_request(&another_revision, git_snapshot_archive_limits())
+            .expect("commit SHA is deliberately outside the circular template");
+
+        let mut changed_product = request.clone();
+        changed_product.product_name = "Other App".to_owned();
+        assert!(
+            descriptor
+                .validate_for_request(&changed_product, git_snapshot_archive_limits())
+                .is_err()
+        );
+
+        let mut changed_repository = request;
+        changed_repository.source_repository = Some("https://github.com/example/other".to_owned());
+        assert!(
+            descriptor
+                .validate_for_request(&changed_repository, git_snapshot_archive_limits())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn git_snapshot_tree_requires_exact_regular_two_file_shape() {
+        let sha = "1".repeat(40);
+        let orphan = format!(
+            "tree {sha}\nauthor Ferry <ferry@example.invalid> 0 +0000\n\
+             committer Ferry <ferry@example.invalid> 0 +0000\n\nsource snapshot\n"
+        );
+        assert!(is_orphan_git_snapshot_commit(orphan.as_bytes()));
+        for invalid in [
+            format!("tree {sha}\nauthor Ferry <ferry@example.invalid> 0 +0000\n"),
+            orphan.replacen("tree ", "blob ", 1),
+            orphan.replacen("author ", &format!("parent {}\nauthor ", "2".repeat(40)), 1),
+        ] {
+            assert!(!is_orphan_git_snapshot_commit(invalid.as_bytes()));
+        }
+
+        let exact = format!(
+            "100644 blob {sha}\t{GIT_SNAPSHOT_DESCRIPTOR_PATH}\0\
+             100644 blob {sha}\t{GIT_SNAPSHOT_ARCHIVE_PATH}\0"
+        );
+        assert!(is_exact_git_snapshot_tree(exact.as_bytes()));
+
+        for invalid in [
+            exact.replace("100644", "120000"),
+            exact.replace(GIT_SNAPSHOT_ARCHIVE_PATH, ".rustferry/goal3/other.zip"),
+            format!("{exact}100644 blob {sha}\textra\0"),
+            exact.trim_end_matches('\0').to_owned(),
+        ] {
+            assert!(!is_exact_git_snapshot_tree(invalid.as_bytes()));
+        }
+    }
+
+    #[test]
     fn public_secret_reference_uses_a_narrow_allowlist() {
         assert!(
             validate_public_secret_reference_name("RUSTFERRY_GOAL3_IOS_CERTIFICATE_P12").is_ok()
@@ -3711,13 +4863,91 @@ unsafe_code = "deny"
         assert!(validate_public_secret_reference_name("CERT=value").is_err());
     }
 
+    fn test_signing_references(profile_names: &[&str]) -> SigningSecretReferences {
+        let reference = |name| {
+            SecretReference::new(SecretReferenceKind::GithubActions, name)
+                .expect("GitHub secret reference")
+        };
+        SigningSecretReferences {
+            certificate: reference("RUSTFERRY_GOAL3_IOS_CERTIFICATE_P12"),
+            password: reference("RUSTFERRY_GOAL3_IOS_CERTIFICATE_PASSWORD"),
+            profiles: profile_names.iter().map(|name| reference(name)).collect(),
+        }
+    }
+
+    fn signing_frame_v2(records: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut frame = SIGNING_SECRET_FRAME_V2_MAGIC.to_vec();
+        frame.extend_from_slice(
+            &u32::try_from(records.len())
+                .expect("record count")
+                .to_be_bytes(),
+        );
+        for (name, value) in records {
+            frame.extend_from_slice(
+                &u16::try_from(name.len())
+                    .expect("reference length")
+                    .to_be_bytes(),
+            );
+            frame.extend_from_slice(
+                &u32::try_from(value.len())
+                    .expect("value length")
+                    .to_be_bytes(),
+            );
+            frame.extend_from_slice(name.as_bytes());
+            frame.extend_from_slice(value);
+        }
+        frame
+    }
+
+    fn assert_signing_frame_error(
+        mut frame: Vec<u8>,
+        references: &SigningSecretReferences,
+        maximum_blob: usize,
+        maximum_password: usize,
+        maximum_decoded: usize,
+        code: &str,
+    ) {
+        let error = parse_signing_secret_frame_in_place(
+            &mut frame,
+            references,
+            maximum_blob,
+            maximum_password,
+            maximum_decoded,
+        )
+        .err()
+        .expect("secret frame must fail");
+        assert_eq!(error.code, code);
+        assert!(frame.iter().all(|byte| *byte == 0));
+    }
+
     #[test]
-    fn signing_stdin_requires_exact_bounded_canonical_fields() {
-        let input = parse_signing_secret_frame(b"AQI=\0\0AwQ=".to_vec(), 8, 8, 8)
-            .expect("canonical secret frame");
-        assert_eq!(input.certificate_p12.expose_secret_bytes(), &[1, 2]);
-        assert!(input.certificate_password.is_empty());
-        assert_eq!(input.provisioning_profile.expose_secret_bytes(), &[3, 4]);
+    fn signing_stdin_preserves_legacy_single_profile_and_wipes_input() {
+        let references = test_signing_references(&["RUSTFERRY_GOAL3_IOS_PROVISIONING_PROFILE"]);
+        let mut frame = b"AQI=\0\0AwQ=".to_vec();
+        let mut resolver = parse_signing_secret_frame_in_place(&mut frame, &references, 8, 8, 8)
+            .expect("canonical legacy secret frame");
+        assert!(frame.iter().all(|byte| *byte == 0));
+        assert_eq!(
+            resolver
+                .resolve(&references.certificate)
+                .expect("certificate")
+                .expose_secret_bytes(),
+            &[1, 2]
+        );
+        assert!(
+            resolver
+                .resolve(&references.password)
+                .expect("password")
+                .is_empty()
+        );
+        assert_eq!(
+            resolver
+                .resolve(&references.profiles[0])
+                .expect("profile")
+                .expose_secret_bytes(),
+            &[3, 4]
+        );
+        assert!(resolver.is_empty());
 
         for malformed in [
             b"AQI=\0password".as_slice(),
@@ -3725,53 +4955,379 @@ unsafe_code = "deny"
             b"AQI=\n\0password\0AwQ=".as_slice(),
             b"\0password\0AwQ=".as_slice(),
         ] {
-            assert!(parse_signing_secret_frame(malformed.to_vec(), 16, 16, 16).is_err());
+            let mut frame = malformed.to_vec();
+            assert!(
+                parse_signing_secret_frame_in_place(&mut frame, &references, 16, 16, 16,).is_err()
+            );
+            assert!(frame.iter().all(|byte| *byte == 0));
         }
-        assert!(parse_signing_secret_frame(b"AQID\0password\0AwQ=".to_vec(), 3, 16, 16).is_err());
-        assert!(parse_signing_secret_frame(b"AQI=\0password\0AwQ=".to_vec(), 16, 4, 16).is_err());
-        assert!(parse_signing_secret_frame(b"AQI=\0password\0AwQ=".to_vec(), 16, 16, 1).is_err());
+        let multi = test_signing_references(&[
+            "RUSTFERRY_GOAL3_IOS_PROVISIONING_PROFILE",
+            "RUSTFERRY_GOAL3_IOS_PROFILE_00112233445566778899AABBCCDDEEFF",
+        ]);
+        let mut legacy = b"AQI=\0password\0AwQ=".to_vec();
+        assert_eq!(
+            parse_signing_secret_frame_in_place(&mut legacy, &multi, 16, 16, 16)
+                .err()
+                .expect("legacy multi-profile frame must fail")
+                .code,
+            "legacy_signing_frame_requires_single_profile"
+        );
+        assert!(legacy.iter().all(|byte| *byte == 0));
     }
 
     #[test]
-    fn stdin_resolver_binds_roles_to_exact_request_references_once() {
-        let reference = |name| {
-            SecretReference::new(SecretReferenceKind::GithubActions, name)
-                .expect("GitHub secret reference")
-        };
-        let certificate = reference("RUSTFERRY_GOAL3_IOS_CERTIFICATE_P12");
-        let password = reference("RUSTFERRY_GOAL3_IOS_CERTIFICATE_PASSWORD");
-        let profile = reference("RUSTFERRY_GOAL3_IOS_PROVISIONING_PROFILE");
-        let input = parse_signing_secret_frame(b"AQI=\0password\0AwQ=".to_vec(), 16, 16, 16)
-            .expect("canonical secret frame");
-        let mut resolver = StdinSecretResolver::new(
-            [certificate.clone(), password.clone(), profile.clone()],
-            input,
-        )
-        .expect("stdin resolver");
+    fn v2_stdin_is_named_exact_bounded_and_one_shot() {
+        let references = test_signing_references(&[
+            "RUSTFERRY_GOAL3_IOS_PROVISIONING_PROFILE",
+            "RUSTFERRY_GOAL3_IOS_PROFILE_00112233445566778899AABBCCDDEEFF",
+        ]);
+        let records = [
+            (references.profiles[1].name(), b"BQY=".as_slice()),
+            (references.password.name(), b"password".as_slice()),
+            (references.certificate.name(), b"AQI=".as_slice()),
+            (references.profiles[0].name(), b"AwQ=".as_slice()),
+        ];
+        let mut frame = signing_frame_v2(&records);
+        let mut resolver = parse_signing_secret_frame_in_place(&mut frame, &references, 16, 16, 16)
+            .expect("canonical v2 secret frame");
+        assert!(frame.iter().all(|byte| *byte == 0));
 
         assert_eq!(
             resolver
-                .resolve(&profile)
-                .expect("profile")
+                .resolve(&references.profiles[1])
+                .expect("extension profile")
                 .expose_secret_bytes(),
-            &[3, 4]
+            &[5, 6]
         );
         assert_eq!(
             resolver
-                .resolve(&certificate)
+                .resolve(&references.certificate)
                 .expect("certificate")
                 .expose_secret_bytes(),
             &[1, 2]
         );
         assert_eq!(
             resolver
-                .resolve(&password)
+                .resolve(&references.password)
                 .expect("password")
                 .expose_secret_bytes(),
             b"password"
         );
-        assert!(resolver.resolve(&password).is_err());
+        assert!(resolver.resolve(&references.password).is_err());
+        assert_eq!(resolver.secrets.len(), 1);
+        resolver
+            .resolve(&references.profiles[0])
+            .expect("application profile");
         assert!(resolver.is_empty());
+    }
+
+    #[test]
+    fn signing_stdin_reader_keeps_one_fixed_allocation_and_rejects_probe_byte() {
+        struct ChunkedReader {
+            bytes: Vec<u8>,
+            position: usize,
+            chunk_size: usize,
+        }
+
+        impl Read for ChunkedReader {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                let available = self.bytes.len().saturating_sub(self.position);
+                let length = available.min(output.len()).min(self.chunk_size);
+                output[..length]
+                    .copy_from_slice(&self.bytes[self.position..self.position + length]);
+                self.position += length;
+                Ok(length)
+            }
+        }
+
+        let mut exact = ChunkedReader {
+            bytes: vec![0x5a; MAX_SIGNING_STDIN_BYTES],
+            position: 0,
+            chunk_size: 7_919,
+        };
+        let frame = read_bounded_signing_secret_stdin(&mut exact).expect("maximum bounded frame");
+        assert_eq!(frame.len(), MAX_SIGNING_STDIN_BYTES);
+        assert!(frame.capacity() > MAX_SIGNING_STDIN_BYTES);
+        assert_eq!(exact.position, MAX_SIGNING_STDIN_BYTES);
+
+        let mut oversized = ChunkedReader {
+            bytes: vec![0x5a; MAX_SIGNING_STDIN_BYTES + 1],
+            position: 0,
+            chunk_size: 4_093,
+        };
+        let error = read_bounded_signing_secret_stdin(&mut oversized)
+            .expect_err("probe byte must reject the frame");
+        assert_eq!(error.code, "invalid_signing_stdin");
+        assert_eq!(oversized.position, MAX_SIGNING_STDIN_BYTES + 1);
+    }
+
+    #[test]
+    fn v2_stdin_rejects_duplicate_unknown_missing_truncated_and_trailing_records() {
+        let references = test_signing_references(&[
+            "RUSTFERRY_GOAL3_IOS_PROVISIONING_PROFILE",
+            "RUSTFERRY_GOAL3_IOS_PROFILE_00112233445566778899AABBCCDDEEFF",
+        ]);
+        let valid = [
+            (references.certificate.name(), b"AQI=".as_slice()),
+            (references.password.name(), b"password".as_slice()),
+            (references.profiles[0].name(), b"AwQ=".as_slice()),
+            (references.profiles[1].name(), b"BQY=".as_slice()),
+        ];
+
+        let mut duplicate = signing_frame_v2(&[valid[0], valid[1], valid[2], valid[2]]);
+        assert_eq!(
+            parse_signing_secret_frame_in_place(&mut duplicate, &references, 16, 16, 16)
+                .err()
+                .expect("duplicate")
+                .code,
+            "duplicate_signing_secret_record"
+        );
+        assert!(duplicate.iter().all(|byte| *byte == 0));
+
+        let mut unknown = signing_frame_v2(&[
+            valid[0],
+            valid[1],
+            valid[2],
+            ("RUSTFERRY_GOAL3_IOS_PROFILE_UNKNOWN", b"BQY="),
+        ]);
+        assert_eq!(
+            parse_signing_secret_frame_in_place(&mut unknown, &references, 64, 16, 16)
+                .err()
+                .expect("unknown")
+                .code,
+            "unknown_signing_secret_record"
+        );
+        assert!(unknown.iter().all(|byte| *byte == 0));
+
+        let mut missing = signing_frame_v2(&valid[..3]);
+        assert_eq!(
+            parse_signing_secret_frame_in_place(&mut missing, &references, 16, 16, 16)
+                .err()
+                .expect("missing")
+                .code,
+            "signing_secret_count_mismatch"
+        );
+        assert!(missing.iter().all(|byte| *byte == 0));
+
+        let mut truncated = signing_frame_v2(&valid);
+        truncated.pop();
+        assert_eq!(
+            parse_signing_secret_frame_in_place(&mut truncated, &references, 16, 16, 16)
+                .err()
+                .expect("truncated")
+                .code,
+            "invalid_signing_stdin"
+        );
+        assert!(truncated.iter().all(|byte| *byte == 0));
+
+        let mut trailing = signing_frame_v2(&valid);
+        trailing.push(0);
+        assert_eq!(
+            parse_signing_secret_frame_in_place(&mut trailing, &references, 16, 16, 16)
+                .err()
+                .expect("trailing")
+                .code,
+            "trailing_signing_secret_frame_bytes"
+        );
+        assert!(trailing.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn v2_stdin_rejects_versions_noncanonical_values_and_every_boundary() {
+        let references = test_signing_references(&["RUSTFERRY_GOAL3_IOS_PROVISIONING_PROFILE"]);
+        let valid = [
+            (references.certificate.name(), b"AQI=".as_slice()),
+            (references.password.name(), b"password".as_slice()),
+            (references.profiles[0].name(), b"AwQ=".as_slice()),
+        ];
+
+        let mut wrong_version = signing_frame_v2(&valid);
+        wrong_version[..8].copy_from_slice(b"RFSIGNV3");
+        assert_signing_frame_error(
+            wrong_version,
+            &references,
+            16,
+            16,
+            16,
+            "unsupported_signing_secret_frame_version",
+        );
+
+        for invalid_blob in [b"AB==".as_slice(), b"AQI=\n".as_slice(), b"raw".as_slice()] {
+            assert_signing_frame_error(
+                signing_frame_v2(&[
+                    (references.certificate.name(), invalid_blob),
+                    valid[1],
+                    valid[2],
+                ]),
+                &references,
+                16,
+                16,
+                16,
+                "invalid_signing_stdin",
+            );
+        }
+
+        for invalid_password in [b"secret\0".as_slice(), b"secret\n".as_slice(), &[0xff]] {
+            assert_signing_frame_error(
+                signing_frame_v2(&[
+                    valid[0],
+                    (references.password.name(), invalid_password),
+                    valid[2],
+                ]),
+                &references,
+                16,
+                16,
+                16,
+                "invalid_signing_password",
+            );
+        }
+
+        assert_signing_frame_error(
+            signing_frame_v2(&[
+                (references.certificate.name(), b"AQIDBA=="),
+                valid[1],
+                valid[2],
+            ]),
+            &references,
+            4,
+            16,
+            16,
+            "invalid_signing_stdin",
+        );
+        assert_signing_frame_error(
+            signing_frame_v2(&[valid[0], (references.password.name(), b"12345"), valid[2]]),
+            &references,
+            16,
+            4,
+            16,
+            "invalid_signing_password",
+        );
+
+        let mut excessive_count = SIGNING_SECRET_FRAME_V2_MAGIC.to_vec();
+        excessive_count.extend_from_slice(
+            &u32::try_from(MAX_SIGNING_SECRET_RECORDS + 1)
+                .expect("count")
+                .to_be_bytes(),
+        );
+        assert_signing_frame_error(
+            excessive_count,
+            &references,
+            16,
+            16,
+            16,
+            "signing_secret_count_mismatch",
+        );
+
+        let mut name_overflow = SIGNING_SECRET_FRAME_V2_MAGIC.to_vec();
+        name_overflow.extend_from_slice(&3_u32.to_be_bytes());
+        name_overflow.extend_from_slice(&129_u16.to_be_bytes());
+        name_overflow.extend_from_slice(&1_u32.to_be_bytes());
+        assert_signing_frame_error(
+            name_overflow,
+            &references,
+            16,
+            16,
+            16,
+            "invalid_signing_stdin",
+        );
+
+        let mut value_overflow = SIGNING_SECRET_FRAME_V2_MAGIC.to_vec();
+        value_overflow.extend_from_slice(&3_u32.to_be_bytes());
+        value_overflow.extend_from_slice(&1_u16.to_be_bytes());
+        value_overflow.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert_signing_frame_error(
+            value_overflow,
+            &references,
+            16,
+            16,
+            16,
+            "invalid_signing_stdin",
+        );
+
+        let mut truncated_header = SIGNING_SECRET_FRAME_V2_MAGIC.to_vec();
+        truncated_header.extend_from_slice(&3_u32.to_be_bytes());
+        truncated_header.push(0);
+        assert_signing_frame_error(
+            truncated_header,
+            &references,
+            16,
+            16,
+            16,
+            "invalid_signing_stdin",
+        );
+    }
+
+    #[test]
+    fn published_signing_output_requires_and_hashes_the_sanitized_log() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let directory = canonical_temporary_root(&temporary).join("published");
+        create_private_directory(&directory).expect("published directory");
+        let record = |artifact_id: &str,
+                      kind: ArtifactKind,
+                      file_name: &str,
+                      bytes: &[u8],
+                      media_type: &str| ArtifactRecord {
+            artifact_id: artifact_id.to_owned(),
+            kind,
+            file_name: file_name.to_owned(),
+            size: u64::try_from(bytes.len()).expect("artifact size"),
+            sha256: sha256_bytes(bytes),
+            media_type: Some(media_type.to_owned()),
+        };
+        let ipa = record(
+            "iphone-ipa",
+            ArtifactKind::Ipa,
+            IPA_NAME,
+            b"ipa",
+            "application/octet-stream",
+        );
+        let signing = record(
+            "signing-report",
+            ArtifactKind::SigningReport,
+            SIGNING_REPORT_NAME,
+            b"signing",
+            "application/json",
+        );
+        let validation = record(
+            "validation-report",
+            ArtifactKind::ValidationReport,
+            VALIDATION_REPORT_NAME,
+            b"validation",
+            "application/json",
+        );
+        let sanitized_log = record(
+            "sanitized-build-log",
+            ArtifactKind::SanitizedLog,
+            SANITIZED_BUILD_LOG_NAME,
+            PROTECTED_SIGNING_SANITIZED_LOG_V1,
+            "text/plain; charset=utf-8",
+        );
+        let mut manifest = rustferry_remote::ArtifactManifest::new("operation-1", "job-1");
+        manifest.artifacts = vec![
+            ipa.clone(),
+            signing.clone(),
+            validation.clone(),
+            sanitized_log.clone(),
+        ];
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest).expect("artifact manifest");
+        for (name, bytes) in [
+            (IPA_NAME, b"ipa".as_slice()),
+            (SIGNING_REPORT_NAME, b"signing".as_slice()),
+            (VALIDATION_REPORT_NAME, b"validation".as_slice()),
+            (SANITIZED_BUILD_LOG_NAME, PROTECTED_SIGNING_SANITIZED_LOG_V1),
+            (ARTIFACT_MANIFEST_NAME, manifest_bytes.as_slice()),
+        ] {
+            fs::write(directory.join(name), bytes).expect("artifact output");
+        }
+
+        verify_published_signing_output(&directory, &manifest).expect("complete signing output");
+
+        fs::write(directory.join(SANITIZED_BUILD_LOG_NAME), b"tampered\n").expect("tampered log");
+        let error = verify_published_signing_output(&directory, &manifest)
+            .expect_err("tampered log must fail");
+        assert_eq!(error.code, "artifact_hash_mismatch");
     }
 
     #[test]
@@ -3796,6 +5352,25 @@ unsafe_code = "deny"
             select_trusted_worker_root(Some(root.clone()), None).expect("runner root"),
             root
         );
+    }
+
+    #[test]
+    fn stdio_control_and_snapshot_sessions_select_the_same_trusted_root() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let root = canonical_temporary_root(&temporary).join("worker");
+        create_private_directory(&root).expect("private worker root");
+
+        let snapshot =
+            select_trusted_worker_root(None, Some(root.clone())).expect("snapshot worker root");
+        let control = select_command_worker_root(None, None, Some(root.clone()))
+            .expect("control worker root");
+        assert_eq!(control, snapshot);
+
+        let missing = select_command_worker_root(None, None, None).expect_err("missing root");
+        assert_eq!(missing.code, "missing_worker_root");
+        let ambiguous = select_command_worker_root(None, Some(root.clone()), Some(root.clone()))
+            .expect_err("ambiguous root");
+        assert_eq!(ambiguous.code, "ambiguous_worker_root");
     }
 
     #[test]

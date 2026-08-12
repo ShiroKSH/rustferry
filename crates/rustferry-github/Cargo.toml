@@ -20,7 +20,9 @@ include = [
 
 [dependencies]
 camino.workspace = true
+goblin.workspace = true
 hex.workspace = true
+log = { workspace = true, optional = true }
 rustferry-core = { version = "=0.1.0", path = "../rustferry-core" }
 rustferry-remote = { version = "=0.1.0", path = "../rustferry-remote" }
 same-file.workspace = true
@@ -30,7 +32,20 @@ serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 unicode-normalization.workspace = true
+ureq = { workspace = true, optional = true }
 zip.workspace = true
+
+[features]
+default = []
+# ureq exposes signed request paths and Location at TRACE. Opting into the
+# production adapter deliberately caps the process-wide log facade at DEBUG.
+secure-job-log-http = ["dep:log", "dep:ureq", "log/max_level_debug"]
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [lints]
 workspace = true

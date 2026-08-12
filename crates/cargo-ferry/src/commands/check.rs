@@ -113,7 +113,7 @@ pub(crate) fn check_project_structured(
                 stage: "Rust project validation",
                 status: output.status.code(),
                 stderr: diagnostic(&output, &diagnostics),
-                log: Some(log),
+                log: Some(Box::new(log)),
                 help: format!(
                     "Fix the first Rust compiler error, then run `cargo ferry check` in {root}. The project was not removed."
                 ),
