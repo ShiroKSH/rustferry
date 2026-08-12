@@ -26,6 +26,8 @@ use std::os::windows::io::AsHandle as _;
 
 use camino::{Utf8Path, Utf8PathBuf};
 #[cfg(windows)]
+use rustferry_core::regular_file_identity_from_file;
+#[cfg(windows)]
 use rustferry_core::windows_private_directory::{
     PrivateDirectoryCleanupStatus, PrivateDirectoryError, PrivateDirectoryErrorKind,
     PrivateFileLinkState, create_private_directory as create_windows_private_directory,
@@ -43,9 +45,7 @@ use rustferry_core::windows_private_directory::{
     verify_private_file_handle as verify_windows_private_file_handle,
     verify_private_file_handle_in_state as verify_windows_private_file_handle_in_state,
 };
-use rustferry_core::{
-    DirectoryIdentityError, RegularFileFilesystemIdentity, regular_file_identity_from_file,
-};
+use rustferry_core::{DirectoryIdentityError, RegularFileFilesystemIdentity};
 use rustferry_remote::{
     ARTIFACT_MANIFEST_SCHEMA_VERSION, AppleToolchainEvidence, ArtifactDownloadRequest,
     ArtifactDownloadResult, ArtifactKind, ArtifactManifest, ArtifactRecord,

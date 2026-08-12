@@ -1849,11 +1849,11 @@ mod unix {
                         .iter()
                         .any(|argument| argument == "credential.helper=")
                 );
-                assert!(
+                assert_eq!(
                     spec.arguments()
                         .iter()
-                        .any(|argument| argument == "http.proxy=")
-                        == (network == GitNetworkPolicy::HttpsWithCredentialManager)
+                        .any(|argument| argument == "http.proxy="),
+                    network == GitNetworkPolicy::HttpsWithCredentialManager
                 );
             }
         }
