@@ -25,7 +25,7 @@ use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt 
 use std::os::windows::io::AsHandle as _;
 
 use camino::{Utf8Path, Utf8PathBuf};
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 use rustferry_core::regular_file_identity_from_file;
 #[cfg(windows)]
 use rustferry_core::windows_private_directory::{
