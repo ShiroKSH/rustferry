@@ -10377,10 +10377,7 @@ mod tests {
             .to_owned();
         let run_name = format!(
             "rustferry-v1|{}|{}|{}|{}",
-            resume.operation_id,
-            resume.request_sha256,
-            resume.source_revision,
-            dispatch_revision
+            resume.operation_id, resume.request_sha256, resume.source_revision, dispatch_revision
         );
         let body = format!(
             "{{\"ref\":\"{branch}\",\"inputs\":{{\"operation_id\":\"{}\",\"request_sha256\":\"{}\",\"source_revision\":\"{}\",\"dispatch_revision\":\"{dispatch_revision}\"}}}}",

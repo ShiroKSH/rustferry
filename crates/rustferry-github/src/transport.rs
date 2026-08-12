@@ -3004,15 +3004,12 @@ impl<R: GhRunner> GithubTransport<R> {
             let output = self.runner.execute(&request)?;
             let repositories = parse_installation_repositories(&output)?;
             let page_length = repositories.len();
-            if let Some(candidate) = repositories
-                .iter()
-                .find(|candidate| {
-                    candidate
-                        .repository
-                        .full_name()
-                        .eq_ignore_ascii_case(&repository.full_name())
-                })
-            {
+            if let Some(candidate) = repositories.iter().find(|candidate| {
+                candidate
+                    .repository
+                    .full_name()
+                    .eq_ignore_ascii_case(&repository.full_name())
+            }) {
                 return Ok(candidate.id);
             }
             if page_length < usize::from(self.limits.per_page) {
@@ -4689,7 +4686,9 @@ mod tests {
             let second = chunk.get(1).copied().unwrap_or(0);
             let third = chunk.get(2).copied().unwrap_or(0);
             encoded.push(char::from(ALPHABET[usize::from(first >> 2)]));
-            encoded.push(char::from(ALPHABET[usize::from((first & 0x03) << 4 | second >> 4)]));
+            encoded.push(char::from(
+                ALPHABET[usize::from((first & 0x03) << 4 | second >> 4)],
+            ));
             encoded.push(if chunk.len() > 1 {
                 char::from(ALPHABET[usize::from((second & 0x0f) << 2 | third >> 6)])
             } else {

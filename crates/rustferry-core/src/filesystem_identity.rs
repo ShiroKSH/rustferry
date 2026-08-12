@@ -1653,9 +1653,7 @@ mod tests {
             RetainedDirectoryIdentity::open(&missing)
                 .unwrap_err()
                 .kind(),
-            DirectoryIdentityErrorKind::OperatingSystem(
-                DirectoryIdentityOperation::OpenDirectory
-            )
+            DirectoryIdentityErrorKind::OperatingSystem(DirectoryIdentityOperation::OpenDirectory)
         );
     }
 

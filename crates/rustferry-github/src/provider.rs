@@ -435,9 +435,7 @@ impl GithubPrincipalIdentityV1 {
                     "resume_repository_credential_repository_mismatch",
                 ))
             }
-            AuthenticatedPrincipal::RepositoryCredential { .. } => {
-                Ok(Self::RepositoryCredential)
-            }
+            AuthenticatedPrincipal::RepositoryCredential { .. } => Ok(Self::RepositoryCredential),
         }
     }
 }
@@ -3443,8 +3441,7 @@ impl<R: GitRunner> GitTemporaryRefPublisher<R> {
             ])
             .map_err(|_| TemporaryRefPublishError::WorkflowFingerprintMismatch)?;
         if workflow.len() > MAX_DISPATCH_FILE_BYTES
-            || WorkflowFingerprint::for_workflow_bytes(&workflow)
-                != *request.workflow_fingerprint
+            || WorkflowFingerprint::for_workflow_bytes(&workflow) != *request.workflow_fingerprint
         {
             return Err(TemporaryRefPublishError::WorkflowFingerprintMismatch);
         }
@@ -5608,8 +5605,10 @@ impl GithubJobResumeV1 {
     pub fn validate_trigger_binding(&self) -> RemoteBuildResult<()> {
         let Some(dispatch) = self.workflow_dispatch.as_deref() else {
             if self.run.as_ref().is_some_and(|run| {
-                matches!(self.principal, GithubPrincipalIdentityV1::RepositoryCredential)
-                    || run.event != GithubRunEventV1::Push
+                matches!(
+                    self.principal,
+                    GithubPrincipalIdentityV1::RepositoryCredential
+                ) || run.event != GithubRunEventV1::Push
             }) {
                 return Err(resume_failure("resume_run_trigger_mismatch"));
             }
@@ -5671,8 +5670,7 @@ impl GithubJobResumeV1 {
                 .map_err(|_| resume_failure("resume_dispatch_commit_invalid"))?,
         )
         .map_err(|_| resume_failure("resume_workflow_dispatch_identity_invalid"))?;
-        if request.body_sha256() != dispatch.body_sha256
-            || request.run_name() != dispatch.run_name
+        if request.body_sha256() != dispatch.body_sha256 || request.run_name() != dispatch.run_name
         {
             return Err(resume_failure("resume_workflow_dispatch_body_mismatch"));
         }
@@ -6239,19 +6237,18 @@ impl GithubJobResumeV1 {
                 || snapshot.phase == GithubGitSnapshotPhaseV1::SourceAbsent
                     && snapshot.source_publication_attempts >= 3
         });
-        let snapshot_cancel_cleanup_proven =
-            self.git_snapshot.as_ref().is_some_and(|snapshot| {
-                snapshot.phase == GithubGitSnapshotPhaseV1::StageDeleted
-                    && snapshot.source_publication_attempts == 0
-                    || snapshot.phase == GithubGitSnapshotPhaseV1::SourcePublishIntent
-                        && snapshot.source_publication_started_at_ms == 0
-                    || matches!(
-                        snapshot.phase,
-                        GithubGitSnapshotPhaseV1::SourceAbsent
-                            | GithubGitSnapshotPhaseV1::SourceConflict
-                            | GithubGitSnapshotPhaseV1::SourceDeleted
-                    )
-            });
+        let snapshot_cancel_cleanup_proven = self.git_snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.phase == GithubGitSnapshotPhaseV1::StageDeleted
+                && snapshot.source_publication_attempts == 0
+                || snapshot.phase == GithubGitSnapshotPhaseV1::SourcePublishIntent
+                    && snapshot.source_publication_started_at_ms == 0
+                || matches!(
+                    snapshot.phase,
+                    GithubGitSnapshotPhaseV1::SourceAbsent
+                        | GithubGitSnapshotPhaseV1::SourceConflict
+                        | GithubGitSnapshotPhaseV1::SourceDeleted
+                )
+        });
         let snapshot_source_cleanup_proven = self.git_snapshot.as_ref().is_none_or(|snapshot| {
             matches!(
                 snapshot.phase,
@@ -7622,7 +7619,8 @@ where
     where
         R: GhRunner,
     {
-        self.current_public_snapshot_source_identity(record).map(drop)
+        self.current_public_snapshot_source_identity(record)
+            .map(drop)
     }
 
     fn acquire_snapshot_source_lease(
@@ -7835,8 +7833,7 @@ where
                         .ok_or_else(|| resume_failure("resume_git_snapshot_binding_missing"))?;
                     if matches!(
                         phase,
-                        GithubGitSnapshotPhaseV1::Prepared
-                            | GithubGitSnapshotPhaseV1::SourceExact
+                        GithubGitSnapshotPhaseV1::Prepared | GithubGitSnapshotPhaseV1::SourceExact
                     ) {
                         self.verify_execution_workflow_default()?;
                     }
@@ -8219,14 +8216,10 @@ where
                         self.release_snapshot_source_lease(record)?;
                         return Ok(());
                     }
-                    if self.config.workflow.run_trigger()
-                        == WorkflowRunTrigger::WorkflowDispatch
-                    {
+                    if self.config.workflow.run_trigger() == WorkflowRunTrigger::WorkflowDispatch {
                         drop(state);
-                        return self.publish_git_snapshot_dispatch_workflow_dispatch(
-                            job_id,
-                            cancellation,
-                        );
+                        return self
+                            .publish_git_snapshot_dispatch_workflow_dispatch(job_id, cancellation);
                     }
                     let result = self.publish_git_snapshot_dispatch(record, cancellation);
                     if !record.publication_intent {
@@ -8376,8 +8369,7 @@ where
             record.publication_quiescence_deadline_ms =
                 publication_quiescence_deadline(record.publication_started_at_ms, 0);
             working.publication_started_at_ms = record.publication_started_at_ms;
-            working.publication_quiescence_deadline_ms =
-                record.publication_quiescence_deadline_ms;
+            working.publication_quiescence_deadline_ms = record.publication_quiescence_deadline_ms;
             self.checkpoint_record(record)
         })();
         if let Err(error) = boundary_result {
@@ -8900,10 +8892,7 @@ where
                 .as_ref()
                 .ok_or_else(|| resume_failure("workflow_dispatch_intent_lost"))?;
             let current = dispatch.request_for_record(&self.config, record)?;
-            if current != request
-                || dispatch.receipt.is_some()
-                || record.run.is_some()
-            {
+            if current != request || dispatch.receipt.is_some() || record.run.is_some() {
                 return Err(provider_failure(
                     "workflow_dispatch_post_forbidden",
                     "Workflow dispatch no longer permits a first POST",
@@ -9116,10 +9105,8 @@ where
                 .is_some()
         };
         if intent_exists {
-            return self.reconcile_workflow_dispatch_with_cancellation_checkpoint(
-                job_id,
-                cancellation,
-            );
+            return self
+                .reconcile_workflow_dispatch_with_cancellation_checkpoint(job_id, cancellation);
         }
         let mut client = self.prepare_workflow_dispatch_client()?;
         self.start_workflow_dispatch_with_client(job_id, &mut *client, cancellation)
@@ -9769,13 +9756,14 @@ where
             );
             manifest.validate_for(&self.config)?;
             let manifest_bytes = manifest.encode()?;
-            let expected_prepared_commit = working.prepared_dispatch_commit.as_ref().ok_or_else(|| {
-                provider_failure(
-                    "publication_reconciliation_unavailable",
-                    "Durable publication does not contain an exact prepared commit",
-                    true,
-                )
-            })?;
+            let expected_prepared_commit =
+                working.prepared_dispatch_commit.as_ref().ok_or_else(|| {
+                    provider_failure(
+                        "publication_reconciliation_unavailable",
+                        "Durable publication does not contain an exact prepared commit",
+                        true,
+                    )
+                })?;
             self.lock_publisher()?
                 .reconcile_temporary_ref(&TemporaryRefReconcileRequest {
                     repository: &self.config.repository,
@@ -9841,7 +9829,9 @@ where
                 || record.publication_uncertain != working.publication_uncertain
                 || record.workflow_dispatch != working.workflow_dispatch
             {
-                return Err(resume_failure("workflow_dispatch_publication_identity_changed"));
+                return Err(resume_failure(
+                    "workflow_dispatch_publication_identity_changed",
+                ));
             }
             if recovered {
                 record.dispatch_commit = Some(expected_prepared_commit);
@@ -10337,8 +10327,7 @@ where
                 .jobs
                 .get(job_id)
                 .ok_or_else(|| job_not_found(job_id))?;
-            if record.workflow_dispatch.is_none()
-                || record.state.is_terminal() && !include_terminal
+            if record.workflow_dispatch.is_none() || record.state.is_terminal() && !include_terminal
             {
                 return Ok(None);
             }
@@ -10392,10 +10381,7 @@ where
         R: GhRunner,
     {
         match snapshot.status() {
-            RunStatus::Requested
-            | RunStatus::Queued
-            | RunStatus::Pending
-            | RunStatus::Waiting => {}
+            RunStatus::Requested | RunStatus::Queued | RunStatus::Pending | RunStatus::Waiting => {}
             RunStatus::InProgress => {
                 if record.state == JobState::Queued {
                     transition_record(record, JobState::Running)?;
@@ -10452,8 +10438,7 @@ where
             }
         }
 
-        let Some(mut snapshot) =
-            self.observe_workflow_dispatch_run(job_id, false, cancellation)?
+        let Some(mut snapshot) = self.observe_workflow_dispatch_run(job_id, false, cancellation)?
         else {
             return Ok(());
         };
@@ -10485,9 +10470,10 @@ where
                         .jobs
                         .get(job_id)
                         .ok_or_else(|| job_not_found(job_id))?;
-                    let handle = record.run.clone().ok_or_else(|| {
-                        resume_failure("workflow_dispatch_run_mapping_missing")
-                    })?;
+                    let handle = record
+                        .run
+                        .clone()
+                        .ok_or_else(|| resume_failure("workflow_dispatch_run_mapping_missing"))?;
                     (handle, record.run_snapshot.clone())
                 };
                 let checked = self
@@ -10502,9 +10488,7 @@ where
                         .jobs
                         .get_mut(job_id)
                         .ok_or_else(|| job_not_found(job_id))?;
-                    if record.workflow_dispatch.is_none()
-                        || record.run.as_ref() != Some(&handle)
-                    {
+                    if record.workflow_dispatch.is_none() || record.run.as_ref() != Some(&handle) {
                         return Err(resume_failure("workflow_dispatch_run_identity_changed"));
                     }
                     Self::validate_record_identity(record, &identity)?;
@@ -10537,9 +10521,7 @@ where
                 self.apply_workflow_dispatch_snapshot(record, &checked)?;
                 self.checkpoint_record(record)
             })();
-            self.lock_state()?
-                .cancellation_reservations
-                .remove(job_id);
+            self.lock_state()?.cancellation_reservations.remove(job_id);
             cancellation_result?;
         } else {
             let mut state = self.lock_state()?;
@@ -10584,11 +10566,8 @@ where
         R: GhRunner,
     {
         if self.config.workflow.run_trigger() == WorkflowRunTrigger::WorkflowDispatch {
-            let synchronization = self.sync_job_with_cancel_policy_inner(
-                job_id,
-                cancellation,
-                allow_cancel_dispatch,
-            );
+            let synchronization =
+                self.sync_job_with_cancel_policy_inner(job_id, cancellation, allow_cancel_dispatch);
             self.checkpoint_workflow_dispatch_cancellation(job_id, cancellation)?;
             return synchronization;
         }
@@ -11098,9 +11077,7 @@ where
             validate_provider_identifier("operation_id", &request.operation_id)?;
 
             let mut checks = Vec::new();
-            let authenticated = self
-                .lock_transport()?
-                .authenticate(&self.config.repository);
+            let authenticated = self.lock_transport()?.authenticate(&self.config.repository);
             cancellation.check()?;
 
             let execution_info = match self.lock_transport()?.repository(&self.config.repository) {
@@ -12135,11 +12112,7 @@ where
                     self.checkpoint_record(record)?;
                     accepted
                 };
-                self.sync_job_with_cancel_policy(
-                    &request.job_id,
-                    &CancellationToken::new(),
-                    true,
-                )?;
+                self.sync_job_with_cancel_policy(&request.job_id, &CancellationToken::new(), true)?;
                 let state = self.lock_state()?;
                 let record = state
                     .jobs
@@ -14228,7 +14201,9 @@ mod tests {
             let second = chunk.get(1).copied().unwrap_or(0);
             let third = chunk.get(2).copied().unwrap_or(0);
             encoded.push(char::from(ALPHABET[usize::from(first >> 2)]));
-            encoded.push(char::from(ALPHABET[usize::from((first & 0x03) << 4 | second >> 4)]));
+            encoded.push(char::from(
+                ALPHABET[usize::from((first & 0x03) << 4 | second >> 4)],
+            ));
             encoded.push(if chunk.len() > 1 {
                 char::from(ALPHABET[usize::from((second & 0x0f) << 2 | third >> 6)])
             } else {
@@ -15747,10 +15722,7 @@ mod tests {
         }
 
         fn with_blocking_result(
-            response: Result<
-                GithubWorkflowDispatchHttpResponse,
-                GithubWorkflowDispatchHttpError,
-            >,
+            response: Result<GithubWorkflowDispatchHttpResponse, GithubWorkflowDispatchHttpError>,
         ) -> (Self, Arc<FakeWorkflowDispatchPostGate>) {
             let gate = Arc::new(FakeWorkflowDispatchPostGate::default());
             let state = FakeWorkflowDispatchState {
@@ -15827,11 +15799,7 @@ mod tests {
             self
         }
 
-        fn cancelling_before(
-            mut self,
-            invocation: u64,
-            cancellation: CancellationToken,
-        ) -> Self {
+        fn cancelling_before(mut self, invocation: u64, cancellation: CancellationToken) -> Self {
             self.cancel_before_invocation = Some((invocation, cancellation));
             self
         }
@@ -17538,15 +17506,17 @@ mod tests {
         let cancellation = CancellationToken::new();
 
         thread::scope(|scope| {
-            let submitted = scope.spawn(|| {
-                poll_ready(provider.submit(unsigned_request(), cancellation.clone()))
-            });
+            let submitted = scope
+                .spawn(|| poll_ready(provider.submit(unsigned_request(), cancellation.clone())));
             gate.wait_until_entered();
             assert!(provider.state.try_lock().is_ok());
             assert!(provider.transport.try_lock().is_ok());
             cancellation.cancel();
             gate.release();
-            let handle = submitted.join().expect("dispatch submit thread").expect("submit");
+            let handle = submitted
+                .join()
+                .expect("dispatch submit thread")
+                .expect("submit");
             assert_eq!(handle.state, JobState::Cancelling);
         });
 
@@ -17555,7 +17525,10 @@ mod tests {
         let record = state.jobs.get("operation-1").expect("dispatch record");
         assert!(record.cancellation_requested);
         assert!(record.cancellation_dispatched);
-        assert_eq!(record.run.as_ref().map(RunHandle::id), Some(RunId::new(73).expect("run")));
+        assert_eq!(
+            record.run.as_ref().map(RunHandle::id),
+            Some(RunId::new(73).expect("run"))
+        );
     }
 
     #[test]
@@ -17625,9 +17598,8 @@ mod tests {
         .with_checkpoint_sink(sink);
         let cancellation = CancellationToken::new();
         thread::scope(|scope| {
-            let submitted = scope.spawn(|| {
-                poll_ready(provider.submit(unsigned_request(), cancellation.clone()))
-            });
+            let submitted = scope
+                .spawn(|| poll_ready(provider.submit(unsigned_request(), cancellation.clone())));
             gate.wait_until_entered();
             cancellation.cancel();
             gate.release();
@@ -17644,9 +17616,12 @@ mod tests {
             .expect("cancelled dispatch intent");
         assert!(resume.cancellation_requested);
         assert!(resume.run.is_none());
-        assert!(resume.workflow_dispatch.as_ref().is_some_and(|dispatch| {
-            dispatch.uncertain && dispatch.receipt.is_none()
-        }));
+        assert!(
+            resume
+                .workflow_dispatch
+                .as_ref()
+                .is_some_and(|dispatch| { dispatch.uncertain && dispatch.receipt.is_none() })
+        );
 
         let restarted = GithubBuildProvider::with_artifact_store_and_clock(
             workflow_dispatch_provider_config(all_authorized()),
@@ -17669,7 +17644,10 @@ mod tests {
         )
         .with_checkpoint_sink(CapturingCheckpointSink::default());
         restarted
-            .restore_job_resumes_offline(vec![resume.clone()], &durable_identity_for_resume(&resume))
+            .restore_job_resumes_offline(
+                vec![resume.clone()],
+                &durable_identity_for_resume(&resume),
+            )
             .expect("restore cancelled dispatch intent");
         restarted
             .reconcile_restored_job("operation-1", &CancellationToken::new())
@@ -17860,10 +17838,8 @@ mod tests {
         let failing = GithubBuildProvider::with_artifact_store_and_clock(
             workflow_dispatch_provider_config(all_authorized()),
             transport(
-                FakeGhRunner::with([Err(GhExecutionError::CommandFailed {
-                    exit_code: Some(1),
-                })])
-                .cancelling_before(1, cancellation.clone()),
+                FakeGhRunner::with([Err(GhExecutionError::CommandFailed { exit_code: Some(1) })])
+                    .cancelling_before(1, cancellation.clone()),
             ),
             FakePublisher::default(),
             NoVerifiedArtifactStore,
@@ -17931,10 +17907,8 @@ mod tests {
         let failing = GithubBuildProvider::with_artifact_store_and_clock(
             workflow_dispatch_provider_config(all_authorized()),
             transport(
-                FakeGhRunner::with([Err(GhExecutionError::CommandFailed {
-                    exit_code: Some(1),
-                })])
-                .cancelling_before(1, cancellation.clone()),
+                FakeGhRunner::with([Err(GhExecutionError::CommandFailed { exit_code: Some(1) })])
+                    .cancelling_before(1, cancellation.clone()),
             ),
             FakePublisher::default(),
             NoVerifiedArtifactStore,
@@ -20451,10 +20425,8 @@ mod tests {
     #[test]
     fn get_only_exact_ref_recovery_never_creates_dispatch_intent_or_posts() {
         let resume = durable_workflow_dispatch_pre_intent_resume();
-        let runner = FakeGhRunner::with([
-            Ok(authenticated_user_row()),
-            Ok(private_repository_row()),
-        ]);
+        let runner =
+            FakeGhRunner::with([Ok(authenticated_user_row()), Ok(private_repository_row())]);
         let requests = Arc::clone(&runner.requests);
         let plan = FakeWorkflowDispatchPlan::with_response(workflow_dispatch_receipt_response(73));
         let sink = CapturingCheckpointSink::default();
@@ -20469,8 +20441,7 @@ mod tests {
                             workflow_dispatch_provider_config(all_authorized())
                                 .workflow
                                 .temporary_branch_namespace(),
-                            BranchName::new("rustferry/goal3/builds/operation-1")
-                                .expect("branch"),
+                            BranchName::new("rustferry/goal3/builds/operation-1").expect("branch"),
                         )
                         .expect("temporary ref"),
                         CommitSha::new(DISPATCH_SHA).expect("dispatch commit"),
@@ -20498,7 +20469,13 @@ mod tests {
                 if code == "workflow_dispatch_mutation_required"
         ));
         assert_eq!(plan.0.clients_created.load(Ordering::SeqCst), 0);
-        assert!(plan.0.requests.lock().expect("dispatch requests").is_empty());
+        assert!(
+            plan.0
+                .requests
+                .lock()
+                .expect("dispatch requests")
+                .is_empty()
+        );
         assert!(
             requests
                 .lock()
@@ -20544,8 +20521,7 @@ mod tests {
                             workflow_dispatch_provider_config(all_authorized())
                                 .workflow
                                 .temporary_branch_namespace(),
-                            BranchName::new("rustferry/goal3/builds/operation-1")
-                                .expect("branch"),
+                            BranchName::new("rustferry/goal3/builds/operation-1").expect("branch"),
                         )
                         .expect("temporary ref"),
                         CommitSha::new(DISPATCH_SHA).expect("dispatch commit"),
@@ -20571,7 +20547,13 @@ mod tests {
             GithubJobReconciliation::NotStarted
         );
         assert_eq!(plan.0.clients_created.load(Ordering::SeqCst), 0);
-        assert!(plan.0.requests.lock().expect("dispatch requests").is_empty());
+        assert!(
+            plan.0
+                .requests
+                .lock()
+                .expect("dispatch requests")
+                .is_empty()
+        );
         let publisher = provider.publisher.lock().expect("publisher");
         assert!(publisher.published.is_empty());
         assert!(publisher.reconciliation.is_some());
@@ -22578,8 +22560,7 @@ mod tests {
         .expect("doctor report");
         assert!(!report.ready);
         assert!(report.checks.iter().any(|check| {
-            check.code == "github.authentication"
-                && check.status == ProviderCheckStatus::Error
+            check.code == "github.authentication" && check.status == ProviderCheckStatus::Error
         }));
     }
 
@@ -22609,8 +22590,7 @@ mod tests {
         ))
         .expect("doctor report");
         assert!(report.checks.iter().any(|check| {
-            check.code == "github.authentication"
-                && check.status == ProviderCheckStatus::Ready
+            check.code == "github.authentication" && check.status == ProviderCheckStatus::Ready
         }));
         assert!(report.checks.iter().any(|check| {
             check.code == "github.workflow_dispatch_default_workflow"

@@ -2261,8 +2261,7 @@ impl GithubRetryChildSession {
             &self.record.local_job_id,
             &provider_job_id,
             self.provider.workflow_run_trigger(),
-        )
-        {
+        ) {
             persist_submit_uncertain(&self.store, &self.record.local_job_id)?;
             return Err(error);
         }

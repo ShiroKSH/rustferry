@@ -1589,10 +1589,7 @@ mod tests {
             r"C:\work\classes"
         );
         assert_eq!(
-            java_tool_path_arg(Utf8Path::new(
-                r"\\?\UNC\server\share\work\App.java"
-            ))
-            .unwrap(),
+            java_tool_path_arg(Utf8Path::new(r"\\?\UNC\server\share\work\App.java")).unwrap(),
             r"\\server\share\work\App.java"
         );
         assert_eq!(
@@ -1661,10 +1658,23 @@ mod tests {
         )
         .unwrap();
 
-        assert!(command.args.iter().all(|argument| !argument.contains(r"\\?\")));
-        assert!(command.args.contains(&r"C:\Android\platforms\android-36\android.jar".to_owned()));
+        assert!(
+            command
+                .args
+                .iter()
+                .all(|argument| !argument.contains(r"\\?\"))
+        );
+        assert!(
+            command
+                .args
+                .contains(&r"C:\Android\platforms\android-36\android.jar".to_owned())
+        );
         assert!(command.args.contains(&r"C:\work\classes".to_owned()));
-        assert!(command.args.contains(&r"C:\work\generated\FerryActivity.java".to_owned()));
+        assert!(
+            command
+                .args
+                .contains(&r"C:\work\generated\FerryActivity.java".to_owned())
+        );
     }
 
     #[cfg(windows)]
@@ -1683,12 +1693,20 @@ mod tests {
         let command = d8_command(
             &toolchain,
             &request,
-            &[r"\\?\C:\work\classes".into(), r"\\?\C:\work\dependency.jar".into()],
+            &[
+                r"\\?\C:\work\classes".into(),
+                r"\\?\C:\work\dependency.jar".into(),
+            ],
             Utf8Path::new(r"\\?\C:\work\dex"),
         )
         .unwrap();
 
-        assert!(command.args.iter().all(|argument| !argument.contains(r"\\?\")));
+        assert!(
+            command
+                .args
+                .iter()
+                .all(|argument| !argument.contains(r"\\?\"))
+        );
         for expected in [
             r"C:\Android\platforms\android-36\android.jar",
             r"C:\work\classes",

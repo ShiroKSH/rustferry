@@ -7765,9 +7765,10 @@ fn require_bound_provider_job(
 ) -> Result<(), CliError> {
     let latest = store.latest(local_job_id)?;
     if latest.provider_job_id.as_deref() != Some(provider_job_id)
-        || latest.provider_resume.as_ref().is_none_or(|resume| {
-            !provider_resume_is_bound(resume, provider_job_id, run_trigger)
-        })
+        || latest
+            .provider_resume
+            .as_ref()
+            .is_none_or(|resume| !provider_resume_is_bound(resume, provider_job_id, run_trigger))
     {
         return Err(remote_error(
             "provider_checkpoint_missing",
@@ -7821,11 +7822,13 @@ fn submit_publication_evidence(
         && resume.validate_trigger_binding().is_ok()
         && match run_trigger {
             WorkflowRunTrigger::Push => resume.workflow_dispatch.is_none(),
-            WorkflowRunTrigger::WorkflowDispatch => resume
-                .workflow_dispatch
-                .as_ref()
-                .is_some_and(|dispatch| dispatch.receipt.is_some())
-                && resume.run.is_some(),
+            WorkflowRunTrigger::WorkflowDispatch => {
+                resume
+                    .workflow_dispatch
+                    .as_ref()
+                    .is_some_and(|dispatch| dispatch.receipt.is_some())
+                    && resume.run.is_some()
+            }
         }
     {
         return SubmitPublicationEvidence::Mapped;
@@ -12502,11 +12505,11 @@ mod tests {
         provider_config_lock_for_signing, provider_resume_is_bound, read_private_config_snapshot,
         reconcile_artifact_path_publication, remote_error, replace_private_config,
         required_build_features_for_source, required_signing_secret_names, retry_artifact_listing,
-        safe_ide_readiness_code, select_requested_artifacts, signing_config_commit_uncertain,
-        signing_readiness_from_report, signing_workflow_phase_policy, snapshot_initial_job,
-        sha256_bytes, snapshot_request_template, source_manifest_digest,
-        submit_publication_evidence,
-        unsigned_signing_plan, update_stored_job, validate_and_promote_durable_success,
+        safe_ide_readiness_code, select_requested_artifacts, sha256_bytes,
+        signing_config_commit_uncertain, signing_readiness_from_report,
+        signing_workflow_phase_policy, snapshot_initial_job, snapshot_request_template,
+        source_manifest_digest, submit_publication_evidence, unsigned_signing_plan,
+        update_stored_job, validate_and_promote_durable_success,
         validate_and_promote_durable_success_with_hook, validate_existing_snapshot_owner,
         validate_git_remote_name, validate_manual_assets_match_plan, validate_stored_config,
         workflow_from_stored, write_create_only,
@@ -12535,13 +12538,13 @@ mod tests {
         GithubPrincipalIdentityV1, GithubRunConclusionV1, GithubRunEventV1, GithubRunIdentityV1,
         GithubRunStatusV1, GithubWorkflowDispatchReceiptV1, GithubWorkflowDispatchResumeV1,
     };
-    use rustferry_github::workflow::WorkflowRunTrigger;
     use rustferry_github::snapshot::{
         GIT_SNAPSHOT_GRAPH_SCHEMA_VERSION, GitSha1ObjectId, GitSnapshotObjectGraphV1,
     };
     use rustferry_github::transport::{
         EnvironmentSecretWriteRequest, GhExecutionError, Repository, TransportError,
     };
+    use rustferry_github::workflow::WorkflowRunTrigger;
     use rustferry_github::{ProtectedEnvironment, SigningSecretNames};
     use rustferry_remote::{
         ArtifactKind, ArtifactManifest, ArtifactRecord, BuildProfile, BundleIdentifier,
@@ -14148,11 +14151,7 @@ mod tests {
             WorkflowRunTrigger::Push,
         ));
         assert_eq!(
-            submit_publication_evidence(
-                &dispatch_mapped,
-                &job_id,
-                WorkflowRunTrigger::Push,
-            ),
+            submit_publication_evidence(&dispatch_mapped, &job_id, WorkflowRunTrigger::Push,),
             SubmitPublicationEvidence::Pending
         );
 
@@ -14180,11 +14179,7 @@ mod tests {
         );
 
         assert_eq!(
-            submit_publication_evidence(
-                &resume,
-                "different-job",
-                WorkflowRunTrigger::Push,
-            ),
+            submit_publication_evidence(&resume, "different-job", WorkflowRunTrigger::Push,),
             SubmitPublicationEvidence::Pending
         );
     }

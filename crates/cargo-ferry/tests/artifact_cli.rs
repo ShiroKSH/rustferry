@@ -175,10 +175,7 @@ fn unsafe_artifact_links_share_one_cli_exit_class() {
     }
 
     for command in ["inspect", "verify"] {
-        let output = run(
-            &config,
-            &["--json", "artifact", command, linked.as_str()],
-        );
+        let output = run(&config, &["--json", "artifact", command, linked.as_str()]);
         assert_eq!(output.status.code(), Some(4), "{command}");
         assert_eq!(
             parse_json(&output.stdout)["error"]["code"],
