@@ -939,14 +939,16 @@ fn scan_archive(
         if !header_starts.insert(entry.header_start()) {
             return Err(GithubArtifactError::LinkedOrSpecialEntry);
         }
-        let data_end = entry
+        let data_start = entry
             .data_start()
+            .ok_or(GithubArtifactError::InvalidArchive)?;
+        let data_end = data_start
             .checked_add(entry.compressed_size())
             .ok_or(GithubArtifactError::InvalidArchive)?;
         if data_end > archive_size {
             return Err(GithubArtifactError::InvalidArchive);
         }
-        compressed_ranges.push((entry.data_start(), data_end));
+        compressed_ranges.push((data_start, data_end));
         expanded_size = expanded_size
             .checked_add(entry.size())
             .ok_or(GithubArtifactError::ExpandedArchiveTooLarge)?;
@@ -1784,14 +1786,16 @@ fn inspect_signed_tree_zip(
         if !header_starts.insert(entry.header_start()) {
             return Err(GithubArtifactError::InvalidProductArchive(artifact));
         }
-        let data_end = entry
+        let data_start = entry
             .data_start()
+            .ok_or(GithubArtifactError::InvalidProductArchive(artifact))?;
+        let data_end = data_start
             .checked_add(entry.compressed_size())
             .ok_or(GithubArtifactError::InvalidProductArchive(artifact))?;
         if data_end > archive_size {
             return Err(GithubArtifactError::InvalidProductArchive(artifact));
         }
-        compressed_ranges.push((entry.data_start(), data_end));
+        compressed_ranges.push((data_start, data_end));
         if let (Some(wrapper_root), Some(wrapper_prefix)) =
             (wrapper_root, wrapper_prefix.as_deref())
         {
