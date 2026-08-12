@@ -97,14 +97,6 @@
       "version": "1.0.2"
     },
     {
-      "checksum": "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1",
-      "license": "MIT OR Apache-2.0",
-      "name": "arbitrary",
-      "repository": "https://github.com/rust-fuzz/arbitrary/",
-      "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "version": "1.4.2"
-    },
-    {
       "checksum": "2aa3a22042e45de04255c7bf3626e239f450200fd0493c1e382263544b20aea6",
       "license": "MIT OR Apache-2.0",
       "name": "assert_cmd",
@@ -511,14 +503,6 @@
       "repository": "https://github.com/jhpratt/deranged",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "version": "0.5.8"
-    },
-    {
-      "checksum": "1e567bd82dcff979e4b03460c307b3cdc9e96fde3d73bed1496d2bc75d9dd62a",
-      "license": "MIT OR Apache-2.0",
-      "name": "derive_arbitrary",
-      "repository": "https://github.com/rust-fuzz/arbitrary",
-      "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "version": "1.4.2"
     },
     {
       "checksum": "6184e33543162437515c2e2b48714794e37845ec9851711914eec9d308f6ebe8",
@@ -2129,12 +2113,12 @@
       "version": "0.9.0"
     },
     {
-      "checksum": "dea7109cdcd5864d4eeb1b58a1648dc9bf520360d7af16ec26d0a9354bafcfc0",
+      "checksum": "972d7902c8735f2695410b8aed7df6ed12a47394aa1c8d7af49f0497b731a94d",
       "license": "MIT OR Apache-2.0",
       "name": "ureq",
       "repository": "https://github.com/algesten/ureq",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "version": "3.3.0"
+      "version": "3.4.0"
     },
     {
       "checksum": "da5f78b09e6941e1a0f2e30e695e4b120377b54d5e0aec11b594bb57b3971613",
@@ -2607,14 +2591,6 @@
       "repository": "https://github.com/unicode-org/icu4x",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "version": "0.11.3"
-    },
-    {
-      "checksum": "eb2a05c7c36fde6c09b08576c9f7fb4cda705990f73b58fe011abf7dfb24168b",
-      "license": "MIT",
-      "name": "zip",
-      "repository": "https://github.com/zip-rs/zip2.git",
-      "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "version": "6.0.0"
     },
     {
       "checksum": "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b",
