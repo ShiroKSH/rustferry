@@ -269,14 +269,70 @@ jobs:
           fi
           test -s "$project/Cargo.toml" ||
             fail_phase "starter_files" "generated Cargo.toml is missing"
-          test -s "$project/Cargo.lock" ||
-            fail_phase "starter_files" "generated Cargo.lock is missing"
           test -s "$project/ferry.toml" ||
             fail_phase "starter_files" "generated ferry.toml is missing"
           test -d "$project/src" ||
             fail_phase "starter_files" "generated src directory is missing"
           test -d "$project/assets" ||
             fail_phase "starter_files" "generated assets directory is missing"
+          lock_stderr_raw="$RUNNER_TEMP/android-lock.raw.stderr"
+          lock_stderr_sanitized="$RUNNER_TEMP/android-lock.stderr"
+          set +e
+          cargo generate-lockfile \
+            --manifest-path "$project/Cargo.toml" \
+            2> "$lock_stderr_raw"
+          lock_status=$?
+          set -e
+          python3 - \
+            "$lock_stderr_raw" \
+            "$lock_stderr_sanitized" <<'PY'
+          from pathlib import Path
+          import os
+          import sys
+
+          source_stderr, output_stderr = map(Path, sys.argv[1:])
+
+          replacements = []
+          for name in (
+              "GITHUB_WORKSPACE",
+              "RUNNER_TEMP",
+              "HOME",
+              "ANDROID_SDK_ROOT",
+              "ANDROID_NDK",
+          ):
+              value = os.environ.get(name)
+              if value:
+                  replacements.append((value, f"${name}"))
+
+          replacements.sort(key=lambda item: len(item[0]), reverse=True)
+          value = source_stderr.read_text(
+              encoding="utf-8",
+              errors="replace",
+          ) if source_stderr.exists() else ""
+          for original, replacement in replacements:
+              value = value.replace(original, replacement)
+          output_stderr.write_text(value[:65536], encoding="utf-8")
+          PY
+          if test "$lock_status" -ne 0; then
+            echo \
+              "::error title=Android starter lockfile failure::cargo generate-lockfile exited with status $lock_status" \
+              >&2
+            if test -s "$lock_stderr_sanitized"; then
+              echo "Sanitized cargo stderr:" >&2
+              sed -n '1,200p' "$lock_stderr_sanitized" >&2
+            fi
+            fail_phase \
+              "starter_lockfile" \
+              "Cargo could not generate the starter lockfile"
+          fi
+          test -s "$project/Cargo.lock" ||
+            fail_phase \
+              "starter_lockfile" \
+              "cargo generate-lockfile succeeded without creating Cargo.lock"
+          test -f "$project/Cargo.lock" ||
+            fail_phase \
+              "starter_lockfile" \
+              "generated Cargo.lock is not a regular file"
           project_metadata="$RUNNER_TEMP/project-metadata.json"
           if ! cargo metadata \
             --locked \
