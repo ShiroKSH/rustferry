@@ -3460,7 +3460,18 @@ mod platform {
             );
             assert_eq!(fs::read(&marker).expect("target survives"), b"preserve");
 
-            fs::remove_file(&linked).expect("remove directory symlink");
+            fs::remove_dir(&linked).expect("remove directory symlink");
+            assert_eq!(
+                fs::symlink_metadata(&linked)
+                    .expect_err("directory symlink is absent")
+                    .kind(),
+                std::io::ErrorKind::NotFound
+            );
+            assert!(target.is_dir());
+            assert_eq!(
+                fs::read(&marker).expect("target survives link cleanup"),
+                b"preserve"
+            );
             fs::remove_dir(&root).expect("remove root");
         }
 
