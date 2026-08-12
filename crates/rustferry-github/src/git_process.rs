@@ -997,17 +997,17 @@ mod windows {
                         .iter()
                         .any(|argument| argument == "credential.helper=")
                 );
-                assert!(
+                assert_eq!(
                     spec.arguments()
                         .iter()
-                        .any(|argument| argument == "http.proxy=")
-                        == (network == GitNetworkPolicy::HttpsWithCredentialManager)
+                        .any(|argument| argument == "http.proxy="),
+                    network == GitNetworkPolicy::HttpsWithCredentialManager
                 );
-                assert!(
+                assert_eq!(
                     spec.arguments()
                         .iter()
-                        .any(|argument| argument == "credential.helper=manager")
-                        == (network == GitNetworkPolicy::HttpsWithCredentialManager)
+                        .any(|argument| argument == "credential.helper=manager"),
+                    network == GitNetworkPolicy::HttpsWithCredentialManager
                 );
             }
         }

@@ -1413,7 +1413,7 @@ pub struct ExecutionWorkflowDoctorRequest<'a> {
     pub default_branch_ref: &'a TrustedSourceRef,
     /// Repository-relative approved workflow path.
     pub workflow_path: &'a str,
-    /// Approved WorkflowDispatch workflow SHA-256.
+    /// Approved `WorkflowDispatch` workflow SHA-256.
     pub workflow_fingerprint: &'a WorkflowFingerprint,
 }
 
@@ -5600,8 +5600,9 @@ impl GithubJobResumeV1 {
     ///
     /// # Errors
     ///
-    /// Rejects a forged or incomplete WorkflowDispatch intent, receipt, correlation title, run
+    /// Rejects a forged or incomplete `WorkflowDispatch` intent, receipt, correlation title, run
     /// identity, or a legacy Push record carrying repository-scoped identity.
+    #[allow(clippy::too_many_lines)]
     pub fn validate_trigger_binding(&self) -> RemoteBuildResult<()> {
         let Some(dispatch) = self.workflow_dispatch.as_deref() else {
             if self.run.as_ref().is_some_and(|run| {
@@ -5685,9 +5686,8 @@ impl GithubJobResumeV1 {
             return Err(resume_failure("resume_workflow_dispatch_receipt_mismatch"));
         }
         match (&dispatch.receipt, &self.run) {
-            (None, None) => Ok(()),
             (None, Some(_)) => Err(resume_failure("resume_workflow_dispatch_receipt_missing")),
-            (Some(_), None) => Ok(()),
+            (None | Some(_), None) => Ok(()),
             (Some(receipt), Some(run))
                 if receipt.run_id == run.run_id
                     && receipt.workflow_id == dispatch.workflow_id
@@ -8329,7 +8329,9 @@ where
                 return Err(resume_failure("snapshot_dispatch_identity_changed"));
             }
             Self::validate_record_identity(record, &initial_identity)?;
-            record.prepared_dispatch_commit = working.prepared_dispatch_commit.clone();
+            record
+                .prepared_dispatch_commit
+                .clone_from(&working.prepared_dispatch_commit);
             record.publication_started_at_ms = 0;
             record.publication_quiescence_deadline_ms = u64::MAX;
             record.publication_intent = true;
@@ -9135,11 +9137,11 @@ where
             .jobs
             .get_mut(job_id)
             .ok_or_else(|| job_not_found(job_id))?;
-        if cancellation.is_cancelled()
-            && !record.cancellation_requested
-            && !record.state.is_terminal()
+        if (record.publication_intent || record.git_snapshot.is_none())
             && !record.state.is_build_terminal()
-            && !(record.git_snapshot.is_some() && !record.publication_intent)
+            && !record.state.is_terminal()
+            && !record.cancellation_requested
+            && cancellation.is_cancelled()
         {
             record.cancellation_requested = true;
             if record.state != JobState::Cancelling {
@@ -10400,6 +10402,7 @@ where
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn sync_workflow_dispatch_job_with_cancel_policy(
         &self,
         job_id: &str,
@@ -11195,7 +11198,7 @@ where
                 (Err(error), _) => ProviderCheck {
                     code: "github.authentication".to_owned(),
                     status: ProviderCheckStatus::Error,
-                    message: transport_public_message(error.clone()),
+                    message: transport_public_message(*error),
                     help: Some("Authenticate the configured GitHub transport and retry".to_owned()),
                 },
             };
@@ -12070,6 +12073,7 @@ where
         Box::pin(async move { result })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn cancel(
         &self,
         request: CancellationRequest,
