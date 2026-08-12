@@ -1510,11 +1510,20 @@ pub fn write_source_bundle_descriptor_file(
 ///
 /// Returns an error for changed source, unsafe output, exceeded bounds, ZIP
 /// failure, or inability to publish without clobbering.
-#[allow(clippy::too_many_lines)]
 pub fn create_source_bundle_archive(
     plan: &SourceBundlePlan,
     output: &Utf8Path,
     limits: SourceArchiveLimits,
+) -> Result<SourceArchive, SourceError> {
+    create_source_bundle_archive_with_temporary_hook(plan, output, limits, || {})
+}
+
+#[allow(clippy::too_many_lines)]
+fn create_source_bundle_archive_with_temporary_hook(
+    plan: &SourceBundlePlan,
+    output: &Utf8Path,
+    limits: SourceArchiveLimits,
+    temporary_created: impl FnOnce(),
 ) -> Result<SourceArchive, SourceError> {
     validate_archive_limits(limits)?;
     validate_source_manifest(&plan.manifest, limits.source)?;
@@ -1524,6 +1533,7 @@ pub fn create_source_bundle_archive(
     verify_source_bundle_plan(plan)?;
 
     let temporary = create_archive_temporary(output)?;
+    temporary_created();
     let cleanup_parent = match temporary.parent.try_clone() {
         Ok(parent) => parent,
         Err(source) => {
@@ -4999,6 +5009,64 @@ fn has_unexpected_directory(directories: &[String], expected: &SourceManifest) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_parent_swap_never_publishes_into_replacement_directory() {
+        use std::{sync::mpsc, thread};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = Utf8PathBuf::from_path_buf(temporary.path().join("workspace")).unwrap();
+        let project = workspace.join("app");
+        fs::create_dir_all(project.join("src")).unwrap();
+        fs::write(workspace.join("Cargo.toml"), b"[workspace]\n").unwrap();
+        fs::write(workspace.join("Cargo.lock"), b"").unwrap();
+        fs::write(project.join("Cargo.toml"), b"[package]\nname = \"app\"\n").unwrap();
+        fs::write(project.join("src/lib.rs"), b"pub fn value() -> u8 { 1 }\n").unwrap();
+        let request = SourceBundleRequest::new(workspace.clone(), project);
+        let plan = plan_source_bundle(&request).unwrap();
+        let root = workspace.parent().unwrap();
+        let output_parent = root.join("publish-parent");
+        let moved_parent = root.join("publish-parent-owned");
+        fs::create_dir(&output_parent).unwrap();
+        let output = output_parent.join("source.zip");
+
+        let output_for_creator = output.clone();
+        let (created_sender, created_receiver) = mpsc::sync_channel(0);
+        let (continue_sender, continue_receiver) = mpsc::sync_channel(0);
+        let creator = thread::spawn(move || {
+            create_source_bundle_archive_with_temporary_hook(
+                &plan,
+                &output_for_creator,
+                SourceArchiveLimits::default(),
+                || {
+                    created_sender.send(()).unwrap();
+                    continue_receiver.recv().unwrap();
+                },
+            )
+        });
+
+        created_receiver.recv().unwrap();
+        fs::rename(&output_parent, &moved_parent).unwrap();
+        fs::create_dir(&output_parent).unwrap();
+        fs::write(output_parent.join("sentinel"), b"unchanged").unwrap();
+        continue_sender.send(()).unwrap();
+        let result = creator.join().unwrap();
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(output_parent.join("sentinel")).unwrap(),
+            b"unchanged"
+        );
+        assert!(!output.exists());
+        assert!(fs::read_dir(&moved_parent).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".source.zip.rustferry-partial-")
+        }));
+    }
 
     #[cfg(unix)]
     #[test]
