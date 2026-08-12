@@ -1739,38 +1739,36 @@ fn archive_parent_swap_never_publishes_into_replacement_directory() {
     fs::create_dir(&output_parent).unwrap();
     let output = output_parent.join("source.zip");
 
-    let watched_parent = output_parent.clone();
-    let replacement_parent = output_parent.clone();
-    let moved_parent_for_attacker = moved_parent.clone();
+    let output_for_creator = output.clone();
     let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
-    let attacker = thread::spawn(move || {
-        ready_sender.send(()).unwrap();
-        let deadline = Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let partial_exists = fs::read_dir(&watched_parent).unwrap().any(|entry| {
-                entry
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".source.zip.rustferry-partial-")
-            });
-            if partial_exists {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "archive creation did not expose its private temporary file"
-            );
-            thread::yield_now();
-        }
-        fs::rename(&watched_parent, &moved_parent_for_attacker).unwrap();
-        fs::create_dir(&replacement_parent).unwrap();
-        write(&replacement_parent.join("sentinel"), b"unchanged");
+    let creator = thread::spawn(move || {
+        ready_receiver.recv().unwrap();
+        create_source_bundle_archive(&plan, &output_for_creator, SourceArchiveLimits::default())
     });
 
-    ready_receiver.recv().unwrap();
-    let result = create_source_bundle_archive(&plan, &output, SourceArchiveLimits::default());
-    attacker.join().unwrap();
+    ready_sender.send(()).unwrap();
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let partial_exists = fs::read_dir(&output_parent).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".source.zip.rustferry-partial-")
+        });
+        if partial_exists {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "archive creation did not expose its private temporary file"
+        );
+        thread::yield_now();
+    }
+    fs::rename(&output_parent, &moved_parent).unwrap();
+    fs::create_dir(&output_parent).unwrap();
+    write(&output_parent.join("sentinel"), b"unchanged");
+    let result = creator.join().unwrap();
 
     assert!(result.is_err());
     assert_eq!(

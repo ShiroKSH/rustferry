@@ -1,7 +1,7 @@
 //! Bounded ingestion of one exact GitHub Actions run attempt's per-job logs.
 //!
 //! This module deliberately stops at a transport-neutral projection. Callers may
-//! persist [`GithubWorkerLogEvent`] values only after their own durable job binding.
+//! persist [`crate::job_logs::GithubWorkerLogEvent`] values only after their own durable job binding.
 //! Raw response bytes, redirect URLs, and unsanitized log lines never enter the DTO.
 
 use std::{

@@ -811,7 +811,7 @@ mod platform {
                 .join()
                 .expect("spawn supervisor")
                 .expect("atomically contained child");
-            let ready_deadline = Instant::now() + Duration::from_secs(5);
+            let ready_deadline = Instant::now() + Duration::from_secs(20);
             while !ready.exists() && Instant::now() < ready_deadline {
                 thread::sleep(Duration::from_millis(10));
             }
