@@ -7100,6 +7100,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn prune_retains_candidate_locks_through_transaction_publication() {
         let _serial = PUBLICATION_TEST_SERIAL
             .lock()

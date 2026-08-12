@@ -10451,6 +10451,9 @@ fn read_private_config_snapshot(
 }
 
 fn read_private_config_file(path: &Utf8Path) -> Result<(ArtifactFileIdentity, Vec<u8>), CliError> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt as _;
+
     let initial_metadata = fs::symlink_metadata(path).map_err(|source| CliError::Io {
         action: "inspect private provider file",
         path: path.to_owned(),
@@ -10464,7 +10467,6 @@ fn read_private_config_file(path: &Utf8Path) -> Result<(ArtifactFileIdentity, Ve
     let file = {
         let mut options = OpenOptions::new();
         options.read(true);
-        use std::os::unix::fs::OpenOptionsExt as _;
         options.custom_flags(libc::O_NOFOLLOW);
         options.open(path).map_err(|source| CliError::Io {
             action: "open GitHub provider config snapshot",
@@ -11346,11 +11348,13 @@ fn cleanup_staged_private_config_commit(
 
 fn finish_private_config_commit(
     root: &Utf8Path,
-    _parent: &Utf8Path,
+    parent: &Utf8Path,
     expected_installed: &StoredGithubConfig,
 ) -> Result<(), CliError> {
     #[cfg(unix)]
-    sync_private_config_directory(_parent)?;
+    sync_private_config_directory(parent)?;
+    #[cfg(not(unix))]
+    let _ = parent;
     let installed = load_config(root)?;
     if &installed != expected_installed {
         return Err(remote_error(
@@ -14001,6 +14005,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn submit_publication_evidence_requires_exact_mapping_or_strong_absence() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let record = durable_controller_record(&temporary, None);

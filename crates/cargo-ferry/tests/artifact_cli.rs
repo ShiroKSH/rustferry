@@ -500,7 +500,7 @@ fn create_file_symlink(target: &Utf8PathBuf, link: &Utf8PathBuf) -> std::io::Res
 }
 
 struct ArtifactFixture {
-    temporary: tempfile::TempDir,
+    _temporary: tempfile::TempDir,
     config: std::path::PathBuf,
     project_root: Utf8PathBuf,
 }
@@ -526,7 +526,7 @@ impl ArtifactFixture {
             .canonicalize_utf8()
             .expect("canonical project path");
         Self {
-            temporary,
+            _temporary: temporary,
             config,
             project_root,
         }

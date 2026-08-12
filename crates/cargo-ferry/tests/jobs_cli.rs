@@ -4,9 +4,9 @@ use std::{collections::BTreeSet, fs};
 
 use assert_cmd::cargo::cargo_bin_cmd;
 use cargo_ferry::job_store::{
-    JOB_STORE_SCHEMA_VERSION, JobStore, LocalJobId, ManagedEventLevel, ManagedEventSource,
-    ManagedJobEventInputV1, StoredBuildOutcome, StoredCancellationStatus, StoredCleanupStatus,
-    StoredFailureV1, StoredJobState, StoredJobV1, StoredProjectIdentityV1,
+    JOB_STORE_SCHEMA_VERSION, JobStore, JobStoreError, LocalJobId, ManagedEventLevel,
+    ManagedEventSource, ManagedJobEventInputV1, StoredBuildOutcome, StoredCancellationStatus,
+    StoredCleanupStatus, StoredFailureV1, StoredJobState, StoredJobV1, StoredProjectIdentityV1,
     StoredProviderIdentityV1, StoredRetryLineageV1, StoredSourceIdentityV1,
 };
 use predicates::prelude::*;
@@ -1000,9 +1000,18 @@ impl PopulatedStore {
         store
             .checkpoint_github_resume(&planned.local_job_id, &queued_resume)
             .expect("queued job checkpoint");
-        let record = store
-            .latest(&planned.local_job_id)
-            .expect("latest queued job revision");
+        let retry_started = std::time::Instant::now();
+        let record = loop {
+            match store.latest(&planned.local_job_id) {
+                Ok(record) => break record,
+                Err(JobStoreError::JobBusy { .. })
+                    if retry_started.elapsed() < std::time::Duration::from_secs(1) =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => panic!("latest queued job revision: {error:?}"),
+            }
+        };
         drop(store);
         Self {
             temporary,
