@@ -791,10 +791,12 @@ static INITIAL_CREATE_OWNER_TEST_CONTROL: std::sync::Mutex<Option<InitialCreateO
 #[derive(Clone)]
 struct PrunePublicationLockTestControl {
     local_job_id: LocalJobId,
-    validated: std::sync::Arc<std::sync::Barrier>,
-    allow_publish: std::sync::Arc<std::sync::Barrier>,
-    published: std::sync::Arc<std::sync::Barrier>,
-    allow_release: std::sync::Arc<std::sync::Barrier>,
+    candidate_locks_held: std::sync::mpsc::Sender<()>,
+    allow_publication: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+    transaction_published: std::sync::mpsc::Sender<()>,
+    allow_lock_release: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+    candidate_locks_released: std::sync::mpsc::Sender<()>,
+    allow_finish: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
 }
 
 #[cfg(test)]
@@ -845,11 +847,29 @@ fn prune_publication_lock_test_control(
 }
 
 #[cfg(test)]
+fn wait_for_prune_publication_test_signal(
+    receiver: &std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    phase: &'static str,
+) {
+    receiver
+        .lock()
+        .expect("prune-publication signal receiver is not poisoned")
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap_or_else(|_| panic!("{phase}"));
+}
+
+#[cfg(test)]
 fn await_prune_publication_validation_test_control(locked: &BTreeMap<LocalJobId, LockedJob>) {
     let control = prune_publication_lock_test_control(locked);
     if let Some(control) = control {
-        control.validated.wait();
-        control.allow_publish.wait();
+        control
+            .candidate_locks_held
+            .send(())
+            .expect("waiting_for_candidate_locks: test receiver dropped");
+        wait_for_prune_publication_test_signal(
+            &control.allow_publication,
+            "waiting_for_publication",
+        );
     }
 }
 
@@ -860,13 +880,39 @@ fn await_prune_publication_validation_test_control(_locked: &BTreeMap<LocalJobId
 fn await_prune_transaction_published_test_control(locked: &BTreeMap<LocalJobId, LockedJob>) {
     let control = prune_publication_lock_test_control(locked);
     if let Some(control) = control {
-        control.published.wait();
-        control.allow_release.wait();
+        control
+            .transaction_published
+            .send(())
+            .expect("waiting_for_publication: test receiver dropped");
+        wait_for_prune_publication_test_signal(
+            &control.allow_lock_release,
+            "waiting_for_worker_completion",
+        );
     }
 }
 
 #[cfg(not(test))]
 fn await_prune_transaction_published_test_control(_locked: &BTreeMap<LocalJobId, LockedJob>) {}
+
+#[cfg(test)]
+fn await_prune_candidate_locks_released_test_control(identifiers: &[LocalJobId]) {
+    let control = PRUNE_PUBLICATION_LOCK_TEST_CONTROL
+        .lock()
+        .expect("prune-publication test-control lock is not poisoned")
+        .as_ref()
+        .filter(|control| identifiers.contains(&control.local_job_id))
+        .cloned();
+    if let Some(control) = control {
+        control
+            .candidate_locks_released
+            .send(())
+            .expect("waiting_for_worker_completion: test receiver dropped");
+        wait_for_prune_publication_test_signal(
+            &control.allow_finish,
+            "waiting_for_worker_completion",
+        );
+    }
+}
 
 fn acquire_operation_lease_from_locked(
     store: &JobStore,
@@ -4217,6 +4263,8 @@ impl JobStore {
         await_prune_transaction_published_test_control(&locked);
         let release_authorization_sha256 = lease_set.release_authorization_sha256.clone();
         drop(locked);
+        #[cfg(test)]
+        await_prune_candidate_locks_released_test_control(&identifiers);
         drop(lease_set);
         finish_prune_transaction(self, &layout, &transaction_sha256, &transaction)?;
         let completion_already_present =
@@ -5450,6 +5498,57 @@ mod tests {
         github_cleaned_resume, persist_providerless_artifact_ready,
     };
     use super::*;
+
+    enum SingleAttemptJobLockProbe {
+        Acquired(LockedJob),
+        Busy,
+        Error(JobStoreError),
+    }
+
+    fn probe_job_lock_once(
+        store: &JobStore,
+        local_job_id: &LocalJobId,
+    ) -> SingleAttemptJobLockProbe {
+        match store.lock_job_unchecked(local_job_id, false) {
+            Ok(locked) => SingleAttemptJobLockProbe::Acquired(locked),
+            Err(JobStoreError::JobBusy { .. }) => SingleAttemptJobLockProbe::Busy,
+            Err(error) => SingleAttemptJobLockProbe::Error(error),
+        }
+    }
+
+    fn expect_busy_lock_probe(probe: SingleAttemptJobLockProbe) {
+        match probe {
+            SingleAttemptJobLockProbe::Busy => {}
+            SingleAttemptJobLockProbe::Acquired(_) => {
+                panic!("single-attempt candidate lock probe unexpectedly acquired the lock")
+            }
+            SingleAttemptJobLockProbe::Error(error) => {
+                panic!("single-attempt candidate lock probe failed: {error:?}")
+            }
+        }
+    }
+
+    fn expect_acquired_lock_probe(probe: SingleAttemptJobLockProbe) -> LockedJob {
+        match probe {
+            SingleAttemptJobLockProbe::Acquired(locked) => locked,
+            SingleAttemptJobLockProbe::Busy => {
+                panic!("single-attempt candidate lock probe remained busy after release")
+            }
+            SingleAttemptJobLockProbe::Error(error) => {
+                panic!("single-attempt candidate lock probe failed after release: {error:?}")
+            }
+        }
+    }
+
+    struct PrunePublicationTestControlReset;
+
+    impl Drop for PrunePublicationTestControlReset {
+        fn drop(&mut self) {
+            *PRUNE_PUBLICATION_LOCK_TEST_CONTROL
+                .lock()
+                .expect("prune-publication test-control lock is not poisoned") = None;
+        }
+    }
 
     fn persist_failed_parent(fixture: &StoreFixture, local_job_id: &str) -> StoredJobV1 {
         let first = fixture.record(local_job_id, 100);
@@ -7002,6 +7101,9 @@ mod tests {
 
     #[test]
     fn prune_retains_candidate_locks_through_transaction_publication() {
+        let _serial = PUBLICATION_TEST_SERIAL
+            .lock()
+            .expect("publication test serial lock is not poisoned");
         let fixture = StoreFixture::new();
         let failed = persist_failed_parent(&fixture, "job-prune-publication-lock");
         let mut first = event(ManagedEventSource::Controller, 1, "controller.first");
@@ -7017,56 +7119,126 @@ mod tests {
             .store
             .replan_prune_after_keepalive_releases(&leases)
             .unwrap();
-        let validated = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let allow_publish = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let published = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let allow_release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let expected_transaction = PruneTransactionV1 {
+            schema_version: ADMIN_TRANSACTION_SCHEMA_VERSION,
+            pruned_at_ms: 1_001,
+            plan: post_release.clone(),
+        };
+        let expected_value = AdminTransactionV1::Prune(expected_transaction.clone());
+        let maximum = MAX_JOB_REVISION_BYTES
+            .saturating_mul(2)
+            .saturating_add(1024 * 1024);
+        let expected_bytes = encode_bounded_json(
+            "administrative transaction bytes",
+            &expected_value,
+            maximum,
+            "encode administrative transaction",
+        )
+        .unwrap();
+        let expected_transaction_sha256 = sha256_hex(&expected_bytes);
+        let layout = ensure_admin_layout(&fixture.store).unwrap();
+        let expected_transaction_path = layout
+            .transactions
+            .join(format!("prune-{expected_transaction_sha256}.json"));
+        drop(layout);
+        let candidate_paths = post_release
+            .candidates
+            .iter()
+            .map(|candidate| {
+                fixture
+                    .store
+                    .version_root()
+                    .join(candidate.local_job_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        let event_path = fixture
+            .store
+            .version_root()
+            .join(pruned.local_job_id.as_str())
+            .join(EVENTS_DIRECTORY);
+        let initial_event_count = fs::read_dir(&event_path).unwrap().count();
+        let (candidate_locks_held, candidate_locks_held_rx) = std::sync::mpsc::channel();
+        let (allow_publication, allow_publication_rx) = std::sync::mpsc::channel();
+        let (transaction_published, transaction_published_rx) = std::sync::mpsc::channel();
+        let (allow_lock_release, allow_lock_release_rx) = std::sync::mpsc::channel();
+        let (candidate_locks_released, candidate_locks_released_rx) = std::sync::mpsc::channel();
+        let (allow_finish, allow_finish_rx) = std::sync::mpsc::channel();
+        let (worker_completed, worker_completed_rx) = std::sync::mpsc::channel();
         *PRUNE_PUBLICATION_LOCK_TEST_CONTROL.lock().unwrap() =
             Some(PrunePublicationLockTestControl {
                 local_job_id: pruned.local_job_id.clone(),
-                validated: std::sync::Arc::clone(&validated),
-                allow_publish: std::sync::Arc::clone(&allow_publish),
-                published: std::sync::Arc::clone(&published),
-                allow_release: std::sync::Arc::clone(&allow_release),
+                candidate_locks_held,
+                allow_publication: std::sync::Arc::new(std::sync::Mutex::new(allow_publication_rx)),
+                transaction_published,
+                allow_lock_release: std::sync::Arc::new(std::sync::Mutex::new(
+                    allow_lock_release_rx,
+                )),
+                candidate_locks_released,
+                allow_finish: std::sync::Arc::new(std::sync::Mutex::new(allow_finish_rx)),
             });
+        let _control_reset = PrunePublicationTestControlReset;
         let prune_store = fixture.store.clone();
-        let prune = std::thread::spawn(move || prune_store.prune(leases, &post_release, 1_001));
-        validated.wait();
-        let mut second = event(ManagedEventSource::Controller, 2, "controller.second");
-        second.occurred_at_ms = pruned.updated_at_ms + 1;
-        let writer_before_publication = fixture.store.append_managed_events(
-            &pruned.local_job_id,
-            second.occurred_at_ms,
-            &[second],
+        let prune_plan = post_release.clone();
+        let prune = std::thread::spawn(move || {
+            let result = prune_store.prune(leases, &prune_plan, 1_001);
+            worker_completed
+                .send(())
+                .expect("waiting_for_worker_completion: test receiver dropped");
+            result
+        });
+        candidate_locks_held_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("waiting_for_candidate_locks");
+        for candidate in &post_release.candidates {
+            expect_busy_lock_probe(probe_job_lock_once(&fixture.store, &candidate.local_job_id));
+        }
+        assert!(!expected_transaction_path.exists());
+        assert!(candidate_paths.iter().all(|path| path.is_dir()));
+        assert_eq!(
+            fs::read_dir(&event_path).unwrap().count(),
+            initial_event_count
         );
-        allow_publish.wait();
-        published.wait();
-        let mut third = event(ManagedEventSource::Controller, 3, "controller.third");
-        third.occurred_at_ms = pruned.updated_at_ms + 2;
-        let writer_after_publication = fixture.store.append_managed_events(
-            &pruned.local_job_id,
-            third.occurred_at_ms,
-            &[third],
-        );
-        allow_release.wait();
-        let prune = prune.join().expect("prune publication thread");
-        *PRUNE_PUBLICATION_LOCK_TEST_CONTROL.lock().unwrap() = None;
 
-        assert!(matches!(
-            writer_before_publication,
-            Err(JobStoreError::JobBusy { local_job_id }) if local_job_id == pruned.local_job_id
-        ));
-        assert!(matches!(
-            writer_after_publication,
-            Err(JobStoreError::RecoveryRequired {
-                reason: "the job participates in an incomplete administrative transaction"
-            })
-        ));
-        prune.expect("prune after locked publication");
+        allow_publication.send(()).unwrap();
+        transaction_published_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("waiting_for_publication");
+        let (_, published_transaction) =
+            read_admin_transaction(&expected_transaction_path).unwrap();
+        assert_eq!(published_transaction, expected_value);
+        assert!(candidate_paths.iter().all(|path| path.is_dir()));
+        assert_eq!(
+            fs::read_dir(&event_path).unwrap().count(),
+            initial_event_count
+        );
+        for candidate in &post_release.candidates {
+            expect_busy_lock_probe(probe_job_lock_once(&fixture.store, &candidate.local_job_id));
+        }
+
+        allow_lock_release.send(()).unwrap();
+        candidate_locks_released_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("waiting_for_worker_completion");
+        for candidate in &post_release.candidates {
+            drop(expect_acquired_lock_probe(probe_job_lock_once(
+                &fixture.store,
+                &candidate.local_job_id,
+            )));
+        }
+        allow_finish.send(()).unwrap();
+        worker_completed_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("waiting_for_worker_completion");
+        let prune = prune.join().expect("prune publication thread");
+        let receipt = prune.expect("prune after locked publication");
+        assert_eq!(receipt.transaction_sha256, expected_transaction_sha256);
+        assert_eq!(receipt.pruned_job_ids, vec![pruned.local_job_id.clone()]);
         assert!(matches!(
             fixture.store.latest(&pruned.local_job_id),
             Err(JobStoreError::JobNotFound { .. })
         ));
+        assert!(candidate_paths.iter().all(|path| !path.exists()));
+        assert!(!event_path.exists());
     }
 
     #[test]
