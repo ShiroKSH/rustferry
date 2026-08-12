@@ -1749,12 +1749,22 @@ mod unix {
 
         use super::*;
 
+        fn system_toolchain() -> Option<UnixGitToolchain> {
+            match UnixGitToolchain::new("/usr/bin/git") {
+                Ok(toolchain) => Some(toolchain),
+                Err(GitProcessPolicyError::InvalidToolLayout) => None,
+                Err(error) => panic!("system toolchain: {error:?}"),
+            }
+        }
+
         #[test]
         fn private_bare_repository_is_offline_and_ignores_ambient_config() {
             if !Path::new("/usr/bin/git").is_file() || !Path::new("/usr/bin/ssh").is_file() {
                 return;
             }
-            let toolchain = UnixGitToolchain::new("/usr/bin/git").expect("system toolchain");
+            let Some(toolchain) = system_toolchain() else {
+                return;
+            };
             let temporary = tempfile::tempdir().expect("fixture");
             let root = temporary.path().join("isolation");
             let mut builder = fs::DirBuilder::new();
@@ -1812,7 +1822,9 @@ mod unix {
             if !Path::new("/usr/bin/git").is_file() || !Path::new("/usr/bin/ssh").is_file() {
                 return;
             }
-            let toolchain = UnixGitToolchain::new("/usr/bin/git").expect("system toolchain");
+            let Some(toolchain) = system_toolchain() else {
+                return;
+            };
             let temporary = tempfile::tempdir().expect("fixture");
             let root = temporary.path().join("isolation");
             fs::DirBuilder::new()

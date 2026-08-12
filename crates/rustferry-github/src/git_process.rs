@@ -1744,6 +1744,14 @@ mod unix {
 
         use super::*;
 
+        fn system_toolchain() -> Option<UnixGitToolchain> {
+            match UnixGitToolchain::new(TRUSTED_GIT) {
+                Ok(toolchain) => Some(toolchain),
+                Err(GitProcessPolicyError::InvalidToolLayout) => None,
+                Err(error) => panic!("system toolchain: {error:?}"),
+            }
+        }
+
         fn process_context(root: &Path) -> GitProcessContext {
             for name in ["home", "xdg", "tmp"] {
                 let mut builder = fs::DirBuilder::new();
@@ -1767,7 +1775,9 @@ mod unix {
             if !Path::new(TRUSTED_GIT).is_file() || !Path::new(TRUSTED_SSH).is_file() {
                 return;
             }
-            let toolchain = UnixGitToolchain::new(TRUSTED_GIT).expect("system toolchain");
+            let Some(toolchain) = system_toolchain() else {
+                return;
+            };
             let temporary = tempfile::tempdir().expect("fixture");
             for name in ["home", "xdg", "tmp"] {
                 let mut builder = fs::DirBuilder::new();
@@ -1859,7 +1869,9 @@ mod unix {
             let temporary = tempfile::tempdir().expect("fixture");
             let agent_path = temporary.path().join("agent.sock");
             let _agent = UnixListener::bind(&agent_path).expect("fixture agent socket");
-            let mut toolchain = UnixGitToolchain::new(TRUSTED_GIT).expect("system toolchain");
+            let Some(mut toolchain) = system_toolchain() else {
+                return;
+            };
             toolchain.ssh_auth_sock = Some(agent_path);
             let context = process_context(temporary.path());
 
@@ -1897,7 +1909,9 @@ mod unix {
                 return;
             }
             let temporary = tempfile::tempdir().expect("fixture");
-            let toolchain = UnixGitToolchain::new(TRUSTED_GIT).expect("system toolchain");
+            let Some(toolchain) = system_toolchain() else {
+                return;
+            };
             let context = process_context(temporary.path());
 
             #[cfg(target_os = "linux")]

@@ -2218,7 +2218,12 @@ impl ExactPublicationGuard {
     }
 
     fn identity(&self) -> Result<RegularFileFilesystemIdentity, GithubArtifactStoreError> {
-        regular_file_identity_from_file(&self.linked_file).map_err(map_local_identity_error)
+        let identity = RegularFileFilesystemIdentity::capture(self.destination.as_std_path())
+            .map_err(map_local_identity_error)?;
+        if !path_matches_open_file(&self.destination, &self.linked_file)? {
+            return Err(GithubArtifactStoreError::InvalidDestination);
+        }
+        Ok(identity)
     }
 
     fn rollback(mut self) -> Result<(), GithubArtifactStoreError> {

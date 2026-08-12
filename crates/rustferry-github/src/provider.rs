@@ -8688,6 +8688,9 @@ where
     where
         R: GhRunner,
     {
+        if record.principal.is_none() || record.execution_repository_id.is_none() {
+            return Ok(());
+        }
         let identity = self.current_resume_identity()?;
         Self::validate_record_identity(record, &identity)
     }
@@ -11846,7 +11849,11 @@ where
             self.checkpoint_record(record)?;
             let prepared_dispatch_commit = record.prepared_dispatch_commit.clone();
             drop(state);
-            let publication_identity = self.current_resume_identity();
+            let publication_identity = if resume_identity.is_some() {
+                self.current_resume_identity().map(Some)
+            } else {
+                Ok(None)
+            };
             let boundary_cancellation = cancellation.check();
             let mut state = self.lock_state()?;
             let record = state.jobs.get_mut(&job_id).ok_or_else(|| {
@@ -11858,7 +11865,11 @@ where
             })?;
             let publication_boundary = publication_identity
                 .and_then(|identity| boundary_cancellation.map(|()| identity))
-                .and_then(|identity| Self::validate_record_identity(record, &identity))
+                .and_then(|identity| {
+                    identity.as_ref().map_or(Ok(()), |identity| {
+                        Self::validate_record_identity(record, identity)
+                    })
+                })
                 .and_then(|()| {
                     if record.prepared_dispatch_commit != prepared_dispatch_commit
                         || !record.publication_intent
@@ -14257,7 +14268,13 @@ mod tests {
                 .map(drop)
                 .map_err(io::Error::other)
         }
-        #[cfg(not(windows))]
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+
+            fs::DirBuilder::new().mode(0o700).create(path)
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             fs::create_dir(path)
         }
