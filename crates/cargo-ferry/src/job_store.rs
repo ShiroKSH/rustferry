@@ -1696,6 +1696,7 @@ impl JobStore {
         fs2::FileExt::try_lock_shared(&lock).map_err(|_| JobStoreError::JobBusy {
             local_job_id: local_job_id.clone(),
         })?;
+        let lock = HeldFileLock::new(lock);
         let layout = self.open_existing_job_layout(local_job_id)?;
         verify_private_lock_identity(&lock, &lock_path)?;
         Ok(ReadOnlyJob {
@@ -1778,6 +1779,7 @@ impl JobStore {
         fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| JobStoreError::JobBusy {
             local_job_id: local_job_id.clone(),
         })?;
+        let lock = HeldFileLock::new(lock);
         let layout = self.open_existing_job_layout(local_job_id)?;
         verify_private_lock_identity(&lock, &lock_path)?;
         if create_layout {
@@ -2242,10 +2244,35 @@ pub enum JobStoreError {
 }
 
 struct LockedJob {
-    lock: File,
+    lock: HeldFileLock,
     guards: Vec<File>,
     revisions_guard: File,
     revisions: PathBuf,
+}
+
+#[derive(Clone)]
+struct HeldFileLock(std::sync::Arc<HeldFileLockInner>);
+
+impl HeldFileLock {
+    fn new(file: File) -> Self {
+        Self(std::sync::Arc::new(HeldFileLockInner(file)))
+    }
+}
+
+impl std::ops::Deref for HeldFileLock {
+    type Target = File;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0.0
+    }
+}
+
+struct HeldFileLockInner(File);
+
+impl Drop for HeldFileLockInner {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
 }
 
 struct ExistingStoreLayout {
@@ -2259,7 +2286,7 @@ struct ExistingJobLayout {
 }
 
 struct ReadOnlyJob {
-    lock: File,
+    lock: HeldFileLock,
     _guards: Vec<File>,
     _revisions_guard: File,
     revisions: PathBuf,
@@ -8037,6 +8064,35 @@ mod tests {
         assert!(matches!(latest, Err(JobStoreError::JobBusy { .. })));
         assert!(matches!(revision, Err(JobStoreError::JobBusy { .. })));
         assert_eq!(read_only.latest(&first.local_job_id).unwrap().revision, 2);
+    }
+
+    #[test]
+    fn completed_short_writes_release_the_job_lock_immediately() {
+        let fixture = StoreFixture::new();
+        let first = fixture.record("job-short-write-release", 100);
+        fixture.store.create(&first).unwrap();
+
+        for expected_revision in 2..=32 {
+            fixture
+                .store
+                .update(&first.local_job_id, |previous| {
+                    let mut next = previous.clone();
+                    next.revision += 1;
+                    next.updated_at_ms += 1;
+                    Ok(next)
+                })
+                .unwrap();
+            drop(
+                fixture
+                    .store
+                    .lock_job_unchecked(&first.local_job_id, false)
+                    .expect("completed short write retained its job lock"),
+            );
+            assert_eq!(
+                fixture.store.latest(&first.local_job_id).unwrap().revision,
+                expected_revision
+            );
+        }
     }
 
     #[cfg(windows)]
