@@ -9,8 +9,8 @@ repository.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/rustferry-android"
 readme.workspace = true
-keywords.workspace = true
-categories.workspace = true
+keywords = ["rust", "android", "apk", "mobile", "packaging"]
+categories = ["development-tools::build-utils"]
 description = "Direct no-Gradle Android packaging backend for RustFerry"
 include = [
     "src/**",

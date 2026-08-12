@@ -9,8 +9,8 @@ repository.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/rustferry-github"
 readme.workspace = true
-keywords.workspace = true
-categories.workspace = true
+keywords = ["rust", "github-actions", "ios", "remote-build", "ci"]
+categories = ["development-tools::build-utils", "network-programming"]
 description = "Secure GitHub Actions workflow generation for RustFerry iPhone builds"
 include = [
     "src/**",

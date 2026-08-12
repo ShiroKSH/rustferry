@@ -6,14 +6,14 @@ All publishable versions come from `workspace.package`; a release must keep them
 | Order | Package | Role | Internal prerequisites |
 | --- | --- | --- | --- |
 | 1 | `rustferry-core` | Configuration, validation, assets, process control | None |
-| 1 | `rustferry` | Application runtime API | None |
-| 1 | `rustferry-remote` | Remote-build protocol, source, signing, and artifact contracts | None |
-| 2 | `rustferry-codegen` | Project, capability, and asset generation | `rustferry-core` |
-| 2 | `rustferry-ssh` | Pinned OpenSSH transport for macOS workers | `rustferry-core`, `rustferry-remote` |
-| 3 | `rustferry-apple` | Apple generation and artifact backend | `rustferry-core`, `rustferry-codegen`, `rustferry-remote` |
-| 3 | `rustferry-android` | Direct Android packaging backend | `rustferry-core`, `rustferry-codegen` |
-| 3 | `rustferry-github` | GitHub transport and workflow provider | `rustferry-core`, `rustferry-remote` |
-| 4 | `cargo-ferry` | Public CLI | Runtime, backend, core, codegen, remote, GitHub, and SSH crates |
+| 2 | `rustferry` | Application runtime API | None |
+| 3 | `rustferry-codegen` | Project, capability, and asset generation | `rustferry-core` |
+| 4 | `rustferry-remote` | Remote-build protocol, source, signing, and artifact contracts | `rustferry-core` on Windows |
+| 5 | `rustferry-android` | Direct Android packaging backend | `rustferry-core`, `rustferry-codegen` |
+| 6 | `rustferry-apple` | Apple generation and artifact backend | `rustferry-core`, `rustferry-codegen`, `rustferry-remote` |
+| 7 | `rustferry-github` | GitHub transport and workflow provider | `rustferry-core`, `rustferry-remote` |
+| 8 | `rustferry-ssh` | Pinned OpenSSH transport for macOS workers | `rustferry-core`, `rustferry-remote` |
+| 9 | `cargo-ferry` | Public CLI | Runtime, backend, core, codegen, remote, GitHub, and SSH crates |
 
 Wait for each prerequisite version to appear in the registry index before
 publishing the next group. The automated release workflow never publishes to
@@ -51,7 +51,7 @@ cargo metadata --locked --no-deps --format-version 1
 python3 scripts/check-release-contract.py
 cargo package --workspace --exclude rustferry-worker-macos --locked --list
 cargo package --workspace --exclude rustferry-worker-macos --locked
-cargo publish --workspace --exclude rustferry-worker-macos --dry-run --locked --no-verify
+cargo publish --workspace --exclude rustferry-worker-macos --dry-run --locked
 python3 scripts/check-release-archives.py \
   --check-sources \
   --target-dir target/package-source-check \
@@ -59,10 +59,10 @@ python3 scripts/check-release-archives.py \
 ```
 
 `cargo package --workspace --exclude rustferry-worker-macos` verifies the
-normalized archives together, so
-unpublished internal dependencies resolve from the package set. The following
-`publish --dry-run --no-verify` repeats registry upload checks without compiling
-the same archives a second time. It performs no upload.
+normalized archives together, so unpublished internal dependencies resolve
+from the package set. The following `publish --dry-run` repeats registry upload
+checks and package verification without uploading. Do not weaken the release
+gate with `--no-verify`.
 
 Inspect the produced archives before approving a draft:
 
@@ -75,23 +75,26 @@ The manual draft-release workflow copies all nine `.crate` files into one
 release assembly, adds the schema, VSIX, license bundle, release notes, and
 SHA-256 checksums, then uploads that assembly as a workflow artifact.
 
-For the pre-remote 2026-08-01 local candidate, archive/source/handshake
-validation passed for the then-current 6/6 publishable crates, the package
-Python suite passed 19/19, and the release contract confirmed 17/17 exact
-internal dependency edges. The largest archive was 152.9 KiB. Those results are
-historical; the expanded nine-crate release surface requires a fresh package,
-source, license, and publish dry-run before release. Its current release-contract check covers all
-28 internal dependency edges, but that does not replace archive or registry dry-runs. No crate was
-published.
+Historical package results do not validate a later release revision. Re-run the
+package, source, license, and publish dry-run gates for all nine archives and
+record the resulting file counts and compressed sizes.
 
 ## Publish procedure
 
 Publishing is a separate, protected manual operation. Run a complete dry-run,
-then publish one group at a time in the order above. Confirm each version with
-`cargo search` or the crates.io API before continuing. Do not use `--no-verify`
-for the real publish. Do not bump versions or publish from a dirty checkout.
+then publish one crate at a time in the documented dependency order. Confirm
+each version with `cargo info <CRATE>@<VERSION>`, `cargo owner --list <CRATE>`,
+and the crates.io API before continuing. Do not use `--no-verify`, pass a token
+on the command line, bump versions, or publish from a dirty checkout.
 
 After publication, install the CLI from the registry into an isolated Cargo
 root and generate/check a new project without a runtime-path environment
 override. This is the acceptance test for registry-based template resolution;
 workspace-path tests alone are insufficient.
+
+If a publish command times out, query the registry before retrying. If a later
+crate fails after prerequisites are public, preserve the published boundary and
+do not yank merely to make the release atomic. Fix only unpublished crates when
+their contracts can remain compatible; otherwise prepare the next patch. Yank
+only for a specific security, legal, or unusable-package defect and document
+the reason.

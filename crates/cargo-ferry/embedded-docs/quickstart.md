@@ -2,23 +2,19 @@
 
 This walkthrough validates ordinary Rust development first. It does not require Android Studio, Xcode, an emulator, a simulator, or a phone.
 
-## 1. Install the current source
-
-From the cargo-ferry checkout:
+## 1. Install cargo-ferry
 
 ```console
-cargo install --path crates/cargo-ferry
+cargo install cargo-ferry --locked
 ```
 
-The package requires Rust 1.92 or newer. Because `rustferry` 0.1.0 is not published yet, the contributor command below selects the checkout explicitly. A published release defaults to the registry and needs no path override. See [Installation](installation.md) for PowerShell syntax and mobile toolchains.
+The package requires Rust 1.92 or newer. Registry installations select the matching `rustferry` runtime automatically and need no path override. See [Installation](installation.md) for source-development commands and mobile toolchains.
 
 ## 2. Generate the starter
 
 ```console
 cargo ferry new weather \
-  --id com.example.weather \
-  --runtime-source path \
-  --runtime-path "$PWD/crates/rustferry"
+  --id com.example.weather
 cd weather
 ```
 
