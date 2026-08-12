@@ -217,6 +217,14 @@
       "version": "0.22.1"
     },
     {
+      "checksum": "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5",
+      "license": "MIT OR Apache-2.0",
+      "name": "base64",
+      "repository": "https://github.com/marshallpierce/rust-base64",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.23.1"
+    },
+    {
       "checksum": "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da",
       "license": "MIT OR Apache-2.0",
       "name": "bitflags",
@@ -831,6 +839,22 @@
       "repository": "https://github.com/RustCrypto/MACs",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "version": "0.12.1"
+    },
+    {
+      "checksum": "918d3568bebf352712bc2ef3d46a8bcf1a75b373be6539de198e9105cbbf9ce0",
+      "license": "MIT OR Apache-2.0",
+      "name": "http",
+      "repository": "https://github.com/hyperium/http",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.5.0"
+    },
+    {
+      "checksum": "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87",
+      "license": "MIT OR Apache-2.0",
+      "name": "httparse",
+      "repository": "https://github.com/seanmonstar/httparse",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.10.1"
     },
     {
       "checksum": "707114b52a152fa7bdb290cd7cd5912d9467273b6d74e21b8d81aca1f8533f6b",
@@ -1553,6 +1577,14 @@
       "version": "0.8.11"
     },
     {
+      "checksum": "a4689e6c2294d81e88dc6261c768b63bc4fcdb852be6d1352498b114f61383b7",
+      "license": "Apache-2.0 AND ISC",
+      "name": "ring",
+      "repository": "https://github.com/briansmith/ring",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.17.14"
+    },
+    {
       "checksum": "2da316a15f47e3d053de9cb2c439650bd8fa4aaeb9365f2e5f27f492ff73c196",
       "license": "Apache-2.0",
       "name": "rpassword",
@@ -1591,6 +1623,30 @@
       "repository": "https://github.com/sunfishcode/rustix-linux-procfs",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "version": "0.1.1"
+    },
+    {
+      "checksum": "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06",
+      "license": "Apache-2.0 OR ISC OR MIT",
+      "name": "rustls",
+      "repository": "https://github.com/rustls/rustls",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.23.43"
+    },
+    {
+      "checksum": "2f4925028c7eb5d1fcdaf196971378ed9d2c1c4efc7dc5d011256f76c99c0a96",
+      "license": "MIT OR Apache-2.0",
+      "name": "rustls-pki-types",
+      "repository": "https://github.com/rustls/pki-types",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.15.1"
+    },
+    {
+      "checksum": "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e",
+      "license": "ISC",
+      "name": "rustls-webpki",
+      "repository": "https://github.com/rustls/webpki",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.103.13"
     },
     {
       "checksum": "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f",
@@ -2065,12 +2121,44 @@
       "version": "0.1.25"
     },
     {
+      "checksum": "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1",
+      "license": "ISC",
+      "name": "untrusted",
+      "repository": "https://github.com/briansmith/untrusted",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.9.0"
+    },
+    {
+      "checksum": "dea7109cdcd5864d4eeb1b58a1648dc9bf520360d7af16ec26d0a9354bafcfc0",
+      "license": "MIT OR Apache-2.0",
+      "name": "ureq",
+      "repository": "https://github.com/algesten/ureq",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "3.3.0"
+    },
+    {
+      "checksum": "da5f78b09e6941e1a0f2e30e695e4b120377b54d5e0aec11b594bb57b3971613",
+      "license": "MIT OR Apache-2.0",
+      "name": "ureq-proto",
+      "repository": "https://github.com/algesten/ureq-proto",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.6.1"
+    },
+    {
       "checksum": "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed",
       "license": "MIT OR Apache-2.0",
       "name": "url",
       "repository": "https://github.com/servo/rust-url",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "version": "2.5.8"
+    },
+    {
+      "checksum": "b8c0a043c9540bae7c578c88f91dda8bd82e59ae27c21baca69c8b191aaf5a6e",
+      "license": "MIT OR Apache-2.0",
+      "name": "utf8-zero",
+      "repository": "https://github.com/algesten/utf8-zero",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.8.1"
     },
     {
       "checksum": "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be",
@@ -2169,6 +2257,14 @@
       "version": "0.2.127"
     },
     {
+      "checksum": "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a",
+      "license": "CDLA-Permissive-2.0",
+      "name": "webpki-roots",
+      "repository": "https://github.com/rustls/webpki-roots",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.0.9"
+    },
+    {
       "checksum": "5c839a674fcd7a98952e593242ea400abe93992746761e38641405d28b00f419",
       "license": "MIT/Apache-2.0",
       "name": "winapi",
@@ -2215,6 +2311,14 @@
       "repository": "https://github.com/open-source-cooperative/windows-native-keyring-store.git",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "version": "1.1.0"
+    },
+    {
+      "checksum": "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d",
+      "license": "MIT OR Apache-2.0",
+      "name": "windows-sys",
+      "repository": "https://github.com/microsoft/windows-rs",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.52.0"
     },
     {
       "checksum": "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b",
