@@ -743,7 +743,7 @@ struct AdminLayout {
     transactions: PathBuf,
     tombstones_guard: File,
     tombstones: PathBuf,
-    lock: File,
+    lock: HeldFileLock,
 }
 
 struct ManagedEventEntry {
@@ -1861,10 +1861,7 @@ fn ensure_managed_event_directory(
     })?;
     sync_directory(&job, job_guard)?;
     Ok(LockedJob {
-        lock: locked
-            .lock
-            .try_clone()
-            .map_err(|source| io_error("clone managed-event job lock", source))?,
+        lock: locked.lock.clone(),
         guards: Vec::new(),
         revisions_guard: events_guard,
         revisions: events,
@@ -1888,13 +1885,11 @@ fn open_managed_event_directory(
         reason: "bound managed event directory is missing",
     })?;
     let lock = match locked {
-        ManagedJobReadGuard::ReadWrite(locked) => &locked.lock,
-        ManagedJobReadGuard::ReadOnly(opened) => &opened.lock,
+        ManagedJobReadGuard::ReadWrite(locked) => locked.lock.clone(),
+        ManagedJobReadGuard::ReadOnly(opened) => opened.lock.clone(),
     };
     Ok(LockedJob {
-        lock: lock
-            .try_clone()
-            .map_err(|source| io_error("clone managed-event read lock", source))?,
+        lock,
         guards: Vec::new(),
         revisions_guard: events_guard,
         revisions: events,
@@ -1920,10 +1915,7 @@ fn ensure_artifact_overlay_directory(
     })?;
     sync_directory(&job, job_guard)?;
     Ok(LockedJob {
-        lock: locked
-            .lock
-            .try_clone()
-            .map_err(|source| io_error("clone artifact-overlay job lock", source))?,
+        lock: locked.lock.clone(),
         guards: Vec::new(),
         revisions_guard: overlays_guard,
         revisions: overlays,
@@ -1980,10 +1972,7 @@ fn read_artifact_overlays_locked(
         return Ok(BTreeMap::new());
     };
     let directory = LockedJob {
-        lock: locked
-            .lock
-            .try_clone()
-            .map_err(|source| io_error("clone artifact-removal job lock", source))?,
+        lock: locked.lock.clone(),
         guards: Vec::new(),
         revisions_guard: guard,
         revisions: overlays,
@@ -2725,6 +2714,7 @@ fn ensure_admin_layout(store: &JobStore) -> Result<AdminLayout, JobStoreError> {
     fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| JobStoreError::RecoveryRequired {
         reason: "another process is recovering or mutating administrative job-store state",
     })?;
+    let lock = HeldFileLock::new(lock);
     let store_layout =
         store
             .open_existing_store_layout()?
@@ -2769,10 +2759,7 @@ fn ensure_admin_layout(store: &JobStore) -> Result<AdminLayout, JobStoreError> {
 
 fn admin_transaction_locked_directory(layout: &AdminLayout) -> Result<LockedJob, JobStoreError> {
     Ok(LockedJob {
-        lock: layout
-            .lock
-            .try_clone()
-            .map_err(|source| io_error("clone administrative transaction lock", source))?,
+        lock: layout.lock.clone(),
         guards: Vec::new(),
         revisions_guard: layout
             .transactions_guard
@@ -2784,10 +2771,7 @@ fn admin_transaction_locked_directory(layout: &AdminLayout) -> Result<LockedJob,
 
 fn admin_tombstone_locked_directory(layout: &AdminLayout) -> Result<LockedJob, JobStoreError> {
     Ok(LockedJob {
-        lock: layout
-            .lock
-            .try_clone()
-            .map_err(|source| io_error("clone administrative tombstone lock", source))?,
+        lock: layout.lock.clone(),
         guards: Vec::new(),
         revisions_guard: layout
             .tombstones_guard
@@ -2804,10 +2788,7 @@ fn consumed_operation_locked_directory(
     let reservations = store.version_root().join(OPERATION_RESERVATIONS_DIRECTORY);
     let reservations_guard = ensure_private_directory(&reservations)?;
     Ok(LockedJob {
-        lock: layout
-            .lock
-            .try_clone()
-            .map_err(|source| io_error("clone consumed operation lock", source))?,
+        lock: layout.lock.clone(),
         guards: Vec::new(),
         revisions_guard: reservations_guard,
         revisions: reservations,
