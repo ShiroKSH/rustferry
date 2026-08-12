@@ -716,6 +716,12 @@ jobs:
           RF_DIAG_BUILD_TOOLS_MATCH: ${{ steps.diagnostics.outputs.build_tools_match }}
         run: |
           set -euo pipefail
+          fail_phase() {
+            local phase="$1"
+            local message="$2"
+            echo "::error title=Android acceptance failure::$phase: $message" >&2
+            exit 1
+          }
           project="$RF_DIAG_PROJECT"
           result="$RF_DIAG_BUILD_RESULT"
           apk="$RF_DIAG_APK"
@@ -746,14 +752,131 @@ jobs:
           package="$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" "$badging")"
           version_code="$(sed -n "s/^package:.* versionCode='\([^']*\)'.*/\1/p" "$badging")"
           version_name="$(sed -n "s/^package:.* versionName='\([^']*\)'.*/\1/p" "$badging")"
-          min_sdk="$(sed -n "s/^sdkVersion:'\([^']*\)'.*/\1/p" "$badging")"
-          target_sdk="$(sed -n "s/^targetSdkVersion:'\([^']*\)'.*/\1/p" "$badging")"
           launcher="$(sed -n \
             "s/^launchable-activity: name='\([^']*\)'.*/\1/p" "$badging")"
           test "$package" = 'org.rustferry.ubuntuacceptance'
-          test "$min_sdk" = '26'
-          test "$target_sdk" = '35'
           test "$launcher" = 'org.rustferry.bridge.FerryActivity'
+
+          apkanalyzer=''
+          if candidate="$(command -v apkanalyzer 2> /dev/null)" && \
+             test -n "$candidate"
+          then
+            apkanalyzer="$candidate"
+          elif test -x \
+            "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/apkanalyzer"
+          then
+            apkanalyzer="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/apkanalyzer"
+          else
+            apkanalyzer="$(
+              for candidate in \
+                "$ANDROID_SDK_ROOT"/cmdline-tools/*/bin/apkanalyzer
+              do
+                test -x "$candidate" || continue
+                version="$(basename "$(dirname "$(dirname "$candidate")")")"
+                if printf '%s\n' "$version" | \
+                   grep -Eq '^[0-9]+([.][0-9]+)*$'
+                then
+                  printf '%s\t%s\n' "$version" "$candidate"
+                fi
+              done | LC_ALL=C sort -V -k1,1 | tail -n 1 | cut -f 2-
+            )"
+          fi
+          if ! test -x "$apkanalyzer"; then
+            fail_phase \
+              "apkanalyzer_unavailable" \
+              "installed apkanalyzer executable was not found"
+          fi
+          if ! apkanalyzer_canonical="$(readlink -f "$apkanalyzer")"; then
+            fail_phase \
+              "apkanalyzer_unavailable" \
+              "installed apkanalyzer path could not be resolved"
+          fi
+          case "$apkanalyzer_canonical" in
+            "$ANDROID_SDK_ROOT"/cmdline-tools/*/bin/apkanalyzer) ;;
+            *)
+              fail_phase \
+                "apkanalyzer_unavailable" \
+                "installed apkanalyzer is outside Android SDK cmdline-tools"
+              ;;
+          esac
+          apkanalyzer_public="\$ANDROID_SDK_ROOT${apkanalyzer_canonical#"$ANDROID_SDK_ROOT"}"
+          apkanalyzer_sha="$(sha256sum "$apkanalyzer_canonical" | awk '{print $1}')"
+          {
+            echo "path=$apkanalyzer_public"
+            echo "sha256=$apkanalyzer_sha"
+          } > "$out/apkanalyzer-identity.txt"
+
+          apkanalyzer_min_stderr="$RUNNER_TEMP/apkanalyzer-min.stderr"
+          apkanalyzer_target_stderr="$RUNNER_TEMP/apkanalyzer-target.stderr"
+          set +e
+          min_sdk="$(
+            "$apkanalyzer" \
+              manifest \
+              min-sdk \
+              "$apk" \
+              2> "$apkanalyzer_min_stderr"
+          )"
+          min_status=$?
+          target_sdk="$(
+            "$apkanalyzer" \
+              manifest \
+              target-sdk \
+              "$apk" \
+              2> "$apkanalyzer_target_stderr"
+          )"
+          target_status=$?
+          set -e
+          python3 "$sanitizer" \
+            "$apkanalyzer_min_stderr" \
+            "$out/apkanalyzer-min.stderr"
+          python3 "$sanitizer" \
+            "$apkanalyzer_target_stderr" \
+            "$out/apkanalyzer-target.stderr"
+          if test "$min_status" -ne 0; then
+            fail_phase \
+              "apkanalyzer_min_sdk" \
+              "apkanalyzer manifest min-sdk exited with status $min_status"
+          fi
+          if test "$target_status" -ne 0; then
+            fail_phase \
+              "apkanalyzer_target_sdk" \
+              "apkanalyzer manifest target-sdk exited with status $target_status"
+          fi
+          min_sdk="$(
+            printf '%s' "$min_sdk" |
+              tr -d '\r\n[:space:]'
+          )"
+          target_sdk="$(
+            printf '%s' "$target_sdk" |
+              tr -d '\r\n[:space:]'
+          )"
+          case "$min_sdk" in
+            ''|*[!0-9]*)
+              fail_phase \
+                "manifest_sdk_levels" \
+                "apkanalyzer returned a non-decimal minimum SDK"
+              ;;
+          esac
+          case "$target_sdk" in
+            ''|*[!0-9]*)
+              fail_phase \
+                "manifest_sdk_levels" \
+                "apkanalyzer returned a non-decimal target SDK"
+              ;;
+          esac
+          test "$min_sdk" = '26' ||
+            fail_phase \
+              "manifest_sdk_levels" \
+              "unexpected minimum SDK in the final APK"
+          test "$target_sdk" = '36' ||
+            fail_phase \
+              "manifest_sdk_levels" \
+              "unexpected target SDK in the final APK"
+          compile_sdk="${ANDROID_PLATFORM#android-}"
+          test "$compile_sdk" = '35' ||
+            fail_phase \
+              "manifest_sdk_levels" \
+              "unexpected compile SDK in the acceptance environment"
           abi="$(sed -n 's#^lib/\([^/]*\)/.*\.so$#\1#p' "$entries" \
             | LC_ALL=C sort -u | paste -sd, -)"
           test "$abi" = 'arm64-v8a'
@@ -937,6 +1060,10 @@ jobs:
             --arg rust_version "$rust_version" \
             --arg cargo_ferry_version "$cli_version" \
             --arg android_sdk "$ANDROID_PLATFORM;build-tools=$BUILD_TOOLS_VERSION" \
+            --arg compile_sdk "$compile_sdk" \
+            --arg sdk_level_source 'apkanalyzer_manifest' \
+            --arg apkanalyzer_identity "$apkanalyzer_public" \
+            --arg apkanalyzer_sha256 "$apkanalyzer_sha" \
             --arg ndk_revision "$ndk_revision" \
             --arg rust_target 'aarch64-linux-android' \
             --arg runtime_source_mode 'local workspace path' \
@@ -983,6 +1110,10 @@ jobs:
               rust_version:$rust_version,
               cargo_ferry_version:$cargo_ferry_version,
               android_sdk:$android_sdk,
+              compile_sdk:$compile_sdk,
+              sdk_level_source:$sdk_level_source,
+              apkanalyzer_identity:$apkanalyzer_identity,
+              apkanalyzer_sha256:$apkanalyzer_sha256,
               ndk_revision:$ndk_revision,
               rust_target:$rust_target,
               runtime_source_mode:$runtime_source_mode,
@@ -1041,6 +1172,7 @@ jobs:
           - cargo-ferry: \`$cli_version\`
           - NDK: \`$ndk_revision\`
           - Build Tools: \`$BUILD_TOOLS_VERSION\`
+          - Compile SDK: \`$compile_sdk\`
           - Target / ABI: \`aarch64-linux-android\` / \`$abi\`
           - Doctor: \`ready_for_android_build=true\`
           - Profile: \`release\`
@@ -1048,7 +1180,9 @@ jobs:
           - SHA-256: \`$apk_sha_before\`
           - Package: \`$package\`
           - Version: \`$version_name\` (\`$version_code\`)
-          - SDK: min \`$min_sdk\`, target \`$target_sdk\`
+          - Manifest SDK: min \`$min_sdk\`, target \`$target_sdk\`
+          - SDK level source: \`apkanalyzer_manifest\`
+          - APK Analyzer: \`$apkanalyzer_public\` / \`$apkanalyzer_sha\`
           - Launcher: \`$launcher\` (\`$launcher_status\`)
           - Signature: \`$signature_result\`; certificate SHA-256 \`$certificate\`
           - ZIP/content: \`$zip_content_status\`
@@ -1070,6 +1204,9 @@ jobs:
               android-acceptance.json \
               android-acceptance.md \
               android-build.log \
+              apkanalyzer-identity.txt \
+              apkanalyzer-min.stderr \
+              apkanalyzer-target.stderr \
               acceptance-zipalign-help.sanitized.log \
               acceptance-zipalign-identity.txt \
               rustferry-zipalign-identity.txt \
@@ -1083,12 +1220,24 @@ jobs:
               rustferry-logs/apksigner-verify.log \
               > checksums.txt
           )
-          evidence_created=true
-          if ! test -s "$evidence_json" || \
-             ! test -s "$evidence_md" || \
-             ! test -s "$out/checksums.txt"
+          evidence_json_created=false
+          evidence_md_created=false
+          checksums_created=false
+          if test -s "$evidence_json"; then
+            evidence_json_created=true
+          fi
+          if test -s "$evidence_md"; then
+            evidence_md_created=true
+          fi
+          if test -s "$out/checksums.txt"; then
+            checksums_created=true
+          fi
+          evidence_created=false
+          if test "$evidence_json_created" = true && \
+             test "$evidence_md_created" = true && \
+             test "$checksums_created" = true
           then
-            evidence_created=false
+            evidence_created=true
           fi
           {
             echo "signature_result=$signature_result"
@@ -1100,6 +1249,11 @@ jobs:
             echo "alignment_status=$alignment_status"
             echo "binaries_match=$binaries_match"
             echo "apk_sha_stable=$apk_sha_stable"
+            echo "min_sdk=$min_sdk"
+            echo "target_sdk=$target_sdk"
+            echo "evidence_json_created=$evidence_json_created"
+            echo "evidence_md_created=$evidence_md_created"
+            echo "checksums_created=$checksums_created"
             echo "evidence_created=$evidence_created"
           } >> "$GITHUB_OUTPUT"
           {
@@ -1167,6 +1321,11 @@ jobs:
           LAUNCHER_STATUS: ${{ steps.evidence.outputs.launcher_status }}
           ZIPALIGN_BASIC_STATUS: ${{ steps.evidence.outputs.zipalign_basic_status }}
           ZIPALIGN_16K_STATUS: ${{ steps.evidence.outputs.zipalign_16k_status }}
+          MIN_SDK: ${{ steps.evidence.outputs.min_sdk }}
+          TARGET_SDK: ${{ steps.evidence.outputs.target_sdk }}
+          EVIDENCE_JSON_CREATED: ${{ steps.evidence.outputs.evidence_json_created }}
+          EVIDENCE_MD_CREATED: ${{ steps.evidence.outputs.evidence_md_created }}
+          CHECKSUMS_CREATED: ${{ steps.evidence.outputs.checksums_created }}
           EVIDENCE_CREATED: ${{ steps.evidence.outputs.evidence_created }}
         run: |
           set -euo pipefail
@@ -1181,5 +1340,10 @@ jobs:
           test "$LAUNCHER_STATUS" = passed
           test "$ZIPALIGN_BASIC_STATUS" = 0
           test "$ZIPALIGN_16K_STATUS" = 0
+          test "$MIN_SDK" = 26
+          test "$TARGET_SDK" = 36
+          test "$EVIDENCE_JSON_CREATED" = true
+          test "$EVIDENCE_MD_CREATED" = true
+          test "$CHECKSUMS_CREATED" = true
           test "$EVIDENCE_CREATED" = true
           test "$UPLOAD_RESULT" = success
