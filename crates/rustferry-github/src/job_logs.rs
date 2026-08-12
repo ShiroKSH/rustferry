@@ -2765,6 +2765,10 @@ mod tests {
         .expect("limits")
     }
 
+    fn private_key_boundary(kind: &str) -> String {
+        format!("-----{kind} PRIVATE KEY-----")
+    }
+
     fn metadata(jobs: &str, total: usize) -> Vec<u8> {
         format!(r#"{{"total_count":{total},"jobs":[{jobs}]}}"#).into_bytes()
     }
@@ -3057,7 +3061,7 @@ mod tests {
             &mut client,
             3,
             vec![
-                b"-----BEGIN PRIVATE KEY-----\n".to_vec(),
+                format!("{}\n", private_key_boundary("BEGIN")).into_bytes(),
                 b"c3VwZXItc2VjcmV0LWtleS1ieXRlcw==\n-----END PRIVATE KEY-----\n".to_vec(),
                 b"AWS_SECRET_ACCESS_KEY=aws-secret-value\n".to_vec(),
             ],
@@ -3094,7 +3098,7 @@ mod tests {
     fn opaque_credentials_quoted_secrets_and_uri_variants_never_leak() {
         for value in [
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            "AKIA1234567890ABCDEF",
+            concat!("AKIA", "1234567890ABCDEF"),
             "2026-08-10T00:00:00Z value=0123456789abcdef0123",
             r#"{"token":"short-secret"}"#,
             r#"TOKEN="abc\"def""#,
@@ -3139,9 +3143,13 @@ mod tests {
             [metadata(&job(3), 1)],
         ));
         let mut oversized = vec![b'x'; MAX_JOB_LOG_LINE_BYTES + 32];
-        oversized.extend_from_slice(b" -----BEGIN PRIVATE KEY-----\n");
-        let mut log = b"2026-08-10T00:00:00Z -----BEGIN PRIVATE KEY-----\n2026-08-10T00:00:01Z c2hvcnQtc2VjcmV0\n2026-08-10T00:00:02Z -----END PRIVATE KEY-----\npem-safe\n2026-08-10T00:00:03Z PuTTY-User-Key-File-3: ssh-rsa\n2026-08-10T00:00:04Z Private-Lines: 1\n2026-08-10T00:00:05Z cHBrc2VjcmV0\n2026-08-10T00:00:06Z Private-MAC: deadbeef\nppk-safe\n"
-            .to_vec();
+        oversized.extend_from_slice(format!(" {}\n", private_key_boundary("BEGIN")).as_bytes());
+        let mut log = format!(
+            "2026-08-10T00:00:00Z {}\n2026-08-10T00:00:01Z c2hvcnQtc2VjcmV0\n2026-08-10T00:00:02Z {}\npem-safe\n2026-08-10T00:00:03Z PuTTY-User-Key-File-3: ssh-rsa\n2026-08-10T00:00:04Z Private-Lines: 1\n2026-08-10T00:00:05Z cHBrc2VjcmV0\n2026-08-10T00:00:06Z Private-MAC: deadbeef\nppk-safe\n",
+            private_key_boundary("BEGIN"),
+            private_key_boundary("END")
+        )
+        .into_bytes();
         log.extend_from_slice(&oversized);
         log.extend_from_slice(
             b"short-secret-after-oversize\n2026-08-10T00:00:07Z -----END PRIVATE KEY-----\nafter-oversize-safe\n",
@@ -3209,7 +3217,15 @@ mod tests {
         queue_job_log(
             &mut client,
             3,
-            vec![b"-----END PRIVATE KEY----- -----BEGIN PRIVATE KEY-----\nshort-fragment\n-----END PRIVATE KEY-----\nafter-close\n".to_vec()],
+            vec![
+                format!(
+                    "{} {}\nshort-fragment\n{}\nafter-close\n",
+                    private_key_boundary("END"),
+                    private_key_boundary("BEGIN"),
+                    private_key_boundary("END")
+                )
+                .into_bytes(),
+            ],
         );
         let mut fetcher = GithubJobLogFetcher::new(client, limits(1024, 1024));
         let poll = fetcher

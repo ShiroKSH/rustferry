@@ -2995,6 +2995,8 @@ mod tests {
             &destination_protocol,
             |published| {
                 assert_eq!(fs::read(published).unwrap(), bytes);
+                #[cfg(not(windows))]
+                remove_new_file(published)?;
                 Ok(())
             },
         )

@@ -21889,7 +21889,7 @@ mod tests {
             },),
             Ok(TemporaryRefPublicationLease::Acquired)
         );
-        drop(first);
+        first.release_git_snapshot_source_lease(&request);
         assert_eq!(
             second.acquire_git_snapshot_source_lease(&request),
             Ok(TemporaryRefPublicationLease::Acquired)

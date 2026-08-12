@@ -1360,6 +1360,8 @@ mod unix {
             self.verify_preparation()?;
             let config_path = self.paths.bare.join("config");
             let head_path = self.paths.bare.join("HEAD");
+            make_private_directory(&self.paths.bare.join("objects"), self.owner_uid)?;
+            make_private_directory(&self.paths.bare.join("objects/info"), self.owner_uid)?;
             make_private_file(&config_path)?;
             make_private_file(&head_path)?;
             let config_bytes = read_control_path(&config_path)?;
@@ -1620,6 +1622,22 @@ mod unix {
         }
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))
             .map_err(|_| PrivateGitRepositoryError::UnsafeControlFile)
+    }
+
+    fn make_private_directory(
+        path: &Path,
+        expected_owner: u32,
+    ) -> Result<(), PrivateGitRepositoryError> {
+        let metadata =
+            fs::symlink_metadata(path).map_err(|_| PrivateGitRepositoryError::UnsafeDirectory)?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != expected_owner
+        {
+            return Err(PrivateGitRepositoryError::UnsafeDirectory);
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .map_err(|_| PrivateGitRepositoryError::UnsafeDirectory)
     }
 
     fn read_control_path(path: &Path) -> Result<Vec<u8>, PrivateGitRepositoryError> {

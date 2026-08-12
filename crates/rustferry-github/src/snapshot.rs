@@ -3597,7 +3597,8 @@ mod tests {
         assert!(fixture.metadata_path.exists());
 
         let fixture = stage_fixture();
-        fs::remove_file(&fixture.metadata_path).unwrap();
+        let displaced_metadata = fixture.isolation_root.join("displaced-metadata");
+        fs::rename(&fixture.metadata_path, &displaced_metadata).unwrap();
         fs::write(&fixture.metadata_path, b"replacement").unwrap();
         assert_eq!(
             GitSnapshotImportInputs::delete_stage_exact(

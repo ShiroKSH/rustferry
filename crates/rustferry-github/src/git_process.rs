@@ -1867,7 +1867,12 @@ mod unix {
                 return;
             }
             let temporary = tempfile::tempdir().expect("fixture");
-            let agent_path = temporary.path().join("agent.sock");
+            let agent_directory = temporary.path().join("agent");
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&agent_directory)
+                .expect("private agent directory");
+            let agent_path = agent_directory.join("agent.sock");
             let _agent = UnixListener::bind(&agent_path).expect("fixture agent socket");
             let Some(mut toolchain) = system_toolchain() else {
                 return;
