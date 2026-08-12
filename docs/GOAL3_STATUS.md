@@ -6,7 +6,7 @@ one-shot `master` acceptance at `607fe78cf1ae22f8c569fb48d067d8478f407883`. This
 preserves the Developer Experience line while adding the remote protocol/provider/worker path and
 the portability, file-identity, no-clobber, bounded-process, and cleanup hardening recorded below.
 
-Windows continuation pre-docs source commit: `GOAL3_SOURCE_COMMIT_PENDING`. This continuation is
+Windows continuation pre-docs source commit: `0ff643f3ce2baf9a28cf0519ad7a825ecd09cbad`. This continuation is
 implemented and Windows-native tested; it has no Windows-originated GitHub/macOS run.
 
 ## Current milestone
@@ -18,6 +18,10 @@ unsigned XCArchive returned to a Linux client. No Windows-originated archive, re
 profile acceptance, physical install/launch/logs, Personal Team flow, extension device signing,
 live SSH build, performance matrix, or reference managed-cloud provider has been validated. The
 exact 18-scenario ledger is in [the support matrix](support-matrix.md#goal-3-physical-iphone-scenarios).
+
+Final Windows Cargo gates at the pre-documentation source head pass: cargo-ferry library 145/145 with 0 failed and 0 ignored (3.79 seconds), the bounded prune-publication regression 1/1 (0.24 seconds; 563 ms wall), related prune tests 8/8 (1.68 seconds), `cli` 42/42 (50.70 seconds), `artifact_cli` 9/9 (0.42 seconds), `jobs_cli` 11/11 (0.44 seconds), and the all-target/all-feature cargo-ferry check. These results separately cover changes after the exact Android production source accepted by run `31590994094`; that APK evidence is not attributed to the later branch head.
+
+Windows-native jobs, artifacts, snapshot, and IDE paths have focused test coverage. A current-revision local Windows APK artifact is not claimed because the upstream `skia-bindings` full-source Windows build blocked local packaging. Windows-originated GitHub/macOS iPhone acceptance remains pending. iPhone builds require a local or remote macOS host with full Xcode and the official Apple toolchain. The live-proven result remains an unsigned physical-iPhone XCArchive; no development-signed IPA, installation, launch, logs, or physical-device runtime is claimed.
 
 ## Final integrated acceptance
 

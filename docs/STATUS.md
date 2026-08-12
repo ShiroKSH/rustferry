@@ -1,10 +1,33 @@
 # Implementation status
 
-Last updated: 2026-08-09
+Last updated: 2026-08-12
 
 Source and documentation now use RustFerry. [Platform artifacts run 30719811812](https://github.com/ShiroKSH/rustferry/actions/runs/30719811812) at commit `8ed0192` produced and inspected current RustFerry-named Android and iOS artifacts. Exact pre-rename `cargo-pocket`/`Pocket*` paths, identifiers, symbols, and hashes remain below as historical evidence.
 
 Goal 3 landed on `master` through PR #8 at `088dedfd1462875f69584db738f5626680b02c91`, followed by the trusted-master acceptance wiring in PR #10 at `607fe78cf1ae22f8c569fb48d067d8478f407883`. That exact head passed [Linux-to-macOS unsigned iPhone acceptance](https://github.com/ShiroKSH/rustferry/actions/runs/31261962599); [worker run `31262066567`](https://github.com/ShiroKSH/rustferry/actions/runs/31262066567) completed unsigned Phase A and cleanup. Protected signing Phase B was skipped because no real PKCS#12 archive, password, provisioning profile, distinct private execution repository, or device was available. [Final CI run `31261962607`](https://github.com/ShiroKSH/rustferry/actions/runs/31261962607) passed all five jobs on attempt 2 after a transient runner failure, including Windows workspace tests and starter generation/check.
+
+## Android source beta acceptance
+
+The Android APK pipeline is artifact-validated on a GitHub-hosted Ubuntu runner. The user-owned application project remains Rust-only. It does not require Gradle or an Android Studio project. The accepted build used local-workspace path runtime mode. Installation, launch and runtime behavior were not validated.
+
+Acceptance run [`31590994094`](https://github.com/ShiroKSH/rustferry/actions/runs/31590994094), job `94095650729`, retained artifact `9139312833`, and production source `ed45328d6fc375e81b20ab10c1014c4b8d224a85` produced `rustferry_android_ubuntu_acceptance.apk`. The retained artifact was downloaded again and all 18 entries in `checksums.txt` matched. Exact APK evidence:
+
+- size: 25,031,645 bytes;
+- SHA-256: `4dfe658492d724ed3320a3221de9c4c407df0a6d4077431d7b72ab85d99f3088`;
+- package and launcher: `org.rustferry.ubuntuacceptance`, `org.rustferry.bridge.FerryActivity`;
+- Rust target and ABI: `aarch64-linux-android`, `arm64-v8a`;
+- NDK and SDKs: `29.0.14206865`; compile 35, minimum 26, target 36;
+- APK Signature Schemes v2 and v3: passed; certificate SHA-256 `353336761cef79fa6df1e04d6782492bf8c9e3e18f62f2fbc05c52eb069104da`;
+- basic ZIP alignment and 16 KiB ZIP alignment: passed;
+- user-owned Gradle project: absent.
+
+This artifact validates only exact Android production source `ed45328d6fc375e81b20ab10c1014c4b8d224a85`, not the later PR head. Later artifact/store/test commits have separate Windows Cargo evidence at pre-documentation head `0ff643f3ce2baf9a28cf0519ad7a825ecd09cbad`: the cargo-ferry library suite passed 145 tests with 0 failed and 0 ignored in 3.79 seconds; the exact prune-publication test passed in 0.24 seconds (563 ms wall); eight related prune tests passed in 1.68 seconds; `cli` passed 42 tests in 50.70 seconds; `artifact_cli` passed 9 tests in 0.42 seconds; `jobs_cli` passed 11 tests in 0.44 seconds; and `cargo check -p cargo-ferry --all-targets --all-features` passed.
+
+Distribution remains source beta / developer preview. Registry-based starter generation remains unavailable until the internal RustFerry crates are published.
+
+Windows-native jobs, artifacts, snapshot, and IDE paths have focused test coverage. A current-revision local Windows APK artifact is not claimed because the upstream `skia-bindings` full-source Windows build blocked local packaging. Windows-originated GitHub/macOS iPhone acceptance remains pending.
+
+iPhone builds require a local or remote macOS host with full Xcode and the official Apple toolchain. The live-proven result remains an unsigned physical-iPhone XCArchive. No development-signed IPA, installation, launch, logs, or physical-device runtime is claimed.
 
 ## Current continuation
 

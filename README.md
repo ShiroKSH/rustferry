@@ -20,7 +20,7 @@
 RustFerry keeps application code and assets in an ordinary Rust project. When you build, it creates the required platform host below `target/ferry/`; that generated glue is disposable and stays out of your source tree.
 
 > [!IMPORTANT]
-> RustFerry is pre-release. Real signed/aligned arm64 Android APKs, arm64 iOS Simulator `.app`/`.appex` bundles, and an unsigned physical-iPhone `.xcarchive` built through the GitHub provider from a Linux client have been independently inspected. Durable remote jobs, sanitized logs, cancellation, retry, managed artifacts, and explicit public GitHub snapshots are implemented and tested on Windows, but no Windows-originated GitHub/macOS build is live-validated. SSH snapshot v1 has deterministic local coverage but no live SSH-produced artifact. A real development-signed remote IPA and runtime behavior on an emulator, Simulator, or physical device remain unvalidated. See the [support matrix](docs/support-matrix.md) and [Goal 3 evidence log](docs/GOAL3_STATUS.md).
+> RustFerry is a source beta / developer preview. The Android APK pipeline is artifact-validated on a GitHub-hosted Ubuntu runner; the accepted build used local-workspace path runtime mode. The user-owned application project remains Rust-only and requires neither Gradle nor an Android Studio project. Installation, launch, and runtime behavior were not validated. Durable remote jobs, sanitized logs, cancellation, retry, managed artifacts, and explicit public GitHub snapshots have focused Windows-native coverage, but no current-revision local Windows APK or Windows-originated GitHub/macOS iPhone acceptance is claimed. The live-proven iPhone result remains an unsigned physical-iPhone XCArchive; no development-signed IPA or device runtime is claimed. See the [support matrix](docs/support-matrix.md), [implementation evidence](docs/STATUS.md), and [Goal 3 evidence log](docs/GOAL3_STATUS.md).
 
 ## What it does
 
@@ -54,6 +54,8 @@ cargo ferry new weather \
 `--runtime-source workspace` supports monorepo development. `CARGO_FERRY_RUNTIME_PATH` remains an optional contributor-only development override when no explicit source is supplied; normal published installations do not require it. Rust 1.92 or newer is required. Local Android builds need the Android SDK/NDK, and local Apple builds need full Xcode. A Linux or Windows client using a configured remote physical-iPhone provider needs neither local Xcode nor an Apple SDK.
 
 After the coordinated crates are published, the normal installation will be `cargo install cargo-ferry`.
+
+Registry-based starter generation remains unavailable until the internal RustFerry crates are published. This source beta therefore uses the reviewed checkout or local-workspace path runtime mode; it is not a crates.io release.
 
 ## Create a project
 

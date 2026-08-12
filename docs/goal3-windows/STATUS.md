@@ -5,7 +5,7 @@ Baseline captured `2026-08-09`; continuation frozen `2026-08-10` on the physical
 | Milestone | Current state | Evidence boundary |
 | --- | --- | --- |
 | 0 — handoff and baseline | Complete | Handoff/ancestry, physical Windows host, isolated directories, metadata/fmt/diff baseline recorded in [BASELINE.md](BASELINE.md). |
-| 1 — Windows native regression | Frozen local gates pass | cargo-ferry library 139/139, binary 235/235, jobs CLI 11/11; all-target check and strict Clippy pass. Historical commands remain append-only in [COMMAND-AUDIT.jsonl](COMMAND-AUDIT.jsonl). |
+| 1 — Windows native regression | Current focused gates pass | cargo-ferry library 145/145, bounded prune publication 1/1, related prune 8/8, CLI 42/42, artifact CLI 9/9, jobs CLI 11/11, and all-target/all-feature check pass at pre-docs head `0ff643f3ce2baf9a28cf0519ad7a825ecd09cbad`. Historical commands remain append-only in [COMMAND-AUDIT.jsonl](COMMAND-AUDIT.jsonl). |
 | 2 — live Windows acceptance | Pending | No Windows-originated GitHub/macOS run. Push remains compatible/default; the preflight made no mutation. |
 | 3 — persistent jobs | Implemented and Windows-native tested | Private immutable store, bounded sanitized logs, list/show/artifacts, and crash-safe prune pass frozen suites. |
 | 4 — cancel/retry | Implemented and Windows-native tested | Fresh-process exact cancellation, exact-source retry, current-source recapture, lineage, and restart recovery pass frozen suites. No GitHub-live result. |
@@ -14,7 +14,7 @@ Baseline captured `2026-08-09`; continuation frozen `2026-08-10` on the physical
 | 7 — signed readiness | Implemented and locally tested | Metadata-only `signing doctor` checks provider/local policy without reading secret values. Configured readiness is not established. |
 | 8 — signed/device acceptance | Blocked on authorized assets; not attempted | No real Apple credentials/profiles/private execution setup/registered device supplied for this continuation. |
 | 9 — VS Code adapter | Implemented and tested | All 13 Goal 3 IDE-v1 tokens are available; schema copies match; Rust black-box 4/4 and live TypeScript 74 passed with 8 environment-dependent cases skipped. |
-| 10 — landing | In progress | Generated Goal 3 `dist/` packages are excluded from landing. Branch push, live acceptance, and Draft PR remain; no automatic merge. |
+| 10 — landing | Final gates complete | Generated Goal 3 `dist/` packages and local evidence are excluded from landing. PR #13 carries the tested Windows control plane and exact Android source-beta evidence; merge remains subject to required checks and approval. |
 
 ## Validation matrix
 
@@ -52,3 +52,5 @@ Baseline captured `2026-08-09`; continuation frozen `2026-08-10` on the physical
 - Apple signing and device behavior: not inferred from readiness, unsigned output, archive shape, or synthetic tests.
 
 See [JOBS.md](JOBS.md), [ARTIFACTS.md](ARTIFACTS.md), and [WINDOWS-ACCEPTANCE.md](WINDOWS-ACCEPTANCE.md) for the executable contract.
+
+The Android APK accepted by Ubuntu run `31590994094` binds exact production source `ed45328d6fc375e81b20ab10c1014c4b8d224a85`; later artifact/store/test commits are covered separately by the Windows Cargo gates above. A current-revision local Windows APK is not claimed because upstream `skia-bindings` full-source Windows compilation blocked local packaging. No Windows-originated GitHub/macOS iPhone acceptance, signed IPA, installation, launch, logs, or physical-device runtime is claimed.

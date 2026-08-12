@@ -4,6 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Record the GitHub-hosted Ubuntu Android source-beta acceptance for production source `ed45328d6fc375e81b20ab10c1014c4b8d224a85`, including the retained signed/aligned arm64 APK evidence and separate Cargo gates for later artifact, store, and test changes.
 - Add private immutable remote-job history with bounded sanitized provider logs, fresh-process cancellation, exact and current-source retry lineage, and crash-safe complete-lineage pruning.
 - Add explicit consent-bound public GitHub GitSnapshot builds for dirty projects with zero-write preview, create-only temporary refs, restart recovery, retained exact-source retry, and non-erasure warnings.
 - Add managed artifact list/show/inspect/verify/reveal/remove commands with exact provenance, Windows retained-identity removal, replacement preservation, and durable idempotence.
