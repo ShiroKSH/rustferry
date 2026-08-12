@@ -322,6 +322,13 @@ mod platform {
         }
     }
 
+    pub(super) fn release_process_file_lease(file: &File) {
+        // SAFETY: the retained descriptor is live and `flock` does not dereference user memory.
+        unsafe {
+            libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+
     pub(super) struct ProcessGroupGuard {
         process_group: u32,
         tracked: bool,
@@ -386,7 +393,7 @@ mod platform {
     use windows_sys::Win32::Foundation::{
         ERROR_LOCK_VIOLATION, ERROR_NO_MORE_FILES, GetLastError, INVALID_HANDLE_VALUE,
     };
-    use windows_sys::Win32::Storage::FileSystem::LockFile;
+    use windows_sys::Win32::Storage::FileSystem::{LockFile, UnlockFile};
     use windows_sys::Win32::System::Console::{
         CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler,
     };
@@ -490,6 +497,13 @@ mod platform {
             } else {
                 Err(error)
             }
+        }
+    }
+
+    pub(super) fn release_process_file_lease(file: &std::fs::File) {
+        // SAFETY: the retained verified file handle is live; this unlocks the acquired range.
+        unsafe {
+            UnlockFile(file.as_raw_handle(), 0, 0, u32::MAX, u32::MAX);
         }
     }
 
@@ -858,6 +872,8 @@ mod platform {
         Ok(None)
     }
 
+    pub(super) const fn release_process_file_lease(_file: &File) {}
+
     pub(super) struct ProcessGroupGuard;
 
     impl ProcessGroupGuard {
@@ -911,7 +927,13 @@ pub fn ensure_descendants_terminate_on_process_exit() -> std::io::Result<bool> {
 /// One operating-system lease released automatically when this process exits.
 #[derive(Debug)]
 pub struct ProcessFileLease {
-    _file: File,
+    file: File,
+}
+
+impl Drop for ProcessFileLease {
+    fn drop(&mut self) {
+        platform::release_process_file_lease(&self.file);
+    }
 }
 
 /// Try to acquire one exclusive process-lifetime lease on an exact file.
@@ -924,7 +946,7 @@ pub struct ProcessFileLease {
 /// Returns an operating-system error when the lease file cannot be securely opened or locked.
 pub fn try_acquire_process_file_lease(path: &Path) -> io::Result<Option<ProcessFileLease>> {
     platform::try_acquire_process_file_lease(path)
-        .map(|lease| lease.map(|file| ProcessFileLease { _file: file }))
+        .map(|lease| lease.map(|file| ProcessFileLease { file }))
 }
 
 /// Keep a newly spawned child tree reachable by the platform interrupt mechanism.

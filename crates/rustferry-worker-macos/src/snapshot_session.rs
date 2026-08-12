@@ -23,6 +23,8 @@ use rustferry_core::windows_private_directory::{
 
 use camino::{Utf8Path, Utf8PathBuf};
 use cap_std::{ambient_authority, fs::Dir as CapabilityDir};
+#[cfg(unix)]
+use rustferry_core::retained_directory_is_unlinked;
 use rustferry_remote::{
     ArtifactKind, ArtifactRecord, COMPILE_HANDOFF_SCHEMA_VERSION, CancellationToken,
     CleanupConfirmation, CompileHandoff, IosArtifactType, IosDeviceBuildRequest, JobState,
@@ -1124,7 +1126,7 @@ impl JobRootGuard {
             Err(_) => return Err(SessionFailure::cleanup("worker_cleanup_failed")),
         }
         #[cfg(unix)]
-        if !retained_directory_is_unlinked(&retained_identity)
+        if !retained_directory_is_unlinked(retained_identity.as_file())
             .map_err(|_| SessionFailure::cleanup("worker_cleanup_failed"))?
         {
             return Err(SessionFailure::cleanup("worker_cleanup_failed"));
@@ -1225,16 +1227,6 @@ fn remove_private_capability_directory_tree(directory: CapabilityDir) -> io::Res
     directory.remove_open_dir_all()
 }
 
-#[cfg(unix)]
-fn retained_directory_is_unlinked(identity: &Handle) -> io::Result<bool> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    identity
-        .as_file()
-        .metadata()
-        .map(|metadata| metadata.nlink() == 0)
-}
-
 #[cfg(windows)]
 fn remove_private_capability_directory_tree(directory: CapabilityDir) -> io::Result<()> {
     remove_private_directory_tree_handle(directory.into_std_file()).map_err(io::Error::other)
@@ -1254,7 +1246,7 @@ fn remove_private_capability_directory_tree(directory: CapabilityDir) -> io::Res
 )]
 fn sync_capability_directory(directory: &CapabilityDir) -> io::Result<()> {
     #[cfg(unix)]
-    directory.try_clone()?.into_std_file().sync_all()?;
+    directory.open(".")?.sync_all()?;
     #[cfg(not(unix))]
     let _ = directory;
     Ok(())
@@ -2406,9 +2398,9 @@ mod tests {
         fs::create_dir(&directory).expect("owned directory");
         let identity = Handle::from_path(&directory).expect("retained identity");
 
-        assert!(!retained_directory_is_unlinked(&identity).expect("live link state"));
+        assert!(!retained_directory_is_unlinked(identity.as_file()).expect("live link state"));
         fs::remove_dir(&directory).expect("unlink owned directory");
-        assert!(retained_directory_is_unlinked(&identity).expect("removed link state"));
+        assert!(retained_directory_is_unlinked(identity.as_file()).expect("removed link state"));
     }
 
     #[cfg(windows)]

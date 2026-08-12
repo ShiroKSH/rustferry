@@ -500,6 +500,13 @@ pub fn directory_identity_from_file(
     platform::directory_identity_from_file(file)
 }
 
+/// Report whether a retained Unix directory no longer has a live filesystem name.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn retained_directory_is_unlinked(file: &std::fs::File) -> std::io::Result<bool> {
+    platform::retained_directory_is_unlinked(file)
+}
+
 /// Open an absolute Windows path for policy-neutral exact regular-file removal.
 ///
 /// The final path component is opened without following a reparse point. The retained handle
@@ -1215,6 +1222,12 @@ mod platform {
         path::Path,
     };
 
+    #[cfg(target_vendor = "apple")]
+    use std::{
+        ffi::OsStr,
+        os::{fd::AsRawFd as _, unix::ffi::OsStrExt as _},
+    };
+
     use super::{
         DirectoryFilesystemIdentity, DirectoryIdentityError, DirectoryIdentityErrorKind,
         DirectoryIdentityOperation, RegularFileFilesystemIdentity,
@@ -1266,6 +1279,45 @@ mod platform {
             return Err(identity_mismatch());
         }
         Ok(())
+    }
+
+    #[cfg_attr(target_vendor = "apple", allow(unsafe_code))]
+    pub(super) fn retained_directory_is_unlinked(
+        directory: &std::fs::File,
+    ) -> std::io::Result<bool> {
+        #[cfg(not(target_vendor = "apple"))]
+        return directory.metadata().map(|metadata| metadata.nlink() == 0);
+
+        #[cfg(target_vendor = "apple")]
+        {
+            let mut path = [0_i8; libc::PATH_MAX as usize];
+            // SAFETY: `directory` is live and `path` is a writable PATH_MAX-sized buffer.
+            let status =
+                unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) };
+            if status != 0 {
+                let error = std::io::Error::last_os_error();
+                return if error.raw_os_error() == Some(libc::ENOENT) {
+                    Ok(true)
+                } else {
+                    Err(error)
+                };
+            }
+            let terminator = path.iter().position(|byte| *byte == 0).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid retained path")
+            })?;
+            let path = path[..terminator]
+                .iter()
+                .map(|byte| (*byte).cast_unsigned())
+                .collect::<Vec<_>>();
+            let rebound = match std::fs::File::open(Path::new(OsStr::from_bytes(&path))) {
+                Ok(rebound) => rebound,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+                Err(error) => return Err(error),
+            };
+            let retained = directory.metadata()?;
+            let rebound = rebound.metadata()?;
+            Ok(retained.dev() != rebound.dev() || retained.ino() != rebound.ino())
+        }
     }
 
     #[cfg(test)]

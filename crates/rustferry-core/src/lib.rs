@@ -26,6 +26,9 @@ pub use config::{
 pub use file_streams::{
     RegularFileStreamError, RegularFileStreamErrorKind, verify_regular_file_has_no_named_streams,
 };
+#[cfg(unix)]
+#[doc(hidden)]
+pub use filesystem_identity::retained_directory_is_unlinked;
 pub use filesystem_identity::{
     DirectoryFilesystemIdentity, DirectoryIdentityError, DirectoryIdentityErrorKind,
     DirectoryIdentityOperation, RegularFileFilesystemIdentity, RetainedDirectoryIdentity,
