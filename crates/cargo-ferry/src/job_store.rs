@@ -1246,7 +1246,7 @@ impl JobStore {
         update: impl FnOnce(&StoredJobV1) -> Result<Option<StoredJobV1>, JobStoreError>,
     ) -> Result<Option<RevisionReceipt>, JobStoreError> {
         self.ensure_writable()?;
-        let locked = self.lock_job(local_job_id, false)?;
+        let locked = self.lock_job_for_short_write(local_job_id, false)?;
         recover_revision_staging(&locked)?;
         let revisions = scan_revision_files(&locked.revisions)?;
         let latest = revisions.last().ok_or_else(|| JobStoreError::JobNotFound {
@@ -1550,7 +1550,7 @@ impl JobStore {
         if record.revision == 1 {
             validate_initial_job_revision(record)?;
         }
-        let locked = self.lock_job(&record.local_job_id, creating)?;
+        let locked = self.lock_job_for_short_write(&record.local_job_id, creating)?;
         recover_revision_staging(&locked)?;
         let revisions = scan_revision_files(&locked.revisions)?;
         if let Some(latest) = revisions.last() {
@@ -1730,6 +1730,25 @@ impl JobStore {
             admin::reject_tombstoned_local_job_id(self, local_job_id)?;
         }
         Ok(locked)
+    }
+
+    fn lock_job_for_short_write(
+        &self,
+        local_job_id: &LocalJobId,
+        create_layout: bool,
+    ) -> Result<LockedJob, JobStoreError> {
+        for attempt in 0..4_096 {
+            match self.lock_job(local_job_id, create_layout) {
+                Ok(locked) => return Ok(locked),
+                Err(JobStoreError::JobBusy { .. }) if attempt < 4_095 => {
+                    std::thread::yield_now();
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(JobStoreError::JobBusy {
+            local_job_id: local_job_id.clone(),
+        })
     }
 
     fn lock_job_unchecked(

@@ -19,6 +19,21 @@ fn generate_project(parent: &std::path::Path, name: &str) -> std::path::PathBuf 
     parent.join(name)
 }
 
+fn canonical_protocol_path(path: &std::path::Path) -> String {
+    let canonical = path.canonicalize().expect("canonical path");
+    let display = canonical.to_string_lossy();
+    #[cfg(windows)]
+    {
+        if let Some(unc) = display.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{unc}");
+        }
+        if let Some(local) = display.strip_prefix(r"\\?\") {
+            return local.to_owned();
+        }
+    }
+    display.into_owned()
+}
+
 fn source_bundle_fixture(parent: &std::path::Path) -> std::path::PathBuf {
     let project = parent.join("source-bundle-fixture");
     fs::create_dir_all(project.join("src")).expect("source fixture directory");
@@ -244,13 +259,7 @@ fn ide_validate_returns_zero_based_diagnostics_for_unicode_workspace() {
     assert_eq!(document["protocol_version"], 1);
     assert_eq!(document["valid"], false);
     let diagnostic = &document["diagnostics"][0];
-    assert_eq!(
-        diagnostic["file"],
-        path.canonicalize()
-            .expect("canonical manifest path")
-            .to_string_lossy()
-            .as_ref()
-    );
+    assert_eq!(diagnostic["file"], canonical_protocol_path(&path));
     assert_eq!(diagnostic["range"]["start"]["character"], 0);
 }
 
@@ -286,10 +295,7 @@ fn ide_validate_uses_unsaved_manifest_stdin_without_writing_it_to_disk() {
     assert_eq!(document["valid"], false);
     assert_eq!(
         document["diagnostics"][0]["file"],
-        path.canonicalize()
-            .expect("canonical manifest path")
-            .to_string_lossy()
-            .as_ref()
+        canonical_protocol_path(&path)
     );
     assert_eq!(document["diagnostics"][0]["range"]["start"]["character"], 0);
     assert_eq!(
