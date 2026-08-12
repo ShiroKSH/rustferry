@@ -105,7 +105,7 @@ jobs:
           done
           cargo package --workspace --exclude rustferry-worker-macos --locked
           cargo publish --workspace --exclude rustferry-worker-macos \
-            --dry-run --locked --no-verify
+            --dry-run --locked
           python3 scripts/check-release-archives.py "$CARGO_TARGET_DIR"/package/*.crate
       - name: Build real CLI protocol fixture
         run: cargo build --locked -p cargo-ferry

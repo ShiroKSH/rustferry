@@ -9,8 +9,8 @@ repository.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/rustferry-remote"
 readme.workspace = true
-keywords.workspace = true
-categories.workspace = true
+keywords = ["rust", "remote-build", "mobile", "artifacts", "protocol"]
+categories = ["development-tools::build-utils", "network-programming"]
 description = "Versioned remote-build contracts and provider interfaces for RustFerry"
 include = [
     "src/**",

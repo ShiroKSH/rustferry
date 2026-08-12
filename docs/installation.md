@@ -7,14 +7,18 @@ Required:
 - Rust and Cargo 1.92 or newer;
 - Git when `cargo ferry new` should initialize a repository.
 
-Published-release flow (available after the coordinated crates are released):
+Install the public pre-release from crates.io:
 
 ```console
-cargo install cargo-ferry
-cargo ferry new weather
+cargo install cargo-ferry --locked
+cargo ferry new weather --id com.example.weather
+cargo ferry doctor --all
+cargo ferry check
 ```
 
-Install from this checkout for contributor development:
+## Development from source
+
+Install from a checkout for contributor development and select its runtime explicitly:
 
 ```console
 cargo install --locked --path crates/cargo-ferry
@@ -22,14 +26,14 @@ cargo ferry --version
 cargo ferry new weather --runtime-source path --runtime-path "$PWD/crates/rustferry"
 ```
 
-Normal generation writes an exact registry dependency and does not contain a developer checkout path. Contributors can select `--runtime-source workspace` or `--runtime-source path --runtime-path ABSOLUTE_PATH`. `CARGO_FERRY_RUNTIME_PATH` remains an optional development override; it must be UTF-8, absolute, canonicalizable, and contain `Cargo.toml`. Invalid inputs fail before files are written. The current repository is pre-release: neither `cargo-ferry` nor `rustferry` 0.1.0 is claimed available from crates.io.
+Normal generation writes an exact registry dependency and does not contain a developer checkout path. Contributors can select `--runtime-source workspace` or `--runtime-source path --runtime-path ABSOLUTE_PATH`. `CARGO_FERRY_RUNTIME_PATH` remains an optional development override; it must be UTF-8, absolute, canonicalizable, and contain `Cargo.toml`. Invalid inputs fail before files are written.
 
 Checking a generated Slint/Skia application on Linux also requires `pkg-config` and the system Fontconfig development package (`libfontconfig1-dev` on Debian and Ubuntu). RustFerry reports the underlying Cargo diagnostic when either prerequisite is missing.
 
 PowerShell equivalent:
 
 ```powershell
-cargo install --path crates/cargo-ferry
+cargo install --locked --path crates/cargo-ferry
 cargo ferry --version
 cargo ferry new weather --runtime-source path --runtime-path (Resolve-Path crates/rustferry).Path
 ```

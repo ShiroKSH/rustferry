@@ -26,12 +26,12 @@ No step below implies that a release or registry publication has occurred.
 
 - [ ] `cargo fmt --all -- --check`
 - [ ] `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings`
-- [ ] `cargo test --locked --workspace --all-features`
+- [ ] `cargo test --locked --workspace --all-targets --all-features`
 - [ ] `RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --all-features --no-deps`
 - [ ] `python3 scripts/check-release-contract.py` reports every internal edge exact.
 - [ ] `cargo package --workspace --exclude rustferry-worker-macos --locked --list`
 - [ ] `cargo package --workspace --exclude rustferry-worker-macos --locked`
-- [ ] `cargo publish --workspace --exclude rustferry-worker-macos --dry-run --locked --no-verify`
+- [ ] `cargo publish --workspace --exclude rustferry-worker-macos --dry-run --locked`
 - [ ] `python3 scripts/check-release-archives.py --check-sources --target-dir target/package-source-check target/package/*.crate`
 - [ ] Inspect all nine `.crate` archives and their normalized manifests; confirm
       both canonical license files are regular root members.
@@ -55,23 +55,21 @@ No step below implies that a release or registry publication has occurred.
 - [ ] Physical-device binaries excluded unless signing, installation, launch,
       and required license notices were actually validated.
 
-## Draft release
+## Release assembly
 
 1. Run the `Draft release` workflow with the exact workspace version and
    `create_draft_release` disabled.
 2. Download the release assembly. Verify package count, schema, versioned VSIX,
    license bundle, notes, and every entry in `SHA256SUMS`.
-3. Configure required reviewers on the GitHub `release` environment.
-4. Rerun the same revision with `create_draft_release` enabled.
-5. Confirm the workflow accepted successful exact-SHA `push` jobs for CI, VS
-   Code, both platform artifacts, and mdBook/Pages.
-6. Inspect the draft body and attachments before any publish operation.
+3. Confirm the release commit has successful exact-SHA `push` jobs for CI, VS Code, both platform artifacts, and mdBook/Pages.
+4. Keep the assembly private until registry publication and registry-only smoke testing succeed.
 
 ## Registry and Marketplace publication
 
 - [ ] Publish crates manually in the order documented in
       [Rust package readiness](packaging.md), waiting for registry visibility
       between dependency groups.
+- [ ] Verify local crates.io authentication without printing or passing the token; stop before the first upload when `cargo login` is still required.
 - [ ] Verify each crate version, tarball, checksum, dependency metadata, docs.rs
       build, and registry timestamp.
 - [ ] Install `cargo-ferry` from crates.io into an isolated Cargo root; generate
@@ -80,6 +78,16 @@ No step below implies that a release or registry publication has occurred.
       manual environment with the required secret.
 - [ ] Verify Marketplace version and install the public extension into an
       isolated VS Code profile.
-- [ ] Publish the GitHub draft only after registry and Marketplace verification.
+- [ ] Create and push annotated tag `v0.1.0` from the verified `master` commit.
+- [ ] Create GitHub Release `RustFerry 0.1.0` as a pre-release with manually reviewed notes covering packages, installation, Rust 1.92, validation limits, and Slint licensing.
+- [ ] Verify the tag target, pre-release flag, notes, links, and any intentional assets.
 - [ ] Create the next patch `Unreleased` changelog section and commit release
       closeout.
+
+## Failure and rollback policy
+
+- Query crates.io before retrying any timed-out upload.
+- Record the last verified package when publication stops partway through.
+- Never overwrite a published version or change its dependency contract.
+- Do not yank a healthy prerequisite because a later package failed. Fix only unpublished packages when compatible; otherwise prepare the next patch release.
+- Yank only for a concrete security, legal, or unusable-package defect, and record the reason and replacement version.

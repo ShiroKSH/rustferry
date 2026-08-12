@@ -18,12 +18,10 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.92"
 license = "MIT OR Apache-2.0"
-authors = ["ShiroKSH <kushidashiro@gmail.com>"]
+authors = ["ShiroKSH"]
 repository = "https://github.com/ShiroKSH/rustferry"
 homepage = "https://shiroksh.github.io/rustferry/"
 readme = "README.md"
-keywords = ["rust", "mobile", "android", "ios", "slint"]
-categories = ["command-line-utilities", "development-tools::build-utils", "gui"]
 
 [workspace.dependencies]
 base64 = "0.23.1"
