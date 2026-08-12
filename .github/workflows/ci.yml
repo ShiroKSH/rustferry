@@ -186,7 +186,13 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           cache-bin: "false"
-      - name: Workspace tests
+      - name: Workspace tests (Linux)
+        if: runner.os == 'Linux'
+        timeout-minutes: 20
+        run: cargo test --locked --workspace --all-features -- --test-threads=1
+      - name: Workspace tests (macOS and Windows)
+        if: runner.os != 'Linux'
+        timeout-minutes: 45
         run: cargo test --locked --workspace --all-features
       - name: Generate and check starter (Unix)
         if: runner.os != 'Windows'
