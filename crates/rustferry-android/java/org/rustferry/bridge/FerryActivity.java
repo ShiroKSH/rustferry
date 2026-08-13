@@ -7,6 +7,10 @@ import android.os.Bundle;
 
 /** Internal activity generated into the APK. Application authors never edit this class. */
 public final class FerryActivity extends NativeActivity {
+    static {
+        System.loadLibrary(@NATIVE_LIBRARY_NAME@);
+    }
+
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);

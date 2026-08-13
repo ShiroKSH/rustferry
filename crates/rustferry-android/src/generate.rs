@@ -277,7 +277,7 @@ fn generate_android_content_inner(
     }
     resources.sort_by(|left, right| left.0.cmp(&right.0));
     binary_resources.sort_by(|left, right| left.0.cmp(&right.0));
-    let java_sources = generate_bridge_sources(config);
+    let java_sources = generate_bridge_sources(config, &native_library_name);
 
     let mut hasher = Sha256::new();
     hasher.update(

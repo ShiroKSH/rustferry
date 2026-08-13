@@ -20,7 +20,10 @@ const WIDGET_SOURCE: &str = include_str!("../java/org/rustferry/bridge/FerryWidg
 const FILE_PROVIDER_SOURCE: &str =
     include_str!("../java/org/rustferry/bridge/FerryFileProvider.java");
 
-pub(crate) fn generate_bridge_sources(config: &FerryConfig) -> Vec<(Utf8PathBuf, String)> {
+pub(crate) fn generate_bridge_sources(
+    config: &FerryConfig,
+    native_library_name: &str,
+) -> Vec<(Utf8PathBuf, String)> {
     let network_status = config.capabilities.network.mode != NetworkMode::None;
     let network_probe = matches!(
         config.capabilities.network.mode,
@@ -80,11 +83,15 @@ pub(crate) fn generate_bridge_sources(config: &FerryConfig) -> Vec<(Utf8PathBuf,
     bridge = bridge.replace("@DEEP_LINK_SCHEMES@", &deep_link_schemes);
     bridge = bridge.replace("@DEEP_LINK_HOSTS@", &deep_link_hosts);
     bridge = bridge.replace("@DEEP_LINK_ACTIONS@", &deep_link_actions);
+    let activity = ACTIVITY_SOURCE.replace(
+        "@NATIVE_LIBRARY_NAME@",
+        &serde_json::to_string(native_library_name).expect("strings always serialize"),
+    );
     let prefix = "java/org/rustferry/bridge";
     vec![
         (
             Utf8PathBuf::from(format!("{prefix}/FerryActivity.java")),
-            ACTIVITY_SOURCE.to_owned(),
+            activity,
         ),
         (
             Utf8PathBuf::from(format!("{prefix}/FerryBridge.java")),
@@ -112,7 +119,7 @@ mod tests {
     #[test]
     fn bridge_capabilities_are_baked_without_template_tokens() {
         let config = FerryConfig::starter("Counter", "com.example.counter");
-        let sources = generate_bridge_sources(&config);
+        let sources = generate_bridge_sources(&config, "counter");
         let bridge = sources
             .iter()
             .find(|(path, _)| path.file_name() == Some("FerryBridge.java"))
@@ -144,7 +151,7 @@ mod tests {
         config.capabilities.deep_links.schemes = vec!["routes".to_owned()];
         config.capabilities.deep_links.allowed_hosts = vec!["app.example.com".to_owned()];
         config.capabilities.deep_links.allowed_actions = vec!["details".to_owned()];
-        let sources = generate_bridge_sources(&config);
+        let sources = generate_bridge_sources(&config, "routes");
         let bridge = sources
             .iter()
             .find(|(path, _)| path.file_name() == Some("FerryBridge.java"))
@@ -173,6 +180,20 @@ mod tests {
         ] {
             assert!(BRIDGE_SOURCE.contains(consumed));
         }
+    }
+
+    #[test]
+    fn activity_loads_native_library_for_jni_callbacks() {
+        let config = FerryConfig::starter("Counter", "com.example.counter");
+        let sources = generate_bridge_sources(&config, "counter_core");
+        let activity = sources
+            .iter()
+            .find(|(path, _)| path.file_name() == Some("FerryActivity.java"))
+            .map(|(_, source)| source)
+            .unwrap();
+
+        assert!(activity.contains("System.loadLibrary(\"counter_core\");"));
+        assert!(!activity.contains("@NATIVE_LIBRARY_NAME@"));
     }
 
     #[test]
