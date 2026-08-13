@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::apk::apk_artifact_digest;
+use crate::command::external_tool_path_arg;
 use crate::error::io_error;
 use crate::{
     AndroidError, AndroidSigningConfig, AndroidToolchain, ApkExpectation, ApkValidation,
@@ -738,76 +739,19 @@ fn javac_command(
         "8".to_owned(),
         "-Xlint:-options".to_owned(),
         "-bootclasspath".to_owned(),
-        java_tool_path_arg(&toolchain.platform.android_jar)?,
+        external_tool_path_arg(&toolchain.platform.android_jar)?,
         "-d".to_owned(),
-        java_tool_path_arg(output)?,
+        external_tool_path_arg(output)?,
     ];
     command.args.extend(
         generated
             .java_sources
             .iter()
-            .map(|path| java_tool_path_arg(path))
+            .map(|path| external_tool_path_arg(path))
             .collect::<Result<Vec<_>, _>>()?,
     );
     command.timeout = timeout;
     Ok(command)
-}
-
-fn java_tool_path_arg(path: &Utf8Path) -> Result<String, AndroidError> {
-    let value = path.as_str();
-    if value.chars().any(char::is_control) {
-        return Err(AndroidError::InvalidJavaToolPath {
-            reason: "control characters are not allowed",
-        });
-    }
-
-    #[cfg(windows)]
-    {
-        if strip_ascii_prefix(value, r"\\.\").is_some() {
-            return Err(AndroidError::InvalidJavaToolPath {
-                reason: "Windows device namespaces are not supported",
-            });
-        }
-        if let Some(verbatim) = strip_ascii_prefix(value, r"\\?\") {
-            if let Some(unc) = strip_ascii_prefix(verbatim, r"UNC\") {
-                let mut components = unc.split('\\');
-                if components.next().is_some_and(|part| !part.is_empty())
-                    && components.next().is_some_and(|part| !part.is_empty())
-                {
-                    return Ok(format!(r"\\{unc}"));
-                }
-                return Err(AndroidError::InvalidJavaToolPath {
-                    reason: "verbatim UNC paths require a server and share",
-                });
-            }
-            let bytes = verbatim.as_bytes();
-            if bytes.len() >= 3
-                && bytes[0].is_ascii_alphabetic()
-                && bytes[1] == b':'
-                && bytes[2] == b'\\'
-            {
-                return Ok(verbatim.to_owned());
-            }
-            return Err(AndroidError::InvalidJavaToolPath {
-                reason: "unsupported Windows verbatim namespace",
-            });
-        }
-    }
-
-    if !path.is_absolute() {
-        return Err(AndroidError::InvalidJavaToolPath {
-            reason: "path must be absolute",
-        });
-    }
-    Ok(value.to_owned())
-}
-
-#[cfg(windows)]
-fn strip_ascii_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
-    value
-        .get(..prefix.len())
-        .filter(|candidate| candidate.eq_ignore_ascii_case(prefix))
-        .map(|_| &value[prefix.len()..])
 }
 
 fn compile_bridge_classes(
@@ -952,14 +896,14 @@ fn d8_command(
         "--min-api".to_owned(),
         request.config.android.min_sdk.to_string(),
         "--lib".to_owned(),
-        java_tool_path_arg(&toolchain.platform.android_jar)?,
+        external_tool_path_arg(&toolchain.platform.android_jar)?,
         "--output".to_owned(),
-        java_tool_path_arg(output)?,
+        external_tool_path_arg(output)?,
     ];
     command.args.extend(
         inputs
             .iter()
-            .map(|path| java_tool_path_arg(path))
+            .map(|path| external_tool_path_arg(path))
             .collect::<Result<Vec<_>, _>>()?,
     );
     Ok(command)
@@ -1581,23 +1525,23 @@ mod tests {
     #[test]
     fn java_tool_path_normalizes_verbatim_drive_unc_and_unicode_paths() {
         assert_eq!(
-            java_tool_path_arg(Utf8Path::new(r"\\?\C:\work\generated\App.java")).unwrap(),
+            external_tool_path_arg(Utf8Path::new(r"\\?\C:\work\generated\App.java")).unwrap(),
             r"C:\work\generated\App.java"
         );
         assert_eq!(
-            java_tool_path_arg(Utf8Path::new(r"\\?\C:\work\classes")).unwrap(),
+            external_tool_path_arg(Utf8Path::new(r"\\?\C:\work\classes")).unwrap(),
             r"C:\work\classes"
         );
         assert_eq!(
-            java_tool_path_arg(Utf8Path::new(r"\\?\UNC\server\share\work\App.java")).unwrap(),
+            external_tool_path_arg(Utf8Path::new(r"\\?\UNC\server\share\work\App.java")).unwrap(),
             r"\\server\share\work\App.java"
         );
         assert_eq!(
-            java_tool_path_arg(Utf8Path::new(r"C:\work\обычный\App.java")).unwrap(),
+            external_tool_path_arg(Utf8Path::new(r"C:\work\обычный\App.java")).unwrap(),
             r"C:\work\обычный\App.java"
         );
         assert_eq!(
-            java_tool_path_arg(Utf8Path::new(r"\\?\C:\работа\App.java")).unwrap(),
+            external_tool_path_arg(Utf8Path::new(r"\\?\C:\работа\App.java")).unwrap(),
             r"C:\работа\App.java"
         );
     }
@@ -1606,8 +1550,8 @@ mod tests {
     fn java_tool_path_rejects_relative_and_control_character_paths() {
         for path in ["relative/App.java", "C:/work/App.java\nother"] {
             assert!(matches!(
-                java_tool_path_arg(Utf8Path::new(path)),
-                Err(AndroidError::InvalidJavaToolPath { .. })
+                external_tool_path_arg(Utf8Path::new(path)),
+                Err(AndroidError::InvalidExternalToolPath { .. })
             ));
         }
     }
@@ -1621,8 +1565,8 @@ mod tests {
             r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\App.java",
         ] {
             assert!(matches!(
-                java_tool_path_arg(Utf8Path::new(path)),
-                Err(AndroidError::InvalidJavaToolPath { .. })
+                external_tool_path_arg(Utf8Path::new(path)),
+                Err(AndroidError::InvalidExternalToolPath { .. })
             ));
         }
     }
@@ -1631,7 +1575,7 @@ mod tests {
     #[test]
     fn java_tool_path_preserves_absolute_non_windows_paths() {
         assert_eq!(
-            java_tool_path_arg(Utf8Path::new("/tmp/работа/App.java")).unwrap(),
+            external_tool_path_arg(Utf8Path::new("/tmp/работа/App.java")).unwrap(),
             "/tmp/работа/App.java"
         );
     }

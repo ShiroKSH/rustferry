@@ -10,6 +10,7 @@ use directories::BaseDirs;
 use fs2::FileExt;
 use uuid::Uuid;
 
+use crate::command::external_tool_path_arg;
 use crate::{AndroidError, AndroidToolchain, CommandSpec, error::io_error, run_command};
 
 /// Alias used only by the machine-local debug certificate.
@@ -27,7 +28,7 @@ pub enum SigningPasswordSource {
 impl SigningPasswordSource {
     fn apksigner_argument(&self) -> Result<String, AndroidError> {
         match self {
-            Self::File(path) => Ok(format!("file:{path}")),
+            Self::File(path) => Ok(format!("file:{}", external_tool_path_arg(path)?)),
             Self::Environment(name)
                 if !name.is_empty()
                     && name
@@ -239,11 +240,15 @@ pub fn apksigner_sign_command(
                 searched: vec![toolchain.build_tools.directory.clone()],
                 fix: "Install a complete Android SDK Build Tools revision.".to_owned(),
             })?;
-    let mut command = CommandSpec::new("sign APK", apksigner, current_dir);
+    let mut command = CommandSpec::new(
+        "sign APK",
+        apksigner,
+        Utf8PathBuf::from(external_tool_path_arg(current_dir)?),
+    );
     command.args = vec![
         "sign".to_owned(),
         "--ks".to_owned(),
-        signing.keystore.to_string(),
+        external_tool_path_arg(&signing.keystore)?,
         "--ks-key-alias".to_owned(),
         signing.key_alias.clone(),
         "--ks-pass".to_owned(),
@@ -253,9 +258,11 @@ pub fn apksigner_sign_command(
         command.args.push("--key-pass".to_owned());
         command.args.push(source.apksigner_argument()?);
     }
-    command
-        .args
-        .extend(["--out".to_owned(), output.to_string(), input.to_string()]);
+    command.args.extend([
+        "--out".to_owned(),
+        external_tool_path_arg(output)?,
+        external_tool_path_arg(input)?,
+    ]);
     Ok(command)
 }
 
@@ -279,12 +286,16 @@ pub fn apksigner_verify_command(
                 searched: vec![toolchain.build_tools.directory.clone()],
                 fix: "Install a complete Android SDK Build Tools revision.".to_owned(),
             })?;
-    let mut command = CommandSpec::new("verify APK signature", apksigner, current_dir);
+    let mut command = CommandSpec::new(
+        "verify APK signature",
+        apksigner,
+        Utf8PathBuf::from(external_tool_path_arg(current_dir)?),
+    );
     command.args = vec![
         "verify".to_owned(),
         "--verbose".to_owned(),
         "--print-certs".to_owned(),
-        apk.to_string(),
+        external_tool_path_arg(apk)?,
     ];
     Ok(command)
 }
@@ -327,16 +338,16 @@ fn ensure_debug_keystore(
         let mut command = CommandSpec::new(
             "create persistent debug keystore",
             toolchain.keytool.clone(),
-            parent,
+            Utf8PathBuf::from(external_tool_path_arg(parent)?),
         );
         command.args = vec![
             "-genkeypair".to_owned(),
             "-keystore".to_owned(),
-            paths.keystore.to_string(),
+            external_tool_path_arg(&paths.keystore)?,
             "-storetype".to_owned(),
             "PKCS12".to_owned(),
             "-storepass:file".to_owned(),
-            paths.password_file.to_string(),
+            external_tool_path_arg(&paths.password_file)?,
             "-alias".to_owned(),
             DEBUG_KEY_ALIAS.to_owned(),
             "-keyalg".to_owned(),
@@ -357,18 +368,18 @@ fn ensure_debug_keystore(
     let mut verify = CommandSpec::new(
         "validate persistent debug keystore",
         toolchain.keytool.clone(),
-        parent,
+        Utf8PathBuf::from(external_tool_path_arg(parent)?),
     );
     verify.args = vec![
         "-J-Duser.language=en".to_owned(),
         "-J-Duser.country=US".to_owned(),
         "-list".to_owned(),
         "-keystore".to_owned(),
-        paths.keystore.to_string(),
+        external_tool_path_arg(&paths.keystore)?,
         "-storetype".to_owned(),
         "PKCS12".to_owned(),
         "-storepass:file".to_owned(),
-        paths.password_file.to_string(),
+        external_tool_path_arg(&paths.password_file)?,
         "-alias".to_owned(),
         DEBUG_KEY_ALIAS.to_owned(),
         "-v".to_owned(),
@@ -527,14 +538,49 @@ fn secure_file(path: &Utf8Path) -> Result<(), AndroidError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{AndroidBuildTools, AndroidNdk, AndroidPlatform};
+
+    #[cfg(windows)]
+    fn signing_toolchain() -> AndroidToolchain {
+        AndroidToolchain {
+            sdk_root: r"C:\Android\Sdk".into(),
+            platform: AndroidPlatform {
+                sdk_root: r"C:\Android\Sdk".into(),
+                api_level: 36,
+                directory: r"C:\Android\Sdk\platforms\android-36".into(),
+                android_jar: r"C:\Android\Sdk\platforms\android-36\android.jar".into(),
+            },
+            build_tools: AndroidBuildTools {
+                sdk_root: r"C:\Android\Sdk".into(),
+                version: "36.0.0".to_owned(),
+                directory: r"C:\Android\Sdk\build-tools\36.0.0".into(),
+                aapt2: None,
+                d8: None,
+                zipalign: None,
+                apksigner: Some(r"C:\Android\Sdk\build-tools\36.0.0\apksigner.bat".into()),
+            },
+            ndk: AndroidNdk {
+                root: r"C:\Android\Sdk\ndk\29.0.0".into(),
+                version: "29.0.0".to_owned(),
+                llvm_prebuilt: None,
+            },
+            cargo: r"C:\Rust\cargo.exe".into(),
+            rustc: None,
+            rustup: None,
+            java: None,
+            javac: None,
+            keytool: r"C:\Java\bin\keytool.exe".into(),
+        }
+    }
 
     #[test]
     fn password_values_are_never_command_arguments() {
-        let source = SigningPasswordSource::File("/secure/signing.pass".into());
-        assert_eq!(
-            source.apksigner_argument().unwrap(),
-            "file:/secure/signing.pass"
-        );
+        #[cfg(windows)]
+        let path = r"C:\secure\signing.pass";
+        #[cfg(not(windows))]
+        let path = "/secure/signing.pass";
+        let source = SigningPasswordSource::File(path.into());
+        assert_eq!(source.apksigner_argument().unwrap(), format!("file:{path}"));
         assert!(!source.apksigner_argument().unwrap().contains("secret"));
     }
 
@@ -542,6 +588,38 @@ mod tests {
     fn rejects_unsafe_environment_names() {
         let source = SigningPasswordSource::Environment("PASSWORD;echo".to_owned());
         assert!(source.apksigner_argument().is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn apksigner_commands_normalize_windows_verbatim_paths() {
+        let signing = ResolvedSigningConfig {
+            keystore: r"\\?\C:\secure\debug.keystore".into(),
+            key_alias: "debug".to_owned(),
+            store_password: SigningPasswordSource::File(
+                r"\\?\C:\secure\debug-keystore.pass".into(),
+            ),
+            key_password: None,
+        };
+        let command = apksigner_sign_command(
+            &signing_toolchain(),
+            &signing,
+            Utf8Path::new(r"\\?\C:\work\aligned.apk"),
+            Utf8Path::new(r"\\?\C:\work\calculator.apk"),
+            Utf8Path::new(r"\\?\C:\work"),
+        )
+        .unwrap();
+        assert_eq!(command.current_dir, Utf8Path::new(r"C:\work"));
+        assert!(command.args.iter().all(|value| !value.contains(r"\\?\")));
+        assert!(command.args.contains(&r"C:\work\calculator.apk".to_owned()));
+
+        let verify = apksigner_verify_command(
+            &signing_toolchain(),
+            Utf8Path::new(r"\\?\C:\work\calculator.apk"),
+            Utf8Path::new(r"\\?\C:\work"),
+        )
+        .unwrap();
+        assert!(verify.args.iter().all(|value| !value.contains(r"\\?\")));
     }
 
     #[test]

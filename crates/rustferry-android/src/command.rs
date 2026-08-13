@@ -340,6 +340,63 @@ fn terminate_process_tree(child: &mut Child, process_group: u32) {
     let _ = child.wait();
 }
 
+pub(crate) fn external_tool_path_arg(path: &Utf8Path) -> Result<String, AndroidError> {
+    let value = path.as_str();
+    if value.chars().any(char::is_control) {
+        return Err(AndroidError::InvalidExternalToolPath {
+            reason: "control characters are not allowed",
+        });
+    }
+
+    #[cfg(windows)]
+    {
+        if strip_ascii_prefix(value, r"\\.\").is_some() {
+            return Err(AndroidError::InvalidExternalToolPath {
+                reason: "Windows device namespaces are not supported",
+            });
+        }
+        if let Some(verbatim) = strip_ascii_prefix(value, r"\\?\") {
+            if let Some(unc) = strip_ascii_prefix(verbatim, r"UNC\") {
+                let mut components = unc.split('\\');
+                if components.next().is_some_and(|part| !part.is_empty())
+                    && components.next().is_some_and(|part| !part.is_empty())
+                {
+                    return Ok(format!(r"\\{unc}"));
+                }
+                return Err(AndroidError::InvalidExternalToolPath {
+                    reason: "verbatim UNC paths require a server and share",
+                });
+            }
+            let bytes = verbatim.as_bytes();
+            if bytes.len() >= 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && bytes[2] == b'\\'
+            {
+                return Ok(verbatim.to_owned());
+            }
+            return Err(AndroidError::InvalidExternalToolPath {
+                reason: "unsupported Windows verbatim namespace",
+            });
+        }
+    }
+
+    if !path.is_absolute() {
+        return Err(AndroidError::InvalidExternalToolPath {
+            reason: "path must be absolute",
+        });
+    }
+    Ok(value.to_owned())
+}
+
+#[cfg(windows)]
+fn strip_ascii_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    value
+        .get(..prefix.len())
+        .filter(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        .map(|_| &value[prefix.len()..])
+}
+
 fn write_log(
     spec: &CommandSpec,
     path: &Utf8Path,

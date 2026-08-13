@@ -4,6 +4,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use rustferry_core::AndroidAbi;
 use serde::Deserialize;
 
+use crate::command::external_tool_path_arg;
 use crate::{AndroidError, AndroidToolchain, CommandSpec};
 
 /// Native and JVM artifacts extracted from one Cargo JSON message stream.
@@ -37,19 +38,19 @@ pub fn cargo_build_command(
     let mut command = CommandSpec::new(
         format!("build Rust cdylib for {}", abi.apk_directory()),
         toolchain.cargo.clone(),
-        project_dir,
+        Utf8PathBuf::from(external_tool_path_arg(project_dir)?),
     );
     command.args = vec![
         "build".to_owned(),
         "--manifest-path".to_owned(),
-        project_dir.join("Cargo.toml").to_string(),
+        external_tool_path_arg(&project_dir.join("Cargo.toml"))?,
         "--package".to_owned(),
         package_name.to_owned(),
         "--lib".to_owned(),
         "--target".to_owned(),
         target.to_owned(),
         "--target-dir".to_owned(),
-        cargo_target_dir.to_string(),
+        external_tool_path_arg(cargo_target_dir)?,
         "--message-format=json-render-diagnostics".to_owned(),
     ];
     if release {
@@ -59,26 +60,38 @@ pub fn cargo_build_command(
     let cc_target_key = target.replace('-', "_");
     command.environment.insert(
         format!("CARGO_TARGET_{cargo_target_key}_LINKER"),
-        linker.to_string(),
-    );
-    command
-        .environment
-        .insert(format!("CC_{cc_target_key}"), linker.to_string());
-    command
-        .environment
-        .insert(format!("AR_{cc_target_key}"), archiver.to_string());
-    command
-        .environment
-        .insert("ANDROID_HOME".to_owned(), toolchain.sdk_root.to_string());
-    command.environment.insert(
-        "ANDROID_SDK_ROOT".to_owned(),
-        toolchain.sdk_root.to_string(),
+        external_tool_path_arg(&linker)?,
     );
     command.environment.insert(
-        "ANDROID_NDK_HOME".to_owned(),
-        toolchain.ndk.root.to_string(),
+        format!("CC_{cc_target_key}"),
+        external_tool_path_arg(&linker)?,
     );
+    command.environment.insert(
+        format!("AR_{cc_target_key}"),
+        external_tool_path_arg(&archiver)?,
+    );
+    set_android_environment(&mut command, &toolchain.sdk_root, &toolchain.ndk.root)?;
     Ok(command)
+}
+
+fn set_android_environment(
+    command: &mut CommandSpec,
+    sdk_root: &Utf8Path,
+    ndk_root: &Utf8Path,
+) -> Result<(), AndroidError> {
+    let sdk_root = external_tool_path_arg(sdk_root)?;
+    let ndk_root = external_tool_path_arg(ndk_root)?;
+    for name in ["ANDROID_HOME", "ANDROID_SDK_ROOT"] {
+        command
+            .environment
+            .insert(name.to_owned(), sdk_root.clone());
+    }
+    for name in ["ANDROID_NDK", "ANDROID_NDK_HOME", "ANDROID_NDK_ROOT"] {
+        command
+            .environment
+            .insert(name.to_owned(), ndk_root.clone());
+    }
+    Ok(())
 }
 
 /// Parse Cargo JSON, constrain reported paths to Cargo's target directory, and collect DEX files.
@@ -305,6 +318,61 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::{AndroidBuildTools, AndroidNdk, AndroidPlatform};
+
+    fn fixture_toolchain(root: &Utf8Path) -> AndroidToolchain {
+        let tool = |name: &str| {
+            let path = root.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+            fs::write(&path, b"").unwrap();
+            path
+        };
+        let prebuilt = root.join("ndk/toolchains/llvm/prebuilt/test");
+        fs::create_dir_all(prebuilt.join("bin")).unwrap();
+        let clang_suffix = if cfg!(windows) { ".cmd" } else { "" };
+        fs::write(
+            prebuilt
+                .join("bin")
+                .join(format!("aarch64-linux-android26-clang{clang_suffix}")),
+            b"",
+        )
+        .unwrap();
+        fs::write(
+            prebuilt
+                .join("bin")
+                .join(format!("llvm-ar{}", std::env::consts::EXE_SUFFIX)),
+            b"",
+        )
+        .unwrap();
+        AndroidToolchain {
+            sdk_root: root.join("sdk"),
+            platform: AndroidPlatform {
+                sdk_root: root.join("sdk"),
+                api_level: 36,
+                directory: root.join("sdk/platforms/android-36"),
+                android_jar: root.join("sdk/platforms/android-36/android.jar"),
+            },
+            build_tools: AndroidBuildTools {
+                sdk_root: root.join("sdk"),
+                version: "36.0.0".to_owned(),
+                directory: root.join("sdk/build-tools/36.0.0"),
+                aapt2: None,
+                d8: None,
+                zipalign: None,
+                apksigner: None,
+            },
+            ndk: AndroidNdk {
+                root: root.join("ndk"),
+                version: "29.0.0".to_owned(),
+                llvm_prebuilt: Some(prebuilt),
+            },
+            cargo: tool("cargo"),
+            rustc: None,
+            rustup: None,
+            java: None,
+            javac: None,
+            keytool: tool("keytool"),
+        }
+    }
 
     fn cargo_messages(native: &Utf8Path, out_dir: &Utf8Path) -> String {
         [
@@ -327,6 +395,54 @@ mod tests {
         .collect::<Vec<_>>()
         .join("\n")
             + "\n"
+    }
+
+    #[test]
+    fn android_environment_includes_native_dependency_ndk_aliases() {
+        let mut command = CommandSpec::new("test", "cargo", ".");
+        #[cfg(windows)]
+        let (sdk, ndk) = (r"C:\Android\sdk", r"C:\Android\ndk");
+        #[cfg(not(windows))]
+        let (sdk, ndk) = ("/android/sdk", "/android/ndk");
+        set_android_environment(&mut command, Utf8Path::new(sdk), Utf8Path::new(ndk)).unwrap();
+
+        for name in ["ANDROID_HOME", "ANDROID_SDK_ROOT"] {
+            assert_eq!(command.environment.get(name).map(String::as_str), Some(sdk));
+        }
+        for name in ["ANDROID_NDK", "ANDROID_NDK_HOME", "ANDROID_NDK_ROOT"] {
+            assert_eq!(command.environment.get(name).map(String::as_str), Some(ndk));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cargo_build_command_normalizes_windows_verbatim_project_paths() {
+        let temporary = TempDir::new().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temporary.path().to_owned()).unwrap();
+        let command = cargo_build_command(
+            &fixture_toolchain(&root),
+            Utf8Path::new(r"\\?\C:\work\calculator"),
+            Utf8Path::new(r"\\?\C:\work\calculator\target"),
+            "calculator",
+            AndroidAbi::Arm64V8a,
+            26,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(command.current_dir, Utf8Path::new(r"C:\work\calculator"));
+        assert!(
+            command
+                .args
+                .iter()
+                .chain(command.environment.values())
+                .all(|value| !value.contains(r"\\?\"))
+        );
+        assert!(
+            command
+                .args
+                .contains(&r"C:\work\calculator\target".to_owned())
+        );
     }
 
     #[test]
