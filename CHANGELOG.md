@@ -11,6 +11,10 @@ All notable changes to this project will be documented in this file.
 - Extend IDE protocol v1 and the VS Code Remote Jobs view with cursor-paged logs, cancel/retry, artifact actions, snapshot preview/submit, and metadata-only signing readiness.
 - Add an additive exact-input `workflow_dispatch` transport foundation while retaining Push as the compatible/default provider trigger; live dispatch still requires a wired provider consumer plus matching default-branch and dispatched-ref workflow definitions.
 - Return a manifest-bound sanitized protected-signing log with every default GitHub development IPA, keep the exact five-file default transport, and add request-bound signed `.app`, reconstructed XCArchive, and main-application dSYM selection with independent client verification.
+- Add a Rust-only Calculator example with tested arithmetic state transitions and an Android-ready Slint UI.
+- Load generated Android app libraries through the JVM before dispatching JNI callbacks from `NativeActivity`.
+- Normalize safe Windows verbatim paths before invoking Cargo, `javac`, and D8 so local Android builds accept canonical project paths.
+- Export the selected NDK under Cargo build-script aliases, including `ANDROID_NDK` required by Skia.
 - Add the public Visual Studio Marketplace listing and marketplace icon for RustFerry for VS Code.
 - Add bounded per-target GitHub manual signing for an application, Widget, and Live Activity with exact repeatable profile selection, canonical static protected secrets, complete target-graph binding, versioned multi-profile stdin transport, and legacy single-application compatibility.
 - Add pinned SSH Mac endpoints and strict snapshot-session v1 with bounded source upload, ordered progress and cancellation, independently verified unsigned XCArchive transfer, receipt-gated publication, and zero-retention cleanup.

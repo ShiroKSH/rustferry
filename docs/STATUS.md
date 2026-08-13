@@ -1,6 +1,6 @@
 # Implementation status
 
-Last updated: 2026-08-12
+Last updated: 2026-08-13
 
 Source and documentation now use RustFerry. [Platform artifacts run 30719811812](https://github.com/ShiroKSH/rustferry/actions/runs/30719811812) at commit `8ed0192` produced and inspected current RustFerry-named Android and iOS artifacts. Exact pre-rename `cargo-pocket`/`Pocket*` paths, identifiers, symbols, and hashes remain below as historical evidence.
 
@@ -63,7 +63,7 @@ Status terms:
 | --- | --- | --- | --- | --- |
 | Workspace/config | Shared model implemented | Shared model implemented | Targeted tests pass | Strict schema, semantic validation, CLI JSON/human tests |
 | Starter generation | Implemented; all eight templates host-check | Implemented; all eight templates host-check | Actual CLI generation/check passed | Atomic generator plus six standalone projects |
-| UI backend | Slint 1.17.1 target-compiled into a public-CLI APK | Slint 1.17.1 public-CLI `.app` artifact-validated | Six Slint examples compile | [ADR-001](ADR-001-ui-backend.md) |
+| UI backend | Slint 1.17.1 target-compiled into a public-CLI APK | Slint 1.17.1 public-CLI `.app` artifact-validated | Seven Slint examples compile | [ADR-001](ADR-001-ui-backend.md) |
 | Build pipeline | Direct arm64 public-CLI APKs artifact-validated | Public-CLI starter, widget, and Live Activity artifacts validated | Build-plan/golden tests | Direct packager and generated Xcode host |
 | Lifecycle/network/storage | Backends implemented; bridge compiled into inspected APK; runtime unobserved | Backends implemented; framework artifact-inspected; runtime unobserved | Models, mocks, and examples pass | `TestRuntime` plus platform bridge tests |
 | Local notifications | Backend/receiver implemented and artifact-inspected; runtime unobserved | Backend implemented and framework artifact-inspected; runtime unobserved | Model and complete mock flow pass | Notifications example plus generated-bridge tests |
@@ -75,7 +75,13 @@ Status terms:
 | IDE and VS Code | Same CLI build/deploy service | Same CLI build/deploy service | Protocol v1 tests; extension TypeScript/lint; 42 base tests pass and 4 real-CLI tests skip when no CLI is supplied; all 46 pass with the final CLI | Installable VSIX and real Extension Host smoke-tested; no mobile runtime claim |
 | Assets | Five-density launcher icons and splash integrated into an inspected signed/aligned arm64 APK | `CompiledCatalog` implemented/tested; runtime-free `SdkOnlyResources` integrated into an inspected signed arm64 `.app` | Source validation, SHA-256 cache integrity, concurrent publication, tamper rejection, packaging, and artifact tests pass | Full `Assets.car` artifact validation still needs an installed iOS Simulator runtime |
 
-Real arm64 Android APK, iOS Simulator `.app`, and `.appex` artifacts have been produced and inspected from projects generated and built through the public CLI. No simulator, emulator, or physical-device behavior has been validated.
+Real arm64 Android APK, iOS Simulator `.app`, and `.appex` artifacts have been produced and inspected from projects generated and built through the public CLI. The Calculator replacement has also been launched and exercised successfully on a physical Android device; broader runtime behavior remains unvalidated.
+
+## Local Windows Calculator acceptance
+
+On 2026-08-13, the Rust-only [`examples/calculator`](../examples/calculator/README.md) project passed six arithmetic state-machine tests, `cargo ferry check`, host compilation, visual inspection, and a direct Windows Android build with SDK/Build Tools 36, NDK 29.0.14206865, JDK 17, and Rust 1.96.0. The build exposed and regression-tested Windows process-boundary fixes for canonical paths passed to Cargo, `javac`, D8, `keytool`, and `apksigner`, plus the `ANDROID_NDK` alias required by Skia.
+
+The first debug artifact reached a physical device but crashed when Java dispatched its initial native event: `NativeActivity` had loaded the app entry point without registering the library for Java native-method lookup. The generated activity now calls `System.loadLibrary` with the validated app library name, and a regression test covers the generated source. The replacement artifact is `examples/calculator/target/ferry/android/debug/calculator.apk` (188,052,420 bytes; SHA-256 `d9a164696e08f6c97c6f1950b335382815be6a3caa4fcfc6b32117c8c165b620`). Independent inspection verified the compiled `System.loadLibrary("calculator")` initializer, package `com.example.rustferry.calculator`, API 26 minimum/API 36 target, `org.rustferry.bridge.FerryActivity` launcher, zero requested permissions, v2/v3 signatures, 16 KiB-aware alignment, one `classes.dex`, five PNG icon densities, and `lib/arm64-v8a/libcalculator.so` as ELF64 AArch64 with the expected JNI callback export. A user-confirmed physical-device launch then verified startup, JNI event dispatch, and calculator interaction without the prior crash.
 
 ## Developer Experience 0.2 evidence
 
