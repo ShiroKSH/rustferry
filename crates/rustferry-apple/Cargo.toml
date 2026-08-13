@@ -9,9 +9,9 @@ repository.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/rustferry-apple"
 readme.workspace = true
-keywords = ["rust", "ios", "xcode", "mobile", "packaging"]
+keywords = ["rust", "ios", "cargo", "xcode", "mobile"]
 categories = ["development-tools::build-utils"]
-description = "Generated Xcode host and iOS artifact backend for RustFerry"
+description = "Generate disposable Xcode hosts and iOS artifacts for RustFerry applications"
 include = [
     "assets/**",
     "src/**",

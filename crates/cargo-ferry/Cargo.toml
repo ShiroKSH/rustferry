@@ -10,7 +10,7 @@ homepage.workspace = true
 readme.workspace = true
 keywords = ["rust", "mobile", "android", "ios", "cargo-subcommand"]
 categories = ["command-line-utilities", "development-tools::cargo-plugins"]
-description = "Build Rust applications for Android and iOS without user-maintained platform projects"
+description = "Ship Rust applications to Android and iOS from Cargo without maintaining Gradle or Xcode projects"
 documentation = "https://docs.rs/cargo-ferry"
 include = [
     "build.rs",

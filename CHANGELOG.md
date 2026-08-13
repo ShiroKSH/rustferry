@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [0.1.1] - Unreleased
 
+- Sharpen the project, package, documentation, and VS Code descriptions and discovery metadata.
+
 ## [0.1.0] - 2026-08-12
 
 RustFerry 0.1.0 is a public pre-release.

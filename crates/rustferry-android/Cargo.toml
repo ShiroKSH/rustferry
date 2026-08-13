@@ -9,9 +9,9 @@ repository.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/rustferry-android"
 readme.workspace = true
-keywords = ["rust", "android", "apk", "mobile", "packaging"]
+keywords = ["rust", "android", "cargo", "apk", "no-gradle"]
 categories = ["development-tools::build-utils"]
-description = "Direct no-Gradle Android packaging backend for RustFerry"
+description = "Build signed Android APKs from Rust and Cargo without maintaining a Gradle project"
 include = [
     "src/**",
     "java/**",

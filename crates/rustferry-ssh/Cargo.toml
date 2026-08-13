@@ -11,7 +11,7 @@ documentation = "https://docs.rs/rustferry-ssh"
 readme.workspace = true
 keywords = ["rust", "ssh", "remote-build", "macos", "transport"]
 categories = ["development-tools::build-utils", "network-programming"]
-description = "Hardened OpenSSH transport for RustFerry macOS workers"
+description = "Hardened OpenSSH transport for RustFerry builds on remote macOS workers"
 include = [
     "src/**",
     "LICENSE-MIT",

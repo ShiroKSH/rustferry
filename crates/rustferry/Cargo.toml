@@ -9,9 +9,9 @@ repository.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/rustferry"
 readme.workspace = true
-keywords = ["rust", "mobile", "android", "ios", "runtime"]
+keywords = ["rust", "mobile", "android", "ios", "slint"]
 categories = ["gui"]
-description = "Cross-platform runtime APIs for RustFerry Android and iOS applications"
+description = "Rust-first runtime APIs for cross-platform Android and iOS applications built with RustFerry"
 include = ["src/**", "LICENSE-MIT", "LICENSE-APACHE"]
 
 [lib]

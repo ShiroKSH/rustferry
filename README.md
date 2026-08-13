@@ -5,7 +5,7 @@
 <h1 align="center">RustFerry</h1>
 
 <p align="center">
-  Build Android and iOS applications from an ordinary Rust project, without maintaining a Gradle or Xcode project.
+  Ship Android and iOS apps from one Rust codebase—without maintaining Gradle or Xcode projects.
 </p>
 
 <p align="center">
@@ -19,9 +19,9 @@
   <a href="https://www.rust-lang.org/tools/install"><img alt="Rust 1.92 or newer" src="https://img.shields.io/badge/rust-1.92%2B-cb5a31?logo=rust"></a>
 </p>
 
-RustFerry 0.1.0 is available as a public pre-release from [crates.io](https://crates.io/crates/cargo-ferry/0.1.0), [GitHub Releases](https://github.com/ShiroKSH/rustferry/releases/tag/v0.1.0), and the [Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=ShiroKSH.rustferry-vscode).
+RustFerry is a Rust-first mobile toolchain for shipping Android and iOS apps from an ordinary Cargo project. Application code and assets stay in Rust; disposable platform hosts are generated under `target/ferry/` while `cargo ferry` handles builds, devices, deployment, logs, CI, signing, and remote macOS builds.
 
-RustFerry keeps application code and assets in a normal Rust project. Android and Apple hosts are generated below `target/ferry/`; they are disposable build output, not projects the application author maintains.
+RustFerry 0.1.0 is available as a public pre-release from [crates.io](https://crates.io/crates/cargo-ferry/0.1.0), [GitHub Releases](https://github.com/ShiroKSH/rustferry/releases/tag/v0.1.0), and the [Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=ShiroKSH.rustferry-vscode).
 
 > [!IMPORTANT]
 > RustFerry 0.1.0 is the first public pre-release. CI and retained evidence validate host tests, generated projects, a signed/aligned arm64 Android APK, iOS Simulator `.app`/`.appex` artifacts, and an unsigned physical-iPhone XCArchive built on a remote macOS worker. One Calculator APK built on Windows was launched and exercised on a physical Android device. Emulator, iOS Simulator, physical-iPhone runtime, generalized device install/run/log workflows, and a development-signed remote IPA remain unvalidated. An API or generated bridge is not, by itself, runtime evidence.

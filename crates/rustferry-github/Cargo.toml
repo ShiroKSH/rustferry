@@ -11,7 +11,7 @@ documentation = "https://docs.rs/rustferry-github"
 readme.workspace = true
 keywords = ["rust", "github-actions", "ios", "remote-build", "ci"]
 categories = ["development-tools::build-utils", "network-programming"]
-description = "Secure GitHub Actions workflow generation for RustFerry iPhone builds"
+description = "Generate secure GitHub Actions workflows for remote RustFerry iPhone builds and signing"
 include = [
     "src/**",
     "LICENSE-MIT",

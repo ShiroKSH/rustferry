@@ -1,6 +1,6 @@
 [book]
 title = "RustFerry"
-description = "Rust-only application source with generated Android and Apple hosts"
+description = "Ship Android and iOS apps from one Rust codebase without maintaining Gradle or Xcode projects"
 authors = ["RustFerry contributors"]
 language = "en"
 src = "."

@@ -9,9 +9,9 @@ repository.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/rustferry-core"
 readme.workspace = true
-keywords = ["rust", "mobile", "configuration", "validation", "tooling"]
+keywords = ["rust", "mobile", "cargo", "configuration", "tooling"]
 categories = ["development-tools::build-utils"]
-description = "Configuration, validation, naming, assets, and process control for RustFerry"
+description = "Configuration, validation, assets, naming, and process control for RustFerry mobile tooling"
 include = [
     "src/**",
     "benches/**",

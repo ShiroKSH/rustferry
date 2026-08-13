@@ -10,7 +10,7 @@ homepage.workspace = true
 readme.workspace = true
 keywords = ["rust", "mobile", "codegen", "android", "ios"]
 categories = ["development-tools::build-utils"]
-description = "Rust-only application project and capability code generation for RustFerry"
+description = "Generate RustFerry projects, platform hosts, and mobile capability glue from Rust"
 documentation = "https://docs.rs/rustferry-codegen"
 include = [
     "src/**",

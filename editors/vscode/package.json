@@ -1,7 +1,7 @@
 {
   "name": "rustferry-vscode",
   "displayName": "RustFerry for VS Code",
-  "description": "Build, inspect, and run RustFerry mobile applications from Visual Studio Code.",
+  "description": "Build, run, and ship RustFerry Android and iOS apps from Visual Studio Code.",
   "version": "0.1.0",
   "publisher": "ShiroKSH",
   "license": "MIT",
@@ -34,9 +34,14 @@
   ],
   "keywords": [
     "rust",
+    "cargo",
     "mobile",
     "android",
     "ios",
+    "cross-platform",
+    "mobile-development",
+    "slint",
+    "vscode",
     "rustferry"
   ],
   "extensionKind": [
