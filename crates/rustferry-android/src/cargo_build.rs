@@ -318,8 +318,10 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    #[cfg(windows)]
     use crate::{AndroidBuildTools, AndroidNdk, AndroidPlatform};
 
+    #[cfg(windows)]
     fn fixture_toolchain(root: &Utf8Path) -> AndroidToolchain {
         let tool = |name: &str| {
             let path = root.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
