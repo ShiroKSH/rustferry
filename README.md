@@ -12,22 +12,26 @@
   <a href="https://github.com/ShiroKSH/rustferry/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/ShiroKSH/rustferry/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/ShiroKSH/rustferry/actions/workflows/platform-artifacts.yml"><img alt="Platform artifacts" src="https://github.com/ShiroKSH/rustferry/actions/workflows/platform-artifacts.yml/badge.svg"></a>
   <a href="https://github.com/ShiroKSH/rustferry/actions/workflows/vscode-extension.yml"><img alt="VS Code extension" src="https://github.com/ShiroKSH/rustferry/actions/workflows/vscode-extension.yml/badge.svg"></a>
-  <a href="https://marketplace.visualstudio.com/items?itemName=ShiroKSH.rustferry-vscode"><img alt="Install RustFerry for VS Code" src="https://img.shields.io/badge/VS%20Code-Marketplace-0078D4?logo=visualstudiocode&logoColor=white"></a>
+  <a href="https://crates.io/crates/cargo-ferry/0.1.0"><img alt="cargo-ferry on crates.io" src="https://img.shields.io/crates/v/cargo-ferry?logo=rust"></a>
+  <a href="https://github.com/ShiroKSH/rustferry/releases/tag/v0.1.0"><img alt="GitHub release" src="https://img.shields.io/github/v/release/ShiroKSH/rustferry?include_prereleases&amp;label=release"></a>
+  <a href="https://marketplace.visualstudio.com/items?itemName=ShiroKSH.rustferry-vscode"><img alt="RustFerry for VS Code 0.1.0 on Marketplace" src="https://img.shields.io/badge/VS%20Marketplace-0.1.0-0078D4?logo=visualstudiocode&amp;logoColor=white"></a>
   <a href="#license"><img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-2f7d73"></a>
   <a href="https://www.rust-lang.org/tools/install"><img alt="Rust 1.92 or newer" src="https://img.shields.io/badge/rust-1.92%2B-cb5a31?logo=rust"></a>
 </p>
 
+RustFerry 0.1.0 is available as a public pre-release from [crates.io](https://crates.io/crates/cargo-ferry/0.1.0), [GitHub Releases](https://github.com/ShiroKSH/rustferry/releases/tag/v0.1.0), and the [Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=ShiroKSH.rustferry-vscode).
+
 RustFerry keeps application code and assets in a normal Rust project. Android and Apple hosts are generated below `target/ferry/`; they are disposable build output, not projects the application author maintains.
 
 > [!IMPORTANT]
-> RustFerry 0.1.0 is a public pre-release. CI and retained evidence validate host tests, generated projects, a signed/aligned arm64 Android APK, iOS Simulator `.app`/`.appex` artifacts, and an unsigned physical-iPhone XCArchive built on a remote macOS worker. One Calculator APK built on Windows was launched and exercised on a physical Android device. Emulator, iOS Simulator, physical-iPhone runtime, generalized device install/run/log workflows, and a development-signed remote IPA remain unvalidated. An API or generated bridge is not, by itself, runtime evidence.
+> RustFerry 0.1.0 is the first public pre-release. CI and retained evidence validate host tests, generated projects, a signed/aligned arm64 Android APK, iOS Simulator `.app`/`.appex` artifacts, and an unsigned physical-iPhone XCArchive built on a remote macOS worker. One Calculator APK built on Windows was launched and exercised on a physical Android device. Emulator, iOS Simulator, physical-iPhone runtime, generalized device install/run/log workflows, and a development-signed remote IPA remain unvalidated. An API or generated bridge is not, by itself, runtime evidence.
 
 ## Install
 
-Rust 1.92 or newer is required.
+Install the published CLI from crates.io. Rust 1.92 or newer is required.
 
 ```console
-cargo install cargo-ferry --locked
+cargo install cargo-ferry --version 0.1.0 --locked
 cargo ferry new weather --id com.example.weather
 cd weather
 cargo ferry doctor --all
@@ -120,7 +124,7 @@ cargo ferry artifact verify <downloaded-path> --job <local-job-id>
 
 ## Visual Studio Code
 
-Install [RustFerry for VS Code](https://marketplace.visualstudio.com/items?itemName=ShiroKSH.rustferry-vscode). The extension discovers trusted `ferry.toml` workspaces and delegates validation, builds, devices, deployment, remote jobs, artifacts, and logs to the versioned `cargo-ferry` protocol.
+[RustFerry for VS Code 0.1.0](https://marketplace.visualstudio.com/items?itemName=ShiroKSH.rustferry-vscode) is available from the Visual Studio Marketplace. The extension discovers trusted `ferry.toml` workspaces and delegates validation, builds, devices, deployment, remote jobs, artifacts, and logs to the versioned `cargo-ferry` protocol.
 
 To package the extension from source:
 
@@ -133,17 +137,19 @@ code --install-extension dist/rustferry-vscode.vsix
 
 ## Workspace crates
 
+All nine publishable workspace crates are available on crates.io as version 0.1.0.
+
 | Crate | Purpose |
 | --- | --- |
-| `cargo-ferry` | User-facing Cargo subcommand |
-| `rustferry` | Application runtime API |
-| `rustferry-core` | Configuration, validation, naming, assets, and shared primitives |
-| `rustferry-codegen` | Project, capability, host, and asset generation |
-| `rustferry-android` | Direct no-Gradle Android packaging backend |
-| `rustferry-apple` | Generated Apple host and artifact backend |
-| `rustferry-remote` | Versioned remote-build contracts |
-| `rustferry-github` | GitHub Actions provider |
-| `rustferry-ssh` | Pinned OpenSSH transport |
+| [`cargo-ferry`](https://crates.io/crates/cargo-ferry/0.1.0) | User-facing Cargo subcommand |
+| [`rustferry`](https://crates.io/crates/rustferry/0.1.0) | Application runtime API |
+| [`rustferry-core`](https://crates.io/crates/rustferry-core/0.1.0) | Configuration, validation, naming, assets, and shared primitives |
+| [`rustferry-codegen`](https://crates.io/crates/rustferry-codegen/0.1.0) | Project, capability, host, and asset generation |
+| [`rustferry-android`](https://crates.io/crates/rustferry-android/0.1.0) | Direct no-Gradle Android packaging backend |
+| [`rustferry-apple`](https://crates.io/crates/rustferry-apple/0.1.0) | Generated Apple host and artifact backend |
+| [`rustferry-remote`](https://crates.io/crates/rustferry-remote/0.1.0) | Versioned remote-build contracts |
+| [`rustferry-github`](https://crates.io/crates/rustferry-github/0.1.0) | GitHub Actions provider |
+| [`rustferry-ssh`](https://crates.io/crates/rustferry-ssh/0.1.0) | Pinned OpenSSH transport |
 | `rustferry-worker-macos` | Non-publishable trusted macOS worker |
 
 `rustferry-worker-macos` is intentionally workspace-only and is not published to crates.io.
