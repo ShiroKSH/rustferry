@@ -3,6 +3,7 @@ updates:
   - package-ecosystem: cargo
     directories:
       - "/"
+      - "/examples/calculator"
       - "/examples/counter"
       - "/examples/kitchen-sink"
       - "/examples/live-score"

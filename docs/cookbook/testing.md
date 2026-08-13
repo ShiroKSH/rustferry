@@ -64,4 +64,4 @@ fn unsupported_ui_path_is_visible() {
 
 ## Example project
 
-Every standalone project under [`examples/`](../../examples) includes a focused `TestRuntime` integration test; start with [Counter](../../examples/counter/README.md).
+Every standalone project under [`examples/`](../../examples) includes focused host-side tests. Capability examples use `TestRuntime`; start with [Counter](../../examples/counter/README.md).

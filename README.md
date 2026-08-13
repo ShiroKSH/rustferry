@@ -230,6 +230,7 @@ Configuration lives in `ferry.toml`. Generated platform files remain under `targ
 
 ## Examples
 
+- [Calculator](examples/calculator/README.md): four-function arithmetic, calculator state transitions, and an Android-ready touch UI.
 - [Counter](examples/counter/README.md): persistence and lifecycle events.
 - [Network Guard](examples/network-guard/README.md): offline UI, required-online gates, and endpoint probes.
 - [Notifications](examples/notifications/README.md): permission, delivery, scheduling, cancellation, and opens.

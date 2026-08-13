@@ -1,0 +1,67 @@
+schema_version = 1
+platforms = ["android"]
+
+[app]
+name = "Calculator"
+identifier = "com.example.rustferry.calculator"
+version = "0.1.0"
+display_version = "0.1.0"
+
+[app.window]
+orientation = "portrait"
+theme = "dark"
+
+[android]
+min_sdk = 26
+target_sdk = "installed"
+abis = ["arm64-v8a"]
+
+[ios]
+min_version = "16.0"
+
+[capabilities.network]
+mode = "none"
+probe_timeout_ms = 3000
+
+[capabilities.notifications]
+local = false
+push = false
+
+[capabilities.storage]
+enabled = false
+
+[capabilities.haptics]
+enabled = false
+
+[capabilities.clipboard]
+enabled = false
+
+[capabilities.share]
+enabled = false
+
+[capabilities.deep_links]
+schemes = []
+allowed_hosts = []
+allowed_actions = []
+
+[permissions.camera]
+enabled = false
+
+[permissions.photos]
+enabled = false
+
+[permissions.microphone]
+enabled = false
+
+[permissions.location_when_in_use]
+enabled = false
+
+[permissions.local_network]
+enabled = false
+
+[extensions.widget]
+enabled = false
+
+[extensions.live_activity]
+enabled = false
+android_fallback = "ongoing-notification"
