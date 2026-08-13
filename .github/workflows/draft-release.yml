@@ -140,26 +140,11 @@ jobs:
             --numeric-owner \
             -czf "dist/rustferry-licenses-$RELEASE_VERSION.tar.gz" \
             license-bundle
-          python3 - "$RELEASE_VERSION" "$GITHUB_SHA" <<'PY'
-          from pathlib import Path
-          import re
-          import sys
-
-          version, revision = sys.argv[1:]
-          changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
-          heading = rf"^## \[?v?{re.escape(version)}\]?(?:\s+-.*)?\s*$\n"
-          match = re.search(heading + r"(.*?)(?=^## |\Z)", changelog, re.M | re.S)
-          if match is None or not match.group(1).strip():
-              raise SystemExit(f"CHANGELOG.md has no release notes for {version}")
-          if "No public release has been cut." in match.group(1):
-              raise SystemExit("CHANGELOG.md still marks the project as unreleased")
-          notes = (
-              f"# RustFerry {version}\n\n"
-              f"Revision: `{revision}`\n\n"
-              f"{match.group(1).strip()}\n"
-          )
-          Path("dist/RELEASE_NOTES.md").write_text(notes, encoding="utf-8")
-          PY
+          python3 scripts/extract_release_notes.py \
+            --changelog CHANGELOG.md \
+            --version "$RELEASE_VERSION" \
+            --revision "$GITHUB_SHA" \
+            --output dist/RELEASE_NOTES.md
           (
             cd dist
             checksum_file="$RUNNER_TEMP/rustferry-SHA256SUMS"
