@@ -2084,7 +2084,16 @@ mod tests {
             fixture.upload_input(&fixture.archive_bytes),
             input_release_receiver,
         );
-        let (output_release_sender, output_release_receiver) = mpsc::sync_channel(1);
+        let (output_release_sender, output_release_receiver) = mpsc::channel();
+        let (watchdog_cancel_sender, watchdog_cancel_receiver) = mpsc::sync_channel(1);
+        let watchdog = thread::spawn(move || {
+            let forced_release = matches!(
+                watchdog_cancel_receiver.recv_timeout(Duration::from_secs(5)),
+                Err(RecvTimeoutError::Timeout)
+            );
+            let _ = output_release_sender.send(());
+            forced_release
+        });
         let mut output = BoundedSessionOutput::spawn(
             BlockingOutputSink {
                 release: output_release_receiver,
@@ -2093,7 +2102,6 @@ mod tests {
             Duration::from_millis(40),
         )
         .expect("bounded output");
-        let started = Instant::now();
         let result = serve_snapshot_session_with_job_id(
             reader,
             &mut output,
@@ -2102,7 +2110,11 @@ mod tests {
             JOB_ID,
         );
         assert_eq!(result, Err(SnapshotSessionServeError::Output));
-        assert!(started.elapsed() < Duration::from_millis(500));
+        watchdog_cancel_sender.send(()).expect("cancel watchdog");
+        assert!(
+            !watchdog.join().expect("watchdog thread"),
+            "snapshot session joined the blocked output writer"
+        );
         assert!(!compiler.called);
         assert_eq!(
             fs::read_dir(&fixture.worker_root)
@@ -2110,7 +2122,6 @@ mod tests {
                 .count(),
             0
         );
-        let _ = output_release_sender.send(());
         let _ = input_release_sender.send(());
     }
 

@@ -147,12 +147,9 @@ fn output_loop(writer: &mut impl Write, receiver: &Receiver<OutputCommand>) {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::{
-            Arc, Mutex,
-            mpsc::{Receiver, SyncSender},
-        },
-        time::Instant,
+    use std::sync::{
+        Arc, Mutex,
+        mpsc::{Receiver, SyncSender},
     };
 
     use super::*;
@@ -220,8 +217,17 @@ mod tests {
 
     #[test]
     fn blocked_system_write_times_out_without_joining_the_writer() {
-        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::channel();
         let (stopped_sender, stopped_receiver) = mpsc::sync_channel(1);
+        let (watchdog_cancel_sender, watchdog_cancel_receiver) = mpsc::sync_channel(1);
+        let watchdog = thread::spawn(move || {
+            let forced_release = matches!(
+                watchdog_cancel_receiver.recv_timeout(Duration::from_secs(5)),
+                Err(RecvTimeoutError::Timeout)
+            );
+            let _ = release_sender.send(());
+            forced_release
+        });
         let mut output = BoundedSessionOutput::spawn(
             BlockingWriter {
                 release: release_receiver,
@@ -231,15 +237,15 @@ mod tests {
             Duration::from_millis(40),
         )
         .expect("bounded output");
-        let started = Instant::now();
         let error = output.write_all(b"blocked").expect_err("write timeout");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert!(started.elapsed() < Duration::from_millis(500));
 
-        let retry_started = Instant::now();
         assert!(output.write_all(b"retry").is_err());
-        assert!(retry_started.elapsed() < Duration::from_millis(100));
-        release_sender.send(()).expect("release writer");
+        watchdog_cancel_sender.send(()).expect("cancel watchdog");
+        assert!(
+            !watchdog.join().expect("watchdog thread"),
+            "bounded output joined the blocked writer"
+        );
         drop(output);
         stopped_receiver
             .recv_timeout(Duration::from_secs(1))
