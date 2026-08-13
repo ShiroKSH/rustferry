@@ -538,6 +538,7 @@ fn secure_file(path: &Utf8Path) -> Result<(), AndroidError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
     use crate::{AndroidBuildTools, AndroidNdk, AndroidPlatform};
 
     #[cfg(windows)]
