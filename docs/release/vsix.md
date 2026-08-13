@@ -26,8 +26,11 @@ renames it to `rustferry-vscode-<version>.vsix` without changing its bytes.
 
 The 2026-08-01 acceptance candidate contains 18 entries, is 44,435 bytes, and
 has SHA-256 `ba8cac7e8d5ec10d3c7a96082f405c3d4d5cdd64afef82bc1f50a5a3d183ce6d`.
-These values identify the locally inspected candidate; publication has not
-occurred.
+These values identify a historical candidate. Marketplace version 0.1.0 is
+publicly listed. The final release assembly contains a later 73,636-byte VSIX
+with SHA-256 `0ae442e9c5b5fb2bc27a9af5093f227a7b42a0334238ce4faf0fc6ce09135641`;
+the protected workflow did not republish it during release closeout because
+the `VSCE_PAT` environment secret is not configured.
 
 The base extension run passes 42 tests and skips 4 live-CLI tests when no CLI is
 supplied. With the final CLI supplied, all 46 tests pass across 12 files. The
