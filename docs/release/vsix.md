@@ -78,7 +78,8 @@ headless Extension Host smoke and performance measurements, and enables the
 protocol integration test. Only the Linux VSIX is uploaded, avoiding three
 identical artifacts.
 
-Marketplace publication is deliberately absent from push and pull-request
-workflows. If enabled later, it must remain a protected manual job using a
-Marketplace token secret after the VSIX, license, and draft-release checks are
-complete.
+Marketplace publication remains absent from push and pull-request workflows.
+The separate manual workflow accepts the successful draft-release assembly run
+ID, requires an exact source-revision match, verifies the retained VSIX before
+and after protected approval, and exposes `VSCE_PAT` only to the final
+`vsce publish --pre-release` step.

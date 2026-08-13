@@ -72,6 +72,12 @@ class ExtractReleaseNotesTests(unittest.TestCase):
         self.assertTrue(body)
         self.assertIn("RustFerry 0.1.0 is a public pre-release.", body)
         self.assertIn("- Establish the RustFerry workspace", body)
+        self.assertIn("### Slint licensing and attribution", body)
+        self.assertIn(
+            "https://slint.dev/logo/MadeWithSlint-logo-light.svg",
+            body,
+        )
+        self.assertIn("application publisher's licensing obligations", body)
         self.assertNotIn("## Unreleased", body)
         self.assertNotIn("\n## ", body)
 

@@ -1,0 +1,160 @@
+name: Publish VS Code Marketplace
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version matching the inspected release assembly
+        required: true
+        type: string
+      assembly_run_id:
+        description: Successful Draft release workflow run for this exact master revision
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: rustferry-vscode-marketplace
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Verify release assembly
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.request.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify request and source revision
+        id: request
+        env:
+          ASSEMBLY_RUN_ID: ${{ inputs.assembly_run_id }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/$DEFAULT_BRANCH"
+          version="${REQUESTED_VERSION#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release version: $REQUESTED_VERSION" >&2
+            exit 1
+          fi
+          if [[ ! "$ASSEMBLY_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Invalid release assembly run ID" >&2
+            exit 1
+          fi
+          python3 scripts/check-release-contract.py --expected-version "$version"
+          extension_version="$(
+            python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          print(json.loads(Path("editors/vscode/package.json").read_text(encoding="utf-8"))["version"])
+          PY
+          )"
+          test "$extension_version" = "$version"
+          workflow_id="$(
+            gh api "repos/$GITHUB_REPOSITORY/actions/workflows/draft-release.yml" \
+              --jq '.id'
+          )"
+          run_json="$(
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$ASSEMBLY_RUN_ID"
+          )"
+          jq -e \
+            --arg sha "$GITHUB_SHA" \
+            --argjson workflow_id "$workflow_id" \
+            '.workflow_id == $workflow_id
+              and .head_sha == $sha
+              and .event == "workflow_dispatch"
+              and .status == "completed"
+              and .conclusion == "success"' \
+            <<< "$run_json" > /dev/null
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: rustferry-release-${{ steps.request.outputs.version }}
+          path: dist
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.assembly_run_id }}
+      - name: Verify Marketplace candidate
+        env:
+          RELEASE_VERSION: ${{ steps.request.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd dist
+            shasum -a 256 -c SHA256SUMS
+          )
+          python3 - "$RELEASE_VERSION" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          import zipfile
+
+          version = sys.argv[1]
+          root = Path("dist")
+          archive = root / f"rustferry-vscode-{version}.vsix"
+          with zipfile.ZipFile(archive) as package:
+              manifest = json.loads(package.read("extension/package.json"))
+          assert manifest["name"] == "rustferry-vscode"
+          assert manifest["publisher"] == "ShiroKSH"
+          assert manifest["version"] == version
+          notes = (root / "RELEASE_NOTES.md").read_text(encoding="utf-8")
+          assert "https://slint.dev/logo/MadeWithSlint-logo-light.svg" in notes
+          PY
+
+  publish:
+    name: Publish approved prerelease
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: vscode-marketplace
+      url: https://marketplace.visualstudio.com/items?itemName=ShiroKSH.rustferry-vscode
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+      - name: Install pinned Marketplace client
+        working-directory: editors/vscode
+        run: npm ci
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: rustferry-release-${{ needs.prepare.outputs.version }}
+          path: dist
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.assembly_run_id }}
+      - name: Reverify approved VSIX
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd dist
+            shasum -a 256 -c SHA256SUMS
+          )
+      - name: Publish verified VSIX as prerelease
+        working-directory: editors/vscode
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$VSCE_PAT"
+          npx --no-install vsce publish \
+            --pre-release \
+            --packagePath "$GITHUB_WORKSPACE/dist/rustferry-vscode-$RELEASE_VERSION.vsix"

@@ -20,6 +20,8 @@ No step below implies that a release or registry publication has occurred.
 - [ ] Confirm RustFerry root licenses and the release license bundle are present.
 - [ ] Record the Slint license path for every generated mobile binary considered
       for attachment. Do not attach such binaries when the choice is unresolved.
+- [ ] Confirm release notes retain the official `#MadeWithSlint` badge unchanged
+      and explain the downstream publisher's attribution or alternate-license duty.
 - [ ] Recheck third-party notices if the VSIX gains any production npm import.
 
 ## Rust and packages
@@ -75,7 +77,11 @@ No step below implies that a release or registry publication has occurred.
 - [ ] Install `cargo-ferry` from crates.io into an isolated Cargo root; generate
       and check a project without a runtime-path override.
 - [ ] Publish the already-inspected VSIX to Marketplace only through a protected
-      manual environment with the required secret.
+      manual `vscode-marketplace` environment with a required reviewer and the
+      `VSCE_PAT` Environment secret.
+- [ ] Verify the Marketplace workflow consumed the successful assembly run from
+      the exact release revision and used `vsce publish --pre-release` without a
+      token argument.
 - [ ] Verify Marketplace version and install the public extension into an
       isolated VS Code profile.
 - [ ] Create and push annotated tag `v0.1.0` from the verified `master` commit.
@@ -83,6 +89,8 @@ No step below implies that a release or registry publication has occurred.
 - [ ] Verify the tag target, pre-release flag, notes, links, and any intentional assets.
 - [ ] Create the next patch `Unreleased` changelog section and commit release
       closeout.
+- [ ] Track migration from the temporary global Marketplace PAT to Microsoft
+      Entra ID or trusted publishing before December 1, 2026.
 
 ## Failure and rollback policy
 

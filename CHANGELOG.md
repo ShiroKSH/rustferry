@@ -35,3 +35,19 @@ RustFerry 0.1.0 is a public pre-release.
 - Add package, license, VSIX, archive-safety, CI, and draft-release hardening.
 - Validate the Rust-only workflow across Windows, Linux, and macOS CI, including generated starters, documentation, the VS Code extension, package archives, and the Android artifact pipeline.
 - Keep Android emulator, iOS Simulator, physical-iPhone runtime, generalized physical-device install/run/log flows, live SSH compilation, and a development-signed remote IPA explicitly unvalidated in this release.
+
+### Slint licensing and attribution
+
+[![Made with Slint](https://slint.dev/logo/MadeWithSlint-logo-light.svg)](https://slint.dev/)
+
+RustFerry's default generated UI uses Slint.
+
+When distributing an application under the Slint Royalty-Free License,
+the application publisher must satisfy Slint's attribution conditions:
+either provide the AboutSlint widget in an accessible About dialog or
+splash screen, or display the official Slint attribution badge on a
+public application/download page.
+
+Applications may instead use Slint under GPLv3 or an applicable
+commercial license. RustFerry does not remove or replace the
+application publisher's licensing obligations.
